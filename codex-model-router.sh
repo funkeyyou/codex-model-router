@@ -1,0 +1,2803 @@
+#!/bin/bash
+set -euo pipefail
+
+find_node() {
+  if [[ -n "${CODEX_MODEL_ROUTER_NODE_BIN:-}" && -x "${CODEX_MODEL_ROUTER_NODE_BIN}" ]]; then
+    printf '%s\n' "${CODEX_MODEL_ROUTER_NODE_BIN}"
+    return
+  fi
+
+  local candidate
+  for candidate in \
+    "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node" \
+    "$(command -v node 2>/dev/null || true)"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
+
+  return 1
+}
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "此安装器仅支持 macOS。" >&2
+  exit 1
+fi
+
+NODE_BIN="$(find_node || true)"
+if [[ -z "${NODE_BIN}" ]]; then
+  echo "未找到 Node.js，请先安装 ChatGPT Desktop 或 Node.js。" >&2
+  exit 1
+fi
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-model-router.XXXXXX")"
+cleanup() {
+  rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT INT TERM
+
+INSTALLER_JS="${TMP_DIR}/installer.mjs"
+awk '
+  /^__CODEX_MODEL_ROUTER_INSTALLER_JS__$/ { capture = 1; next }
+  /^__CODEX_MODEL_ROUTER_ROUTER_JS__$/ { capture = 0 }
+  capture { print }
+' "$0" > "${INSTALLER_JS}"
+
+export CODEX_MODEL_ROUTER_SCRIPT_PATH="$0"
+export CODEX_MODEL_ROUTER_NODE_BIN="${NODE_BIN}"
+ARG_COUNT=$#
+set +e
+"${NODE_BIN}" "${INSTALLER_JS}" "$@"
+EXIT_STATUS=$?
+set -e
+if [[ ${ARG_COUNT} -eq 0 && -t 0 ]]; then
+  echo
+  read -r -p "按回车键结束（窗口是否关闭取决于终端设置）..." _
+fi
+exit ${EXIT_STATUS}
+
+: <<'__CODEX_MODEL_ROUTER_EMBEDDED__'
+__CODEX_MODEL_ROUTER_INSTALLER_JS__
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { createServer } from "node:net";
+import { basename, dirname, join, resolve } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { createInterface } from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
+
+const INSTALLER_VERSION = "1.4.0";
+const PROVIDER_ID = "compat_router";
+const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const EFFORT_DESCRIPTIONS = {
+  low: "响应较快，使用较少推理",
+  medium: "平衡响应速度与推理深度",
+  high: "为复杂任务提供更深入的推理",
+  xhigh: "为高难度任务提供超高推理深度",
+  max: "最高推理深度",
+};
+
+const env = process.env;
+const requestedAction = process.argv[2]?.toLowerCase() ?? null;
+const scriptPath = env.CODEX_MODEL_ROUTER_SCRIPT_PATH;
+const nodeBin = env.CODEX_MODEL_ROUTER_NODE_BIN;
+const homeDir = env.HOME;
+const codexHome = resolve(env.CODEX_HOME || join(homeDir, ".codex"));
+const installRoot = resolve(
+  env.CODEX_MODEL_ROUTER_HOME || join(codexHome, "model-router"),
+);
+const backupsRoot = resolve(join(codexHome, "backups", "model-router"));
+const launchAgentsDir = resolve(
+  env.CODEX_MODEL_ROUTER_LAUNCH_AGENTS_DIR ||
+    join(homeDir, "Library", "LaunchAgents"),
+);
+const manifestPath = join(installRoot, "install.json");
+const routerPath = join(installRoot, "router.mjs");
+const bridgePath = join(installRoot, "claude-bridge.mjs");
+const settingsPath = join(installRoot, "settings.json");
+const catalogPath = join(installRoot, "models.json");
+const logPath = join(installRoot, "router.err.log");
+const installHash = createHash("sha256")
+  .update(codexHome)
+  .digest("hex")
+  .slice(0, 10);
+const launchLabel = `com.openai.codex.model-router.${installHash}`;
+const plistPath = join(launchAgentsDir, `${launchLabel}.plist`);
+const testMode = env.CODEX_MODEL_ROUTER_TEST_MODE === "1";
+const assumeYes = env.CODEX_MODEL_ROUTER_YES === "1";
+
+function fail(message) {
+  throw new Error(message);
+}
+
+function printHeading(message) {
+  console.log(`\n${message}`);
+}
+
+function timestamp() {
+  return new Date().toISOString().replaceAll(":", "-").replace(".", "-");
+}
+
+function ensureDirectory(path, mode = 0o700) {
+  mkdirSync(path, { recursive: true, mode });
+  chmodSync(path, mode);
+}
+
+function writeJsonAtomic(path, value, mode = 0o600) {
+  const temporaryPath = `${path}.tmp-${process.pid}`;
+  writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
+    mode,
+  });
+  renameSync(temporaryPath, path);
+  chmodSync(path, mode);
+}
+
+function shell(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
+    env: options.env ?? env,
+    cwd: options.cwd,
+  });
+  if (options.allowFailure !== true && result.status !== 0) {
+    const detail = (result.stderr || result.stdout || "").trim();
+    fail(`${command} 执行失败${detail ? `：${detail}` : ""}`);
+  }
+  return result;
+}
+
+function findExecutable(candidates) {
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function commandPath(name) {
+  const result = shell("/usr/bin/which", [name], { allowFailure: true });
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
+const codexBin = findExecutable([
+  env.CODEX_MODEL_ROUTER_CODEX_BIN,
+  "/Applications/ChatGPT.app/Contents/Resources/codex",
+  commandPath("codex"),
+]);
+
+function readManifest() {
+  if (!existsSync(manifestPath)) return null;
+  return JSON.parse(readFileSync(manifestPath, "utf8"));
+}
+
+function extractRouterSource() {
+  if (!scriptPath || !existsSync(scriptPath)) {
+    fail("无法读取安装器源文件。" );
+  }
+  const source = readFileSync(scriptPath, "utf8");
+  const marker = "__CODEX_MODEL_ROUTER_ROUTER_JS__\n";
+  const markerIndex = source.indexOf(marker);
+  if (markerIndex < 0) fail("安装器中缺少内嵌路由器代码。" );
+  const routerSource = source.slice(markerIndex + marker.length);
+  const endMarker = "\n__CODEX_MODEL_ROUTER_BRIDGE_JS__";
+  const endIndex = routerSource.lastIndexOf(endMarker);
+  return endIndex < 0 ? routerSource : routerSource.slice(0, endIndex);
+}
+
+function loadBridgeSource() {
+  if (!scriptPath || !existsSync(scriptPath)) {
+    fail("无法读取安装器源文件。" );
+  }
+  const source = readFileSync(scriptPath, "utf8");
+  const marker = "__CODEX_MODEL_ROUTER_BRIDGE_JS__\n";
+  const markerIndex = source.indexOf(marker);
+  if (markerIndex < 0) fail("安装器中缺少内嵌 Claude 转译代码。" );
+  const bridgeSource = source.slice(markerIndex + marker.length);
+  const endMarker = "\n__CODEX_MODEL_ROUTER_EMBEDDED__";
+  const endIndex = bridgeSource.lastIndexOf(endMarker);
+  return endIndex < 0 ? bridgeSource : bridgeSource.slice(0, endIndex);
+}
+
+async function ask(question, defaultValue = null) {
+  if (defaultValue != null && env.CODEX_MODEL_ROUTER_BASE_URL) {
+    return defaultValue;
+  }
+  const rl = createInterface({ input, output });
+  try {
+    const suffix = defaultValue == null ? "" : ` [${defaultValue}]`;
+    const answer = (await rl.question(`${question}${suffix}: `)).trim();
+    return answer || defaultValue || "";
+  } finally {
+    rl.close();
+  }
+}
+
+async function confirm(question, defaultYes = true) {
+  if (assumeYes) return true;
+  const rl = createInterface({ input, output });
+  try {
+    const answer = (
+      await rl.question(`${question} ${defaultYes ? "[Y/n]" : "[y/N]"}: `)
+    )
+      .trim()
+      .toLowerCase();
+    if (!answer) return defaultYes;
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+function normalizeUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    fail(`Base URL 无效：${value}`);
+  }
+  if (!/^https?:$/.test(parsed.protocol)) {
+    fail("Base URL 必须使用 http:// 或 https://。" );
+  }
+  parsed.hash = "";
+  parsed.search = "";
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function keychainServiceFor(baseUrl) {
+  const digest = createHash("sha256").update(baseUrl).digest("hex").slice(0, 16);
+  return `com.openai.codex.model-router.${digest}`;
+}
+
+function keychainHas(service) {
+  if (env.CODEX_MODEL_ROUTER_TEST_API_KEY) return false;
+  return (
+    shell(
+      "/usr/bin/security",
+      ["find-generic-password", "-a", "codex", "-s", service],
+      { allowFailure: true },
+    ).status === 0
+  );
+}
+
+function storeApiKey(service, baseUrl) {
+  const label = `Codex 模型路由器：${new URL(baseUrl).host}`;
+  const testKey = env.CODEX_MODEL_ROUTER_TEST_API_KEY;
+  if (testKey) {
+    return;
+  }
+
+  console.log("请在 macOS 钥匙串提示中输入 API Key。" );
+  console.log("API Key 不会写入 config.toml 或安装器文件。" );
+  const result = spawnSync(
+    "/usr/bin/security",
+    [
+      "add-generic-password",
+      "-U",
+      "-a",
+      "codex",
+      "-s",
+      service,
+      "-l",
+      label,
+      "-j",
+      "供 Codex 本机模型路由器使用",
+      "-w",
+    ],
+    { stdio: "inherit" },
+  );
+  if (result.status !== 0) fail("API Key 未能保存到钥匙串。" );
+}
+
+function readApiKey(service) {
+  if (env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+    return env.CODEX_MODEL_ROUTER_TEST_API_KEY;
+  }
+  return shell("/usr/bin/security", [
+    "find-generic-password",
+    "-a",
+    "codex",
+    "-s",
+    service,
+    "-w",
+  ]).stdout.trim();
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function candidateApiRoots(baseUrl) {
+  const normalized = normalizeUrl(baseUrl);
+  const candidates = [];
+  if (/\/v1$/i.test(new URL(normalized).pathname)) {
+    candidates.push(normalized);
+  } else {
+    candidates.push(`${normalized}/v1`, normalized);
+  }
+  return [...new Set(candidates)];
+}
+
+// 模型 -> 供應商（取自 /models 的 owned_by），用來決定是否啟用 Anthropic 轉譯。
+const modelOwners = new Map();
+
+function normalizeOwner(owner) {
+  const value = String(owner || "").toLowerCase();
+  if (value.includes("anthropic")) return "anthropic";
+  if (value.includes("openai")) return "openai";
+  if (value.includes("xai") || value.includes("grok")) return "xai";
+  return value || "unknown";
+}
+
+function parseModelList(payload) {
+  const values = [];
+  if (Array.isArray(payload?.data)) {
+    for (const item of payload.data) {
+      if (typeof item?.id === "string" && item.id.trim()) {
+        values.push(item.id.trim());
+        modelOwners.set(item.id.trim(), normalizeOwner(item.owned_by));
+      }
+    }
+  }
+  if (Array.isArray(payload?.models)) {
+    for (const item of payload.models) {
+      const value = item?.id ?? item?.slug ?? item?.model;
+      if (typeof value === "string" && value.trim()) values.push(value.trim());
+    }
+  }
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
+}
+
+async function discoverApiRoot(baseUrl, apiKey) {
+  const failures = [];
+  for (const apiRoot of candidateApiRoots(baseUrl)) {
+    const modelsUrl = `${apiRoot.replace(/\/$/, "")}/models`;
+    try {
+      const response = await fetchWithTimeout(modelsUrl, {
+        headers: { authorization: `Bearer ${apiKey}` },
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        failures.push(`${modelsUrl}: HTTP ${response.status}`);
+        continue;
+      }
+      const models = parseModelList(JSON.parse(text));
+      if (models.length === 0) {
+        failures.push(`${modelsUrl}：响应中没有模型 ID`);
+        continue;
+      }
+      return { apiRoot, models };
+    } catch (error) {
+      failures.push(`${modelsUrl}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  fail(`无法发现可用模型。${failures.join("；")}`);
+}
+
+function parseSelection(value, modelCount) {
+  if (/^(all|\*)$/i.test(value.trim())) {
+    return Array.from({ length: modelCount }, (_, index) => index);
+  }
+  const selected = new Set();
+  for (const rawPart of value.split(",")) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(part);
+    if (range) {
+      const start = Number(range[1]);
+      const end = Number(range[2]);
+      const low = Math.min(start, end);
+      const high = Math.max(start, end);
+      for (let number = low; number <= high; number += 1) {
+        if (number < 1 || number > modelCount) fail(`选择项 ${number} 超出范围。`);
+        selected.add(number - 1);
+      }
+      continue;
+    }
+    if (!/^\d+$/.test(part)) fail(`选择格式无效：${part}`);
+    const number = Number(part);
+    if (number < 1 || number > modelCount) fail(`选择项 ${number} 超出范围。`);
+    selected.add(number - 1);
+  }
+  if (selected.size === 0) fail("没有选择任何模型。" );
+  return [...selected].sort((a, b) => a - b);
+}
+
+async function selectModels(models) {
+  printHeading("可用模型");
+  models.forEach((model, index) => {
+    console.log(`${String(index + 1).padStart(3)}. ${model}`);
+  });
+  const automaticSelection = env.CODEX_MODEL_ROUTER_TEST_MODELS;
+  const answer =
+    automaticSelection ||
+    (await ask("请输入模型编号，可使用逗号、范围，或输入 all 全选"));
+  return parseSelection(answer, models.length).map((index) => models[index]);
+}
+
+async function testResponse(apiRoot, apiKey, model, effort) {
+  const body = {
+    model,
+    input: "Reply with exactly OK.",
+    max_output_tokens: 128,
+    store: false,
+  };
+  if (effort) body.reasoning = { effort };
+  const response = await fetchWithTimeout(
+    `${apiRoot.replace(/\/$/, "")}/responses`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+    90000,
+  );
+  const responseText = await response.text();
+  return {
+    ok: response.ok,
+    status: response.status,
+    detail: response.ok ? "" : responseText.slice(0, 240),
+  };
+}
+
+// Anthropic 的驗證錯誤會直接回報上限，且驗證在推論前發生（不計費）。
+// 送遠超任何現有模型的長度，確保必定被拒 —— 因此這個探測是免費的。
+async function probeAnthropicContextWindow(apiRoot, apiKey, model) {
+  const filler = "word ".repeat(1300000);
+  try {
+    const response = await fetchWithTimeout(
+      `${apiRoot.replace(/\/$/, "")}/messages`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: "user", content: filler }] }),
+      },
+      180000,
+    );
+    const text = await response.text();
+    const match = /prompt is too long:\s*\d+\s*tokens?\s*>\s*(\d+)\s*maximum/i.exec(text);
+    if (match) return Number(match[1]);
+  } catch {}
+  return null;
+}
+
+// max_tokens 超標同樣是免費的驗證錯誤，順便帶出正式模型 ID。
+async function probeAnthropicMaxOutput(apiRoot, apiKey, model) {
+  try {
+    const response = await fetchWithTimeout(
+      `${apiRoot.replace(/\/$/, "")}/messages`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, max_tokens: 9999999, messages: [{ role: "user", content: "hi" }] }),
+      },
+      60000,
+    );
+    const text = await response.text();
+    const limit = /max_tokens:\s*\d+\s*>\s*(\d+)/i.exec(text);
+    const id = /output tokens for ([A-Za-z0-9._-]+)/i.exec(text);
+    return { maxOutput: limit ? Number(limit[1]) : null, canonicalId: id ? id[1] : null };
+  } catch {}
+  return { maxOutput: null, canonicalId: null };
+}
+
+// Anthropic 模型走原生 /messages（閘道的 Responses 相容層對 Claude 是壞的）。
+async function probeAnthropicModel(apiRoot, apiKey, model) {
+  try {
+    const response = await fetchWithTimeout(
+      `${apiRoot.replace(/\/$/, "")}/messages`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model, max_tokens: 16, stream: true,
+          messages: [{ role: "user", content: "Reply with exactly OK." }],
+        }),
+      },
+      90000,
+    );
+    const text = await response.text();
+    let detail = "";
+    try {
+      const parsed = JSON.parse(text);
+      detail = parsed?.error?.message || "";
+    } catch {}
+    return { ok: response.ok, status: response.status, detail: detail || text.slice(0, 160) };
+  } catch (error) {
+    return { ok: false, status: 0, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function probeModel(apiRoot, apiKey, model) {
+  const supportedEfforts = [];
+  for (const effort of EFFORTS) {
+    process.stdout.write(`  ${effort.padEnd(7)} `);
+    try {
+      const result = await testResponse(apiRoot, apiKey, model, effort);
+      if (result.ok) {
+        supportedEfforts.push(effort);
+        console.log("支持");
+      } else {
+        console.log(`不支持（HTTP ${result.status}）`);
+      }
+    } catch (error) {
+      console.log(`探测失败（${error instanceof Error ? error.message : String(error)}）`);
+    }
+  }
+
+  if (supportedEfforts.length > 0) {
+    return { supported: true, efforts: supportedEfforts, stripReasoning: false };
+  }
+
+  process.stdout.write("  默认    ");
+  try {
+    const result = await testResponse(apiRoot, apiKey, model, null);
+    if (result.ok) {
+      console.log("支持，但不提供推理强度控制");
+      return { supported: true, efforts: [], stripReasoning: true };
+    }
+    console.log(`不支持（HTTP ${result.status}）`);
+  } catch (error) {
+    console.log(`探测失败（${error instanceof Error ? error.message : String(error)}）`);
+  }
+  return { supported: false, efforts: [], stripReasoning: false };
+}
+
+function pickerSlug(model) {
+  const readable = model
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 44) || "model";
+  const digest = createHash("sha256").update(model).digest("hex").slice(0, 8);
+  return `custom/${readable}-${digest}`;
+}
+
+function defaultEffort(efforts) {
+  for (const effort of ["medium", "low", "high", "xhigh", "max"]) {
+    if (efforts.includes(effort)) return effort;
+  }
+  return "none";
+}
+
+function loadBundledCatalog() {
+  const result = shell(
+    codexBin,
+    [
+      "debug",
+      "models",
+      "--bundled",
+      "-c",
+      "model_catalog_json=null",
+      "-c",
+      'model_provider="openai"',
+    ],
+    { env: { ...env, CODEX_HOME: codexHome } },
+  );
+  const catalog = JSON.parse(result.stdout);
+  if (!Array.isArray(catalog?.models) || catalog.models.length === 0) {
+    fail("Codex 返回了空的内置模型目录。" );
+  }
+  return catalog;
+}
+
+function customCatalogEntry(officialModels, route, index) {
+  const lastSegment = route.upstreamModel.split("/").at(-1);
+  const exactTemplate = officialModels.find(
+    (model) => model.slug === route.upstreamModel || model.slug === lastSegment,
+  );
+  const fallbackTemplate =
+    officialModels.find((model) => model.slug === "gpt-5.6-sol") ||
+    officialModels.find((model) => model.visibility === "list") ||
+    officialModels[0];
+  const entry = structuredClone(exactTemplate || fallbackTemplate);
+  entry.slug = route.pickerSlug;
+  entry.display_name = route.displayName;
+  entry.description = `${route.upstreamModel}，由 ${route.providerHost} 提供`;
+  entry.default_reasoning_level = defaultEffort(route.efforts);
+  entry.supported_reasoning_levels = route.efforts.map((effort) => ({
+    effort,
+    description: EFFORT_DESCRIPTIONS[effort],
+  }));
+  entry.priority =
+    Math.max(...officialModels.map((model) => Number(model.priority || 0))) +
+    index +
+    1;
+  entry.visibility = "list";
+  entry.supported_in_api = true;
+  entry.additional_speed_tiers = [];
+  entry.service_tiers = [];
+  entry.availability_nux = null;
+  entry.upgrade = null;
+  entry.supports_search_tool = false;
+  delete entry.web_search_tool_type;
+  // 上下文視窗解析順序：探測值 > 官方同名模板 > 通用模板值（並警告）。
+  if (Number.isFinite(route.contextWindow) && route.contextWindow > 0) {
+    entry.context_window = route.contextWindow;
+    entry.max_context_window = route.contextWindow;
+    entry.effective_context_window_percent = 95;
+  } else if (!exactTemplate) {
+    console.log(
+      `  ⚠️  ${route.upstreamModel}：无法自动探测上下文上限，` +
+        `沿用模板值 ${entry.context_window}。如与实际不符请手动修改 models.json。`,
+    );
+  }
+  if (Number.isFinite(route.maxOutputTokens) && route.maxOutputTokens > 0) {
+    entry.max_output_tokens = route.maxOutputTokens;
+  }
+  return entry;
+}
+
+function deepGet(object, path) {
+  const parts = path.split(".");
+  let current = object;
+  for (const part of parts) {
+    if (current == null || !Object.hasOwn(current, part)) {
+      return { present: false, value: null };
+    }
+    current = current[part];
+  }
+  return { present: true, value: current };
+}
+
+async function codexRpc(method, params) {
+  const child = spawn(codexBin, ["app-server"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...env, CODEX_HOME: codexHome },
+  });
+  child.stderr.on("data", () => {});
+  let buffer = "";
+  let settled = false;
+  const responsePromise = new Promise((resolvePromise, rejectPromise) => {
+    const timeout = setTimeout(() => {
+      if (!settled) rejectPromise(new Error(`Timed out waiting for ${method}`));
+    }, 30000);
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (message.id === 1) {
+          settled = true;
+          clearTimeout(timeout);
+          if (message.error) rejectPromise(new Error(message.error.message));
+          else resolvePromise(message.result);
+        }
+      }
+    });
+    child.on("error", rejectPromise);
+    child.on("exit", (code) => {
+      if (!settled) rejectPromise(new Error(`Codex app-server exited with code ${code}`));
+    });
+  });
+  child.stdin.write(
+    `${JSON.stringify({
+      method: "initialize",
+      id: 0,
+      params: {
+        clientInfo: {
+          name: "codex_model_router_installer",
+          title: "Codex 模型路由器安装器",
+          version: INSTALLER_VERSION,
+        },
+      },
+    })}\n`,
+  );
+  child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
+  child.stdin.write(`${JSON.stringify({ method, id: 1, params })}\n`);
+  try {
+    return await responsePromise;
+  } finally {
+    child.kill("SIGTERM");
+  }
+}
+
+async function readUserConfig() {
+  const result = await codexRpc("config/read", {
+    includeLayers: true,
+    cwd: null,
+  });
+  const userLayer = result.layers?.find((layer) => layer.name?.type === "user");
+  return {
+    config: userLayer?.config || {},
+    version: userLayer?.version || null,
+    filePath: userLayer?.name?.file || join(codexHome, "config.toml"),
+  };
+}
+
+async function writeConfigEdits(edits) {
+  return codexRpc("config/batchWrite", {
+    edits: edits.map(({ keyPath, value }) => ({
+      keyPath,
+      value,
+      mergeStrategy: "replace",
+    })),
+    reloadUserConfig: false,
+  });
+}
+
+function xmlEscape(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function launchAgentPlist(port) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${xmlEscape(launchLabel)}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>${xmlEscape(nodeBin)}</string>
+      <string>${xmlEscape(routerPath)}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${xmlEscape(installRoot)}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>${xmlEscape(logPath)}</string>
+  </dict>
+</plist>
+`;
+}
+
+function launchDomain() {
+  return `gui/${process.getuid()}`;
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function stopLaunchAgent() {
+  shell("/bin/launchctl", ["bootout", `${launchDomain()}/${launchLabel}`], {
+    allowFailure: true,
+  });
+}
+
+function startLaunchAgent() {
+  stopLaunchAgent();
+  sleepSync(300);
+  let lastResult = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    lastResult = shell(
+      "/bin/launchctl",
+      ["bootstrap", launchDomain(), plistPath],
+      { allowFailure: true },
+    );
+    if (lastResult.status === 0) return;
+    sleepSync(500 * (attempt + 1));
+  }
+  const detail = (lastResult?.stderr || lastResult?.stdout || "").trim();
+  fail(`无法启动 LaunchAgent${detail ? `：${detail}` : ""}`);
+}
+
+async function freePort(preferredPort = 48953) {
+  for (let port = preferredPort; port < preferredPort + 200; port += 1) {
+    const available = await new Promise((resolvePromise) => {
+      const server = createServer();
+      server.unref();
+      server.once("error", () => resolvePromise(false));
+      server.listen(port, "127.0.0.1", () => {
+        server.close(() => resolvePromise(true));
+      });
+    });
+    if (available) return port;
+  }
+  fail("无法找到空闲的本机端口。" );
+}
+
+async function waitForHealth(port) {
+  const url = `http://127.0.0.1:${port}/healthz`;
+  let lastError = null;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(url, {}, 1500);
+      if (response.ok) return await response.json();
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+  }
+  fail(`路由器健康检查失败：${lastError?.message || "未知错误"}`);
+}
+
+function verifyLogin() {
+  if (testMode) return;
+  const result = shell(codexBin, ["login", "status"], {
+    allowFailure: true,
+    env: { ...env, CODEX_HOME: codexHome },
+  });
+  if (result.status !== 0 || !/ChatGPT/i.test(`${result.stdout}\n${result.stderr}`)) {
+    fail("安装前必须先使用 ChatGPT 账号登录 Codex。" );
+  }
+}
+
+function configBackup(configFile) {
+  ensureDirectory(backupsRoot);
+  const backupPath = join(backupsRoot, `config-${timestamp()}.toml`);
+  if (existsSync(configFile)) copyFileSync(configFile, backupPath);
+  else writeFileSync(backupPath, "", { mode: 0o600 });
+  chmodSync(backupPath, 0o600);
+  return backupPath;
+}
+
+function copyIfExists(source, destination) {
+  if (!existsSync(source)) return false;
+  copyFileSync(source, destination);
+  chmodSync(destination, statSync(source).mode & 0o777);
+  return true;
+}
+
+function rollbackEdits(previousConfig) {
+  const previousOpenaiBaseUrl = previousConfig.openaiBaseUrl || {
+    present: false,
+    value: null,
+  };
+  return [
+    {
+      keyPath: "model_provider",
+      value: previousConfig.modelProvider.present
+        ? previousConfig.modelProvider.value
+        : null,
+    },
+    {
+      keyPath: "openai_base_url",
+      value: previousOpenaiBaseUrl.present
+        ? previousOpenaiBaseUrl.value
+        : null,
+    },
+    {
+      keyPath: "model_catalog_json",
+      value: previousConfig.modelCatalogJson.present
+        ? previousConfig.modelCatalogJson.value
+        : null,
+    },
+    {
+      keyPath: `model_providers.${PROVIDER_ID}`,
+      value: previousConfig.provider.present ? previousConfig.provider.value : null,
+    },
+  ];
+}
+
+async function install() {
+  if (!codexBin) fail("未找到 Codex CLI，请先安装 ChatGPT Desktop 或 Codex CLI。" );
+  verifyLogin();
+
+  const existingManifest = readManifest();
+  printHeading(existingManifest ? "重新配置 Codex 模型路由器" : "安装 Codex 模型路由器");
+  const defaultBaseUrl = existingManifest?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
+  const baseUrl = normalizeUrl(
+    env.CODEX_MODEL_ROUTER_BASE_URL ||
+      (await ask("兼容 OpenAI 的 Base URL", defaultBaseUrl)),
+  );
+  const keychainService = keychainServiceFor(baseUrl);
+
+  if (keychainHas(keychainService)) {
+    const update = await confirm("钥匙串中已存在 API Key，是否替换？", false);
+    if (update) storeApiKey(keychainService, baseUrl);
+  } else {
+    storeApiKey(keychainService, baseUrl);
+  }
+  const apiKey = readApiKey(keychainService);
+
+  console.log("正在发现可用模型..." );
+  const discovery = await discoverApiRoot(baseUrl, apiKey);
+  console.log(`API 根地址：${discovery.apiRoot}`);
+  const selectedModels = await selectModels(discovery.models);
+  console.log("\n每个选中的模型最多会执行五次小型 Responses API 探测。" );
+  if (!(await confirm("是否继续进行能力探测？", true))) {
+    fail("已在修改配置前取消安装。" );
+  }
+
+  const routes = [];
+  for (const model of selectedModels) {
+    printHeading(`正在测试 ${model}`);
+    const owner = modelOwners.get(model) || "unknown";
+
+    if (owner === "anthropic") {
+      // Claude 走本機轉譯：直接驗證原生 /messages。
+      process.stdout.write("  原生 /messages  ");
+      const probeResult = await probeAnthropicModel(discovery.apiRoot, apiKey, model);
+      if (probeResult.ok) {
+        console.log("支持");
+      } else {
+        console.log(`失败（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
+        // 5xx / 0 多半是上游容量或网络问题，而非模型真的不受支持。
+        if (probeResult.status === 0 || probeResult.status >= 500) {
+          console.log(
+            `跳过 ${model}：上游暂时不可用，并非模型不受支持。稍后重跑安装器即可加入。`,
+          );
+        } else if (probeResult.status === 401 || probeResult.status === 403) {
+          console.log(`跳过 ${model}：当前 API Key 无权访问该模型。`);
+        } else if (probeResult.status === 404) {
+          console.log(
+            `跳过 ${model}：该网关未提供 Anthropic 原生 /messages 端点，无法本地转译。`,
+          );
+        } else {
+          console.log(`跳过 ${model}：Anthropic 原生端点探测未通过。`);
+        }
+        continue;
+      }
+      process.stdout.write("  上下文上限    ");
+      const contextWindow = await probeAnthropicContextWindow(discovery.apiRoot, apiKey, model);
+      console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "无法探测（将回退）");
+      process.stdout.write("  最大输出      ");
+      const { maxOutput, canonicalId } = await probeAnthropicMaxOutput(discovery.apiRoot, apiKey, model);
+      console.log(
+        maxOutput
+          ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
+          : "无法探测",
+      );
+      routes.push({
+        pickerSlug: pickerSlug(model),
+        upstreamModel: model,
+        displayName: model,
+        providerHost: new URL(discovery.apiRoot).host,
+        // 轉譯後 effort 直接對應 thinking budget，五档皆可用。
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        stripReasoning: false,
+        translate: "anthropic",
+        contextWindow,
+        maxOutputTokens: maxOutput,
+      });
+      continue;
+    }
+
+    const probe = await probeModel(discovery.apiRoot, apiKey, model);
+    if (!probe.supported) {
+      console.log(`跳过 ${model}：Responses API 探测未通过。`);
+      continue;
+    }
+    routes.push({
+      pickerSlug: pickerSlug(model),
+      upstreamModel: model,
+      displayName: model,
+      providerHost: new URL(discovery.apiRoot).host,
+      efforts: probe.efforts,
+      stripReasoning: probe.stripReasoning,
+      contextWindow: null,
+    });
+  }
+  if (routes.length === 0) fail("选中的模型均未通过 Responses API 探测。" );
+
+  const bundledCatalog = loadBundledCatalog();
+  const officialModels = bundledCatalog.models.filter(
+    (model) => !String(model.slug).startsWith("custom/"),
+  );
+  const customModels = routes.map((route, index) =>
+    customCatalogEntry(officialModels, route, index),
+  );
+  const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
+
+  const userConfig = await readUserConfig();
+  const previousConfig =
+    existingManifest?.previousConfig || {
+      modelProvider: deepGet(userConfig.config, "model_provider"),
+      openaiBaseUrl: deepGet(userConfig.config, "openai_base_url"),
+      modelCatalogJson: deepGet(userConfig.config, "model_catalog_json"),
+      provider: deepGet(userConfig.config, `model_providers.${PROVIDER_ID}`),
+    };
+  const backupPath = existingManifest?.configBackup || configBackup(userConfig.filePath);
+  const port = existingManifest?.port || (await freePort());
+  const routerSource = extractRouterSource();
+  let reconfigureBackupDir = null;
+  if (existingManifest) {
+    reconfigureBackupDir = join(backupsRoot, `reconfigure-${timestamp()}`);
+    ensureDirectory(reconfigureBackupDir);
+    copyIfExists(routerPath, join(reconfigureBackupDir, "router.mjs"));
+    copyIfExists(bridgePath, join(reconfigureBackupDir, "claude-bridge.mjs"));
+    copyIfExists(settingsPath, join(reconfigureBackupDir, "settings.json"));
+    copyIfExists(catalogPath, join(reconfigureBackupDir, "models.json"));
+    copyIfExists(manifestPath, join(reconfigureBackupDir, "install.json"));
+    copyIfExists(plistPath, join(reconfigureBackupDir, basename(plistPath)));
+  }
+
+  ensureDirectory(installRoot);
+  ensureDirectory(launchAgentsDir);
+  writeFileSync(routerPath, routerSource, { mode: 0o600 });
+  chmodSync(routerPath, 0o600);
+  writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
+  chmodSync(bridgePath, 0o600);
+  writeJsonAtomic(catalogPath, combinedCatalog);
+  writeJsonAtomic(settingsPath, {
+    version: INSTALLER_VERSION,
+    apiRoot: discovery.apiRoot,
+    baseUrl,
+    keychainService,
+    keychainAccount: "codex",
+    officialBaseUrl: OFFICIAL_BASE_URL,
+    catalogPath,
+    port,
+    routes,
+  });
+  writeFileSync(plistPath, launchAgentPlist(port), { mode: 0o600 });
+  chmodSync(plistPath, 0o600);
+  shell("/usr/bin/plutil", ["-lint", plistPath]);
+
+  let configChanged = false;
+  try {
+    startLaunchAgent();
+    await waitForHealth(port);
+    const writeResult = await writeConfigEdits([
+      { keyPath: "model_provider", value: "openai" },
+      {
+        keyPath: "openai_base_url",
+        value: `http://127.0.0.1:${port}/v1`,
+      },
+      { keyPath: "model_catalog_json", value: catalogPath },
+      { keyPath: `model_providers.${PROVIDER_ID}`, value: null },
+    ]);
+    configChanged = true;
+
+    const manifest = {
+      version: INSTALLER_VERSION,
+      installedAt: new Date().toISOString(),
+      baseUrl,
+      apiRoot: discovery.apiRoot,
+      keychainService,
+      keychainAccount: "codex",
+      providerId: "openai",
+      legacyProviderId: PROVIDER_ID,
+      launchLabel,
+      plistPath,
+      routerPath,
+      bridgePath,
+      settingsPath,
+      catalogPath,
+      logPath,
+      port,
+      routes,
+      previousConfig,
+      configBackup: backupPath,
+      configVersionAfterInstall: writeResult.version || null,
+      codexBin,
+      nodeBin,
+    };
+    const modelCheck = shell(codexBin, ["debug", "models"], {
+      env: { ...env, CODEX_HOME: codexHome },
+    });
+    const effectiveCatalog = JSON.parse(modelCheck.stdout);
+    const visibleSlugs = new Set(effectiveCatalog.models?.map((model) => model.slug));
+    for (const route of routes) {
+      if (!visibleSlugs.has(route.pickerSlug)) {
+        fail(`Codex model/list 中缺少已安装模型：${route.pickerSlug}`);
+      }
+    }
+    writeJsonAtomic(manifestPath, manifest);
+  } catch (error) {
+    if (configChanged && !existingManifest) {
+      try {
+        await writeConfigEdits(rollbackEdits(previousConfig));
+      } catch {}
+    }
+    stopLaunchAgent();
+    if (existingManifest && reconfigureBackupDir) {
+      copyIfExists(join(reconfigureBackupDir, "router.mjs"), routerPath);
+      copyIfExists(join(reconfigureBackupDir, "claude-bridge.mjs"), bridgePath);
+      copyIfExists(join(reconfigureBackupDir, "settings.json"), settingsPath);
+      copyIfExists(join(reconfigureBackupDir, "models.json"), catalogPath);
+      copyIfExists(join(reconfigureBackupDir, "install.json"), manifestPath);
+      copyIfExists(
+        join(reconfigureBackupDir, basename(plistPath)),
+        plistPath,
+      );
+      try {
+        startLaunchAgent();
+      } catch {}
+    } else {
+      const failedInstallDir = join(backupsRoot, `failed-install-${timestamp()}`);
+      ensureDirectory(failedInstallDir);
+      if (existsSync(plistPath)) {
+        renameSync(plistPath, join(failedInstallDir, basename(plistPath)));
+      }
+      if (existsSync(installRoot)) {
+        renameSync(installRoot, join(failedInstallDir, "model-router"));
+      }
+    }
+    throw error;
+  }
+
+  printHeading("安装完成");
+  console.log(`路由器：http://127.0.0.1:${port}`);
+  console.log("已添加模型：");
+  for (const route of routes) {
+    const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供应商默认值";
+    console.log(`  - ${route.displayName}`);
+    console.log(`    选择器 ID：${route.pickerSlug}`);
+    console.log(`    推理强度：${effortText}`);
+  }
+  console.log(`配置备份：${backupPath}`);
+  if (
+    existingManifest?.keychainService &&
+    existingManifest.keychainService !== keychainService &&
+    !testMode
+  ) {
+    const removeOldKey = await confirm(
+      "是否从钥匙串中删除上一个 Base URL 对应的 API Key？",
+      true,
+    );
+    if (removeOldKey) {
+      shell(
+        "/usr/bin/security",
+        [
+          "delete-generic-password",
+          "-a",
+          existingManifest.keychainAccount || "codex",
+          "-s",
+          existingManifest.keychainService,
+        ],
+        { allowFailure: true },
+      );
+    }
+  }
+  console.log("\n请完全退出并重新打开 ChatGPT Desktop。" );
+  console.log("安装器继续使用内置 openai 供应商，因此 Remote 中的既有聊天仍会显示。" );
+  console.log("安装前由其他自定义供应商创建的任务，仍可能需要单独迁移。" );
+  console.log(`回退命令：${basename(scriptPath)} rollback`);
+}
+
+async function status() {
+  const manifest = readManifest();
+  if (!manifest) {
+    console.log("当前 CODEX_HOME 尚未安装 Codex 模型路由器。" );
+    process.exitCode = 1;
+    return;
+  }
+  printHeading("Codex 模型路由器状态");
+  console.log(`已安装版本：${manifest.version}`);
+  console.log(`API 根地址：${manifest.apiRoot}`);
+  console.log(`路由器：http://127.0.0.1:${manifest.port}`);
+  console.log(`LaunchAgent：${manifest.launchLabel}`);
+  console.log(`Codex 供应商：${manifest.providerId || "openai"}`);
+  try {
+    const health = await waitForHealth(manifest.port);
+    console.log(`健康状态：${health.status === "ok" ? "正常" : health.status}`);
+    console.log(`请求数：${health.stats?.requests ?? 0}`);
+    console.log(`官方模型路由数：${health.stats?.official ?? 0}`);
+    console.log(`自定义模型路由数：${health.stats?.custom ?? 0}`);
+    console.log(`失败数：${health.stats?.failures ?? 0}`);
+  } catch (error) {
+    console.log(`健康状态：不可用（${error.message}）`);
+  }
+  console.log("模型：");
+  for (const route of manifest.routes) {
+    console.log(`  - ${route.displayName} -> ${route.upstreamModel}`);
+  }
+}
+
+async function rollback() {
+  const manifest = readManifest();
+  if (!manifest) {
+    console.log("没有可回退的安装。" );
+    return;
+  }
+  printHeading("回退 Codex 模型路由器");
+  console.log("只会还原由安装器管理的 Codex 配置项。" );
+  console.log(`完整配置备份：${manifest.configBackup}`);
+  if (!(await confirm("是否继续？", true))) return;
+
+  await writeConfigEdits(rollbackEdits(manifest.previousConfig));
+  stopLaunchAgent();
+
+  const archiveDir = join(backupsRoot, `rollback-${timestamp()}`);
+  ensureDirectory(archiveDir);
+  if (existsSync(plistPath)) renameSync(plistPath, join(archiveDir, basename(plistPath)));
+  if (existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
+
+  const removeKey = await confirm("是否从钥匙串中删除自定义供应商的 API Key？", true);
+  if (removeKey) {
+    shell(
+      "/usr/bin/security",
+      [
+        "delete-generic-password",
+        "-a",
+        manifest.keychainAccount || "codex",
+        "-s",
+        manifest.keychainService,
+      ],
+      { allowFailure: true },
+    );
+  }
+
+  printHeading("回退完成");
+  console.log(`安装文件已封存至：${archiveDir}`);
+  console.log("请完全退出并重新打开 ChatGPT Desktop，然后创建一个新任务。" );
+}
+
+function help() {
+  console.log(`Codex 模型路由器 ${INSTALLER_VERSION}
+
+用法：
+  ${basename(scriptPath || "codex-model-router.command")} install
+  ${basename(scriptPath || "codex-model-router.command")} status
+  ${basename(scriptPath || "codex-model-router.command")} rollback
+
+安装时会询问：
+  1. 兼容 OpenAI 的 Base URL
+  2. API Key（保存在 macOS 钥匙串）
+  3. 要添加的模型
+
+安装器会继续将官方 ChatGPT Codex 模型发送到 OpenAI，只有选中的
+自定义模型选择器 ID 才会发送到配置的供应商。Codex 仍使用内置
+openai 供应商 ID，以保持 Desktop 与手机 Remote 的既有聊天可见。
+`);
+}
+
+async function chooseAction() {
+  printHeading("Codex 模型路由器");
+  console.log("  1. 安装或重新配置");
+  console.log("  2. 查看状态");
+  console.log("  3. 回退配置");
+  console.log("  4. 退出");
+  const answer = await ask("请选择操作", "1");
+  const choices = {
+    "1": "install",
+    install: "install",
+    setup: "install",
+    "2": "status",
+    status: "status",
+    "3": "rollback",
+    rollback: "rollback",
+    uninstall: "rollback",
+    "4": "exit",
+    exit: "exit",
+    quit: "exit",
+  };
+  const action = choices[answer.trim().toLowerCase()];
+  if (!action) fail(`无法识别的菜单选项：${answer}`);
+  return action;
+}
+
+try {
+  const action = requestedAction || (await chooseAction());
+  if (action === "install" || action === "setup") await install();
+  else if (action === "status") await status();
+  else if (action === "rollback" || action === "uninstall") await rollback();
+  else if (action === "exit") console.log("未进行任何修改。" );
+  else if (action === "help" || action === "--help" || action === "-h") help();
+  else fail(`无法识别的命令：${action}`);
+} catch (error) {
+  console.error(`\n错误：${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+}
+
+__CODEX_MODEL_ROUTER_ROUTER_JS__
+import http from "node:http";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { zstdDecompressSync } from "node:zlib";
+import { toAnthropicRequest, bridgeAnthropicStream } from "./claude-bridge.mjs";
+
+const routerDirectory = dirname(fileURLToPath(import.meta.url));
+const settingsPath = join(routerDirectory, "settings.json");
+const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+const listenHost = "127.0.0.1";
+const listenPort = Number(settings.port);
+const apiRoot = String(settings.apiRoot).replace(/\/$/, "");
+const officialBase = String(settings.officialBaseUrl).replace(/\/$/, "");
+const keychainService = settings.keychainService;
+const keychainAccount = settings.keychainAccount || "codex";
+const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route]));
+const tokenCacheTtlMs = 5 * 60 * 1000;
+const authValidationTtlMs = 5 * 60 * 1000;
+const maxRememberedThreads = 2048;
+const maxPendingMessages = 8;
+// --- 診斷用擷取（settings.captureDir 有值時才啟用，預設關閉）---
+const captureDir = typeof settings.captureDir === "string" && settings.captureDir
+  ? settings.captureDir
+  : null;
+let captureSeq = 0;
+function captureNext(kind) {
+  if (!captureDir) return null;
+  const id = `${String(++captureSeq).padStart(3, "0")}-${kind}`;
+  try { mkdirSync(captureDir, { recursive: true }); } catch {}
+  return id;
+}
+function captureWrite(id, suffix, data) {
+  if (!captureDir || !id) return;
+  try { writeFileSync(join(captureDir, `${id}.${suffix}`), data); } catch {}
+}
+function captureAppend(id, suffix, data) {
+  if (!captureDir || !id) return;
+  try { appendFileSync(join(captureDir, `${id}.${suffix}`), data); } catch {}
+}
+
+const closeOnUpstreamError = settings.closeOnUpstreamError === true;
+
+// Codex 的 WebSocket response.create 訊息含有若干「協定層」欄位，它們在
+// WebSocket 上合法，但不是 HTTP Responses API 的參數。本路由對上游一律使用
+// HTTP，若原樣轉送，上游會回 "Unsupported parameter: ..." 並導致預熱與工具
+// 接續回合失敗（官方後端與第三方閘道皆然）。
+const websocketOnlyFields = [
+  "generate",
+  "ws_request_header_traceparent",
+  "ws_request_header_trace",
+];
+
+// --- 有狀態接續的本機重建 ---------------------------------------------------
+// Codex 在工具接續回合只送工具結果並倚賴伺服器保存狀態（previous_response_id），
+// 但部分閘道不支援。由於 Codex 自己仍持有完整歷史（下一個完整請求會補齊），
+// 這裡以「上次完整輸入 + 該輪產生的輸出 + 本次新項目」在本機重建等價請求。
+const threadHistories = new Map();
+const maxRememberedHistories = 32;
+
+function historyKeyFor(body, headers) {
+  const sessionId = body?.client_metadata?.session_id;
+  if (typeof sessionId === "string" && sessionId) return sessionId;
+  for (const name of ["thread-id", "session-id"]) {
+    const value = headers?.[name];
+    if (typeof value === "string" && value) return value;
+  }
+  return null;
+}
+
+function setHistory(key, input) {
+  if (!key) return;
+  threadHistories.delete(key);
+  threadHistories.set(key, {
+    input: Array.isArray(input) ? input.slice() : [],
+    output: [],
+  });
+  while (threadHistories.size > maxRememberedHistories) {
+    const oldest = threadHistories.keys().next().value;
+    if (oldest === undefined) break;
+    threadHistories.delete(oldest);
+  }
+}
+
+function appendHistoryOutput(key, item) {
+  const history = key ? threadHistories.get(key) : null;
+  if (!history || !item || typeof item !== "object") return;
+  // reasoning 項目要能在後續請求中被接受，必須帶 encrypted_content。
+  if (item.type === "reasoning" && !item.encrypted_content) return;
+  history.output.push(item);
+}
+
+function rebuildStatefulInput(key, incomingInput) {
+  const history = key ? threadHistories.get(key) : null;
+  if (!history || history.input.length === 0) return null;
+  const incoming = Array.isArray(incomingInput) ? incomingInput : [];
+  return [...history.input, ...history.output, ...incoming];
+}
+const heartbeatIntervalMs =
+  Number(settings.heartbeatIntervalMs) > 0 ? Number(settings.heartbeatIntervalMs) : 15000;
+
+const requestHopByHopHeaders = new Set([
+  "connection",
+  "content-encoding",
+  "content-length",
+  "host",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+const responseHeadersToStrip = new Set([
+  "connection",
+  "content-encoding",
+  "content-length",
+  "transfer-encoding",
+]);
+const customForwardHeaders = new Set([
+  "accept",
+  "content-type",
+  "user-agent",
+  "x-client-request-id",
+]);
+
+const stats = {
+  startedAt: new Date().toISOString(),
+  requests: 0,
+  websockets: 0,
+  websocketResponses: 0,
+  websocketEvents: 0,
+  heartbeats: 0,
+  authProbeFailures: 0,
+  upstreamErrorCloses: 0,
+  statefulFallbacks: 0,
+  responseFailedSent: 0,
+  websocketOnlyFieldsStripped: 0,
+  queuedResponses: 0,
+  responseInProgressRejects: 0,
+  statefulRebuilds: 0,
+  statefulRebuildMisses: 0,
+  translatedRequests: 0,
+  lastAuthProbeStatus: null,
+  models: 0,
+  official: 0,
+  custom: 0,
+  reasoningRewrites: 0,
+  failures: 0,
+  lastOfficialStatus: null,
+  lastCustomStatus: null,
+  lastWebSocketStatus: null,
+  lastRoute: null,
+  lastModel: null,
+  lastReasoningEffort: null,
+  lastForwardedReasoningEffort: null,
+};
+const validatedAuthDigests = new Map();
+const threadRoutes = new Map();
+let apiKeyCache = null;
+
+function writeJson(response, status, payload) {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(payload));
+}
+
+function getApiKey(forceRefresh = false) {
+  if (process.env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+    return process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
+  }
+  const now = Date.now();
+  if (!forceRefresh && apiKeyCache && apiKeyCache.expiresAt > now) {
+    return apiKeyCache.value;
+  }
+  const value = execFileSync(
+    "/usr/bin/security",
+    [
+      "find-generic-password",
+      "-a",
+      keychainAccount,
+      "-s",
+      keychainService,
+      "-w",
+    ],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  ).trim();
+  if (!value) throw new Error("自定义供应商的钥匙串项目为空");
+  apiKeyCache = { value, expiresAt: now + tokenCacheTtlMs };
+  return value;
+}
+
+function appendHeader(headers, name, value) {
+  if (Array.isArray(value)) {
+    for (const entry of value) headers.append(name, entry);
+  } else {
+    headers.set(name, value);
+  }
+}
+
+function buildOfficialHeaders(requestHeaders) {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(requestHeaders)) {
+    const normalized = name.toLowerCase();
+    if (
+      requestHopByHopHeaders.has(normalized) ||
+      normalized.startsWith("sec-websocket-") ||
+      value == null
+    ) {
+      continue;
+    }
+    appendHeader(headers, name, value);
+  }
+  return headers;
+}
+
+function buildCustomHeaders(requestHeaders, apiKey) {
+  const headers = new Headers({ authorization: `Bearer ${apiKey}` });
+  for (const [name, value] of Object.entries(requestHeaders)) {
+    if (!customForwardHeaders.has(name.toLowerCase()) || value == null) continue;
+    appendHeader(headers, name, value);
+  }
+  if (!headers.has("accept")) headers.set("accept", "text/event-stream");
+  if (!headers.has("content-type")) headers.set("content-type", "application/json");
+  return headers;
+}
+
+function filteredResponseHeaders(upstreamHeaders) {
+  const headers = {};
+  for (const [name, value] of upstreamHeaders) {
+    if (!responseHeadersToStrip.has(name.toLowerCase())) headers[name] = value;
+  }
+  return headers;
+}
+
+function authDigest(headers) {
+  const authorization = headers.authorization;
+  const accountId = headers["chatgpt-account-id"];
+  if (
+    typeof authorization !== "string" ||
+    !authorization.startsWith("Bearer ") ||
+    typeof accountId !== "string" ||
+    !accountId
+  ) {
+    return null;
+  }
+  return createHash("sha256")
+    .update(authorization)
+    .update("\0")
+    .update(accountId)
+    .digest("hex");
+}
+
+function markAuthValidated(headers) {
+  const digest = authDigest(headers);
+  if (digest) validatedAuthDigests.set(digest, Date.now() + authValidationTtlMs);
+}
+
+function hasValidatedAuth(headers) {
+  const digest = authDigest(headers);
+  if (!digest) return false;
+  const expiresAt = validatedAuthDigests.get(digest);
+  if (!expiresAt || expiresAt <= Date.now()) {
+    validatedAuthDigests.delete(digest);
+    return false;
+  }
+  return true;
+}
+
+async function validateOfficialAuth(requestHeaders) {
+  if (hasValidatedAuth(requestHeaders)) return true;
+  if (!authDigest(requestHeaders)) return false;
+  let upstream;
+  try {
+    upstream = await fetch(`${officialBase}/models`, {
+      headers: buildOfficialHeaders(requestHeaders),
+      redirect: "manual",
+    });
+  } catch {
+    stats.authProbeFailures += 1;
+    return false;
+  }
+  await upstream.arrayBuffer();
+  stats.lastAuthProbeStatus = upstream.status;
+  // 這支端點缺少 client_version 參數時會回 400，但未授權一律是 401/403。
+  // 因此只有明確的未授權才視為驗證失敗，否則參數問題會讓所有自訂模型被誤擋。
+  if (upstream.status === 401 || upstream.status === 403) return false;
+  markAuthValidated(requestHeaders);
+  return true;
+}
+
+function rememberRoute(headers, route) {
+  for (const headerName of ["thread-id", "session-id"]) {
+    const id = headers[headerName];
+    if (typeof id !== "string" || !id) continue;
+    threadRoutes.delete(id);
+    threadRoutes.set(id, route);
+  }
+  while (threadRoutes.size > maxRememberedThreads) {
+    const first = threadRoutes.keys().next().value;
+    if (!first) break;
+    threadRoutes.delete(first);
+  }
+}
+
+function rememberedRoute(headers) {
+  for (const headerName of ["thread-id", "session-id"]) {
+    const id = headers[headerName];
+    if (typeof id === "string" && threadRoutes.has(id)) return threadRoutes.get(id);
+  }
+  return null;
+}
+
+function chooseRoute(headers, body) {
+  if (typeof body?.model === "string" && routeMap.has(body.model)) {
+    return routeMap.get(body.model);
+  }
+  if (typeof body?.model === "string") return null;
+  return rememberedRoute(headers);
+}
+
+function fallbackEffort(efforts) {
+  for (const effort of ["max", "xhigh", "high", "medium", "low"]) {
+    if (efforts.includes(effort)) return effort;
+  }
+  return null;
+}
+
+function rewriteCustomBody(body, route) {
+  const rewritten = { ...body, model: route.upstreamModel };
+  const requestedEffort = body?.reasoning?.effort;
+  if (route.stripReasoning || route.efforts.length === 0) {
+    delete rewritten.reasoning;
+    if (body?.reasoning) stats.reasoningRewrites += 1;
+    return rewritten;
+  }
+  if (requestedEffort && !route.efforts.includes(requestedEffort)) {
+    const effort = fallbackEffort(route.efforts);
+    rewritten.reasoning = effort ? { ...body.reasoning, effort } : undefined;
+    stats.reasoningRewrites += 1;
+  }
+  return rewritten;
+}
+
+function targetUrl(custom, incomingUrl) {
+  const path = incomingUrl.pathname.startsWith("/v1/")
+    ? incomingUrl.pathname.slice(3)
+    : incomingUrl.pathname;
+  const base = custom ? apiRoot : officialBase;
+  return new URL(`${base}${path}${incomingUrl.search}`);
+}
+
+async function streamUpstream(upstream, response) {
+  response.writeHead(upstream.status, filteredResponseHeaders(upstream.headers));
+  if (!upstream.body) {
+    response.end();
+    return;
+  }
+  for await (const chunk of upstream.body) {
+    if (!response.write(chunk)) await once(response, "drain");
+  }
+  response.end();
+}
+
+async function fetchCustom(target, headers, body, signal) {
+  let apiKey = getApiKey(false);
+  let upstream = await fetch(target, {
+    method: "POST",
+    headers: buildCustomHeaders(headers, apiKey),
+    body,
+    redirect: "manual",
+    signal,
+  });
+  if (upstream.status !== 401 && upstream.status !== 403) return upstream;
+  await upstream.arrayBuffer();
+  apiKey = getApiKey(true);
+  return fetch(target, {
+    method: "POST",
+    headers: buildCustomHeaders(headers, apiKey),
+    body,
+    redirect: "manual",
+    signal,
+  });
+}
+
+async function fetchModelUpstream(
+  requestHeaders,
+  incomingUrl,
+  body,
+  bodyBuffer,
+  signal,
+  meta = {},
+) {
+  const route = chooseRoute(requestHeaders, body);
+  rememberRoute(requestHeaders, route);
+  const isCustom = route != null;
+
+  // previous_response_id 需要真正的 WebSocket 上游；本路由對上游一律使用 HTTP，
+  // 官方後端與第三方閘道都會拒絕。因此在此統一改寫成等價的完整請求，
+  // 三條路徑（官方 / 自訂 / Anthropic 轉譯）共用同一份歷史。
+  const historyKey = historyKeyFor(body, requestHeaders);
+  meta.historyKey = historyKey;
+  let effectiveBody = body;
+  if (body?.previous_response_id) {
+    const rebuilt = rebuildStatefulInput(historyKey, body.input);
+    if (rebuilt) {
+      effectiveBody = { ...body, input: rebuilt };
+      delete effectiveBody.previous_response_id;
+      setHistory(historyKey, rebuilt);
+      stats.statefulRebuilds += 1;
+    } else {
+      // 無可用歷史時維持原樣，交由上游報錯 + 關閉連線讓 Codex 重送完整歷史。
+      stats.statefulRebuildMisses += 1;
+    }
+  } else {
+    setHistory(historyKey, body.input);
+  }
+
+  let outboundBodyObject = isCustom
+    ? rewriteCustomBody(effectiveBody, route)
+    : effectiveBody;
+  let outboundBody = Buffer.from(JSON.stringify(outboundBodyObject));
+
+  stats.lastRoute = isCustom ? "custom" : "official";
+  stats.lastModel = body?.model ?? null;
+  stats.lastReasoningEffort = body?.reasoning?.effort ?? null;
+  stats.lastForwardedReasoningEffort =
+    outboundBodyObject?.reasoning?.effort ?? null;
+
+  if (isCustom) {
+    if (!(await validateOfficialAuth(requestHeaders))) {
+      return new Response(
+        JSON.stringify({
+          error: { message: "需要 ChatGPT 身份验证", type: "auth_error" },
+        }),
+        { status: 401, headers: { "content-type": "application/json" } },
+      );
+    }
+    stats.custom += 1;
+    if (route.translate === "anthropic") {
+      // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
+      const { request: anthropicRequest, freeform } = toAnthropicRequest(effectiveBody, route);
+      meta.translate = "anthropic";
+      meta.freeform = freeform;
+      meta.model = body.model;
+      meta.requestBody = effectiveBody;
+      meta.anthropicRequest = anthropicRequest;
+      stats.translatedRequests += 1;
+      const translated = await fetchCustom(
+        new URL(`${apiRoot}/messages`),
+        requestHeaders,
+        Buffer.from(JSON.stringify(anthropicRequest)),
+        signal,
+      );
+      stats.lastCustomStatus = translated.status;
+      return translated;
+    }
+    const upstream = await fetchCustom(
+      targetUrl(true, incomingUrl),
+      requestHeaders,
+      outboundBody,
+      signal,
+    );
+    stats.lastCustomStatus = upstream.status;
+    return upstream;
+  }
+
+  if (!authDigest(requestHeaders)) {
+    return new Response(
+      JSON.stringify({
+        error: { message: "需要 ChatGPT 身份验证", type: "auth_error" },
+      }),
+      { status: 401, headers: { "content-type": "application/json" } },
+    );
+  }
+  stats.official += 1;
+  const upstream = await fetch(targetUrl(false, incomingUrl), {
+    method: "POST",
+    headers: buildOfficialHeaders(requestHeaders),
+    body: outboundBody.length > 0 ? outboundBody : bodyBuffer, // outboundBody 已含重建結果
+    redirect: "manual",
+    signal,
+  });
+  stats.lastOfficialStatus = upstream.status;
+  if (upstream.status === 200) markAuthValidated(requestHeaders);
+  return upstream;
+}
+
+async function handleResponses(request, response, incomingUrl) {
+  const encoding = request.headers["content-encoding"];
+  if (encoding && encoding !== "identity" && encoding !== "zstd") {
+    writeJson(response, 415, {
+      error: { message: "不支持的请求内容编码", type: "router_error" },
+    });
+    return;
+  }
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  const encodedBody = Buffer.concat(chunks);
+  const decodedBody = encoding === "zstd" ? zstdDecompressSync(encodedBody) : encodedBody;
+  let body;
+  try {
+    body = JSON.parse(decodedBody.toString("utf8"));
+  } catch {
+    writeJson(response, 400, { error: { message: "JSON 格式无效", type: "router_error" } });
+    return;
+  }
+
+  const abortController = new AbortController();
+  let finished = false;
+  request.on("aborted", () => abortController.abort());
+  response.on("finish", () => {
+    finished = true;
+  });
+  response.on("close", () => {
+    if (!finished) abortController.abort();
+  });
+
+  const upstream = await fetchModelUpstream(
+    request.headers,
+    incomingUrl,
+    body,
+    decodedBody,
+    abortController.signal,
+  );
+  await streamUpstream(upstream, response);
+}
+
+const websocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const maxWebSocketMessageBytes = 32 * 1024 * 1024;
+
+function encodeWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
+  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  let header;
+  if (body.length <= 125) {
+    header = Buffer.from([0x80 | opcode, body.length]);
+  } else if (body.length <= 0xffff) {
+    header = Buffer.allocUnsafe(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(body.length, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(body.length), 2);
+  }
+  return Buffer.concat([header, body]);
+}
+
+function sendWebSocketFrame(socket, opcode, payload) {
+  if (!socket.destroyed && socket.writable) {
+    socket.write(encodeWebSocketFrame(opcode, payload));
+  }
+}
+
+function sendWebSocketJson(socket, payload) {
+  sendWebSocketFrame(socket, 0x1, JSON.stringify(payload));
+}
+
+function closeWebSocket(socket, code = 1000, reason = "") {
+  if (socket.destroyed || !socket.writable) return;
+  const reasonBytes = Buffer.from(reason).subarray(0, 123);
+  const payload = Buffer.allocUnsafe(2 + reasonBytes.length);
+  payload.writeUInt16BE(code, 0);
+  reasonBytes.copy(payload, 2);
+  sendWebSocketFrame(socket, 0x8, payload);
+  socket.end();
+}
+
+function parseWebSocketFrames(buffer) {
+  const frames = [];
+  let offset = 0;
+  while (offset + 2 <= buffer.length) {
+    const first = buffer[offset];
+    const second = buffer[offset + 1];
+    let payloadLength = second & 0x7f;
+    let cursor = offset + 2;
+    if (payloadLength === 126) {
+      if (cursor + 2 > buffer.length) break;
+      payloadLength = buffer.readUInt16BE(cursor);
+      cursor += 2;
+    } else if (payloadLength === 127) {
+      if (cursor + 8 > buffer.length) break;
+      const longLength = buffer.readBigUInt64BE(cursor);
+      if (longLength > BigInt(maxWebSocketMessageBytes)) {
+        throw new Error("WebSocket 消息超过路由器限制");
+      }
+      payloadLength = Number(longLength);
+      cursor += 8;
+    }
+    if (payloadLength > maxWebSocketMessageBytes) {
+      throw new Error("WebSocket 消息超过路由器限制");
+    }
+    const masked = (second & 0x80) !== 0;
+    let mask = null;
+    if (masked) {
+      if (cursor + 4 > buffer.length) break;
+      mask = buffer.subarray(cursor, cursor + 4);
+      cursor += 4;
+    }
+    if (cursor + payloadLength > buffer.length) break;
+    const payload = Buffer.from(buffer.subarray(cursor, cursor + payloadLength));
+    if (mask) {
+      for (let index = 0; index < payload.length; index += 1) {
+        payload[index] ^= mask[index % 4];
+      }
+    }
+    frames.push({
+      fin: (first & 0x80) !== 0,
+      opcode: first & 0x0f,
+      payload,
+    });
+    offset = cursor + payloadLength;
+  }
+  return { frames, remainder: buffer.subarray(offset) };
+}
+
+function sendSseBlockToWebSocket(socket, block, onEvent = null) {
+  const data = block
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+  if (!data || data === "[DONE]") return;
+  const parsed = JSON.parse(data);
+  if (onEvent) onEvent(parsed);
+  sendWebSocketFrame(socket, 0x1, data);
+  stats.websocketEvents += 1;
+}
+
+async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyKey = null) {
+  stats.lastWebSocketStatus = upstream.status;
+  if (upstream.status < 200 || upstream.status >= 300) {
+    const rawText = await upstream.text();
+    let payload = null;
+    try {
+      payload = JSON.parse(rawText);
+    } catch {}
+    const errorObject = payload?.error || {
+      type: "router_upstream_error",
+      code: String(upstream.status),
+      message: rawText || `上游返回 HTTP ${upstream.status}`,
+    };
+    sendWebSocketJson(socket, { type: "error", error: errorObject });
+    // Codex 不處理 type:"error"（日誌: unhandled responses event），只送它會無聲卡死。
+    // response.failed 是 Responses API 標準的失敗終止事件，Codex 有對應處理
+    // （二進位字串: "response.failed event received"），因此一併送出。
+    sendWebSocketJson(socket, {
+      type: "response.failed",
+      sequence_number: 0,
+      response: {
+        id: `resp_router_${Date.now().toString(36)}`,
+        object: "response",
+        created_at: Math.floor(Date.now() / 1000),
+        status: "failed",
+        error: {
+          code: errorObject.code ? String(errorObject.code) : String(upstream.status),
+          message: errorObject.message || `上游返回 HTTP ${upstream.status}`,
+        },
+        incomplete_details: null,
+        output: [],
+        usage: null,
+      },
+    });
+    // 關閉連線的策略需要區分兩種錯誤：
+    //
+    // 1) 預熱請求（websocket.warmup=true）在部分閘道上必定失敗，但 Codex 會忽略
+    //    並在同一條連線上送出真正的請求。此時關閉連線只會讓每次工具往返多付
+    //    一次斷線重試，所以不能關。
+    //
+    // 2) previous_response_id 不被支援：Codex 在工具接續回合只送工具結果並倚賴
+    //    伺服器保存狀態，而它是以「連線」為單位判斷伺服器是否具備該能力。
+    //    此時若不關閉，Codex 收到它不認得的 type:"error" 會無聲卡死；關閉後
+    //    它會重連，並在新連線上重送完整歷史 —— 因此這種錯誤必須關。
+    stats.responseFailedSent += 1;
+    const isStatefulUnsupported =
+      typeof rawText === "string" && rawText.includes("previous_response_id");
+    if (isStatefulUnsupported || closeOnUpstreamError) {
+      stats.upstreamErrorCloses += 1;
+      if (isStatefulUnsupported) stats.statefulFallbacks += 1;
+      closeWebSocket(socket, 1011, `upstream ${upstream.status}`);
+    }
+    return;
+  }
+  if (!upstream.body) throw new Error("WebSocket 上游响应没有正文");
+
+  const onEvent = historyKey
+    ? (event) => {
+        if (event?.type === "response.output_item.done" && event.item) {
+          appendHistoryOutput(historyKey, event.item);
+        }
+      }
+    : null;
+  const decoder = new TextDecoder();
+  let pending = "";
+  for await (const chunk of upstream.body) {
+    captureAppend(captureId, "response.sse", Buffer.from(chunk));
+    pending += decoder.decode(chunk, { stream: true });
+    for (;;) {
+      const match = /\r?\n\r?\n/.exec(pending);
+      if (!match) break;
+      const block = pending.slice(0, match.index);
+      pending = pending.slice(match.index + match[0].length);
+      sendSseBlockToWebSocket(socket, block, onEvent);
+    }
+  }
+  pending += decoder.decode();
+  if (pending.trim()) sendSseBlockToWebSocket(socket, pending, onEvent);
+}
+
+function startWebSocketHeartbeat(socket) {
+  const timer = setInterval(() => {
+    if (socket.destroyed || !socket.writable) return;
+    sendWebSocketFrame(socket, 0x9, Buffer.alloc(0));
+    stats.heartbeats += 1;
+  }, heartbeatIntervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
+}
+
+async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = null) {
+  stats.lastWebSocketStatus = upstream.status;
+  if (!upstream.body) throw new Error("WebSocket 上游响应没有正文");
+  const tee = captureId
+    ? async function* (src) {
+        for await (const chunk of src) {
+          captureAppend(captureId, "anthropic-response.sse", Buffer.from(chunk));
+          yield chunk;
+        }
+      }
+    : null;
+  await bridgeAnthropicStream(
+    tee ? tee(upstream.body) : upstream.body,
+    (event) => {
+      captureAppend(captureId, "response.sse", `data: ${JSON.stringify(event)}\n\n`);
+      sendWebSocketJson(socket, event);
+      stats.websocketEvents += 1;
+    },
+    meta,
+  );
+}
+
+async function handleWebSocketResponse(
+  request,
+  socket,
+  incomingUrl,
+  message,
+  abortController,
+) {
+  const body = { ...message, stream: true };
+  delete body.type;
+  for (const field of websocketOnlyFields) {
+    if (field in body) {
+      delete body[field];
+      stats.websocketOnlyFieldsStripped += 1;
+    }
+  }
+  const bodyBuffer = Buffer.from(JSON.stringify(body));
+  const captureId = captureNext(
+    typeof body.model === "string" && routeMap.has(body.model) ? "custom" : "official",
+  );
+  captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
+  const stopHeartbeat = startWebSocketHeartbeat(socket);
+  const meta = {};
+  try {
+    const upstream = await fetchModelUpstream(
+      request.headers,
+      incomingUrl,
+      body,
+      bodyBuffer,
+      abortController.signal,
+      meta,
+    );
+    stats.websocketResponses += 1;
+    if (meta.anthropicRequest) {
+      captureWrite(captureId, "anthropic-request.json", JSON.stringify(meta.anthropicRequest, null, 2));
+    }
+    if (meta.translate === "anthropic" && upstream.status >= 200 && upstream.status < 300) {
+      await bridgeAnthropicToWebSocket(upstream, socket, meta, captureId);
+    } else {
+      await bridgeSseToWebSocket(upstream, socket, captureId, meta.historyKey);
+    }
+  } finally {
+    stopHeartbeat();
+  }
+}
+
+function handleWebSocketUpgrade(request, socket, head) {
+  let incomingUrl;
+  try {
+    incomingUrl = new URL(request.url || "/", `http://${listenHost}:${listenPort}`);
+  } catch {
+    socket.destroy();
+    return;
+  }
+  if (
+    incomingUrl.pathname !== "/responses" &&
+    incomingUrl.pathname !== "/v1/responses"
+  ) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const websocketKey = request.headers["sec-websocket-key"];
+  if (typeof websocketKey !== "string") {
+    socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  const accept = createHash("sha1")
+    .update(websocketKey + websocketMagic)
+    .digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+  );
+  stats.websockets += 1;
+
+  let pending = head;
+  let fragmentOpcode = null;
+  let fragmentChunks = [];
+  let activeAbortController = null;
+  const pendingMessages = [];
+
+  const handleMessage = (payload) => {
+    let message;
+    try {
+      message = JSON.parse(payload.toString("utf8"));
+    } catch {
+      closeWebSocket(socket, 1007, "JSON 无效");
+      return;
+    }
+    if (message?.type === "response.cancel") {
+      activeAbortController?.abort();
+      return;
+    }
+    if (message?.type !== "response.create") {
+      sendWebSocketJson(socket, {
+        type: "error",
+        error: {
+          type: "unsupported_event",
+          code: "unsupported_event",
+          message: "仅支持 response.create 和 response.cancel",
+        },
+      });
+      return;
+    }
+    // 上游送出 response.completed 之後，本路由仍在讀完串流尾端；Codex 一看到
+    // completed 就會在同一條連線上送出下一個請求。若此時直接回 response_in_progress，
+    // Codex 不處理該錯誤事件而會無聲卡死。因此改為排隊，仍維持逐一序列化執行。
+    if (activeAbortController) {
+      if (pendingMessages.length >= maxPendingMessages) {
+        sendWebSocketJson(socket, {
+          type: "error",
+          error: {
+            type: "response_in_progress",
+            code: "response_in_progress",
+            message: "当前连接的待处理请求过多",
+          },
+        });
+        stats.responseInProgressRejects += 1;
+        return;
+      }
+      pendingMessages.push(message);
+      stats.queuedResponses += 1;
+      return;
+    }
+
+    startResponse(message);
+  };
+
+  function startResponse(message) {
+    activeAbortController = new AbortController();
+    void handleWebSocketResponse(
+      request,
+      socket,
+      incomingUrl,
+      message,
+      activeAbortController,
+    )
+      .catch((error) => {
+        const aborted = error instanceof Error && error.name === "AbortError";
+        if (!aborted) {
+          stats.failures += 1;
+          process.stderr.write(`model-router-websocket-error:${error}\n`);
+          sendWebSocketJson(socket, {
+            type: "error",
+            error: {
+              type: "router_error",
+              code: "router_error",
+              message: "模型路由器的 WebSocket 桥接失败",
+            },
+          });
+        }
+      })
+      .finally(() => {
+        activeAbortController = null;
+        const next = pendingMessages.shift();
+        if (next && !socket.destroyed && socket.writable) startResponse(next);
+      });
+  }
+
+  const consume = (chunk) => {
+    try {
+      pending = Buffer.concat([pending, chunk]);
+      const parsed = parseWebSocketFrames(pending);
+      pending = parsed.remainder;
+      for (const frame of parsed.frames) {
+        if (frame.opcode === 0x8) {
+          activeAbortController?.abort();
+          closeWebSocket(socket);
+          return;
+        }
+        if (frame.opcode === 0x9) {
+          sendWebSocketFrame(socket, 0x0a, frame.payload);
+          continue;
+        }
+        if (frame.opcode === 0x0a) continue;
+        if (frame.opcode === 0x1 || frame.opcode === 0x2) {
+          fragmentOpcode = frame.opcode;
+          fragmentChunks = [frame.payload];
+        } else if (frame.opcode === 0x0 && fragmentOpcode != null) {
+          fragmentChunks.push(frame.payload);
+        } else {
+          closeWebSocket(socket, 1002, "帧类型不受支持");
+          return;
+        }
+        const fragmentBytes = fragmentChunks.reduce(
+          (total, item) => total + item.length,
+          0,
+        );
+        if (fragmentBytes > maxWebSocketMessageBytes) {
+          closeWebSocket(socket, 1009, "消息过大");
+          return;
+        }
+        if (frame.fin) {
+          const messagePayload = Buffer.concat(fragmentChunks);
+          fragmentOpcode = null;
+          fragmentChunks = [];
+          handleMessage(messagePayload);
+        }
+      }
+    } catch {
+      closeWebSocket(socket, 1002, "帧无效");
+    }
+  };
+
+  socket.on("data", consume);
+  socket.on("close", () => activeAbortController?.abort());
+  socket.on("error", () => activeAbortController?.abort());
+  if (head.length > 0) consume(Buffer.alloc(0));
+}
+
+const server = http.createServer(async (request, response) => {
+  stats.requests += 1;
+  try {
+    const incomingUrl = new URL(request.url || "/", `http://${listenHost}:${listenPort}`);
+    if (request.method === "GET" && incomingUrl.pathname === "/healthz") {
+      writeJson(response, 200, {
+        status: "ok",
+        version: settings.version,
+        uptimeSeconds: Math.floor(process.uptime()),
+        stats,
+      });
+      return;
+    }
+    if (
+      request.method === "GET" &&
+      (incomingUrl.pathname === "/models" || incomingUrl.pathname === "/v1/models")
+    ) {
+      stats.models += 1;
+      writeJson(response, 200, JSON.parse(readFileSync(settings.catalogPath, "utf8")));
+      return;
+    }
+    if (
+      request.method === "POST" &&
+      (incomingUrl.pathname.startsWith("/responses") ||
+        incomingUrl.pathname.startsWith("/v1/responses"))
+    ) {
+      await handleResponses(request, response, incomingUrl);
+      return;
+    }
+    writeJson(response, 404, { error: { message: "未找到", type: "not_found" } });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const aborted =
+      (error instanceof Error && error.name === "AbortError") ||
+      message === "This operation was aborted";
+    if (aborted) {
+      if (!response.writableEnded) response.end();
+      return;
+    }
+    stats.failures += 1;
+    process.stderr.write(`model-router-error:${message}\n`);
+    if (!response.headersSent) {
+      writeJson(response, 502, {
+        error: { message: "模型路由器的上游请求失败", type: "router_error" },
+      });
+    } else if (!response.writableEnded) {
+      response.end();
+    }
+  }
+});
+
+server.on("upgrade", handleWebSocketUpgrade);
+
+server.listen(listenPort, listenHost, () => {
+  process.stderr.write(`model-router-ready:${listenHost}:${listenPort}\n`);
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => server.close(() => process.exit(0)));
+}
+__CODEX_MODEL_ROUTER_BRIDGE_JS__
+// Codex Responses API <-> Anthropic Messages API 雙向轉譯。
+//
+// 存在的理由：部分閘道的 /v1/responses 與 /v1/chat/completions 相容層對
+// Claude 模型有缺陷（串流回 400 stream_options、非串流 content 恆為空），
+// 但 /v1/messages 原生端點完全正常。因此改由本機轉譯。
+//
+// 兩側格式皆取自實際擷取的封包，見 capture/ 目錄。
+
+const EFFORT_BUDGET = {
+  low: 2048,
+  medium: 8192,
+  high: 16384,
+  xhigh: 24576,
+  max: 32768,
+  // Codex 的 ultra 帶「自動任務委派」語意，Claude 這側無對應概念。
+  // 路由不對外宣告 ultra，但全域 model_reasoning_effort 可能飄進來，
+  // 因此仍需對應一個預算，否則會靜默地完全不送 thinking。
+  ultra: 49152,
+};
+const DEFAULT_MAX_TOKENS = 32000;
+// 留給實際回答的餘裕：max_tokens 必須大於 thinking budget。
+const OUTPUT_HEADROOM = 4096;
+
+// ---------------------------------------------------------------- 請求方向
+
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => (typeof part?.text === "string" ? part.text : ""))
+    .filter(Boolean)
+    .join("\n");
+}
+
+// additional_tools 內含 namespace 巢狀，攤平成單層。
+function flattenTools(items, out = []) {
+  for (const tool of items || []) {
+    if (tool?.type === "namespace") flattenTools(tool.tools, out);
+    else if (tool?.name) out.push(tool);
+  }
+  return out;
+}
+
+// Codex 的 type:"custom" 是自由格式工具（input 為原始字串），
+// Anthropic 沒有對應概念，用單一 string 參數的 schema 模擬。
+const FREEFORM_KEY = "input";
+
+function toAnthropicTools(codexTools) {
+  const tools = [];
+  const freeform = new Set();
+  for (const tool of codexTools) {
+    if (tool.type === "custom") {
+      freeform.add(tool.name);
+      tools.push({
+        name: tool.name,
+        description: tool.description || "",
+        input_schema: {
+          type: "object",
+          properties: {
+            [FREEFORM_KEY]: {
+              type: "string",
+              description:
+                "The raw payload for this tool, passed through verbatim.",
+            },
+          },
+          required: [FREEFORM_KEY],
+        },
+      });
+    } else if (tool.type === "function") {
+      tools.push({
+        name: tool.name,
+        description: tool.description || "",
+        input_schema: tool.parameters || { type: "object", properties: {} },
+      });
+    }
+  }
+  return { tools, freeform };
+}
+
+function decodeReasoning(encrypted) {
+  if (typeof encrypted !== "string" || !encrypted) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(encrypted, "base64").toString("utf8"));
+    if (parsed && typeof parsed.thinking === "string" && parsed.signature) {
+      return { type: "thinking", thinking: parsed.thinking, signature: parsed.signature };
+    }
+  } catch {}
+  return null;
+}
+
+export function encodeReasoning(thinking, signature) {
+  return Buffer.from(JSON.stringify({ thinking, signature }), "utf8").toString("base64");
+}
+
+// route 可傳字串（僅模型名）或路由物件（含探測到的 maxOutputTokens）。
+export function toAnthropicRequest(body, route) {
+  const upstreamModel = typeof route === "string" ? route : route?.upstreamModel;
+  const modelMaxOutput =
+    typeof route === "object" && Number.isFinite(route?.maxOutputTokens) && route.maxOutputTokens > 0
+      ? route.maxOutputTokens
+      : null;
+  const systemParts = [];
+  const messages = [];
+  let codexTools = [];
+
+  // 同 role 的連續區塊必須合併，否則 Anthropic 會拒絕。
+  const push = (role, block) => {
+    const last = messages[messages.length - 1];
+    if (last && last.role === role) last.content.push(block);
+    else messages.push({ role, content: [block] });
+  };
+
+  // body.input 允許是純字串（簡易呼叫），統一成項目陣列。
+  const inputItems = typeof body.input === "string"
+    ? [{ type: "message", role: "user", content: [{ type: "input_text", text: body.input }] }]
+    : (Array.isArray(body.input) ? body.input : []);
+
+  for (const item of inputItems) {
+    switch (item?.type) {
+      case "additional_tools":
+        codexTools = flattenTools(item.tools);
+        break;
+
+      case "message": {
+        const text = textOf(item.content);
+        if (!text) break;
+        if (item.role === "developer" || item.role === "system") systemParts.push(text);
+        else if (item.role === "assistant") push("assistant", { type: "text", text });
+        else push("user", { type: "text", text });
+        break;
+      }
+
+      case "reasoning": {
+        const block = decodeReasoning(item.encrypted_content);
+        if (block) push("assistant", block);
+        break;
+      }
+
+      case "custom_tool_call":
+        push("assistant", {
+          type: "tool_use",
+          id: item.call_id,
+          name: item.name,
+          input: { [FREEFORM_KEY]: typeof item.input === "string" ? item.input : "" },
+        });
+        break;
+
+      case "function_call": {
+        let input = {};
+        try { input = JSON.parse(item.arguments || "{}"); } catch {}
+        push("assistant", { type: "tool_use", id: item.call_id, name: item.name, input });
+        break;
+      }
+
+      case "custom_tool_call_output":
+      case "function_call_output":
+        push("user", {
+          type: "tool_result",
+          tool_use_id: item.call_id,
+          content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+        });
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  // Anthropic 要求首個訊息必須是 user。
+  if (!messages.length || messages[0].role !== "user") {
+    messages.unshift({ role: "user", content: [{ type: "text", text: "." }] });
+  }
+
+  const { tools, freeform } = toAnthropicTools(codexTools);
+
+  const effort = body?.reasoning?.effort;
+  let budget = EFFORT_BUDGET[effort] || 0;
+  let maxTokens = Math.max(
+    Number(body.max_output_tokens) || DEFAULT_MAX_TOKENS,
+    budget + OUTPUT_HEADROOM,
+  );
+  // 不可超過該模型實際允許的輸出上限，否則上游直接 400。
+  if (modelMaxOutput) maxTokens = Math.min(maxTokens, modelMaxOutput);
+  // 夾過之後 budget 可能反超 max_tokens，需同步縮小以維持 budget < max_tokens。
+  if (budget && budget + OUTPUT_HEADROOM > maxTokens) {
+    budget = Math.max(1024, maxTokens - OUTPUT_HEADROOM);
+  }
+
+  const request = {
+    model: upstreamModel,
+    max_tokens: maxTokens,
+    messages,
+    stream: true,
+  };
+
+  if (systemParts.length) {
+    // 最後一段掛 cache_control，讓穩定的前綴可被快取。
+    const blocks = systemParts.map((text) => ({ type: "text", text }));
+    blocks[blocks.length - 1].cache_control = { type: "ephemeral" };
+    request.system = blocks;
+  }
+  if (tools.length) {
+    request.tools = tools;
+    if (body.tool_choice === "auto" || !body.tool_choice) request.tool_choice = { type: "auto" };
+    else if (body.tool_choice === "required") request.tool_choice = { type: "any" };
+    else if (body.tool_choice === "none") delete request.tools;
+  }
+  if (budget >= 1024) request.thinking = { type: "enabled", budget_tokens: budget };
+
+  return { request, freeform };
+}
+
+// ---------------------------------------------------------------- 回應方向
+
+function randomId(prefix, length) {
+  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let out = prefix;
+  while (out.length < length) out += chars[Math.floor(Math.random() * chars.length)];
+  return out.slice(0, length);
+}
+
+function mapUsage(anthropicUsage) {
+  const u = anthropicUsage || {};
+  const input = Number(u.input_tokens) || 0;
+  const cached = Number(u.cache_read_input_tokens) || 0;
+  const cacheWrite = Number(u.cache_creation_input_tokens) || 0;
+  const output = Number(u.output_tokens) || 0;
+  return {
+    input_tokens: input + cached + cacheWrite,
+    input_tokens_details: { cached_tokens: cached, cache_write_tokens: cacheWrite },
+    output_tokens: output,
+    output_tokens_details: {
+      reasoning_tokens: Number(u.output_tokens_details?.thinking_tokens) || 0,
+    },
+    total_tokens: input + cached + cacheWrite + output,
+  };
+}
+
+/**
+ * 讀取 Anthropic 的 SSE 串流，逐一產生 Codex Responses 事件。
+ * @param {AsyncIterable<Uint8Array>} upstreamBody
+ * @param {(event: object) => void} emit
+ * @param {{model: string, requestBody: object, freeform: Set<string>}} ctx
+ */
+export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
+  const responseId = randomId("resp_", 55);
+  const createdAt = Math.floor(Date.now() / 1000);
+  let seq = 0;
+  let outputIndex = 0;
+  let usage = null;
+  let stopReason = null;
+  const output = [];
+
+  const base = () => ({
+    id: responseId,
+    object: "response",
+    created_at: createdAt,
+    status: "in_progress",
+    background: false,
+    completed_at: null,
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    max_output_tokens: null,
+    model: ctx.model,
+    output: [],
+    parallel_tool_calls: false,
+    previous_response_id: null,
+    prompt_cache_key: ctx.requestBody?.prompt_cache_key ?? null,
+    reasoning: ctx.requestBody?.reasoning ?? null,
+    store: false,
+    temperature: 1.0,
+    text: ctx.requestBody?.text ?? { format: { type: "text" }, verbosity: "low" },
+    tool_choice: ctx.requestBody?.tool_choice ?? "auto",
+    tools: [],
+    truncation: "disabled",
+    usage: null,
+    user: null,
+    metadata: {},
+  });
+
+  const send = (event) => { emit({ ...event, sequence_number: seq++ }); };
+
+  send({ type: "response.created", response: base() });
+  send({ type: "response.in_progress", response: base() });
+
+  // 目前正在組裝的 content block
+  let cur = null;
+
+  const decoder = new TextDecoder();
+  let pending = "";
+
+  const handle = (event) => {
+    switch (event.type) {
+      case "content_block_start": {
+        const block = event.content_block || {};
+        if (block.type === "thinking") {
+          cur = { kind: "thinking", itemId: randomId("rs_", 53), thinking: "", signature: "", index: outputIndex };
+          send({
+            type: "response.output_item.added",
+            output_index: outputIndex,
+            item: { id: cur.itemId, type: "reasoning", content: [], encrypted_content: "", summary: [] },
+          });
+        } else if (block.type === "text") {
+          cur = { kind: "text", itemId: randomId("msg_", 54), text: "", index: outputIndex };
+          send({
+            type: "response.output_item.added",
+            output_index: outputIndex,
+            item: { id: cur.itemId, type: "message", status: "in_progress", content: [], phase: "commentary", role: "assistant" },
+          });
+          send({
+            type: "response.content_part.added",
+            content_index: 0,
+            item_id: cur.itemId,
+            output_index: outputIndex,
+            part: { type: "output_text", annotations: [], logprobs: [], text: "" },
+          });
+        } else if (block.type === "tool_use") {
+          const isFreeform = ctx.freeform.has(block.name);
+          cur = {
+            kind: isFreeform ? "custom_tool" : "function_tool",
+            itemId: randomId("fc_", 54),
+            callId: block.id,
+            name: block.name,
+            json: "",
+            index: outputIndex,
+          };
+          send({
+            type: "response.output_item.added",
+            output_index: outputIndex,
+            item: isFreeform
+              ? { id: cur.itemId, type: "custom_tool_call", status: "in_progress", call_id: cur.callId, input: "", name: cur.name }
+              : { id: cur.itemId, type: "function_call", status: "in_progress", call_id: cur.callId, arguments: "", name: cur.name },
+          });
+        }
+        break;
+      }
+
+      case "content_block_delta": {
+        if (!cur) break;
+        const d = event.delta || {};
+        if (d.type === "thinking_delta" && cur.kind === "thinking") {
+          cur.thinking += d.thinking || "";
+        } else if (d.type === "signature_delta" && cur.kind === "thinking") {
+          cur.signature += d.signature || "";
+        } else if (d.type === "text_delta" && cur.kind === "text") {
+          cur.text += d.text || "";
+          send({
+            type: "response.output_text.delta",
+            content_index: 0,
+            item_id: cur.itemId,
+            output_index: cur.index,
+            delta: d.text || "",
+          });
+        } else if (d.type === "input_json_delta") {
+          // 自由格式工具的參數包在 JSON 字串裡，無法逐段安全解碼，
+          // 因此先累積，於 content_block_stop 一次送出。
+          cur.json += d.partial_json || "";
+        }
+        break;
+      }
+
+      case "content_block_stop": {
+        if (!cur) break;
+        if (cur.kind === "thinking") {
+          const item = {
+            id: cur.itemId,
+            type: "reasoning",
+            content: [],
+            encrypted_content: encodeReasoning(cur.thinking, cur.signature),
+            summary: [],
+          };
+          output.push(item);
+          send({ type: "response.output_item.done", output_index: cur.index, item });
+        } else if (cur.kind === "text") {
+          send({
+            type: "response.output_text.done",
+            content_index: 0,
+            item_id: cur.itemId,
+            logprobs: [],
+            output_index: cur.index,
+            text: cur.text,
+          });
+          send({
+            type: "response.content_part.done",
+            content_index: 0,
+            item_id: cur.itemId,
+            output_index: cur.index,
+            part: { type: "output_text", annotations: [], logprobs: [], text: cur.text },
+          });
+          const item = {
+            id: cur.itemId,
+            type: "message",
+            status: "completed",
+            content: [{ type: "output_text", annotations: [], logprobs: [], text: cur.text }],
+            phase: "commentary",
+            role: "assistant",
+          };
+          output.push(item);
+          send({ type: "response.output_item.done", output_index: cur.index, item });
+        } else if (cur.kind === "custom_tool" || cur.kind === "function_tool") {
+          let parsed = {};
+          try { parsed = JSON.parse(cur.json || "{}"); } catch {}
+          if (cur.kind === "custom_tool") {
+            const input = typeof parsed[FREEFORM_KEY] === "string" ? parsed[FREEFORM_KEY] : (cur.json || "");
+            send({ type: "response.custom_tool_call_input.delta", delta: input, item_id: cur.itemId, output_index: cur.index });
+            send({ type: "response.custom_tool_call_input.done", input, item_id: cur.itemId, output_index: cur.index });
+            const item = { id: cur.itemId, type: "custom_tool_call", status: "completed", call_id: cur.callId, input, name: cur.name };
+            output.push(item);
+            send({ type: "response.output_item.done", output_index: cur.index, item });
+          } else {
+            const args = JSON.stringify(parsed);
+            send({ type: "response.function_call_arguments.delta", delta: args, item_id: cur.itemId, output_index: cur.index });
+            send({ type: "response.function_call_arguments.done", arguments: args, item_id: cur.itemId, output_index: cur.index });
+            const item = { id: cur.itemId, type: "function_call", status: "completed", call_id: cur.callId, arguments: args, name: cur.name };
+            output.push(item);
+            send({ type: "response.output_item.done", output_index: cur.index, item });
+          }
+        }
+        outputIndex += 1;
+        cur = null;
+        break;
+      }
+
+      case "message_start":
+        usage = event.message?.usage || null;
+        break;
+
+      case "message_delta":
+        stopReason = event.delta?.stop_reason ?? stopReason;
+        if (event.usage) usage = { ...(usage || {}), ...event.usage };
+        break;
+
+      case "message_stop": {
+        const response = base();
+        response.status = "completed";
+        response.completed_at = Math.floor(Date.now() / 1000);
+        response.output = output;
+        response.usage = mapUsage(usage);
+        if (stopReason === "max_tokens") {
+          response.status = "incomplete";
+          response.incomplete_details = { reason: "max_output_tokens" };
+        }
+        send({ type: "response.completed", response });
+        break;
+      }
+
+      case "error": {
+        send({ type: "error", error: event.error || { message: "上游錯誤" } });
+        break;
+      }
+
+      default:
+        break; // ping 等忽略
+    }
+  };
+
+  for await (const chunk of upstreamBody) {
+    pending += decoder.decode(chunk, { stream: true });
+    for (;;) {
+      const match = /\r?\n\r?\n/.exec(pending);
+      if (!match) break;
+      const block = pending.slice(0, match.index);
+      pending = pending.slice(match.index + match[0].length);
+      const line = /^data:\s*(.*)$/m.exec(block);
+      if (!line) continue;
+      let event;
+      try { event = JSON.parse(line[1]); } catch { continue; }
+      handle(event);
+    }
+  }
+}
+__CODEX_MODEL_ROUTER_EMBEDDED__
