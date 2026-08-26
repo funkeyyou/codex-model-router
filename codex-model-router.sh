@@ -77,7 +77,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.4.0";
+const INSTALLER_VERSION = "1.4.1";
 const PROVIDER_ID = "compat_router";
 const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
@@ -1866,6 +1866,27 @@ function sendWebSocketFrame(socket, opcode, payload) {
   }
 }
 
+// Codex 不處理 type:"error"（日誌: unhandled responses event），只送它會無聲卡死。
+// response.failed 是 Responses API 標準的失敗終止事件，Codex 有對應處理。
+// 所有錯誤路徑都必須經過這裡，否則就會留下卡死的缺口。
+function sendResponseFailed(socket, code, message) {
+  sendWebSocketJson(socket, {
+    type: "response.failed",
+    sequence_number: 0,
+    response: {
+      id: `resp_router_${Date.now().toString(36)}`,
+      object: "response",
+      created_at: Math.floor(Date.now() / 1000),
+      status: "failed",
+      error: { code: String(code), message: String(message) },
+      incomplete_details: null,
+      output: [],
+      usage: null,
+    },
+  });
+  stats.responseFailedSent += 1;
+}
+
 function sendWebSocketJson(socket, payload) {
   sendWebSocketFrame(socket, 0x1, JSON.stringify(payload));
 }
@@ -1955,26 +1976,11 @@ async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyK
       message: rawText || `上游返回 HTTP ${upstream.status}`,
     };
     sendWebSocketJson(socket, { type: "error", error: errorObject });
-    // Codex 不處理 type:"error"（日誌: unhandled responses event），只送它會無聲卡死。
-    // response.failed 是 Responses API 標準的失敗終止事件，Codex 有對應處理
-    // （二進位字串: "response.failed event received"），因此一併送出。
-    sendWebSocketJson(socket, {
-      type: "response.failed",
-      sequence_number: 0,
-      response: {
-        id: `resp_router_${Date.now().toString(36)}`,
-        object: "response",
-        created_at: Math.floor(Date.now() / 1000),
-        status: "failed",
-        error: {
-          code: errorObject.code ? String(errorObject.code) : String(upstream.status),
-          message: errorObject.message || `上游返回 HTTP ${upstream.status}`,
-        },
-        incomplete_details: null,
-        output: [],
-        usage: null,
-      },
-    });
+    sendResponseFailed(
+      socket,
+      errorObject.code || upstream.status,
+      errorObject.message || `上游返回 HTTP ${upstream.status}`,
+    );
     // 關閉連線的策略需要區分兩種錯誤：
     //
     // 1) 預熱請求（websocket.warmup=true）在部分閘道上必定失敗，但 Codex 會忽略
@@ -1985,7 +1991,6 @@ async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyK
     //    伺服器保存狀態，而它是以「連線」為單位判斷伺服器是否具備該能力。
     //    此時若不關閉，Codex 收到它不認得的 type:"error" 會無聲卡死；關閉後
     //    它會重連，並在新連線上重送完整歷史 —— 因此這種錯誤必須關。
-    stats.responseFailedSent += 1;
     const isStatefulUnsupported =
       typeof rawText === "string" && rawText.includes("previous_response_id");
     if (isStatefulUnsupported || closeOnUpstreamError) {
@@ -2199,14 +2204,18 @@ function handleWebSocketUpgrade(request, socket, head) {
         if (!aborted) {
           stats.failures += 1;
           process.stderr.write(`model-router-websocket-error:${error}\n`);
+          const detail = error instanceof Error ? error.message : String(error);
           sendWebSocketJson(socket, {
             type: "error",
             error: {
               type: "router_error",
               code: "router_error",
-              message: "模型路由器的 WebSocket 桥接失败",
+              message: `模型路由器的 WebSocket 桥接失败：${detail}`,
             },
           });
+          // 網路層例外（fetch failed / terminated）同樣要送終止事件，
+          // 否則 Codex 會停在「思考中」直到 idle timeout 才重試。
+          sendResponseFailed(socket, "router_error", detail);
         }
       })
       .finally(() => {
