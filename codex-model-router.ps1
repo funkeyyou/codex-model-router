@@ -1,63 +1,135 @@
-#!/bin/bash
-set -euo pipefail
+﻿# Codex 模型路由器 —— Windows 安装器
+#
+# 用法：
+#   powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
+#   powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
+#   powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
+#
+# 文件末尾的注释块内嵌 installer / router / claude-bridge 三段 JavaScript，
+# 与 codex-model-router.sh 逐字一致，由 tools/sync-payloads.mjs 同步。
 
-find_node() {
-  if [[ -n "${CODEX_MODEL_ROUTER_NODE_BIN:-}" && -x "${CODEX_MODEL_ROUTER_NODE_BIN}" ]]; then
-    printf '%s\n' "${CODEX_MODEL_ROUTER_NODE_BIN}"
-    return
-  fi
+$ErrorActionPreference = 'Stop'
 
-  local candidate
-  for candidate in \
-    "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node" \
-    "$(command -v node 2>/dev/null || true)"; do
-    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
-      printf '%s\n' "${candidate}"
-      return
-    fi
-  done
+# router.mjs 用 node:zlib 的 zstd 解压 Codex 送来的请求体，需要 Node v22.15 起。
+$MinimumNodeVersion = [Version] '22.15.0'
+$commandArguments = @($args)
 
-  return 1
+function Get-NodeVersion {
+  param([string] $Path)
+  try {
+    $raw = & $Path --version
+  } catch {
+    return $null
+  }
+  if ($LASTEXITCODE -ne 0 -or -not $raw) { return $null }
+  $match = [regex]::Match(($raw | Select-Object -First 1), '^v(\d+)\.(\d+)\.(\d+)')
+  if (-not $match.Success) { return $null }
+  return [Version] ('{0}.{1}.{2}' -f $match.Groups[1].Value, $match.Groups[2].Value, $match.Groups[3].Value)
 }
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "此安装器仅支持 macOS。Windows 请改用 codex-model-router.ps1。" >&2
-  exit 1
-fi
+function Get-NodeCandidate {
+  $candidates = New-Object System.Collections.Generic.List[string]
+  if ($env:CODEX_MODEL_ROUTER_NODE_BIN) { [void] $candidates.Add($env:CODEX_MODEL_ROUTER_NODE_BIN) }
 
-NODE_BIN="$(find_node || true)"
-if [[ -z "${NODE_BIN}" ]]; then
-  echo "未找到 Node.js，请先安装 ChatGPT Desktop 或 Node.js。" >&2
-  exit 1
-fi
+  # PATH 上的 Node 优先：Codex 自带的那份放在带版本哈希的目录里，
+  # 应用升级后路径会失效，计划任务就会指向已不存在的可执行文件。
+  $onPath = Get-Command node.exe -ErrorAction SilentlyContinue
+  if ($onPath) { [void] $candidates.Add($onPath.Source) }
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-model-router.XXXXXX")"
-cleanup() {
-  rm -rf "${TMP_DIR}"
+  if ($env:LOCALAPPDATA) {
+    $codexRoot = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex'
+    [void] $candidates.Add((Join-Path $codexRoot 'bin\node.exe'))
+    foreach ($relative in @('runtimes\cua_node', 'bin')) {
+      $parent = Join-Path $codexRoot $relative
+      if (-not (Test-Path -LiteralPath $parent -PathType Container)) { continue }
+      Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        ForEach-Object {
+          [void] $candidates.Add((Join-Path $_.FullName 'bin\node.exe'))
+          [void] $candidates.Add((Join-Path $_.FullName 'node.exe'))
+        }
+    }
+  }
+  return $candidates
 }
-trap cleanup EXIT INT TERM
 
-INSTALLER_JS="${TMP_DIR}/installer.mjs"
-awk '
-  /^__CODEX_MODEL_ROUTER_INSTALLER_JS__$/ { capture = 1; next }
-  /^__CODEX_MODEL_ROUTER_ROUTER_JS__$/ { capture = 0 }
-  capture { print }
-' "$0" > "${INSTALLER_JS}"
+function Find-NodeBinary {
+  $tooOld = @()
+  foreach ($candidate in (Get-NodeCandidate)) {
+    if (-not $candidate -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+    $version = Get-NodeVersion -Path $candidate
+    if (-not $version) { continue }
+    if ($version -lt $MinimumNodeVersion) {
+      $tooOld += ('{0}（v{1}）' -f $candidate, $version)
+      continue
+    }
+    return $candidate
+  }
+  if ($tooOld.Count -gt 0) {
+    throw ("找到的 Node.js 版本过低，需要 v$MinimumNodeVersion 及以上：`n  " + ($tooOld -join "`n  "))
+  }
+  throw "未找到 Node.js。请先安装 Codex 桌面版，或安装 Node.js v$MinimumNodeVersion 及以上。"
+}
 
-export CODEX_MODEL_ROUTER_SCRIPT_PATH="$0"
-export CODEX_MODEL_ROUTER_NODE_BIN="${NODE_BIN}"
-ARG_COUNT=$#
-set +e
-"${NODE_BIN}" "${INSTALLER_JS}" "$@"
-EXIT_STATUS=$?
-set -e
-if [[ ${ARG_COUNT} -eq 0 && -t 0 ]]; then
-  echo
-  read -r -p "按回车键结束（窗口是否关闭取决于终端设置）..." _
-fi
-exit ${EXIT_STATUS}
+function Get-EmbeddedSection {
+  param([string] $Content, [string] $StartMarker, [string] $EndMarker)
+  $start = $Content.IndexOf("`n$StartMarker`n", [StringComparison]::Ordinal)
+  if ($start -lt 0) { throw "安装器中缺少内嵌代码段：$StartMarker" }
+  $from = $start + $StartMarker.Length + 2
+  $end = $Content.IndexOf("`n$EndMarker`n", $from, [StringComparison]::Ordinal)
+  if ($end -lt 0) { throw "安装器中缺少结束标记：$EndMarker" }
+  return $Content.Substring($from, $end - $from)
+}
 
-: <<'__CODEX_MODEL_ROUTER_EMBEDDED__'
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+  Write-Error '此安装器仅支持 Windows。macOS 请改用 codex-model-router.sh。'
+  exit 1
+}
+
+$scriptPath = $PSCommandPath
+if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+  Write-Error '无法定位安装器文件。请先把脚本保存到本地，再以 -File 方式运行。'
+  exit 1
+}
+
+$nodeBin = Find-NodeBinary
+$content = [IO.File]::ReadAllText($scriptPath).Replace("`r`n", "`n")
+$installerSource = Get-EmbeddedSection -Content $content `
+  -StartMarker '__CODEX_MODEL_ROUTER_INSTALLER_JS__' `
+  -EndMarker '__CODEX_MODEL_ROUTER_ROUTER_JS__'
+
+$tempDir = Join-Path ([IO.Path]::GetTempPath()) ('codex-model-router-' + [Guid]::NewGuid().ToString('N').Substring(0, 12))
+$null = New-Item -ItemType Directory -Path $tempDir
+$installerPath = Join-Path $tempDir 'installer.mjs'
+[IO.File]::WriteAllText($installerPath, $installerSource, (New-Object Text.UTF8Encoding $false))
+
+$previousOutputEncoding = [Console]::OutputEncoding
+$previousInputEncoding = [Console]::InputEncoding
+$exitCode = 0
+try {
+  # Node 一律以 UTF-8 输出；控制台代码页不是 65001 时中文会变乱码。
+  try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+  try { [Console]::InputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+
+  $env:CODEX_MODEL_ROUTER_SCRIPT_PATH = $scriptPath
+  $env:CODEX_MODEL_ROUTER_NODE_BIN = $nodeBin
+
+  & $nodeBin $installerPath @commandArguments
+  $exitCode = $LASTEXITCODE
+} finally {
+  try { [Console]::OutputEncoding = $previousOutputEncoding } catch { }
+  try { [Console]::InputEncoding = $previousInputEncoding } catch { }
+  Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if ($commandArguments.Count -eq 0 -and -not [Console]::IsInputRedirected) {
+  Write-Host ''
+  $null = Read-Host '按回车键结束'
+}
+
+exit $exitCode
+
+<#
 __CODEX_MODEL_ROUTER_INSTALLER_JS__
 import { createHash } from "node:crypto";
 import {
@@ -3317,3 +3389,4 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   }
 }
 __CODEX_MODEL_ROUTER_EMBEDDED__
+#>

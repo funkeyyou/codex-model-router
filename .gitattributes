@@ -1,0 +1,6 @@
+# 兩個安裝器都內嵌同一份 JavaScript 負載，換行必須逐字一致，
+# 否則 tools/sync-payloads.mjs --check 會在不同平台的簽出上誤報。
+*.sh   text eol=lf
+*.ps1  text eol=lf
+*.mjs  text eol=lf
+*.md   text eol=lf
