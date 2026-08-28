@@ -151,7 +151,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.5.0";
+const INSTALLER_VERSION = "1.5.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -1860,6 +1860,32 @@ function stripBridgeReasoning(input) {
   return { input: kept, removed: input.length - kept.length };
 }
 
+// 轉譯層必須替它合成的 message / function_call 補上 item id（串流協定要求），
+// 但那是本機隨機鑄的混合大小寫字串。官方後端只認自己發過的 id 格式，會整輪回
+// Invalid 'input[n].id'：碰過 Claude 的對話一切回官方模型就卡死。
+// 上游發的 id 一律是小寫十六進位，因此「後綴帶大寫」足以辨識出自鑄的 id。
+// 這裡只拿掉 id 欄位而不動整個項目：Responses API 的輸入項本來就可以沒有 id，
+// 工具配對靠的是 call_id，內容因此完整保留。
+function isBridgeMintedId(value) {
+  if (typeof value !== "string") return false;
+  const match = /^(?:msg|fc|rs|resp)_([A-Za-z0-9]{20,})$/.exec(value);
+  return match !== null && /[A-Z]/.test(match[1]);
+}
+
+function stripBridgeItemIds(input) {
+  if (!Array.isArray(input)) return { input, removed: 0 };
+  let removed = 0;
+  const mapped = input.map((item) => {
+    if (!item || typeof item !== "object" || !isBridgeMintedId(item.id)) {
+      return item;
+    }
+    removed += 1;
+    const { id, ...rest } = item;
+    return rest;
+  });
+  return { input: removed > 0 ? mapped : input, removed };
+}
+
 function historyKeyFor(body, headers) {
   const sessionId = body?.client_metadata?.session_id;
   if (typeof sessionId === "string" && sessionId) return sessionId;
@@ -1941,6 +1967,7 @@ const stats = {
   queuedResponses: 0,
   responseInProgressRejects: 0,
   bridgeReasoningStripped: 0,
+  bridgeIdsStripped: 0,
   statefulRebuilds: 0,
   statefulRebuildMisses: 0,
   translatedRequests: 0,
@@ -2248,12 +2275,18 @@ async function fetchModelUpstream(
     setHistory(historyKey, body.input);
   }
 
-  // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除。
+  // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
+  // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
   if (route?.translate !== "anthropic") {
     const stripped = stripBridgeReasoning(effectiveBody.input);
     if (stripped.removed > 0) {
       effectiveBody = { ...effectiveBody, input: stripped.input };
       stats.bridgeReasoningStripped += stripped.removed;
+    }
+    const reidentified = stripBridgeItemIds(effectiveBody.input);
+    if (reidentified.removed > 0) {
+      effectiveBody = { ...effectiveBody, input: reidentified.input };
+      stats.bridgeIdsStripped += reidentified.removed;
     }
   }
 
