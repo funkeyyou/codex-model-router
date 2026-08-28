@@ -10,6 +10,10 @@ Codex 仍使用內建的 `openai` 供應商 ID，所以桌面版與手機 Remote
 
 ## 安裝
 
+兩個平台各有一支進入點——macOS 是 bash 腳本，Windows 是 PowerShell 腳本。兩邊的
+shell 與下載工具不同，沒辦法共用同一行指令；但裝出來的東西完全一樣：同一份路由器
+與轉譯程式碼、同一套設定流程。
+
 ### macOS
 
 ```bash
@@ -21,6 +25,8 @@ curl -fsSL https://raw.githubusercontent.com/funkeyyou/codex-model-router/main/c
 
 ### Windows
 
+在 PowerShell 視窗裡執行（`.ps1` 直接雙擊只會用記事本開啟）：
+
 ```powershell
 curl.exe -fsSL https://raw.githubusercontent.com/funkeyyou/codex-model-router/main/codex-model-router.ps1 -o codex-model-router.ps1; powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
 ```
@@ -29,13 +35,20 @@ curl.exe -fsSL https://raw.githubusercontent.com/funkeyyou/codex-model-router/ma
 > 若改用瀏覽器下載，先在檔案內容裡按「解除封鎖」再執行。
 
 安裝時會詢問三件事：Base URL、API Key、以及要加入哪些模型。
+輸入 API Key 時畫面不會顯示任何字元（跟 `sudo` 一樣），貼上後直接按 Enter。
 
 ## 其他指令
+
+不帶參數執行會出現選單，也可以直接指定動作。
+
+macOS：
 
 ```bash
 bash codex-model-router.sh status     # 檢視安裝狀態與健康度
 bash codex-model-router.sh rollback   # 回退（安裝檔會封存，不會刪除）
 ```
+
+Windows：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
@@ -74,9 +87,13 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
 
 ## 健康檢查
 
+macOS：
+
 ```bash
 curl -s http://127.0.0.1:48953/healthz | python3 -m json.tool
 ```
+
+Windows：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
@@ -84,6 +101,8 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 
 `failures` 應恆為 0。`statefulFallbacks` 或 `responseFailedSent` 持續增加代表上游有狀況；
 `statefulRebuilds` 與 `queuedResponses` 增加屬正常。
+
+實際埠號以 `status` 印出的為準：48953 被佔用時安裝器會自動往後找。
 
 ## 疑難排解
 
