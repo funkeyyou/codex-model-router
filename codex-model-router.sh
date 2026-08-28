@@ -77,7 +77,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.4.2";
+const INSTALLER_VERSION = "1.4.3";
 const PROVIDER_ID = "compat_router";
 const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
@@ -1371,6 +1371,28 @@ const websocketOnlyFields = [
 const threadHistories = new Map();
 const maxRememberedHistories = 32;
 
+// 轉譯層為了讓 Anthropic 的 thinking 簽章能往返，把 {thinking, signature}
+// 編碼進 reasoning 的 encrypted_content。官方後端驗不過這種內容
+// （The encrypted content for item ... could not be verified），
+// 因此送往非 Anthropic 路由時必須先剝除，否則碰過 Claude 的對話就切不回官方。
+function isBridgeReasoning(item) {
+  if (item?.type !== "reasoning") return false;
+  const enc = item.encrypted_content;
+  if (typeof enc !== "string" || !enc) return false;
+  try {
+    const parsed = JSON.parse(Buffer.from(enc, "base64").toString("utf8"));
+    return Boolean(parsed && typeof parsed.thinking === "string" && parsed.signature);
+  } catch {
+    return false;
+  }
+}
+
+function stripBridgeReasoning(input) {
+  if (!Array.isArray(input)) return { input, removed: 0 };
+  const kept = input.filter((item) => !isBridgeReasoning(item));
+  return { input: kept, removed: input.length - kept.length };
+}
+
 function historyKeyFor(body, headers) {
   const sessionId = body?.client_metadata?.session_id;
   if (typeof sessionId === "string" && sessionId) return sessionId;
@@ -1451,6 +1473,7 @@ const stats = {
   websocketOnlyFieldsStripped: 0,
   queuedResponses: 0,
   responseInProgressRejects: 0,
+  bridgeReasoningStripped: 0,
   statefulRebuilds: 0,
   statefulRebuildMisses: 0,
   translatedRequests: 0,
@@ -1726,6 +1749,15 @@ async function fetchModelUpstream(
     }
   } else {
     setHistory(historyKey, body.input);
+  }
+
+  // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除。
+  if (route?.translate !== "anthropic") {
+    const stripped = stripBridgeReasoning(effectiveBody.input);
+    if (stripped.removed > 0) {
+      effectiveBody = { ...effectiveBody, input: stripped.input };
+      stats.bridgeReasoningStripped += stripped.removed;
+    }
   }
 
   let outboundBodyObject = isCustom
