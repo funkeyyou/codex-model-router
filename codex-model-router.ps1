@@ -146,12 +146,13 @@ import {
 } from "node:fs";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
+import { Writable } from "node:stream";
 import { basename, dirname, join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.5.1";
+const INSTALLER_VERSION = "1.5.2";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -237,12 +238,18 @@ function writeJsonAtomic(path, value, mode = 0o600) {
 }
 
 function shell(command, args, options = {}) {
+  // 有 input 時 stdin 必須是管線：spawnSync 對 "ignore" 的 stdio[0] 會直接
+  // 丟掉 input，子行程只會讀到空字串。
+  const defaultStdio = options.input != null
+    ? ["pipe", "pipe", "pipe"]
+    : ["ignore", "pipe", "pipe"];
   const result = spawnSync(command, args, {
     encoding: "utf8",
-    stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
+    stdio: options.stdio ?? defaultStdio,
     env: options.env ?? env,
     cwd: options.cwd,
-    // 互動式的子行程要沿用呼叫端的主控台，不能帶 CREATE_NO_WINDOW。
+    // 有 input 時 spawnSync 會自動把 stdio[0] 換成管線。
+    input: options.input,
     windowsHide: options.windowsHide ?? true,
   });
   if (options.allowFailure !== true && result.status !== 0) {
@@ -274,16 +281,23 @@ function commandPath(name) {
 
 // --- Windows 專用小工具 ----------------------------------------------------
 // 一律用 -EncodedCommand 傳腳本，免去跨層引號逸出的問題。
-// options.interactive：拿掉 -NonInteractive，否則 Read-Host 會直接丟例外。
+// 這些子行程一律非互動：需要使用者輸入的部分留在本行程做，避免兩邊搶主控台。
+// $ProgressPreference 要關，否則 Add-Type 的進度條會蓋掉畫面。
 function powershell(script, options = {}) {
-  const encoded = Buffer.from(script, "utf16le").toString("base64");
-  const args = ["-NoProfile"];
-  if (!options.interactive) args.push("-NonInteractive");
-  args.push("-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded);
-  return shell("powershell.exe", args, {
-    ...options,
-    windowsHide: options.windowsHide ?? !options.interactive,
-  });
+  const full = `$ProgressPreference = 'SilentlyContinue'\n${script}`;
+  const encoded = Buffer.from(full, "utf16le").toString("base64");
+  return shell(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-EncodedCommand",
+      encoded,
+    ],
+    options,
+  );
 }
 
 function psQuote(value) {
@@ -422,6 +436,32 @@ async function confirm(question, defaultYes = true) {
   }
 }
 
+// 隱藏輸入的提問。這一段一定要留在本行程：spawnSync 期間本行程的 stdin
+// 仍掛在同一個主控台上，交給子行程 Read-Host 會被吃掉第一次輸入。
+async function askSecret(question) {
+  let muted = false;
+  const maskedOutput = new Writable({
+    write(chunk, encoding, callback) {
+      if (!muted) output.write(chunk, encoding);
+      callback();
+    },
+  });
+  const rl = createInterface({
+    input,
+    output: maskedOutput,
+    terminal: Boolean(output.isTTY),
+  });
+  try {
+    const answer = rl.question(`${question}: `);
+    muted = true;
+    return (await answer).trim();
+  } finally {
+    muted = false;
+    rl.close();
+    output.write("\n");
+  }
+}
+
 function normalizeUrl(value) {
   let parsed;
   try {
@@ -461,7 +501,7 @@ function keychainHas(service) {
   );
 }
 
-function storeApiKey(service, baseUrl) {
+async function storeApiKey(service, baseUrl) {
   if (env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
     return;
   }
@@ -469,28 +509,35 @@ function storeApiKey(service, baseUrl) {
   if (isWindows) {
     ensureDirectory(credentialsRoot);
     const target = credentialFileFor(service);
-    console.log("请输入自定义供应商的 API Key（输入内容不会回显）。" );
     console.log("API Key 会用 Windows 凭据保护（DPAPI）以当前用户身份加密保存，" );
     console.log("不会写入 config.toml 或安装器文件。" );
-    // 由 PowerShell 直接讀入並加密，明文不經過 Node 行程。
+    let apiKey = "";
+    for (let attempt = 0; attempt < 3 && !apiKey; attempt += 1) {
+      if (attempt > 0) console.log("API Key 不能为空，请重新输入。" );
+      apiKey = await askSecret("API Key（输入不会显示）");
+    }
+    if (!apiKey) fail("API Key 不能为空。" );
+    // 明文以管線交給 PowerShell 做 DPAPI 加密：不會出現在命令列或行程清單。
     const result = powershell(
       [
         "$ErrorActionPreference = 'Stop'",
         "Add-Type -AssemblyName System.Security",
-        "$secure = Read-Host -Prompt 'API Key' -AsSecureString",
-        "$ptr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($secure)",
-        "try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringUni($ptr) }",
-        "finally { [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($ptr) }",
-        "if ([string]::IsNullOrWhiteSpace($plain)) { exit 2 }",
+        "$buffer = New-Object IO.MemoryStream",
+        "[Console]::OpenStandardInput().CopyTo($buffer)",
+        "$plain = [Text.Encoding]::UTF8.GetString($buffer.ToArray()).Trim()",
+        "if ([string]::IsNullOrEmpty($plain)) { exit 2 }",
         `$entropy = [Text.Encoding]::UTF8.GetBytes(${psQuote(service)})`,
         "$bytes = [Text.Encoding]::UTF8.GetBytes($plain)",
         "$blob = [Security.Cryptography.ProtectedData]::Protect($bytes, $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)",
         `[IO.File]::WriteAllText(${psQuote(target)}, [Convert]::ToBase64String($blob))`,
       ].join("\n"),
-      { stdio: "inherit", allowFailure: true, interactive: true },
+      { input: apiKey, allowFailure: true },
     );
     if (result.status === 2) fail("API Key 不能为空。" );
-    if (result.status !== 0 || !existsSync(target)) fail("API Key 未能保存。" );
+    if (result.status !== 0 || !existsSync(target)) {
+      const detail = (result.stderr || "").trim().split(/\r?\n/)[0] || "";
+      fail(`API Key 未能保存。${detail ? `${detail}` : ""}`);
+    }
     restrictAcl(target);
     return;
   }
@@ -1363,9 +1410,9 @@ async function install() {
       `${secretStoreLabel}中已存在 API Key，是否替换？`,
       false,
     );
-    if (update) storeApiKey(keychainService, baseUrl);
+    if (update) await storeApiKey(keychainService, baseUrl);
   } else {
-    storeApiKey(keychainService, baseUrl);
+    await storeApiKey(keychainService, baseUrl);
   }
   const apiKey = readApiKey(keychainService);
 
@@ -2014,6 +2061,7 @@ function readStoredSecret() {
   const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
   const script = [
     "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
     "Add-Type -AssemblyName System.Security",
     "[Console]::OutputEncoding = New-Object Text.UTF8Encoding $false",
     `$blob = [Convert]::FromBase64String(([IO.File]::ReadAllText(${quote(credentialPath)})).Trim())`,
