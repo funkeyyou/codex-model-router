@@ -77,7 +77,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.4.1";
+const INSTALLER_VERSION = "1.4.2";
 const PROVIDER_ID = "compat_router";
 const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
@@ -2384,6 +2384,56 @@ function flattenTools(items, out = []) {
 // Anthropic 沒有對應概念，用單一 string 參數的 schema 模擬。
 const FREEFORM_KEY = "input";
 
+// Anthropic 的 input_schema 不接受「頂層」的 oneOf / allOf / anyOf
+// （錯誤訊息：input_schema does not support oneOf, allOf, or anyOf at the top level）。
+// 巢狀在 properties 裡的組合關鍵字是合法的，因此只攤平最外層。
+//
+// allOf → 合併所有分支（properties 聯集、required 聯集）
+// oneOf / anyOf → properties 取聯集，required 取交集（只保留每個分支都必填的）
+function flattenTopLevelSchema(schema) {
+  if (!schema || typeof schema !== "object") {
+    return { type: "object", properties: {} };
+  }
+  const combinators = ["allOf", "oneOf", "anyOf"].filter(
+    (k) => Array.isArray(schema[k]) && schema[k].length > 0,
+  );
+  if (combinators.length === 0) {
+    // 仍需確保是 object 型別，Anthropic 只接受物件 schema。
+    if (schema.type && schema.type !== "object") {
+      return { type: "object", properties: { value: schema }, required: ["value"] };
+    }
+    return { ...schema, type: "object", properties: schema.properties || {} };
+  }
+
+  const rest = { ...schema };
+  const properties = { ...(schema.properties || {}) };
+  let required = Array.isArray(schema.required) ? [...schema.required] : null;
+
+  for (const key of combinators) {
+    const branches = schema[key].map((b) => flattenTopLevelSchema(b));
+    delete rest[key];
+    for (const b of branches) Object.assign(properties, b.properties || {});
+    const branchRequired = branches.map((b) =>
+      Array.isArray(b.required) ? b.required : [],
+    );
+    if (key === "allOf") {
+      const union = new Set(required || []);
+      for (const r of branchRequired) for (const k of r) union.add(k);
+      required = [...union];
+    } else {
+      // 分支互斥，只有每個分支都必填的欄位才能安全地標為必填。
+      let inter = branchRequired[0] || [];
+      for (const r of branchRequired.slice(1)) inter = inter.filter((k) => r.includes(k));
+      required = required ? required.filter((k) => inter.includes(k)) : inter;
+    }
+  }
+
+  const out = { ...rest, type: "object", properties };
+  if (required && required.length) out.required = required;
+  else delete out.required;
+  return out;
+}
+
 function toAnthropicTools(codexTools) {
   const tools = [];
   const freeform = new Set();
@@ -2409,7 +2459,7 @@ function toAnthropicTools(codexTools) {
       tools.push({
         name: tool.name,
         description: tool.description || "",
-        input_schema: tool.parameters || { type: "object", properties: {} },
+        input_schema: flattenTopLevelSchema(tool.parameters),
       });
     }
   }
