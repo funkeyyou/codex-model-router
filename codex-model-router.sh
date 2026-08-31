@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.5.3";
+const INSTALLER_VERSION = "1.5.4";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -1787,7 +1787,12 @@ import { readFileSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs"
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
-import { toAnthropicRequest, bridgeAnthropicStream } from "./claude-bridge.mjs";
+import {
+  toAnthropicRequest,
+  bridgeAnthropicStream,
+  decodeCompaction,
+  COMPACTION_REPLAY_PREFIX,
+} from "./claude-bridge.mjs";
 
 const routerDirectory = dirname(fileURLToPath(import.meta.url));
 const settingsPath = join(routerDirectory, "settings.json");
@@ -1873,7 +1878,7 @@ function stripBridgeReasoning(input) {
 // 工具配對靠的是 call_id，內容因此完整保留。
 function isBridgeMintedId(value) {
   if (typeof value !== "string") return false;
-  const match = /^(?:msg|fc|rs|resp)_([A-Za-z0-9]{20,})$/.exec(value);
+  const match = /^(?:msg|fc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
   return match !== null && /[A-Z]/.test(match[1]);
 }
 
@@ -1887,6 +1892,26 @@ function stripBridgeItemIds(input) {
     removed += 1;
     const { id, ...rest } = item;
     return rest;
+  });
+  return { input: removed > 0 ? mapped : input, removed };
+}
+
+// 轉譯層自己合成的 compaction 項目，其 encrypted_content 只有本機解得開。
+// 官方後端與其他供應商都認不得，必須在離開 Anthropic 路由前還原成一般訊息，
+// 否則壓縮過的對話一切回官方模型就整輪被拒。
+function rewriteBridgeCompaction(input) {
+  if (!Array.isArray(input)) return { input, removed: 0 };
+  let removed = 0;
+  const mapped = input.map((item) => {
+    if (item?.type !== "compaction" && item?.type !== "context_compaction") return item;
+    const summary = decodeCompaction(item.encrypted_content);
+    if (summary === null) return item;
+    removed += 1;
+    return {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: `${COMPACTION_REPLAY_PREFIX}${summary}` }],
+    };
   });
   return { input: removed > 0 ? mapped : input, removed };
 }
@@ -1973,6 +1998,7 @@ const stats = {
   responseInProgressRejects: 0,
   bridgeReasoningStripped: 0,
   bridgeIdsStripped: 0,
+  bridgeCompactionRewritten: 0,
   statefulRebuilds: 0,
   statefulRebuildMisses: 0,
   translatedRequests: 0,
@@ -2294,6 +2320,11 @@ async function fetchModelUpstream(
       effectiveBody = { ...effectiveBody, input: reidentified.input };
       stats.bridgeIdsStripped += reidentified.removed;
     }
+    const recompacted = rewriteBridgeCompaction(effectiveBody.input);
+    if (recompacted.removed > 0) {
+      effectiveBody = { ...effectiveBody, input: recompacted.input };
+      stats.bridgeCompactionRewritten += recompacted.removed;
+    }
   }
 
   let outboundBodyObject = isCustom
@@ -2319,9 +2350,13 @@ async function fetchModelUpstream(
     stats.custom += 1;
     if (route.translate === "anthropic") {
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
-      const { request: anthropicRequest, freeform } = toAnthropicRequest(effectiveBody, route);
+      const { request: anthropicRequest, freeform, compaction } = toAnthropicRequest(
+        effectiveBody,
+        route,
+      );
       meta.translate = "anthropic";
       meta.freeform = freeform;
+      meta.compaction = compaction;
       meta.model = body.model;
       meta.requestBody = effectiveBody;
       meta.anthropicRequest = anthropicRequest;
@@ -3049,6 +3084,39 @@ export function encodeReasoning(thinking, signature) {
   return Buffer.from(JSON.stringify({ thinking, signature }), "utf8").toString("base64");
 }
 
+// --- remote compaction v2 -----------------------------------------------
+// Codex 上下文滿了會發一輪壓縮請求：input 末端附一個 {"type":"compaction_trigger"}，
+// 並要求輸出「恰好一個」{"type":"compaction"} 項目，否則整輪 Fatal
+// （remote compaction v2 expected exactly one compaction output item, got 0 ...）。
+// 那個項目在官方是後端合成的，模型本身不會吐，因此轉譯層必須自己補。
+//
+// encrypted_content 對客戶端是不透明字串，只會被原樣塞回後續請求的 input，
+// 所以比照 reasoning 的做法把摘要編碼進去，下一輪再解出來還原成訊息。
+const COMPACTION_PROMPT =
+  "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\n" +
+  "Include:\n" +
+  "- Current progress and key decisions made\n" +
+  "- Important context, constraints, or user preferences\n" +
+  "- What remains to be done (clear next steps)\n" +
+  "- Any critical data, examples, or references needed to continue\n\n" +
+  "Be concise, structured, and focused on helping the next LLM seamlessly continue the work.\n";
+
+export const COMPACTION_REPLAY_PREFIX =
+  "Summary of the earlier conversation, compacted. Continue the task from here.\n\n";
+
+export function encodeCompaction(summary) {
+  return Buffer.from(JSON.stringify({ compaction: summary }), "utf8").toString("base64");
+}
+
+export function decodeCompaction(encrypted) {
+  if (typeof encrypted !== "string" || !encrypted) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(encrypted, "base64").toString("utf8"));
+    if (parsed && typeof parsed.compaction === "string") return parsed.compaction;
+  } catch {}
+  return null;
+}
+
 // route 可傳字串（僅模型名）或路由物件（含探測到的 maxOutputTokens）。
 export function toAnthropicRequest(body, route) {
   const upstreamModel = typeof route === "string" ? route : route?.upstreamModel;
@@ -3059,6 +3127,7 @@ export function toAnthropicRequest(body, route) {
   const systemParts = [];
   const messages = [];
   let codexTools = [];
+  let compaction = false;
 
   // 同 role 的連續區塊必須合併，否則 Anthropic 會拒絕。
   const push = (role, block) => {
@@ -3118,10 +3187,27 @@ export function toAnthropicRequest(body, route) {
         });
         break;
 
+      // 這一輪是壓縮回合（項目本身不帶內容，純粹是請求控制）。
+      case "compaction_trigger":
+        compaction = true;
+        break;
+
+      // 前一次壓縮的產物，會一直跟著後續每一輪回來；還原成文字才不會遺失上下文。
+      case "compaction":
+      case "context_compaction": {
+        const summary = decodeCompaction(item.encrypted_content);
+        if (summary) push("user", { type: "text", text: `${COMPACTION_REPLAY_PREFIX}${summary}` });
+        break;
+      }
+
       default:
         break;
     }
   }
+
+  // compaction_trigger 本身沒有文字，模型不會知道要做什麼；補上與 Codex 本機
+  // 壓縮同一份提示詞，產出的摘要格式才會跟官方一致。
+  if (compaction) push("user", { type: "text", text: COMPACTION_PROMPT });
 
   // Anthropic 要求首個訊息必須是 user。
   if (!messages.length || messages[0].role !== "user") {
@@ -3156,7 +3242,8 @@ export function toAnthropicRequest(body, route) {
     blocks[blocks.length - 1].cache_control = { type: "ephemeral" };
     request.system = blocks;
   }
-  if (tools.length) {
+  // 壓縮回合只能回一個 compaction 項目，帶著工具反而會讓模型改去呼叫工具。
+  if (tools.length && !compaction) {
     request.tools = tools;
     if (body.tool_choice === "auto" || !body.tool_choice) request.tool_choice = { type: "auto" };
     else if (body.tool_choice === "required") request.tool_choice = { type: "any" };
@@ -3164,7 +3251,7 @@ export function toAnthropicRequest(body, route) {
   }
   if (budget >= 1024) request.thinking = { type: "enabled", budget_tokens: budget };
 
-  return { request, freeform };
+  return { request, freeform, compaction };
 }
 
 // ---------------------------------------------------------------- 回應方向
@@ -3197,7 +3284,7 @@ function mapUsage(anthropicUsage) {
  * 讀取 Anthropic 的 SSE 串流，逐一產生 Codex Responses 事件。
  * @param {AsyncIterable<Uint8Array>} upstreamBody
  * @param {(event: object) => void} emit
- * @param {{model: string, requestBody: object, freeform: Set<string>}} ctx
+ * @param {{model: string, requestBody: object, freeform: Set<string>, compaction?: boolean}} ctx
  */
 export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   const responseId = randomId("resp_", 55);
@@ -3236,7 +3323,21 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
     metadata: {},
   });
 
-  const send = (event) => { emit({ ...event, sequence_number: seq++ }); };
+  // 壓縮回合：模型吐的 reasoning / message / tool_use 一律不外送，
+  // 全部收攏成一個 compaction 項目，於 message_stop 一次補上。
+  const compactionMode = Boolean(ctx.compaction);
+  let compactionText = "";
+  let suppress = compactionMode;
+  const passthroughWhileSuppressed = new Set([
+    "response.created",
+    "response.in_progress",
+    "error",
+  ]);
+
+  const send = (event) => {
+    if (suppress && !passthroughWhileSuppressed.has(event.type)) return;
+    emit({ ...event, sequence_number: seq++ });
+  };
 
   send({ type: "response.created", response: base() });
   send({ type: "response.in_progress", response: base() });
@@ -3330,6 +3431,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           output.push(item);
           send({ type: "response.output_item.done", output_index: cur.index, item });
         } else if (cur.kind === "text") {
+          if (compactionMode) compactionText += cur.text;
           send({
             type: "response.output_text.done",
             content_index: 0,
@@ -3389,6 +3491,24 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
         break;
 
       case "message_stop": {
+        if (compactionMode) {
+          suppress = false;
+          // 摘要為空也必須送出項目，否則客戶端直接 Fatal。
+          const summary = compactionText.trim() || "(compaction produced no summary)";
+          const item = {
+            id: randomId("cmp_", 54),
+            type: "compaction",
+            encrypted_content: encodeCompaction(summary),
+          };
+          send({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { id: item.id, type: "compaction", encrypted_content: "" },
+          });
+          send({ type: "response.output_item.done", output_index: 0, item });
+          output.length = 0;
+          output.push(item);
+        }
         const response = base();
         response.status = "completed";
         response.completed_at = Math.floor(Date.now() / 1000);
