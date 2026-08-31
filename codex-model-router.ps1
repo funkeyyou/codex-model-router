@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.6.1";
+const INSTALLER_VERSION = "1.6.2";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -3204,6 +3204,43 @@ function textOf(content) {
     .join("\n");
 }
 
+// Codex 會把截圖等圖片以 data URL 放進訊息或工具結果。若整包 JSON.stringify
+// 成文字，base64 會以「約 1 個 token 對 1 個字元」的比率計費——一張 867 KB 的
+// 截圖就要 82 萬 token，兩張就把 100 萬的上下文撐爆，且完全看不出原因。
+// 轉成原生 image 區塊後，同一張圖只要約 (寬 x 高) / 750 個 token。
+const DATA_URL_PATTERN = /^data:([^;,]+);base64,([\s\S]*)$/;
+
+function toImageBlock(url) {
+  if (typeof url !== "string" || !url) return null;
+  const match = DATA_URL_PATTERN.exec(url);
+  if (match) {
+    return { type: "image", source: { type: "base64", media_type: match[1], data: match[2] } };
+  }
+  if (/^https?:\/\//.test(url)) return { type: "image", source: { type: "url", url } };
+  return null;
+}
+
+function toAnthropicBlocks(content) {
+  if (typeof content === "string") {
+    return content ? [{ type: "text", text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    if (content === null || content === undefined) return [];
+    const text = JSON.stringify(content);
+    return text ? [{ type: "text", text }] : [];
+  }
+  const blocks = [];
+  for (const part of content) {
+    if (typeof part?.text === "string" && part.text) {
+      blocks.push({ type: "text", text: part.text });
+      continue;
+    }
+    const image = toImageBlock(part?.image_url ?? part?.url);
+    if (image) blocks.push(image);
+  }
+  return blocks;
+}
+
 // additional_tools 內含 namespace 巢狀，攤平成單層。
 function flattenTools(items, out = []) {
   for (const tool of items || []) {
@@ -3378,11 +3415,20 @@ export function toAnthropicRequest(body, route) {
         break;
 
       case "message": {
-        const text = textOf(item.content);
-        if (!text) break;
-        if (item.role === "developer" || item.role === "system") systemParts.push(text);
-        else if (item.role === "assistant") push("assistant", { type: "text", text });
-        else push("user", { type: "text", text });
+        if (item.role === "developer" || item.role === "system") {
+          // system 只接受純文字。
+          const text = textOf(item.content);
+          if (text) systemParts.push(text);
+          break;
+        }
+        const blocks = toAnthropicBlocks(item.content);
+        if (!blocks.length) break;
+        if (item.role === "assistant") {
+          // Anthropic 的 assistant 訊息不接受圖片區塊。
+          for (const block of blocks) if (block.type === "text") push("assistant", block);
+        } else {
+          for (const block of blocks) push("user", block);
+        }
         break;
       }
 
@@ -3409,13 +3455,15 @@ export function toAnthropicRequest(body, route) {
       }
 
       case "custom_tool_call_output":
-      case "function_call_output":
+      case "function_call_output": {
+        const blocks = toAnthropicBlocks(item.output);
         push("user", {
           type: "tool_result",
           tool_use_id: item.call_id,
-          content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+          content: blocks.length ? blocks : [{ type: "text", text: "(no output)" }],
         });
         break;
+      }
 
       // 這一輪是壓縮回合（項目本身不帶內容，純粹是請求控制）。
       case "compaction_trigger":
