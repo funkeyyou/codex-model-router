@@ -146,6 +146,16 @@ node tools/sync-payloads.mjs           # 寫入 .ps1
 node tools/sync-payloads.mjs --check   # 只比對，有落差就以非零狀態結束
 ```
 
+**請不要手改 `.ps1`，也不要自己寫同步腳本。** 那個工具除了搬運文字，還負責兩件
+容易被忽略、壞掉又不會立刻報錯的事：
+
+- `.ps1` 開頭必須保留 UTF-8 BOM。PowerShell 5.1 少了 BOM 會改用 ANSI 代碼頁讀檔，
+  安裝器的所有中文訊息都會變成亂碼。
+- 三段負載要整批同步。只同步其中一段（例如只改了 installer 就只搬 installer）
+  會讓 Windows 版靜默停留在舊的 router 或 claude-bridge。
+
+換行由 `.gitattributes` 統一成 LF；混進 CRLF 會讓 `--check` 在不同平台的簽出上誤報。
+
 ## 授權
 
 MIT
