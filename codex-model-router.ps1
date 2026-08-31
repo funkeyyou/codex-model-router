@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.6.0";
+const INSTALLER_VERSION = "1.6.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -2155,6 +2155,22 @@ function appendHistoryOutput(key, item) {
   history.output.push(item);
 }
 
+// Codex 的 HTTP 傳輸在工具接續回合只送新項目，但 WebSocket 傳輸會同時帶上
+// previous_response_id 與「完整歷史」。若對後者照樣做重建，等於把整段歷史再接
+// 一份到自己記住的歷史後面，每一輪就多一份完整複本，上下文線性暴衝直到上游
+// 回 prompt is too long。因此重建前必須先判斷這份 input 到底是不是完整歷史。
+//
+// 完整請求一定從工具宣告或 system / developer 指令開始；接續請求則以工具結果
+// 這類項目開頭。以此判別即可涵蓋兩種傳輸。
+function looksLikeCompleteInput(input) {
+  if (!Array.isArray(input) || input.length === 0) return false;
+  return input.some(
+    (item) =>
+      item?.type === "additional_tools" ||
+      (item?.type === "message" && (item.role === "developer" || item.role === "system")),
+  );
+}
+
 function rebuildStatefulInput(key, incomingInput) {
   const history = key ? threadHistories.get(key) : null;
   if (!history || history.input.length === 0) return null;
@@ -2208,6 +2224,7 @@ const stats = {
   bridgeCompactionRewritten: 0,
   statefulRebuilds: 0,
   statefulRebuildMisses: 0,
+  statefulPassthroughs: 0,
   translatedRequests: 0,
   lastAuthProbeStatus: null,
   models: 0,
@@ -2499,7 +2516,13 @@ async function fetchModelUpstream(
   const historyKey = historyKeyFor(body, requestHeaders);
   meta.historyKey = historyKey;
   let effectiveBody = body;
-  if (body?.previous_response_id) {
+  if (body?.previous_response_id && looksLikeCompleteInput(body.input)) {
+    // 已經是完整歷史，不需要重建，只要拿掉上游不支援的 previous_response_id。
+    effectiveBody = { ...body };
+    delete effectiveBody.previous_response_id;
+    setHistory(historyKey, body.input);
+    stats.statefulPassthroughs += 1;
+  } else if (body?.previous_response_id) {
     const rebuilt = rebuildStatefulInput(historyKey, body.input);
     if (rebuilt) {
       effectiveBody = { ...body, input: rebuilt };
