@@ -1,12 +1,12 @@
 ﻿# Claude 原生端点诊断 —— 找出安装器为何跳过 Claude 模型
 # 用法： powershell -ExecutionPolicy Bypass -File .\claude-probe-diag.ps1 <API_ROOT> [模型名]
-#   例： powershell -ExecutionPolicy Bypass -File .\claude-probe-diag.ps1 https://your-gateway.example.com/v1 ark/claude-opus-5
+#   例： powershell -ExecutionPolicy Bypass -File .\claude-probe-diag.ps1 https://your-gateway.example.com/v1 claude-opus-5
 #
 # 不传 -ApiKey 时会以隐藏输入的方式询问，避免 API Key 留在命令历史里。
 
 param(
   [Parameter(Mandatory = $true, Position = 0)][string] $ApiRoot,
-  [Parameter(Position = 1)][string] $Model = 'ark/claude-opus-5',
+  [Parameter(Position = 1)][string] $Model = 'claude-opus-5',
   [string] $ApiKey
 )
 

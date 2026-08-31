@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.5.2";
+const INSTALLER_VERSION = "1.5.3";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -640,20 +640,35 @@ function normalizeOwner(owner) {
   return value || "unknown";
 }
 
+// 供應商欄位沒有統一名稱，各家自架閘道用的鍵不一樣。
+function ownerOf(item) {
+  return normalizeOwner(item?.owned_by ?? item?.owner ?? item?.provider ?? item?.vendor);
+}
+
+// 有些閘道的 /models 完全不帶供應商欄位（例如直接回 Anthropic 格式的
+// {id, type, display_name, created_at}），此時只能從模型名推斷。
+// 猜錯是安全的：下面會先探測原生 /messages，不通就回退到通用 Responses 路由。
+function looksAnthropic(model) {
+  return /(^|[/:_-])(claude|anthropic)([/:._-]|$)/i.test(String(model || ""));
+}
+
 function parseModelList(payload) {
   const values = [];
   if (Array.isArray(payload?.data)) {
     for (const item of payload.data) {
       if (typeof item?.id === "string" && item.id.trim()) {
         values.push(item.id.trim());
-        modelOwners.set(item.id.trim(), normalizeOwner(item.owned_by));
+        modelOwners.set(item.id.trim(), ownerOf(item));
       }
     }
   }
   if (Array.isArray(payload?.models)) {
     for (const item of payload.models) {
       const value = item?.id ?? item?.slug ?? item?.model;
-      if (typeof value === "string" && value.trim()) values.push(value.trim());
+      if (typeof value === "string" && value.trim()) {
+        values.push(value.trim());
+        if (!modelOwners.has(value.trim())) modelOwners.set(value.trim(), ownerOf(item));
+      }
     }
   }
   return [...new Set(values)].sort((a, b) => a.localeCompare(b));
@@ -1429,54 +1444,69 @@ async function install() {
   for (const model of selectedModels) {
     printHeading(`正在测试 ${model}`);
     const owner = modelOwners.get(model) || "unknown";
+    const ownerIsAnthropic = owner === "anthropic";
+    // /models 沒標供應商时按模型名推断，否则 Claude 会静默落到通用 Responses
+    // 路由——Codex 的 Code Mode 用 namespace 包装工具，那条路必然失败。
+    const guessedAnthropic = !ownerIsAnthropic && owner === "unknown" && looksAnthropic(model);
 
-    if (owner === "anthropic") {
+    if (ownerIsAnthropic || guessedAnthropic) {
+      if (guessedAnthropic) {
+        console.log("  供应商        /models 未标注，按模型名推断为 Anthropic");
+      }
       // Claude 走本機轉譯：直接驗證原生 /messages。
       process.stdout.write("  原生 /messages  ");
       const probeResult = await probeAnthropicModel(discovery.apiRoot, apiKey, model);
-      if (probeResult.ok) {
-        console.log("支持");
-      } else {
+      if (!probeResult.ok) {
         console.log(`失败（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
-        // 5xx / 0 多半是上游容量或网络问题，而非模型真的不受支持。
-        if (probeResult.status === 0 || probeResult.status >= 500) {
+        if (guessedAnthropic) {
+          // 只是按名字猜的，探测不通不足以判定模型不可用，回退到通用路由。
+          console.log("  该网关没有可用的 Anthropic 原生端点，改用通用 Responses 路由重试。");
+          console.log("  注意：Codex 的 Code Mode 用 namespace 包装工具，部分网关会因此报错或丢工具。");
+        } else if (probeResult.status === 0 || probeResult.status >= 500) {
+          // 5xx / 0 多半是上游容量或网络问题，而非模型真的不受支持。
           console.log(
             `跳过 ${model}：上游暂时不可用，并非模型不受支持。稍后重跑安装器即可加入。`,
           );
+          continue;
         } else if (probeResult.status === 401 || probeResult.status === 403) {
           console.log(`跳过 ${model}：当前 API Key 无权访问该模型。`);
+          continue;
         } else if (probeResult.status === 404) {
           console.log(
             `跳过 ${model}：该网关未提供 Anthropic 原生 /messages 端点，无法本地转译。`,
           );
+          continue;
         } else {
           console.log(`跳过 ${model}：Anthropic 原生端点探测未通过。`);
+          continue;
         }
+      }
+      if (probeResult.ok) {
+        console.log("支持");
+        process.stdout.write("  上下文上限    ");
+        const contextWindow = await probeAnthropicContextWindow(discovery.apiRoot, apiKey, model);
+        console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "无法探测（将回退）");
+        process.stdout.write("  最大输出      ");
+        const { maxOutput, canonicalId } = await probeAnthropicMaxOutput(discovery.apiRoot, apiKey, model);
+        console.log(
+          maxOutput
+            ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
+            : "无法探测",
+        );
+        routes.push({
+          pickerSlug: pickerSlug(model),
+          upstreamModel: model,
+          displayName: model,
+          providerHost: new URL(discovery.apiRoot).host,
+          // 轉譯後 effort 直接對應 thinking budget，五档皆可用。
+          efforts: ["low", "medium", "high", "xhigh", "max"],
+          stripReasoning: false,
+          translate: "anthropic",
+          contextWindow,
+          maxOutputTokens: maxOutput,
+        });
         continue;
       }
-      process.stdout.write("  上下文上限    ");
-      const contextWindow = await probeAnthropicContextWindow(discovery.apiRoot, apiKey, model);
-      console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "无法探测（将回退）");
-      process.stdout.write("  最大输出      ");
-      const { maxOutput, canonicalId } = await probeAnthropicMaxOutput(discovery.apiRoot, apiKey, model);
-      console.log(
-        maxOutput
-          ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
-          : "无法探测",
-      );
-      routes.push({
-        pickerSlug: pickerSlug(model),
-        upstreamModel: model,
-        displayName: model,
-        providerHost: new URL(discovery.apiRoot).host,
-        // 轉譯後 effort 直接對應 thinking budget，五档皆可用。
-        efforts: ["low", "medium", "high", "xhigh", "max"],
-        stripReasoning: false,
-        translate: "anthropic",
-        contextWindow,
-        maxOutputTokens: maxOutput,
-      });
-      continue;
     }
 
     const probe = await probeModel(discovery.apiRoot, apiKey, model);

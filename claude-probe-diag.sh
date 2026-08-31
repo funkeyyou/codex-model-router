@@ -1,11 +1,11 @@
 #!/bin/bash
 # Claude 原生端點診斷 —— 找出安裝器為何跳過 Claude 模型
 # 用法： bash claude-probe-diag.sh <API_ROOT> <API_KEY> [模型名]
-#   例： bash claude-probe-diag.sh https://your-gateway.example.com/v1 sk-xxx ark/claude-opus-5
+#   例： bash claude-probe-diag.sh https://your-gateway.example.com/v1 sk-xxx claude-opus-5
 
 ROOT="${1:?請提供 API root，例如 https://your-gateway.example.com/v1}"
 KEY="${2:?請提供 API key}"
-MODEL="${3:-ark/claude-opus-5}"
+MODEL="${3:-claude-opus-5}"
 ROOT="${ROOT%/}"
 
 echo "API Root : $ROOT"

@@ -75,10 +75,14 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
 
 - **自動偵測上下文上限**——Anthropic 模型透過供應商的驗證錯誤精確取得（該探測不計費），
   其餘沿用官方同名模板；找不到時明確警告，不會靜默填入錯誤的預設值。
-- **自動判斷是否需要轉譯**——依 `/v1/models` 回報的 `owned_by` 決定。
-- **Claude 模型本機轉譯**——部分閘道的 Responses 相容層對 Claude 有缺陷（串流回
-  `stream_options` 錯誤、非串流內容為空）。此時改走 Anthropic 原生 `/v1/messages`
-  並在本機做雙向轉譯，同時掛上 `cache_control` 以啟用提示快取。
+- **自動判斷是否需要轉譯**——優先依 `/v1/models` 的 `owned_by`；部分自架閘道完全不回
+  這個欄位（例如直接回 Anthropic 格式的 `{id, type, display_name}`），此時改用模型名推斷，
+  再以原生 `/messages` 驗證。推斷錯誤是安全的：探測不通會回退到通用 Responses 路由並提示。
+- **Claude 模型本機轉譯**——部分閘道的 Responses 相容層對 Claude 有缺陷：有的串流回
+  `stream_options` 錯誤、非串流內容為空；有的會把 Codex Code Mode 的 `namespace`
+  工具包裝原樣轉給 Anthropic 而被拒（`Input tag 'namespace' does not match...`），
+  導致模型調不到任何工具。此時改走 Anthropic 原生 `/v1/messages` 並在本機做雙向轉譯
+  （含把 namespace 攤平），同時掛上 `cache_control` 以啟用提示快取。
 - **有狀態接續的本機重建**——Codex 在工具接續回合只送工具結果並倚賴
   `previous_response_id`，但該參數需要真正的 WebSocket 上游。本路由改以
   「上次完整輸入 + 該輪輸出 + 本次新項目」在本機重建等價的完整請求。
