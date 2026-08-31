@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.6.2";
+const INSTALLER_VERSION = "1.6.3";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -2589,13 +2589,19 @@ async function handleResponses(request, response, incomingUrl) {
     if (!finished) abortController.abort();
   });
 
+  const meta = {};
   const upstream = await fetchModelUpstream(
     request.headers,
     incomingUrl,
     body,
     decodedBody,
     abortController.signal,
+    meta,
   );
+  if (meta.translate === "anthropic" && upstream.status >= 200 && upstream.status < 300) {
+    await bridgeAnthropicToHttp(upstream, response, meta);
+    return;
+  }
   await streamUpstream(upstream, response);
 }
 
@@ -2795,6 +2801,27 @@ function startWebSocketHeartbeat(socket) {
   }, heartbeatIntervalMs);
   if (typeof timer.unref === "function") timer.unref();
   return () => clearInterval(timer);
+}
+
+// HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回
+// HTTPS；此時若把 Anthropic 的原生事件原樣送回，客戶端解不開，該對話就會
+// 永遠停在「正在重新連線」，而且再也回不來——因為每次重試都是同一個結果。
+async function bridgeAnthropicToHttp(upstream, response, meta) {
+  stats.lastCustomStatus = upstream.status;
+  if (!upstream.body) throw new Error("上游响应没有正文");
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  await bridgeAnthropicStream(
+    upstream.body,
+    (event) => {
+      response.write("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n");
+    },
+    meta,
+  );
+  response.end();
 }
 
 async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = null) {
