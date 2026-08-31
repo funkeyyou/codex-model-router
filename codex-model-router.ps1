@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.5.4";
+const INSTALLER_VERSION = "1.6.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -1407,6 +1407,86 @@ function rollbackEdits(previousConfig) {
   ];
 }
 
+// 探測單一模型並產生路由設定；不支援時回傳 null。
+// install() 與 addModels() 共用，避免兩條路徑的判斷邏輯各寫一份而漂移。
+async function buildRouteForModel(discovery, apiKey, model) {
+  printHeading(`正在测试 ${model}`);
+  const owner = modelOwners.get(model) || "unknown";
+  const ownerIsAnthropic = owner === "anthropic";
+  // /models 沒標供應商时按模型名推断，否则 Claude 会静默落到通用 Responses
+  // 路由——Codex 的 Code Mode 用 namespace 包装工具，那条路必然失败。
+  const guessedAnthropic = !ownerIsAnthropic && owner === "unknown" && looksAnthropic(model);
+
+  if (ownerIsAnthropic || guessedAnthropic) {
+    if (guessedAnthropic) {
+      console.log("  供应商        /models 未标注，按模型名推断为 Anthropic");
+    }
+    // Claude 走本機轉譯：直接驗證原生 /messages。
+    process.stdout.write("  原生 /messages  ");
+    const probeResult = await probeAnthropicModel(discovery.apiRoot, apiKey, model);
+    if (probeResult.ok) {
+      console.log("支持");
+      process.stdout.write("  上下文上限    ");
+      const contextWindow = await probeAnthropicContextWindow(discovery.apiRoot, apiKey, model);
+      console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "无法探测（将回退）");
+      process.stdout.write("  最大输出      ");
+      const { maxOutput, canonicalId } = await probeAnthropicMaxOutput(discovery.apiRoot, apiKey, model);
+      console.log(
+        maxOutput
+          ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
+          : "无法探测",
+      );
+      return {
+        pickerSlug: pickerSlug(model),
+        upstreamModel: model,
+        displayName: model,
+        providerHost: new URL(discovery.apiRoot).host,
+        // 轉譯後 effort 直接對應 thinking budget，五档皆可用。
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        stripReasoning: false,
+        translate: "anthropic",
+        contextWindow,
+        maxOutputTokens: maxOutput,
+      };
+    }
+
+    console.log(`失败（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
+    if (guessedAnthropic) {
+      // 只是按名字猜的，探测不通不足以判定模型不可用，回退到通用路由。
+      console.log("  该网关没有可用的 Anthropic 原生端点，改用通用 Responses 路由重试。");
+      console.log("  注意：Codex 的 Code Mode 用 namespace 包装工具，部分网关会因此报错或丢工具。");
+    } else if (probeResult.status === 0 || probeResult.status >= 500) {
+      // 5xx / 0 多半是上游容量或网络问题，而非模型真的不受支持。
+      console.log(`跳过 ${model}：上游暂时不可用，并非模型不受支持。稍后重跑安装器即可加入。`);
+      return null;
+    } else if (probeResult.status === 401 || probeResult.status === 403) {
+      console.log(`跳过 ${model}：当前 API Key 无权访问该模型。`);
+      return null;
+    } else if (probeResult.status === 404) {
+      console.log(`跳过 ${model}：该网关未提供 Anthropic 原生 /messages 端点，无法本地转译。`);
+      return null;
+    } else {
+      console.log(`跳过 ${model}：Anthropic 原生端点探测未通过。`);
+      return null;
+    }
+  }
+
+  const probe = await probeModel(discovery.apiRoot, apiKey, model);
+  if (!probe.supported) {
+    console.log(`跳过 ${model}：Responses API 探测未通过。`);
+    return null;
+  }
+  return {
+    pickerSlug: pickerSlug(model),
+    upstreamModel: model,
+    displayName: model,
+    providerHost: new URL(discovery.apiRoot).host,
+    efforts: probe.efforts,
+    stripReasoning: probe.stripReasoning,
+    contextWindow: null,
+  };
+}
+
 async function install() {
   if (!codexBin) fail(`未找到 Codex CLI，请先安装 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
@@ -1442,87 +1522,8 @@ async function install() {
 
   const routes = [];
   for (const model of selectedModels) {
-    printHeading(`正在测试 ${model}`);
-    const owner = modelOwners.get(model) || "unknown";
-    const ownerIsAnthropic = owner === "anthropic";
-    // /models 沒標供應商时按模型名推断，否则 Claude 会静默落到通用 Responses
-    // 路由——Codex 的 Code Mode 用 namespace 包装工具，那条路必然失败。
-    const guessedAnthropic = !ownerIsAnthropic && owner === "unknown" && looksAnthropic(model);
-
-    if (ownerIsAnthropic || guessedAnthropic) {
-      if (guessedAnthropic) {
-        console.log("  供应商        /models 未标注，按模型名推断为 Anthropic");
-      }
-      // Claude 走本機轉譯：直接驗證原生 /messages。
-      process.stdout.write("  原生 /messages  ");
-      const probeResult = await probeAnthropicModel(discovery.apiRoot, apiKey, model);
-      if (!probeResult.ok) {
-        console.log(`失败（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
-        if (guessedAnthropic) {
-          // 只是按名字猜的，探测不通不足以判定模型不可用，回退到通用路由。
-          console.log("  该网关没有可用的 Anthropic 原生端点，改用通用 Responses 路由重试。");
-          console.log("  注意：Codex 的 Code Mode 用 namespace 包装工具，部分网关会因此报错或丢工具。");
-        } else if (probeResult.status === 0 || probeResult.status >= 500) {
-          // 5xx / 0 多半是上游容量或网络问题，而非模型真的不受支持。
-          console.log(
-            `跳过 ${model}：上游暂时不可用，并非模型不受支持。稍后重跑安装器即可加入。`,
-          );
-          continue;
-        } else if (probeResult.status === 401 || probeResult.status === 403) {
-          console.log(`跳过 ${model}：当前 API Key 无权访问该模型。`);
-          continue;
-        } else if (probeResult.status === 404) {
-          console.log(
-            `跳过 ${model}：该网关未提供 Anthropic 原生 /messages 端点，无法本地转译。`,
-          );
-          continue;
-        } else {
-          console.log(`跳过 ${model}：Anthropic 原生端点探测未通过。`);
-          continue;
-        }
-      }
-      if (probeResult.ok) {
-        console.log("支持");
-        process.stdout.write("  上下文上限    ");
-        const contextWindow = await probeAnthropicContextWindow(discovery.apiRoot, apiKey, model);
-        console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "无法探测（将回退）");
-        process.stdout.write("  最大输出      ");
-        const { maxOutput, canonicalId } = await probeAnthropicMaxOutput(discovery.apiRoot, apiKey, model);
-        console.log(
-          maxOutput
-            ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
-            : "无法探测",
-        );
-        routes.push({
-          pickerSlug: pickerSlug(model),
-          upstreamModel: model,
-          displayName: model,
-          providerHost: new URL(discovery.apiRoot).host,
-          // 轉譯後 effort 直接對應 thinking budget，五档皆可用。
-          efforts: ["low", "medium", "high", "xhigh", "max"],
-          stripReasoning: false,
-          translate: "anthropic",
-          contextWindow,
-          maxOutputTokens: maxOutput,
-        });
-        continue;
-      }
-    }
-
-    const probe = await probeModel(discovery.apiRoot, apiKey, model);
-    if (!probe.supported) {
-      console.log(`跳过 ${model}：Responses API 探测未通过。`);
-      continue;
-    }
-    routes.push({
-      pickerSlug: pickerSlug(model),
-      upstreamModel: model,
-      displayName: model,
-      providerHost: new URL(discovery.apiRoot).host,
-      efforts: probe.efforts,
-      stripReasoning: probe.stripReasoning,
-      contextWindow: null,
-    });
+    const route = await buildRouteForModel(discovery, apiKey, model);
+    if (route) routes.push(route);
   }
   if (routes.length === 0) fail("选中的模型均未通过 Responses API 探测。" );
 
@@ -1704,6 +1705,130 @@ async function install() {
   console.log(`回退命令：${basename(scriptPath)} rollback`);
 }
 
+// 在既有安裝上追加模型：沿用已保存的 Base URL、API Key、端口與既有路由，
+// 只探測這次新選的模型。不重問任何設定，也不改動 config.toml。
+async function addModels() {
+  if (!codexBin) fail(`未找到 Codex CLI，请先安装 ${desktopAppName} 或 Codex CLI。`);
+  verifyLogin();
+
+  const manifest = readManifest();
+  if (!manifest) {
+    fail("当前 CODEX_HOME 尚未安装 Codex 模型路由器，请先选择「安装或重新配置」。");
+  }
+  if (!existsSync(settingsPath)) {
+    fail("找不到 settings.json，安装可能已损坏，请改用「安装或重新配置」。");
+  }
+
+  printHeading("添加模型");
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  const existingRoutes = Array.isArray(settings.routes) ? settings.routes : [];
+  const baseUrl = settings.baseUrl || manifest.baseUrl;
+  const keychainService = settings.keychainService || manifest.keychainService;
+  const port = Number(settings.port || manifest.port);
+  console.log(`Base URL：${baseUrl}`);
+  console.log(`端口：${port}`);
+  console.log(`已配置 ${existingRoutes.length} 个自定义模型：`);
+  for (const route of existingRoutes) {
+    console.log(`  - ${route.displayName || route.upstreamModel}`);
+  }
+
+  const apiKey = readApiKey(keychainService);
+  console.log("\n正在发现可用模型...");
+  const discovery = await discoverApiRoot(baseUrl, apiKey);
+  const configured = new Set(existingRoutes.map((route) => route.upstreamModel));
+  const available = discovery.models.filter((model) => !configured.has(model));
+  if (available.length === 0) {
+    fail("该 Base URL 上的模型都已配置，没有可添加的项。");
+  }
+
+  const selectedModels = await selectModels(available);
+  if (selectedModels.length === 0) fail("未选择任何模型。");
+  console.log("\n每个选中的模型最多会执行五次小型 Responses API 探测。");
+  if (!(await confirm("是否继续进行能力探测？", true))) {
+    fail("已在修改配置前取消。");
+  }
+
+  const newRoutes = [];
+  for (const model of selectedModels) {
+    const route = await buildRouteForModel(discovery, apiKey, model);
+    if (route) newRoutes.push(route);
+  }
+  if (newRoutes.length === 0) fail("选中的模型均未通过探测，配置未改动。");
+
+  const routes = [...existingRoutes, ...newRoutes];
+  const backupDir = join(backupsRoot, `add-model-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(routerPath, join(backupDir, "router.mjs"));
+  copyIfExists(bridgePath, join(backupDir, "claude-bridge.mjs"));
+  copyIfExists(settingsPath, join(backupDir, "settings.json"));
+  copyIfExists(catalogPath, join(backupDir, "models.json"));
+  copyIfExists(manifestPath, join(backupDir, "install.json"));
+
+  const bundledCatalog = loadBundledCatalog();
+  const officialModels = bundledCatalog.models.filter(
+    (model) => !String(model.slug).startsWith("custom/"),
+  );
+  const customModels = routes.map((route, index) =>
+    customCatalogEntry(officialModels, route, index),
+  );
+  const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
+
+  try {
+    // 路由器與轉譯層一併刷新，否则 settings.version 会与实际运行的代码对不上。
+    writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
+    chmodSync(routerPath, 0o600);
+    writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
+    chmodSync(bridgePath, 0o600);
+    writeJsonAtomic(catalogPath, combinedCatalog);
+    writeJsonAtomic(settingsPath, { ...settings, version: INSTALLER_VERSION, routes });
+    writeJsonAtomic(manifestPath, {
+      ...manifest,
+      version: INSTALLER_VERSION,
+      updatedAt: new Date().toISOString(),
+      routes,
+    });
+    stopService();
+    startService();
+    await waitForHealth(port);
+
+    const modelCheck = shell(codexBin, ["debug", "models"], {
+      env: { ...env, CODEX_HOME: codexHome },
+    });
+    const visibleSlugs = new Set(
+      JSON.parse(modelCheck.stdout).models?.map((model) => model.slug),
+    );
+    for (const route of newRoutes) {
+      if (!visibleSlugs.has(route.pickerSlug)) {
+        fail(`Codex model/list 中缺少新增模型：${route.pickerSlug}`);
+      }
+    }
+  } catch (error) {
+    console.error("\n添加失败，正在还原之前的配置...");
+    copyIfExists(join(backupDir, "router.mjs"), routerPath);
+    copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
+    copyIfExists(join(backupDir, "settings.json"), settingsPath);
+    copyIfExists(join(backupDir, "models.json"), catalogPath);
+    copyIfExists(join(backupDir, "install.json"), manifestPath);
+    try {
+      stopService();
+      startService();
+    } catch {}
+    throw error;
+  }
+
+  printHeading("添加完成");
+  console.log("本次新增：");
+  for (const route of newRoutes) {
+    const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供应商默认值";
+    console.log(`  - ${route.displayName}`);
+    console.log(`    选择器 ID：${route.pickerSlug}`);
+    console.log(`    推理强度：${effortText}`);
+  }
+  console.log(`\n现共 ${routes.length} 个自定义模型。`);
+  console.log(`备份：${backupDir}`);
+  console.log(`\n请完全退出并重新打开 ${desktopAppName}。`);
+}
+
 async function status() {
   const manifest = readManifest();
   if (!manifest) {
@@ -1798,6 +1923,7 @@ function help() {
 
 用法：
   ${basename(scriptPath || "codex-model-router.command")} install
+  ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} status
   ${basename(scriptPath || "codex-model-router.command")} rollback
 
@@ -1805,6 +1931,9 @@ function help() {
   1. 兼容 OpenAI 的 Base URL
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
+
+add 用于在已有安装上追加模型：沿用已保存的 Base URL、API Key 与端口，
+只探测新选的模型，不会重问设置，也不改动 config.toml。
 
 安装器会继续将官方 ChatGPT Codex 模型发送到 OpenAI，只有选中的
 自定义模型选择器 ID 才会发送到配置的供应商。Codex 仍使用内置
@@ -1815,20 +1944,25 @@ openai 供应商 ID，以保持 Desktop 与手机 Remote 的既有聊天可见�
 async function chooseAction() {
   printHeading("Codex 模型路由器");
   console.log("  1. 安装或重新配置");
-  console.log("  2. 查看状态");
-  console.log("  3. 回退配置");
-  console.log("  4. 退出");
+  console.log("  2. 添加模型（保留现有配置）");
+  console.log("  3. 查看状态");
+  console.log("  4. 回退配置");
+  console.log("  5. 退出");
   const answer = await ask("请选择操作", "1");
   const choices = {
     "1": "install",
     install: "install",
     setup: "install",
-    "2": "status",
+    "2": "add",
+    add: "add",
+    "add-model": "add",
+    addmodel: "add",
+    "3": "status",
     status: "status",
-    "3": "rollback",
+    "4": "rollback",
     rollback: "rollback",
     uninstall: "rollback",
-    "4": "exit",
+    "5": "exit",
     exit: "exit",
     quit: "exit",
   };
@@ -1840,6 +1974,7 @@ async function chooseAction() {
 try {
   const action = requestedAction || (await chooseAction());
   if (action === "install" || action === "setup") await install();
+  else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
   else if (action === "status") await status();
   else if (action === "rollback" || action === "uninstall") await rollback();
   else if (action === "exit") console.log("未进行任何修改。" );
