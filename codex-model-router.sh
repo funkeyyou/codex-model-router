@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.6.4";
+const INSTALLER_VERSION = "1.7.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -1916,8 +1916,9 @@ try {
 __CODEX_MODEL_ROUTER_ROUTER_JS__
 import http from "node:http";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
+import tls from "node:tls";
 import { readFileSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1965,6 +1966,11 @@ function captureAppend(id, suffix, data) {
 }
 
 const closeOnUpstreamError = settings.closeOnUpstreamError === true;
+
+// 官方後端支援 Responses 的 WebSocket 模式：同一條上游連線可以用
+// previous_response_id 接續，每輪只送新項目，不必重送完整歷史。
+// 設 settings.upstreamWebSocket = false 可退回全 HTTP 行為。
+const upstreamWebSocketEnabled = settings.upstreamWebSocket !== false;
 
 // Codex 的 WebSocket response.create 訊息含有若干「協定層」欄位，它們在
 // WebSocket 上合法，但不是 HTTP Responses API 的參數。本路由對上游一律使用
@@ -2089,6 +2095,28 @@ function rebuildStatefulInput(key, incomingInput) {
   const incoming = Array.isArray(incomingInput) ? incomingInput : [];
   return [...history.input, ...history.output, ...incoming];
 }
+
+// 從 Claude 轉譯路由切出去時，必須清掉轉譯層合成的內容，否則官方與其他供應商
+// 會整輪拒收。官方路由不論走 HTTP 或 WebSocket 都要做這一步。
+function stripBridgeArtifacts(body) {
+  let result = body;
+  const stripped = stripBridgeReasoning(result.input);
+  if (stripped.removed > 0) {
+    result = { ...result, input: stripped.input };
+    stats.bridgeReasoningStripped += stripped.removed;
+  }
+  const reidentified = stripBridgeItemIds(result.input);
+  if (reidentified.removed > 0) {
+    result = { ...result, input: reidentified.input };
+    stats.bridgeIdsStripped += reidentified.removed;
+  }
+  const recompacted = rewriteBridgeCompaction(result.input);
+  if (recompacted.removed > 0) {
+    result = { ...result, input: recompacted.input };
+    stats.bridgeCompactionRewritten += recompacted.removed;
+  }
+  return result;
+}
 const heartbeatIntervalMs =
   Number(settings.heartbeatIntervalMs) > 0 ? Number(settings.heartbeatIntervalMs) : 15000;
 
@@ -2136,6 +2164,11 @@ const stats = {
   bridgeCompactionRewritten: 0,
   statefulRebuilds: 0,
   statefulRebuildMisses: 0,
+  upstreamWebSocketConnects: 0,
+  upstreamWebSocketTurns: 0,
+  upstreamWebSocketIncremental: 0,
+  upstreamWebSocketReplays: 0,
+  upstreamWebSocketFallbacks: 0,
   translatedRequests: 0,
   lastAuthProbeStatus: null,
   models: 0,
@@ -2445,21 +2478,7 @@ async function fetchModelUpstream(
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
   if (route?.translate !== "anthropic") {
-    const stripped = stripBridgeReasoning(effectiveBody.input);
-    if (stripped.removed > 0) {
-      effectiveBody = { ...effectiveBody, input: stripped.input };
-      stats.bridgeReasoningStripped += stripped.removed;
-    }
-    const reidentified = stripBridgeItemIds(effectiveBody.input);
-    if (reidentified.removed > 0) {
-      effectiveBody = { ...effectiveBody, input: reidentified.input };
-      stats.bridgeIdsStripped += reidentified.removed;
-    }
-    const recompacted = rewriteBridgeCompaction(effectiveBody.input);
-    if (recompacted.removed > 0) {
-      effectiveBody = { ...effectiveBody, input: recompacted.input };
-      stats.bridgeCompactionRewritten += recompacted.removed;
-    }
+    effectiveBody = stripBridgeArtifacts(effectiveBody);
   }
 
   let outboundBodyObject = isCustom
@@ -2780,6 +2799,260 @@ function startWebSocketHeartbeat(socket) {
   return () => clearInterval(timer);
 }
 
+// --- 上游 WebSocket（僅官方路由）-------------------------------------------
+// 官方後端支援 Responses 的 WebSocket 模式，同一條連線可用 previous_response_id
+// 接續，每輪只送新項目。實測（2026-09-02，官方 backend）：
+//   - 同一條連線接續：成功
+//   - 換一條連線沿用舊 id：Invalid previous_response_id
+//   - generate:false 預熱：成功，且其 id 可被接續
+// 因此接續狀態必須以「上游連線」為單位追蹤；跨連線、跨模型或找不到來源時，
+// 一律改送本機重建的完整歷史，等價於原本的 HTTP 行為。
+//
+// 客戶端送出的訊框必須加遮罩（RFC 6455），與伺服器端的 encodeWebSocketFrame 不同。
+function encodeMaskedWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
+  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+  let header;
+  if (body.length <= 125) {
+    header = Buffer.from([0x80 | opcode, 0x80 | body.length]);
+  } else if (body.length <= 0xffff) {
+    header = Buffer.allocUnsafe(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(body.length, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(body.length), 2);
+  }
+  const mask = randomBytes(4);
+  const masked = Buffer.allocUnsafe(body.length);
+  for (let index = 0; index < body.length; index += 1) {
+    masked[index] = body[index] ^ mask[index % 4];
+  }
+  return Buffer.concat([header, mask, masked]);
+}
+
+function officialWebSocketTarget() {
+  const url = new URL(officialBase + "/responses");
+  return {
+    host: url.hostname,
+    port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
+    path: url.pathname + url.search,
+    secure: url.protocol === "https:",
+  };
+}
+
+function connectUpstreamWebSocket(requestHeaders, timeoutMs = 15000) {
+  const target = officialWebSocketTarget();
+  if (!target.secure) throw new Error("上游 WebSocket 需要 HTTPS 端点");
+  const key = randomBytes(16).toString("base64");
+  const expectedAccept = createHash("sha1").update(key + websocketMagic).digest("base64");
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect({
+      host: target.host,
+      port: target.port,
+      servername: target.host,
+    });
+    let settled = false;
+    let buffer = Buffer.alloc(0);
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const timer = setTimeout(() => fail(new Error("上游 WebSocket 握手超时")), timeoutMs);
+    const onHandshakeData = (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const boundary = buffer.indexOf("\r\n\r\n");
+      if (boundary < 0) return;
+      const headerText = buffer.subarray(0, boundary).toString("utf8");
+      const remainder = buffer.subarray(boundary + 4);
+      const status = Number(/^HTTP\/1\.[01]\s+(\d+)/.exec(headerText)?.[1]);
+      if (status !== 101) {
+        fail(new Error("上游 WebSocket 握手失败 HTTP " + (status || "?")));
+        return;
+      }
+      const acceptLine = /sec-websocket-accept:\s*(\S+)/i.exec(headerText)?.[1];
+      if (acceptLine !== expectedAccept) {
+        fail(new Error("上游 WebSocket 握手校验失败"));
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      socket.off("data", onHandshakeData);
+      socket.off("error", fail);
+      resolve(createUpstreamSession(socket, remainder));
+    };
+    socket.on("data", onHandshakeData);
+    socket.once("error", fail);
+    socket.once("secureConnect", () => {
+      const headers = new Headers(buildOfficialHeaders(requestHeaders));
+      const lines = ["GET " + target.path + " HTTP/1.1", "Host: " + target.host];
+      for (const [name, value] of headers) {
+        if (name.toLowerCase() === "host") continue;
+        lines.push(name + ": " + value);
+      }
+      lines.push("Connection: Upgrade");
+      lines.push("Upgrade: websocket");
+      lines.push("Sec-WebSocket-Key: " + key);
+      lines.push("Sec-WebSocket-Version: 13");
+      socket.write(lines.join("\r\n") + "\r\n\r\n");
+    });
+  });
+}
+
+function createUpstreamSession(socket, leftover) {
+  const session = {
+    socket,
+    closed: false,
+    // 這條上游連線產生過的 response id；只有命中才可以安全地接續。
+    responseIds: new Set(),
+    onEvent: null,
+    onClosed: null,
+  };
+  let buffer = leftover ?? Buffer.alloc(0);
+  let fragments = [];
+  const markClosed = (reason) => {
+    if (session.closed) return;
+    session.closed = true;
+    const notify = session.onClosed;
+    session.onClosed = null;
+    if (notify) notify(reason);
+  };
+  socket.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    let parsed;
+    try {
+      parsed = parseWebSocketFrames(buffer);
+    } catch (error) {
+      socket.destroy();
+      markClosed(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    buffer = parsed.remainder;
+    for (const frame of parsed.frames) {
+      if (frame.opcode === 0x9) {
+        socket.write(encodeMaskedWebSocketFrame(0xa, frame.payload));
+        continue;
+      }
+      if (frame.opcode === 0xa) continue;
+      if (frame.opcode === 0x8) {
+        socket.destroy();
+        markClosed("上游 WebSocket 已关闭");
+        return;
+      }
+      if (frame.opcode === 0x1) fragments = [frame.payload];
+      else if (frame.opcode === 0x0) fragments.push(frame.payload);
+      else continue;
+      if (!frame.fin) continue;
+      const text = Buffer.concat(fragments).toString("utf8");
+      fragments = [];
+      let event;
+      try {
+        event = JSON.parse(text);
+      } catch {
+        continue;
+      }
+      if (session.onEvent) session.onEvent(event);
+    }
+  });
+  socket.on("error", (error) => markClosed(error instanceof Error ? error.message : String(error)));
+  socket.on("close", () => markClosed("上游 WebSocket 连接结束"));
+  session.send = (payload) => {
+    if (session.closed || socket.destroyed || !socket.writable) {
+      throw new Error("上游 WebSocket 不可写");
+    }
+    socket.write(encodeMaskedWebSocketFrame(0x1, JSON.stringify(payload)));
+  };
+  session.destroy = () => {
+    if (!socket.destroyed) socket.destroy();
+    markClosed("本地关闭");
+  };
+  return session;
+}
+
+// 送出一輪並轉發事件。回傳 { ok, retryWithReplay }。
+// 在收到 response.in_progress 之前先緩衝：若此時上游拒絕接續，Codex 尚未看到
+// 本輪任何事件，可以安全地改用完整歷史重送，不會產生半截輸出。
+function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let flushed = false;
+    const buffered = [];
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      session.onEvent = null;
+      session.onClosed = null;
+      signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+    const failHard = (error) => {
+      if (settled) return;
+      settled = true;
+      session.onEvent = null;
+      session.onClosed = null;
+      signal?.removeEventListener("abort", onAbort);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const onAbort = () => {
+      if (settled) return;
+      try {
+        session.send({ type: "response.cancel" });
+      } catch {}
+      failHard(new Error("已取消"));
+    };
+    const flush = () => {
+      if (flushed) return;
+      flushed = true;
+      for (const event of buffered.splice(0)) onEvent(event);
+    };
+    const isInvalidChain = (event) => {
+      const message = String(
+        event?.error?.message || event?.response?.error?.message || "",
+      );
+      return message.includes("previous_response_id");
+    };
+
+    session.onClosed = (reason) => failHard(new Error(reason || "上游 WebSocket 中断"));
+    session.onEvent = (event) => {
+      const type = String(event?.type || "");
+      if (!flushed && (type === "error" || type === "response.failed") && isInvalidChain(event)) {
+        finish({ ok: false, retryWithReplay: true });
+        return;
+      }
+      if (flushed) onEvent(event);
+      else buffered.push(event);
+      if (type === "response.in_progress") flush();
+      if (type === "response.completed") {
+        flush();
+        const responseId = event?.response?.id;
+        if (typeof responseId === "string" && responseId) session.responseIds.add(responseId);
+        finish({ ok: true, retryWithReplay: false });
+        return;
+      }
+      if (type === "response.failed" || type === "error") {
+        flush();
+        finish({ ok: true, retryWithReplay: false });
+      }
+    };
+
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      session.send(payload);
+    } catch (error) {
+      failHard(error);
+    }
+  });
+}
+
 // HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回
 // HTTPS；此時若把 Anthropic 的原生事件原樣送回，客戶端解不開，該對話就會
 // 永遠停在「正在重新連線」，而且再也回不來——因為每次重試都是同一個結果。
@@ -2794,6 +3067,9 @@ async function bridgeAnthropicToHttp(upstream, response, meta) {
   await bridgeAnthropicStream(
     upstream.body,
     (event) => {
+      if (event?.type === "response.output_item.done" && event.item) {
+        appendHistoryOutput(meta.historyKey, event.item);
+      }
       response.write("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n");
     },
     meta,
@@ -2816,6 +3092,11 @@ async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = nu
     tee ? tee(upstream.body) : upstream.body,
     (event) => {
       captureAppend(captureId, "response.sse", `data: ${JSON.stringify(event)}\n\n`);
+      // 轉譯路由同樣要把輸出記進本機歷史，否則之後切到其他模型時，
+      // 重建的歷史會少掉 Claude 這一輪的回答與工具呼叫。
+      if (event?.type === "response.output_item.done" && event.item) {
+        appendHistoryOutput(meta.historyKey, event.item);
+      }
       sendWebSocketJson(socket, event);
       stats.websocketEvents += 1;
     },
@@ -2829,7 +3110,149 @@ async function handleWebSocketResponse(
   incomingUrl,
   message,
   abortController,
+  connectionState = null,
 ) {
+  // 走上游 WebSocket 的那一輪，決定要透傳接續還是重播完整歷史。
+  // 回傳 true 表示本輪已完整處理；false 表示尚未送出任何事件，可安全回退。
+  return await handleWebSocketResponseInner(
+    request,
+    socket,
+    incomingUrl,
+    message,
+    abortController,
+    connectionState,
+  );
+}
+
+async function tryUpstreamWebSocketTurn(
+  request,
+  socket,
+  message,
+  abortController,
+  connectionState,
+) {
+  const probe = { ...message };
+  delete probe.type;
+  const historyKey = historyKeyFor(probe, request.headers);
+  const previousId =
+    typeof message.previous_response_id === "string" && message.previous_response_id
+      ? message.previous_response_id
+      : null;
+
+  let session = connectionState.session;
+  if (!session || session.closed) {
+    try {
+      session = await connectUpstreamWebSocket(request.headers);
+    } catch (error) {
+      connectionState.upstreamDisabled = true;
+      connectionState.session = null;
+      stats.upstreamWebSocketFallbacks += 1;
+      process.stderr.write(
+        "model-router-upstream-ws-unavailable:" +
+          (error instanceof Error ? error.message : String(error)) +
+          "\n",
+      );
+      return false;
+    }
+    connectionState.session = session;
+    stats.upstreamWebSocketConnects += 1;
+  }
+
+  // 只有這條上游連線自己產生過的 id 才能接續；其餘情況一律重播完整歷史。
+  const canChain = Boolean(previousId && session.responseIds.has(previousId));
+  const buildPayload = (chain) => {
+    let outgoing = { ...message };
+    if (chain) {
+      // 接續：沿用 Codex 的增量 input 與 previous_response_id，
+      // 但本機歷史仍要補齊，供之後回退或切換路由時使用。
+      const rebuilt = rebuildStatefulInput(historyKey, message.input);
+      if (rebuilt) setHistory(historyKey, rebuilt);
+      stats.upstreamWebSocketIncremental += 1;
+    } else {
+      const rebuilt = previousId ? rebuildStatefulInput(historyKey, message.input) : null;
+      const input = rebuilt || message.input;
+      setHistory(historyKey, input);
+      outgoing = { ...outgoing, input };
+      delete outgoing.previous_response_id;
+      if (previousId) stats.upstreamWebSocketReplays += 1;
+    }
+    const sanitized = stripBridgeArtifacts({ input: outgoing.input });
+    outgoing.input = sanitized.input;
+    outgoing.type = "response.create";
+    return outgoing;
+  };
+
+  const forward = (event) => {
+    if (event?.type === "response.output_item.done" && event.item) {
+      appendHistoryOutput(historyKey, event.item);
+    }
+    sendWebSocketJson(socket, event);
+    stats.websocketEvents += 1;
+  };
+
+  for (const chain of canChain ? [true, false] : [false]) {
+    let outcome;
+    try {
+      outcome = await runUpstreamWebSocketTurn(session, buildPayload(chain), {
+        onEvent: forward,
+        signal: abortController.signal,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "已取消") return true;
+      connectionState.upstreamDisabled = true;
+      connectionState.session = null;
+      session.destroy();
+      stats.upstreamWebSocketFallbacks += 1;
+      process.stderr.write(
+        "model-router-upstream-ws-error:" +
+          (error instanceof Error ? error.message : String(error)) +
+          "\n",
+      );
+      return false;
+    }
+    if (outcome.ok) {
+      stats.upstreamWebSocketTurns += 1;
+      stats.lastWebSocketStatus = 200;
+      stats.official += 1;
+      stats.lastRoute = "official-ws";
+      stats.lastModel = message?.model ?? null;
+      stats.lastReasoningEffort = message?.reasoning?.effort ?? null;
+      stats.lastForwardedReasoningEffort = message?.reasoning?.effort ?? null;
+      markAuthValidated(request.headers);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function handleWebSocketResponseInner(
+  request,
+  socket,
+  incomingUrl,
+  message,
+  abortController,
+  connectionState = null,
+) {
+  // 官方路由優先走上游 WebSocket；只有它支援連線內的 previous_response_id 接續。
+  // 任何一步失敗都會回退到既有的 HTTP/SSE 路徑，且此時 Codex 尚未收到本輪事件。
+  if (
+    upstreamWebSocketEnabled &&
+    connectionState &&
+    !connectionState.upstreamDisabled &&
+    message?.type === "response.create" &&
+    chooseRoute(request.headers, message) == null &&
+    authDigest(request.headers)
+  ) {
+    const handled = await tryUpstreamWebSocketTurn(
+      request,
+      socket,
+      message,
+      abortController,
+      connectionState,
+    );
+    if (handled) return;
+  }
+
   const body = { ...message, stream: true };
   delete body.type;
   for (const field of websocketOnlyFields) {
@@ -2907,6 +3330,8 @@ function handleWebSocketUpgrade(request, socket, head) {
   let fragmentChunks = [];
   let activeAbortController = null;
   const pendingMessages = [];
+  // 每條 Codex 連線對應一條上游 WebSocket；接續狀態不能跨連線共用。
+  const connectionState = { session: null, upstreamDisabled: false };
 
   const handleMessage = (payload) => {
     let message;
@@ -2963,6 +3388,7 @@ function handleWebSocketUpgrade(request, socket, head) {
       incomingUrl,
       message,
       activeAbortController,
+      connectionState,
     )
       .catch((error) => {
         const aborted = error instanceof Error && error.name === "AbortError";
@@ -3036,8 +3462,13 @@ function handleWebSocketUpgrade(request, socket, head) {
   };
 
   socket.on("data", consume);
-  socket.on("close", () => activeAbortController?.abort());
-  socket.on("error", () => activeAbortController?.abort());
+  const teardown = () => {
+    activeAbortController?.abort();
+    connectionState.session?.destroy();
+    connectionState.session = null;
+  };
+  socket.on("close", teardown);
+  socket.on("error", teardown);
   if (head.length > 0) consume(Buffer.alloc(0));
 }
 
