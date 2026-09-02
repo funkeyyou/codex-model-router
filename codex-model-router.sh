@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.7.0";
+const INSTALLER_VERSION = "1.8.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -89,6 +89,8 @@ const serviceKindLabel = isWindows ? "Windows 计划任务" : "LaunchAgent";
 const desktopAppName = isWindows ? "Codex 桌面版" : "ChatGPT Desktop";
 const PROVIDER_ID = "compat_router";
 const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const DEFAULT_RELEASES_URL =
+  "https://raw.githubusercontent.com/funkeyyou/codex-model-router/main/releases.json";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const EFFORT_DESCRIPTIONS = {
   low: "响应较快，使用较少推理",
@@ -138,6 +140,8 @@ const credentialsRoot = resolve(
 const serviceName = isWindows ? taskName : launchLabel;
 const testMode = env.CODEX_MODEL_ROUTER_TEST_MODE === "1";
 const assumeYes = env.CODEX_MODEL_ROUTER_YES === "1";
+const releasesUrl = env.CODEX_MODEL_ROUTER_RELEASES_URL || DEFAULT_RELEASES_URL;
+let releaseCatalogPromise = null;
 
 function fail(message) {
   throw new Error(message);
@@ -543,6 +547,171 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function versionParts(value) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(value || "").trim());
+  return match ? match.slice(1).map(Number) : null;
+}
+
+function compareVersions(left, right) {
+  const a = versionParts(left);
+  const b = versionParts(right);
+  if (!a || !b) return null;
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+function assertInstallerNotOlder(installedVersion) {
+  const comparison = compareVersions(INSTALLER_VERSION, installedVersion);
+  if (comparison != null && comparison < 0) {
+    fail(
+      `已安装版本 ${installedVersion} 比当前安装器 ${INSTALLER_VERSION} 更新。` +
+        "为避免降级，请重新下载最新版安装器。",
+    );
+  }
+}
+
+function terminalSafeText(value, maxLength = 320) {
+  return String(value ?? "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function normalizeReleaseCatalog(payload) {
+  if (!payload || typeof payload !== "object") fail("版本清单格式无效。");
+  const latest = terminalSafeText(payload.latest, 32);
+  if (!versionParts(latest)) fail("版本清单缺少有效的 latest 版本。");
+  if (!Array.isArray(payload.releases)) fail("版本清单缺少 releases 数组。");
+
+  const releases = [];
+  const seen = new Set();
+  for (const item of payload.releases.slice(0, 50)) {
+    const version = terminalSafeText(item?.version, 32);
+    if (!versionParts(version) || seen.has(version)) continue;
+    const changes = Array.isArray(item?.changes)
+      ? item.changes
+          .map((change) => terminalSafeText(change))
+          .filter(Boolean)
+          .slice(0, 20)
+      : [];
+    if (changes.length === 0) continue;
+    seen.add(version);
+    releases.push({
+      version,
+      date: terminalSafeText(item?.date, 32),
+      changes,
+    });
+  }
+  if (!seen.has(latest)) fail(`版本清单中找不到最新版本 ${latest} 的说明。`);
+  releases.sort((left, right) => compareVersions(right.version, left.version));
+  return { latest, releases };
+}
+
+async function loadReleaseCatalog() {
+  if (releaseCatalogPromise) return releaseCatalogPromise;
+  releaseCatalogPromise = (async () => {
+    let raw;
+    if (env.CODEX_MODEL_ROUTER_RELEASES_JSON) {
+      raw = env.CODEX_MODEL_ROUTER_RELEASES_JSON;
+    } else {
+      const response = await fetchWithTimeout(
+        releasesUrl,
+        {
+          headers: {
+            accept: "application/json",
+            "user-agent": `codex-model-router/${INSTALLER_VERSION}`,
+          },
+        },
+        4000,
+      );
+      if (!response.ok) fail(`版本清单返回 HTTP ${response.status}。`);
+      raw = await response.text();
+    }
+    if (Buffer.byteLength(raw, "utf8") > 128 * 1024) {
+      fail("版本清单超过大小限制。");
+    }
+    return normalizeReleaseCatalog(JSON.parse(raw));
+  })();
+  return releaseCatalogPromise;
+}
+
+function releasesBetween(catalog, installedVersion) {
+  const latestEntry = catalog.releases.find((entry) => entry.version === catalog.latest);
+  if (!installedVersion || compareVersions(installedVersion, catalog.latest) === null) {
+    return latestEntry ? [latestEntry] : [];
+  }
+  const installedVsLatest = compareVersions(installedVersion, catalog.latest);
+  if (installedVsLatest === 0) return latestEntry ? [latestEntry] : [];
+  if (installedVsLatest > 0) return [];
+  return catalog.releases
+    .filter((entry) => {
+      const afterInstalled = compareVersions(entry.version, installedVersion);
+      const notAfterLatest = compareVersions(entry.version, catalog.latest);
+      return (
+        afterInstalled != null &&
+        afterInstalled > 0 &&
+        notAfterLatest != null &&
+        notAfterLatest <= 0
+      );
+    })
+    .sort((left, right) => compareVersions(left.version, right.version));
+}
+
+async function printVersionSummary() {
+  const manifest = readManifest();
+  const installedVersion = terminalSafeText(manifest?.version, 32) || null;
+  printHeading("版本信息");
+  console.log(`已安装版本：${installedVersion || "尚未安装"}`);
+  console.log(`当前安装器：${INSTALLER_VERSION}`);
+
+  let catalog;
+  try {
+    catalog = await loadReleaseCatalog();
+  } catch {
+    console.log("线上最新版本：无法检查");
+    console.log("版本状态：网络不可用或 GitHub 版本清单暂时无法读取（不影响安装）");
+    return;
+  }
+
+  console.log(`线上最新版本：${catalog.latest}`);
+  const installerVsLatest = compareVersions(INSTALLER_VERSION, catalog.latest);
+  const installedVsLatest = installedVersion
+    ? compareVersions(installedVersion, catalog.latest)
+    : null;
+
+  if (installerVsLatest != null && installerVsLatest < 0) {
+    console.log(`版本状态：当前安装器已过期，请重新下载 ${catalog.latest}`);
+  } else if (!installedVersion) {
+    console.log(`版本状态：将安装 ${INSTALLER_VERSION}`);
+  } else if (installedVsLatest == null) {
+    console.log("版本状态：无法比较已安装版本，请重新运行最新版安装器");
+  } else if (installedVsLatest < 0) {
+    console.log(`版本状态：可更新 ${installedVersion} → ${catalog.latest}`);
+  } else if (installedVsLatest === 0) {
+    console.log("版本状态：已是最新版本");
+  } else {
+    console.log("版本状态：已安装版本比线上版本更新");
+  }
+
+  const releases = releasesBetween(catalog, installedVersion);
+  if (releases.length === 0) return;
+  const heading =
+    !installedVersion || installedVsLatest == null
+      ? "最新版本内容"
+      : installedVsLatest === 0
+        ? "当前版本内容"
+        : "更新内容";
+  console.log(`${heading}：`);
+  for (const release of releases) {
+    console.log(`  ${release.version}${release.date ? `（${release.date}）` : ""}`);
+    for (const change of release.changes) console.log(`    - ${change}`);
   }
 }
 
@@ -1416,10 +1585,11 @@ async function buildRouteForModel(discovery, apiKey, model) {
 }
 
 async function install() {
+  const existingManifest = readManifest();
+  if (existingManifest?.version) assertInstallerNotOlder(existingManifest.version);
   if (!codexBin) fail(`未找到 Codex CLI，请先安装 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
 
-  const existingManifest = readManifest();
   printHeading(existingManifest ? "重新配置 Codex 模型路由器" : "安装 Codex 模型路由器");
   const defaultBaseUrl = existingManifest?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
   const baseUrl = normalizeUrl(
@@ -1636,10 +1806,11 @@ async function install() {
 // 在既有安裝上追加模型：沿用已保存的 Base URL、API Key、端口與既有路由，
 // 只探測這次新選的模型。不重問任何設定，也不改動 config.toml。
 async function addModels() {
+  const manifest = readManifest();
+  if (manifest?.version) assertInstallerNotOlder(manifest.version);
   if (!codexBin) fail(`未找到 Codex CLI，请先安装 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
 
-  const manifest = readManifest();
   if (!manifest) {
     fail("当前 CODEX_HOME 尚未安装 Codex 模型路由器，请先选择「安装或重新配置」。");
   }
@@ -1765,7 +1936,6 @@ async function status() {
     return;
   }
   printHeading("Codex 模型路由器状态");
-  console.log(`已安装版本：${manifest.version}`);
   console.log(`API 根地址：${manifest.apiRoot}`);
   console.log(`路由器：http://127.0.0.1:${manifest.port}`);
   console.log(
@@ -1900,6 +2070,17 @@ async function chooseAction() {
 }
 
 try {
+  const versionAwareActions = new Set([
+    "install",
+    "setup",
+    "add",
+    "add-model",
+    "addmodel",
+    "status",
+  ]);
+  if (!requestedAction || versionAwareActions.has(requestedAction)) {
+    await printVersionSummary();
+  }
   const action = requestedAction || (await chooseAction());
   if (action === "install" || action === "setup") await install();
   else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
@@ -2057,14 +2238,20 @@ function rewriteBridgeCompaction(input) {
   return { input: removed > 0 ? mapped : input, removed };
 }
 
-function historyKeyFor(body, headers) {
+function historyKeyFor(body, headers, connectionNamespace = null) {
   const sessionId = body?.client_metadata?.session_id;
-  if (typeof sessionId === "string" && sessionId) return sessionId;
+  let logicalKey = typeof sessionId === "string" && sessionId ? sessionId : null;
   for (const name of ["thread-id", "session-id"]) {
     const value = headers?.[name];
-    if (typeof value === "string" && value) return value;
+    if (!logicalKey && typeof value === "string" && value) logicalKey = value;
   }
-  return null;
+  // client_metadata.session_id 不是 WebSocket 連線識別；背景任務可能和目前 task
+  // 重複使用它。歷史重建若只靠 session_id，兩條連線會互相覆蓋完整提示詞。
+  // WebSocket 路徑因此以連線 namespace 隔離；HTTP 才沿用既有 logical key。
+  if (connectionNamespace) {
+    return logicalKey ? `${connectionNamespace}\0${logicalKey}` : connectionNamespace;
+  }
+  return logicalKey;
 }
 
 function setHistory(key, input) {
@@ -2457,7 +2644,7 @@ async function fetchModelUpstream(
   // previous_response_id 需要真正的 WebSocket 上游；本路由對上游一律使用 HTTP，
   // 官方後端與第三方閘道都會拒絕。因此在此統一改寫成等價的完整請求，
   // 三條路徑（官方 / 自訂 / Anthropic 轉譯）共用同一份歷史。
-  const historyKey = historyKeyFor(body, requestHeaders);
+  const historyKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
   meta.historyKey = historyKey;
   let effectiveBody = body;
   if (body?.previous_response_id) {
@@ -3133,7 +3320,11 @@ async function tryUpstreamWebSocketTurn(
 ) {
   const probe = { ...message };
   delete probe.type;
-  const historyKey = historyKeyFor(probe, request.headers);
+  const historyKey = historyKeyFor(
+    probe,
+    request.headers,
+    connectionState.connectionNamespace,
+  );
   const previousId =
     typeof message.previous_response_id === "string" && message.previous_response_id
       ? message.previous_response_id
@@ -3267,7 +3458,7 @@ async function handleWebSocketResponseInner(
   );
   captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
   const stopHeartbeat = startWebSocketHeartbeat(socket);
-  const meta = {};
+  const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null };
   try {
     const upstream = await fetchModelUpstream(
       request.headers,
@@ -3331,7 +3522,11 @@ function handleWebSocketUpgrade(request, socket, head) {
   let activeAbortController = null;
   const pendingMessages = [];
   // 每條 Codex 連線對應一條上游 WebSocket；接續狀態不能跨連線共用。
-  const connectionState = { session: null, upstreamDisabled: false };
+  const connectionState = {
+    session: null,
+    upstreamDisabled: false,
+    connectionNamespace: randomBytes(16).toString("hex"),
+  };
 
   const handleMessage = (payload) => {
     let message;

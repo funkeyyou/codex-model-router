@@ -37,6 +37,15 @@ curl.exe -fsSL https://raw.githubusercontent.com/funkeyyou/codex-model-router/ma
 安裝時會詢問三件事：Base URL、API Key、以及要加入哪些模型。
 輸入 API Key 時畫面不會顯示任何字元（跟 `sudo` 一樣），貼上後直接按 Enter。
 
+## 版本資訊與更新內容
+
+安裝器啟動時會顯示「已安裝版本」、「目前這支安裝器版本」與「GitHub 線上最新版本」。
+若有更新，會按版本順序列出從已安裝版本到最新版之間的所有變更；若手上的安裝器本身
+已落後，也會先提示重新下載最新版，避免用舊腳本覆蓋新安裝。
+
+版本資料來自 repo 根目錄的 `releases.json`。檢查逾時或離線時只會顯示無法檢查，
+不會阻塞安裝、添加模型、狀態檢查或回退流程，也不會上傳任何本機設定。
+
 ## 其他指令
 
 不帶參數執行會出現選單，也可以直接指定動作。
@@ -85,7 +94,9 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   （含把 namespace 攤平），同時掛上 `cache_control` 以啟用提示快取。
 - **有狀態接續的本機重建**——Codex 在工具接續回合只送工具結果並倚賴
   `previous_response_id`，但該參數需要真正的 WebSocket 上游。本路由改以
-  「上次完整輸入 + 該輪輸出 + 本次新項目」在本機重建等價的完整請求。
+  「上次完整輸入 + 該輪輸出 + 本次新項目」在本機重建等價的完整請求；每條
+  WebSocket 都有獨立的歷史 namespace，背景任務即使重複使用同一個 `session_id`
+  也不會覆蓋目前對話。
 - **連線保活**——長請求期間送出 WebSocket ping，避免客戶端閒置逾時。
 - **錯誤可見**——上游錯誤會轉為標準的 `response.failed` 事件，不會讓客戶端無聲卡住。
 
@@ -145,6 +156,9 @@ powershell -ExecutionPolicy Bypass -File .\claude-probe-diag.ps1 <API_ROOT> <模
 node tools/sync-payloads.mjs           # 寫入 .ps1
 node tools/sync-payloads.mjs --check   # 只比對，有落差就以非零狀態結束
 ```
+
+發布新版本時也要更新 `releases.json` 的 `latest` 與對應更新說明；同步工具會驗證
+`latest` 是否和安裝器內的 `INSTALLER_VERSION` 一致。
 
 **請不要手改 `.ps1`，也不要自己寫同步腳本。** 那個工具除了搬運文字，還負責兩件
 容易被忽略、壞掉又不會立刻報錯的事：

@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const shellPath = join(repoRoot, "codex-model-router.sh");
 const powershellPath = join(repoRoot, "codex-model-router.ps1");
+const releasesPath = join(repoRoot, "releases.json");
 
 const BEGIN_MARKER = "__CODEX_MODEL_ROUTER_INSTALLER_JS__";
 const END_MARKER = "__CODEX_MODEL_ROUTER_EMBEDDED__";
@@ -47,6 +48,14 @@ function replacePayload(text, payload) {
 
 const shell = readText(shellPath);
 const powershell = readText(powershellPath);
+const releases = JSON.parse(readFileSync(releasesPath, "utf8"));
+const installerVersion = /const INSTALLER_VERSION = "([^"]+)";/.exec(shell.text)?.[1];
+if (!installerVersion) throw new Error("codex-model-router.sh 缺少 INSTALLER_VERSION");
+if (releases.latest !== installerVersion) {
+  throw new Error(
+    `releases.json latest=${releases.latest} 与 INSTALLER_VERSION=${installerVersion} 不一致`,
+  );
+}
 const payload = extractPayload(shell.text);
 const updated = replacePayload(powershell.text, payload);
 
