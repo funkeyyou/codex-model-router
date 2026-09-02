@@ -17,7 +17,7 @@ shell 與下載工具不同，沒辦法共用同一行指令；但裝出來的�
 ### macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/funkeyyou/codex-model-router/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
+curl -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
 ```
 
 > 用 `curl` 下載不會被加上隔離屬性，所以不會跳 Gatekeeper 警告。
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/funkeyyou/codex-model-router/main/c
 在 PowerShell 視窗裡執行（`.ps1` 直接雙擊只會用記事本開啟）：
 
 ```powershell
-curl.exe -fsSL https://raw.githubusercontent.com/funkeyyou/codex-model-router/main/codex-model-router.ps1 -o codex-model-router.ps1; powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
+curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
 ```
 
 > 同樣地，用 `curl.exe` 下載不會被標上「來自網際網路」，不會觸發 SmartScreen 警告。

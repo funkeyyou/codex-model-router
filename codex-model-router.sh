@@ -90,7 +90,7 @@ const desktopAppName = isWindows ? "Codex 桌面版" : "ChatGPT Desktop";
 const PROVIDER_ID = "compat_router";
 const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_RELEASES_URL =
-  "https://raw.githubusercontent.com/funkeyyou/codex-model-router/main/releases.json";
+  "https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/releases.json";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const EFFORT_DESCRIPTIONS = {
   low: "响应较快，使用较少推理",
