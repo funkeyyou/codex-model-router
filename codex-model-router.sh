@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.9.0";
+const INSTALLER_VERSION = "1.9.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -934,8 +934,16 @@ async function probeAnthropicModel(apiRoot, apiKey, model) {
   }
 }
 
+// 「這次問不到」與「模型不支援」必須分開。額度用盡、上游容量不足、閘道逾時
+// 都會讓探測失敗，但模型本身好好的——把這種結果當成不支援，就會在重新配置時
+// 把原本正常的模型或推理強度從設定裡刪掉，而且刪得無聲無息。
+export function isTransientProbeStatus(status) {
+  return status === 0 || status === 408 || status === 429 || status >= 500;
+}
+
 async function probeModel(apiRoot, apiKey, model) {
   const supportedEfforts = [];
+  const transientEfforts = [];
   for (const effort of EFFORTS) {
     process.stdout.write(`  ${effort.padEnd(7)} `);
     try {
@@ -943,16 +951,26 @@ async function probeModel(apiRoot, apiKey, model) {
       if (result.ok) {
         supportedEfforts.push(effort);
         console.log("支持");
+      } else if (isTransientProbeStatus(result.status)) {
+        transientEfforts.push(effort);
+        console.log(`暂时不可用（HTTP ${result.status}）`);
       } else {
         console.log(`不支持（HTTP ${result.status}）`);
       }
     } catch (error) {
-      console.log(`探测失败（${error instanceof Error ? error.message : String(error)}）`);
+      // 逾時或連線層例外同樣只代表這次問不到。
+      transientEfforts.push(effort);
+      console.log(`暂时不可用（${error instanceof Error ? error.message : String(error)}）`);
     }
   }
 
   if (supportedEfforts.length > 0) {
-    return { supported: true, efforts: supportedEfforts, stripReasoning: false };
+    return {
+      supported: true,
+      efforts: supportedEfforts,
+      stripReasoning: false,
+      transientEfforts,
+    };
   }
 
   process.stdout.write("  默认    ");
@@ -960,13 +978,20 @@ async function probeModel(apiRoot, apiKey, model) {
     const result = await testResponse(apiRoot, apiKey, model, null);
     if (result.ok) {
       console.log("支持，但不提供推理强度控制");
-      return { supported: true, efforts: [], stripReasoning: true };
+      return { supported: true, efforts: [], stripReasoning: true, transientEfforts };
     }
     console.log(`不支持（HTTP ${result.status}）`);
+    return {
+      supported: false,
+      efforts: [],
+      stripReasoning: false,
+      transientEfforts,
+      transient: isTransientProbeStatus(result.status),
+    };
   } catch (error) {
-    console.log(`探测失败（${error instanceof Error ? error.message : String(error)}）`);
+    console.log(`暂时不可用（${error instanceof Error ? error.message : String(error)}）`);
+    return { supported: false, efforts: [], stripReasoning: false, transientEfforts, transient: true };
   }
-  return { supported: false, efforts: [], stripReasoning: false };
 }
 
 function pickerSlug(model) {
@@ -1506,6 +1531,44 @@ function rollbackEdits(previousConfig) {
 
 // 探測單一模型並產生路由設定；不支援時回傳 null。
 // install() 與 addModels() 共用，避免兩條路徑的判斷邏輯各寫一份而漂移。
+// 決定這次探測結果要不要沿用既有設定。
+//
+// 純函式，install() 直接用它，測試也直接測它——判斷規則只有這一份，
+// 不會出現「測試通過但實際行為不同」的情況。
+//
+// 回傳 { route, kept, restored }：
+//   route     這個模型最終要寫進設定的路由，null 表示不納入
+//   kept      "model"（整條沿用）、"efforts"（補回強度）或 null（用新結果）
+//   restored  被補回來的推理強度
+export function resolveRouteWithPrevious(outcome, previous) {
+  const { route, transient, transientEfforts = [] } = outcome;
+
+  if (!route) {
+    // 確定不支援就照樣移除；只有「這次問不到」才沿用既有設定。
+    if (previous && transient) return { route: previous, kept: "model", restored: [] };
+    return { route: null, kept: null, restored: [] };
+  }
+
+  // 模型本身通過了，但個別強度可能因暫時性錯誤沒測到；上次驗過的才補回來。
+  const restored = transientEfforts.filter(
+    (effort) =>
+      Array.isArray(previous?.efforts) &&
+      previous.efforts.includes(effort) &&
+      !route.efforts.includes(effort),
+  );
+  if (restored.length === 0) return { route, kept: null, restored: [] };
+
+  // 依 EFFORTS 的順序排回去，避免設定檔裡的順序無謂跳動。
+  const efforts = EFFORTS.filter(
+    (effort) => route.efforts.includes(effort) || restored.includes(effort),
+  );
+  return { route: { ...route, efforts }, kept: "efforts", restored };
+}
+
+// 回傳 { route, transient, transientEfforts }：
+//   route            探測成功的路由，失敗為 null
+//   transient        失敗是否只是「這次問不到」（呼叫端可據此保留既有設定）
+//   transientEfforts 這次暫時問不到的推理強度
 async function buildRouteForModel(discovery, apiKey, model) {
   printHeading(`正在测试 ${model}`);
   const owner = modelOwners.get(model) || "unknown";
@@ -1533,7 +1596,7 @@ async function buildRouteForModel(discovery, apiKey, model) {
           ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
           : "无法探测",
       );
-      return {
+      const route = {
         pickerSlug: pickerSlug(model),
         upstreamModel: model,
         displayName: model,
@@ -1545,6 +1608,7 @@ async function buildRouteForModel(discovery, apiKey, model) {
         contextWindow,
         maxOutputTokens: maxOutput,
       };
+      return { route, transient: false, transientEfforts: [] };
     }
 
     console.log(`失败（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
@@ -1552,28 +1616,36 @@ async function buildRouteForModel(discovery, apiKey, model) {
       // 只是按名字猜的，探测不通不足以判定模型不可用，回退到通用路由。
       console.log("  该网关没有可用的 Anthropic 原生端点，改用通用 Responses 路由重试。");
       console.log("  注意：Codex 的 Code Mode 用 namespace 包装工具，部分网关会因此报错或丢工具。");
-    } else if (probeResult.status === 0 || probeResult.status >= 500) {
-      // 5xx / 0 多半是上游容量或网络问题，而非模型真的不受支持。
-      console.log(`跳过 ${model}：上游暂时不可用，并非模型不受支持。稍后重跑安装器即可加入。`);
-      return null;
+    } else if (isTransientProbeStatus(probeResult.status)) {
+      // 額度、上游容量或網路問題，而非模型真的不受支持。
+      console.log(`跳过 ${model}：上游暂时不可用，并非模型不受支持。`);
+      return { route: null, transient: true, transientEfforts: [] };
     } else if (probeResult.status === 401 || probeResult.status === 403) {
       console.log(`跳过 ${model}：当前 API Key 无权访问该模型。`);
-      return null;
+      return { route: null, transient: false, transientEfforts: [] };
     } else if (probeResult.status === 404) {
       console.log(`跳过 ${model}：该网关未提供 Anthropic 原生 /messages 端点，无法本地转译。`);
-      return null;
+      return { route: null, transient: false, transientEfforts: [] };
     } else {
       console.log(`跳过 ${model}：Anthropic 原生端点探测未通过。`);
-      return null;
+      return { route: null, transient: false, transientEfforts: [] };
     }
   }
 
   const probe = await probeModel(discovery.apiRoot, apiKey, model);
   if (!probe.supported) {
-    console.log(`跳过 ${model}：Responses API 探测未通过。`);
-    return null;
+    console.log(
+      probe.transient
+        ? `跳过 ${model}：上游暂时不可用，并非模型不受支持。`
+        : `跳过 ${model}：Responses API 探测未通过。`,
+    );
+    return {
+      route: null,
+      transient: Boolean(probe.transient),
+      transientEfforts: probe.transientEfforts || [],
+    };
   }
-  return {
+  const route = {
     pickerSlug: pickerSlug(model),
     upstreamModel: model,
     displayName: model,
@@ -1582,6 +1654,7 @@ async function buildRouteForModel(discovery, apiKey, model) {
     stripReasoning: probe.stripReasoning,
     contextWindow: null,
   };
+  return { route, transient: false, transientEfforts: probe.transientEfforts || [] };
 }
 
 async function install() {
@@ -1618,12 +1691,41 @@ async function install() {
     fail("已在修改配置前取消安装。" );
   }
 
+  // 重新配置時，這次探測遇到的暫時性失敗不足以推翻上次已經驗過的結果。
+  // 否則只要重裝當下額度用盡或閘道抽風，原本正常的模型與推理強度就會被靜默
+  // 移除，使用者要等到下次想切模型才發現，而且會誤以為是模型不支援。
+  const previousRoutes = new Map(
+    (existingManifest?.routes || [])
+      .filter((route) => route && typeof route.upstreamModel === "string")
+      .map((route) => [route.upstreamModel, route]),
+  );
+
   const routes = [];
+  const keptModels = [];
+  const keptEfforts = [];
   for (const model of selectedModels) {
-    const route = await buildRouteForModel(discovery, apiKey, model);
-    if (route) routes.push(route);
+    const outcome = await buildRouteForModel(discovery, apiKey, model);
+    const { route, kept, restored } = resolveRouteWithPrevious(
+      outcome,
+      previousRoutes.get(model),
+    );
+    if (!route) continue;
+    if (kept === "model") {
+      console.log(`  保留 ${model} 的既有设置：本次失败属于暂时性问题，不改动已验证过的配置。`);
+      keptModels.push(model);
+    } else if (kept === "efforts") {
+      console.log(`  保留 ${model} 既有的推理强度：${restored.join(", ")}（本次为暂时性失败）。`);
+      keptEfforts.push(`${model}: ${restored.join(", ")}`);
+    }
+    routes.push(route);
   }
   if (routes.length === 0) fail("选中的模型均未通过 Responses API 探测。" );
+  if (keptModels.length > 0 || keptEfforts.length > 0) {
+    console.log("\n本次探测遇到暂时性故障，以下项目沿用上次已验证的设置：" );
+    for (const model of keptModels) console.log(`  - ${model}（整个模型）`);
+    for (const line of keptEfforts) console.log(`  - ${line}`);
+    console.log("  上游恢复后重跑一次安装器，即可用最新探测结果覆盖。" );
+  }
 
   const bundledCatalog = loadBundledCatalog();
   const officialModels = bundledCatalog.models.filter(
@@ -1850,7 +1952,8 @@ async function addModels() {
 
   const newRoutes = [];
   for (const model of selectedModels) {
-    const route = await buildRouteForModel(discovery, apiKey, model);
+    // 這裡的模型都是新選的，沒有既有設定可以沿用；暫時性失敗只能略過。
+    const { route } = await buildRouteForModel(discovery, apiKey, model);
     if (route) newRoutes.push(route);
   }
   if (newRoutes.length === 0) fail("选中的模型均未通过探测，配置未改动。");
