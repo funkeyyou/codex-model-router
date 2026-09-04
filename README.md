@@ -96,6 +96,12 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   400，部分閘道靜默丟棄），結果是在 Codex 裡選 low 或 max 毫無差別、而且一律跑在高強度。
   安裝時會探測 `output_config.effort`，支援的話把五檔直接透傳。實測 low 檔耗時從
   約 17 秒降到約 9.5 秒。
+- **閘道生的圖不再石沉大海**——部分閘道會自行啟用 `image_generation`，回應帶著整張圖，
+  但 Codex 只在自己發起生圖時才會建立可渲染項目，收到了也只是塞進歷史。路由器因此把它
+  翻成 Codex 的內建 `view_image` 呼叫：圖先落地（預設 `~/Downloads`，`imageOutputDir` 可改），
+  再合成一次工具呼叫，Codex 就會產生 `ImageView` 項目顯示出來（在工具活動區塊裡），
+  模型自己也拿得到那張圖。合成的呼叫用可辨識的 `call_id` 前綴，送往上游前連同輸出一起剝除
+  ——上游不認得這個工具，留著會讓下一輪被拒。`viewImageBridge = false` 可只保留存檔。
 - **顯示推理摘要**——這些模型預設 `display` 是 `omitted`：thinking 區塊照樣送來，
   但文字是空的。安裝時探測 `adaptive`／`summarized`，支援就明確要求摘要，並把它串成
   `reasoning_summary` 事件、寫進 reasoning 項目的 `summary` 欄位——Codex 顯示的是
