@@ -92,6 +92,14 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   工具包裝原樣轉給 Anthropic 而被拒（`Input tag 'namespace' does not match...`），
   導致模型調不到任何工具。此時改走 Anthropic 原生 `/v1/messages` 並在本機做雙向轉譯
   （含把 namespace 攤平），同時掛上 `cache_control` 以啟用提示快取。
+- **推理強度真的會生效**——`thinking.budget_tokens` 在較新的模型上已被移除（官方直接
+  400，部分閘道靜默丟棄），結果是在 Codex 裡選 low 或 max 毫無差別、而且一律跑在高強度。
+  安裝時會探測 `output_config.effort`，支援的話把五檔直接透傳。實測 low 檔耗時從
+  約 17 秒降到約 9.5 秒。
+- **對話歷史可被快取**——Anthropic 的快取前綴是 `tools → system → messages`，只在
+  system 掛斷點的話，會長大的歷史每輪都要重算。安裝時探測頂層 `cache_control`，
+  支援就加上滾動斷點。實測約 2 萬 token 的歷史，未快取輸入從 19650 降到 2。
+  兩項探測失敗或不支援時都自動沿用原有行為。
 - **有狀態接續的本機重建**——Codex 在工具接續回合只送工具結果並倚賴
   `previous_response_id`，但該參數需要真正的 WebSocket 上游。本路由改以
   「上次完整輸入 + 該輪輸出 + 本次新項目」在本機重建等價的完整請求；每條

@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.9.1";
+const INSTALLER_VERSION = "1.10.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -907,6 +907,36 @@ async function probeAnthropicMaxOutput(apiRoot, apiKey, model) {
   return { maxOutput: null, canonicalId: null };
 }
 
+// 探測某個 Anthropic 請求參數能不能用。
+// 回傳 true / false；無法判定（暫時性故障）時回傳 null，由呼叫端保守處理。
+async function probeAnthropicParam(apiRoot, apiKey, model, extra) {
+  try {
+    const response = await fetchWithTimeout(
+      `${apiRoot.replace(/\/$/, "")}/messages`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model, max_tokens: 16,
+          messages: [{ role: "user", content: "Reply with exactly OK." }],
+          ...extra,
+        }),
+      },
+      60000,
+    );
+    if (response.ok) {
+      await response.text();
+      return true;
+    }
+    const text = await response.text();
+    // 5xx／限流只代表這次問不到，不能據此判定參數不支援。
+    if (isTransientProbeStatus(response.status)) return null;
+    return false;
+  } catch {
+    return null;
+  }
+}
+
 // Anthropic 模型走原生 /messages（閘道的 Responses 相容層對 Claude 是壞的）。
 async function probeAnthropicModel(apiRoot, apiKey, model) {
   try {
@@ -1596,6 +1626,35 @@ async function buildRouteForModel(discovery, apiKey, model) {
           ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
           : "无法探测",
       );
+
+      // budget_tokens 在较新的模型上已被移除：官方直接 400，部分网关静默丢弃，
+      // 结果是 Codex 里选 low 或 max 毫无差别，而且一律跑在高强度。
+      // 支持 output_config 的话就直接透传五档，低强度才真的会变快。
+      process.stdout.write("  推理强度控制  ");
+      const supportsOutputConfig = await probeAnthropicParam(
+        discovery.apiRoot, apiKey, model, { output_config: { effort: "low" } },
+      );
+      console.log(
+        supportsOutputConfig === true
+          ? "output_config.effort（五档直接透传）"
+          : supportsOutputConfig === false
+            ? "thinking.budget_tokens（该模型不支持 output_config）"
+            : "无法探测，保守使用 thinking.budget_tokens",
+      );
+
+      // 对话历史每轮都会重送；没有滚动断点的话上游每轮都要重算整段历史。
+      process.stdout.write("  提示词缓存    ");
+      const supportsCache = await probeAnthropicParam(
+        discovery.apiRoot, apiKey, model, { cache_control: { type: "ephemeral" } },
+      );
+      console.log(
+        supportsCache === true
+          ? "支持滚动断点"
+          : supportsCache === false
+            ? "网关不接受顶层 cache_control，仅缓存系统提示词"
+            : "无法探测，仅缓存系统提示词",
+      );
+
       const route = {
         pickerSlug: pickerSlug(model),
         upstreamModel: model,
@@ -1607,6 +1666,9 @@ async function buildRouteForModel(discovery, apiKey, model) {
         translate: "anthropic",
         contextWindow,
         maxOutputTokens: maxOutput,
+        // 探测不出来时一律保守：沿用旧行为，不会因为猜错而整条路由 400。
+        effortControl: supportsOutputConfig === true ? "output_config" : "thinking_budget",
+        promptCache: supportsCache === true,
       };
       return { route, transient: false, transientEfforts: [] };
     }
@@ -3950,6 +4012,10 @@ const DEFAULT_MAX_TOKENS = 32000;
 // 留給實際回答的餘裕：max_tokens 必須大於 thinking budget。
 const OUTPUT_HEADROOM = 4096;
 
+// Anthropic 的 output_config.effort 接受的檔位。Codex 的五檔剛好同名，
+// 因此支援這個參數的模型可以直接透傳，不必再換算成 token 預算。
+const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
 // ---------------------------------------------------------------- 請求方向
 
 function textOf(content) {
@@ -4252,7 +4318,16 @@ export function toAnthropicRequest(body, route) {
   const { tools, freeform } = toAnthropicTools(codexTools);
 
   const effort = body?.reasoning?.effort;
-  let budget = EFFORT_BUDGET[effort] || 0;
+  // 推理強度有兩種控制方式，安裝時探測出哪一種可用：
+  //
+  //   output_config  新式。Codex 的五檔與 Anthropic 的 effort 同名，直接透傳。
+  //                  thinking 交給模型自己決定（現行模型預設就是開著的）。
+  //   thinking_budget 舊式。budget_tokens 只在較舊的模型上有效；在 Opus 5 這類
+  //                  模型上官方直接 400，部分閘道則是靜默丟掉——結果就是使用者
+  //                  在 Codex 裡選 low 或 max 完全沒有差別，且一律跑在高強度。
+  const useOutputConfig = route?.effortControl === "output_config";
+
+  let budget = useOutputConfig ? 0 : EFFORT_BUDGET[effort] || 0;
   let maxTokens = Math.max(
     Number(body.max_output_tokens) || DEFAULT_MAX_TOKENS,
     budget + OUTPUT_HEADROOM,
@@ -4274,6 +4349,13 @@ export function toAnthropicRequest(body, route) {
     stream: true,
   };
 
+  // 滾動快取斷點：Anthropic 的快取前綴是 tools -> system -> messages，只在
+  // system 掛斷點的話，會長大的對話歷史每輪都要重算。頂層 cache_control 會把
+  // 斷點自動推到最新一輪，後續請求整段歷史都能命中快取。
+  // 必須是明確探測過的 true：升級前裝的路由沒有這個欄位，若預設開啟，遇到不吃
+  // 頂層 cache_control 的閘道會讓每一條 Claude 請求都 400。
+  if (route?.promptCache === true) request.cache_control = { type: "ephemeral" };
+
   if (systemParts.length) {
     // 最後一段掛 cache_control，讓穩定的前綴可被快取。
     const blocks = systemParts.map((text) => ({ type: "text", text }));
@@ -4287,7 +4369,13 @@ export function toAnthropicRequest(body, route) {
     else if (body.tool_choice === "required") request.tool_choice = { type: "any" };
     else if (body.tool_choice === "none") delete request.tools;
   }
-  if (budget >= 1024) request.thinking = { type: "enabled", budget_tokens: budget };
+  if (useOutputConfig) {
+    // Codex 的 ultra 帶「自動任務委派」語意，Anthropic 沒有對應檔位，對到 max。
+    const mapped = effort === "ultra" ? "max" : effort;
+    if (ANTHROPIC_EFFORTS.has(mapped)) request.output_config = { effort: mapped };
+  } else if (budget >= 1024) {
+    request.thinking = { type: "enabled", budget_tokens: budget };
+  }
 
   return { request, freeform, compaction };
 }
