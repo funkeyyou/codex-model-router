@@ -246,6 +246,42 @@ function restrictAcl(path) {
   );
 }
 
+// Windows 的「下載」可以被搬到別的磁碟，而且相當常見；固定用
+// %USERPROFILE%\Downloads 會把生成的圖寫到使用者根本不會去看的舊位置。
+// 真正的來源是已知資料夾的登錄項，讀不到就退回預設。
+function windowsDownloadsDir() {
+  const guid = "{374DE290-123F-4565-9164-39C4925E467B}";
+  const key =
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders";
+  const result = powershell(
+    [
+      `$value = (Get-ItemProperty -LiteralPath ${psQuote(key)} -Name ${psQuote(guid)}).${psQuote(guid)}`,
+      "[Environment]::ExpandEnvironmentVariables($value)",
+    ].join("\n"),
+    { allowFailure: true },
+  );
+  if (result.status !== 0) return null;
+  return (result.stdout || "").trim() || null;
+}
+
+// 生成的圖預設落在使用者的「下載」。明確寫進 settings 讓它看得見也改得動；
+// 使用者若已經改過就沿用，重新安裝不該把它蓋掉。
+function resolveImageOutputDir() {
+  if (existsSync(settingsPath)) {
+    try {
+      const previous = JSON.parse(readFileSync(settingsPath, "utf8"));
+      if (typeof previous.imageOutputDir === "string" && previous.imageOutputDir) {
+        return previous.imageOutputDir;
+      }
+    } catch {}
+  }
+  if (isWindows) {
+    const resolved = windowsDownloadsDir();
+    if (resolved) return resolved;
+  }
+  return join(homeDir, "Downloads");
+}
+
 function listDirectories(directory) {
   try {
     return readdirSync(directory, { withFileTypes: true }).filter((entry) =>
@@ -1858,6 +1894,7 @@ async function install() {
     officialBaseUrl: OFFICIAL_BASE_URL,
     catalogPath,
     logPath,
+    imageOutputDir: resolveImageOutputDir(),
     port,
     routes,
   });
@@ -1892,7 +1929,8 @@ async function install() {
       serviceKind: isWindows ? "schtasks" : "launchd",
       serviceName,
       launchLabel,
-      plistPath,
+      // Windows 沒有 LaunchAgent，記一條不存在的 .plist 路徑只會誤導。
+      plistPath: isWindows ? null : plistPath,
       serviceDefinitionPath: isWindows ? taskXmlPath : plistPath,
       routerPath,
       bridgePath,
