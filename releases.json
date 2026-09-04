@@ -1,6 +1,17 @@
 {
-  "latest": "1.11.0",
+  "latest": "1.12.0",
   "releases": [
+    {
+      "version": "1.12.0",
+      "date": "2026-09-04",
+      "changes": [
+        "网关自行生成的图片不再石沉大海：转译成 Codex 内建的 view_image 调用，图片会显示出来。",
+        "生成的图片同时落地保存，默认存到 ~/Downloads，可用 settings.json 的 imageOutputDir 更改。",
+        "本机合成的 view_image 调用与其输出在送往上游前剥除，避免上游因不认识该工具而拒绝整轮请求。",
+        "健康检查新增 imagesSaved、viewImageCallsInjected、viewImageCallsStripped 计数。",
+        "可用 settings.json 的 viewImageBridge = false 关闭转译，只保留存档。"
+      ]
+    },
     {
       "version": "1.11.0",
       "date": "2026-09-04",

@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.11.0";
+const INSTALLER_VERSION = "1.12.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -2289,6 +2289,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
 import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
@@ -2336,6 +2337,73 @@ function captureAppend(id, suffix, data) {
 }
 
 const closeOnUpstreamError = settings.closeOnUpstreamError === true;
+
+// --- 生圖結果的轉譯 ---------------------------------------------------------
+//
+// 部分閘道會自己啟用 image_generation，回應裡因此帶著 image_generation_call
+// 與整張圖的 base64。Codex 收得到、也會原樣存進歷史再送回來，但它只在自己
+// 主動要求生圖時才有顯示路徑，於是圖就這樣沉在歷史裡，使用者永遠看不到。
+//
+// 這裡把它翻成 Codex 本來就會顯示的東西：把圖落地成檔案，再合成一個
+// view_image 工具呼叫（view_image 是 Codex 的內建用戶端工具）。
+//
+// 連鎖問題：Codex 執行完會把 function_call_output 送回來，但上游從沒宣告過
+// 這個工具，原樣轉發會讓下一輪被拒。因此本機合成的呼叫用可辨識的 call_id
+// 前綴，送往上游前連同它的輸出一起剝掉——與既有的 stripBridgeArtifacts 同一套路。
+const viewImageBridgeEnabled = settings.viewImageBridge !== false;
+const imageOutputDir =
+  typeof settings.imageOutputDir === "string" && settings.imageOutputDir
+    ? settings.imageOutputDir
+    : join(homedir(), "Downloads");
+const ROUTER_IMAGE_CALL_PREFIX = "call_rtrimg_";
+
+// 只認副檔名，不做完整解析：認不出來就當 png，反正 Codex 是靠內容判讀。
+function imageExtension(buffer) {
+  if (buffer.length >= 8 && buffer.readUInt32BE(0) === 0x89504e47) return "png";
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8) return "jpg";
+  if (buffer.length >= 12 && buffer.subarray(8, 12).toString("latin1") === "WEBP") return "webp";
+  if (buffer.length >= 6 && buffer.subarray(0, 3).toString("latin1") === "GIF") return "gif";
+  return "png";
+}
+
+export function saveGeneratedImage(item, directory = imageOutputDir) {
+  if (typeof item?.result !== "string" || item.result.length < 32) return null;
+  let buffer;
+  try {
+    buffer = Buffer.from(item.result, "base64");
+  } catch {
+    return null;
+  }
+  if (buffer.length < 16) return null;
+  try {
+    mkdirSync(directory, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const target = join(
+      directory,
+      `codex-image-${stamp}-${randomBytes(3).toString("hex")}.${imageExtension(buffer)}`,
+    );
+    writeFileSync(target, buffer);
+    return target;
+  } catch {
+    return null;
+  }
+}
+
+// 本機合成的 view_image 呼叫，供上游剝除時辨識。
+export function isRouterImageCallId(value) {
+  return typeof value === "string" && value.startsWith(ROUTER_IMAGE_CALL_PREFIX);
+}
+
+// 上游沒有這個工具，因此本機合成的呼叫與它的輸出都不能送出去。
+export function stripRouterImageCalls(input) {
+  if (!Array.isArray(input)) return { input, removed: 0 };
+  const kept = input.filter(
+    (item) => !(item && typeof item === "object" && isRouterImageCallId(item.call_id)),
+  );
+  const removed = input.length - kept.length;
+  // 與其他剝除函式一致：沒有要動的東西就回傳原陣列，不做無謂配置。
+  return { input: removed > 0 ? kept : input, removed };
+}
 
 // 官方後端支援 Responses 的 WebSocket 模式：同一條上游連線可以用
 // previous_response_id 接續，每輪只送新項目，不必重送完整歷史。
@@ -2537,6 +2605,15 @@ function stripBridgeArtifacts(body) {
   }
   return result;
 }
+
+// 本機合成的 view_image 呼叫與它的輸出不能送去上游——那個工具是路由器自己
+// 生出來的，上游不認得。所有離開本機的請求都要先過這一關。
+function stripRouterImageArtifacts(body) {
+  const stripped = stripRouterImageCalls(body?.input);
+  if (stripped.removed === 0) return body;
+  stats.viewImageCallsStripped += stripped.removed;
+  return { ...body, input: stripped.input };
+}
 const heartbeatIntervalMs =
   Number(settings.heartbeatIntervalMs) > 0 ? Number(settings.heartbeatIntervalMs) : 15000;
 
@@ -2590,6 +2667,9 @@ const stats = {
   upstreamWebSocketReplays: 0,
   upstreamWebSocketFallbacks: 0,
   upstreamWebSocketCooldowns: 0,
+  imagesSaved: 0,
+  viewImageCallsInjected: 0,
+  viewImageCallsStripped: 0,
   translatedRequests: 0,
   lastAuthProbeStatus: null,
   models: 0,
@@ -2917,6 +2997,9 @@ async function fetchModelUpstream(
     effectiveBody = stripBridgeArtifacts(effectiveBody);
   }
 
+  // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
+  effectiveBody = stripRouterImageArtifacts(effectiveBody);
+
   let outboundBodyObject = isCustom
     ? rewriteCustomBody(effectiveBody, route)
     : effectiveBody;
@@ -3148,7 +3231,7 @@ export function parseWebSocketFrames(buffer) {
   return { frames, remainder: buffer.subarray(offset) };
 }
 
-function sendSseBlockToWebSocket(socket, block, onEvent = null) {
+function sendSseBlockToWebSocket(socket, block, onEvent = null, imageState = null) {
   const data = block
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
@@ -3157,8 +3240,77 @@ function sendSseBlockToWebSocket(socket, block, onEvent = null) {
   if (!data || data === "[DONE]") return;
   const parsed = JSON.parse(data);
   if (onEvent) onEvent(parsed);
+
+  // response.completed 要補上合成的項目，Codex 的最終狀態才與串流一致。
+  if (imageState && parsed?.type === "response.completed" && imageState.pending.length > 0) {
+    for (const injection of imageState.pending) emitViewImageCall(socket, injection);
+    const rewritten = structuredClone(parsed);
+    if (Array.isArray(rewritten.response?.output)) {
+      for (const injection of imageState.pending) rewritten.response.output.push(injection.item);
+    }
+    imageState.pending = [];
+    sendWebSocketJson(socket, rewritten);
+    stats.websocketEvents += 1;
+    return;
+  }
+
+  // 原樣轉發：不重新序列化，避免動到上游的位元組。
   sendWebSocketFrame(socket, 0x1, data);
   stats.websocketEvents += 1;
+
+  if (imageState) noteImageGenerationItem(parsed, imageState);
+}
+
+// 記下這一輪出現過的最大 output_index，合成項目才不會撞號。
+function noteImageGenerationItem(event, imageState) {
+  if (Number.isFinite(event?.output_index)) {
+    imageState.maxIndex = Math.max(imageState.maxIndex, event.output_index);
+  }
+  if (event?.type !== "response.output_item.done") return;
+  const item = event.item;
+  if (item?.type !== "image_generation_call" || item.status !== "completed") return;
+  const path = saveGeneratedImage(item);
+  if (!path) return;
+  stats.imagesSaved += 1;
+  if (!viewImageBridgeEnabled) return;
+  const callId = ROUTER_IMAGE_CALL_PREFIX + randomBytes(12).toString("hex");
+  imageState.pending.push({
+    path,
+    item: {
+      id: "fc_" + randomBytes(24).toString("hex"),
+      type: "function_call",
+      call_id: callId,
+      name: "view_image",
+      arguments: JSON.stringify({ path }),
+      status: "completed",
+    },
+  });
+}
+
+// 合成一次 view_image 呼叫的完整事件序列，讓 Codex 當成正常工具呼叫執行。
+function emitViewImageCall(socket, injection) {
+  const index = injection.outputIndex;
+  const { item } = injection;
+  sendWebSocketJson(socket, {
+    type: "response.output_item.added",
+    output_index: index,
+    item: { ...item, arguments: "", status: "in_progress" },
+  });
+  sendWebSocketJson(socket, {
+    type: "response.function_call_arguments.delta",
+    item_id: item.id,
+    output_index: index,
+    delta: item.arguments,
+  });
+  sendWebSocketJson(socket, {
+    type: "response.function_call_arguments.done",
+    item_id: item.id,
+    output_index: index,
+    arguments: item.arguments,
+  });
+  sendWebSocketJson(socket, { type: "response.output_item.done", output_index: index, item });
+  stats.websocketEvents += 4;
+  stats.viewImageCallsInjected += 1;
 }
 
 async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyKey = null) {
@@ -3208,6 +3360,7 @@ async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyK
         }
       }
     : null;
+  const imageState = { pending: [], maxIndex: -1 };
   const decoder = new TextDecoder();
   let pending = "";
   for await (const chunk of upstream.body) {
@@ -3218,11 +3371,25 @@ async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyK
       if (!match) break;
       const block = pending.slice(0, match.index);
       pending = pending.slice(match.index + match[0].length);
-      sendSseBlockToWebSocket(socket, block, onEvent);
+      assignInjectionIndices(imageState);
+      sendSseBlockToWebSocket(socket, block, onEvent, imageState);
     }
   }
   pending += decoder.decode();
-  if (pending.trim()) sendSseBlockToWebSocket(socket, pending, onEvent);
+  if (pending.trim()) {
+    assignInjectionIndices(imageState);
+    sendSseBlockToWebSocket(socket, pending, onEvent, imageState);
+  }
+}
+
+// 合成項目排在這一輪所有真實項目之後，避免與上游的 output_index 相撞。
+function assignInjectionIndices(imageState) {
+  for (const injection of imageState.pending) {
+    if (injection.outputIndex === undefined) {
+      imageState.maxIndex += 1;
+      injection.outputIndex = imageState.maxIndex;
+    }
+  }
 }
 
 function startWebSocketHeartbeat(socket) {
