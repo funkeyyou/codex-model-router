@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPayloads } from "./helpers/payloads.mjs";
@@ -58,8 +58,16 @@ test("沒有結果、空字串、爛資料都不會寫出檔案", () => {
   assert.equal(readdirSync(dir).length, 0);
 });
 
-test("目錄不可寫時回傳 null，不會讓整輪炸掉", () => {
-  assert.equal(saveGeneratedImage({ result: PNG.toString("base64") }, "/dev/null/nope"), null);
+test("目錄建不出來時回傳 null，不會讓整輪炸掉", () => {
+  // 不能用 /dev/null/nope：那在 Windows 上是個普通相對路徑，mkdir 會成功，
+  // 於是這個測試不但驗不到東西，還會在系統磁碟根目錄寫出 \dev\null\nope\。
+  // 改成把目標掛在一個普通檔案底下——兩個平台都會拿到 ENOTDIR。
+  const dir = mkdtempSync(join(tmpdir(), "img-"));
+  const notADirectory = join(dir, "occupied");
+  writeFileSync(notADirectory, "x");
+  const target = join(notADirectory, "nope");
+  assert.equal(saveGeneratedImage({ result: PNG.toString("base64") }, target), null);
+  assert.equal(readdirSync(dir).length, 1, "不該在別處留下檔案");
 });
 
 // --- call_id 的辨識 ---------------------------------------------------------

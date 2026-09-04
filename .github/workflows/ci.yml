@@ -42,7 +42,9 @@ jobs:
       - name: bash 安裝器語法
         run: bash -n codex-model-router.sh
 
-      - name: PowerShell 安裝器語法
+      # 這裡的 pwsh 是 PowerShell 7；Windows 使用者實際跑的是內建的 5.1。
+      # 語法差異由下面的 windows job 補上，這一步只是讓 Linux 上也能早點發現壞掉。
+      - name: PowerShell 安裝器語法（PowerShell 7）
         shell: pwsh
         run: |
           $errors = $null
@@ -60,3 +62,62 @@ jobs:
         run: |
           head -c 3 codex-model-router.ps1 | od -An -tx1 | tr -d ' \n' | grep -qx efbbbf \
             || { echo 'codex-model-router.ps1 缺少 UTF-8 BOM'; exit 1; }
+
+  # Windows 的兩件事在 ubuntu 上驗不到：
+  #
+  #   1. 使用者跑的是內建的 Windows PowerShell 5.1，不是 CI 裝的 pwsh 7。
+  #      5.1 沒有 ??、?.、三元運算子與 && / ||，這些在 7 上都是合法語法。
+  #   2. 負載本身要能在 Windows 上跑。POSIX 專用的路徑（例如拿 /dev/null/nope
+  #      當「寫不進去的目錄」）在 Windows 上會變成普通相對路徑：測試照樣通過，
+  #      實際上什麼都沒驗到，還會在系統磁碟根目錄寫出檔案。
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          # Codex 桌面版內建的那一版。
+          node-version: "24"
+
+      # .gitattributes 把換行統一成 LF；在 Windows 簽出上跑一次，確認沒被 CRLF 破壞。
+      - name: 內嵌負載已同步到 .ps1（Windows 簽出）
+        run: node tools/sync-payloads.mjs --check
+
+      - name: 測試
+        run: npm test
+
+      # shell: powershell 就是 Windows 內建的 5.1，跟使用者實際執行的環境一致。
+      #
+      # 以下兩步的腳本內容一律用 ASCII：runner 會把 run 區塊寫成暫存 .ps1 再交給
+      # 5.1 執行，而那個暫存檔沒有 BOM——中文寫進去，檢查自己就會先變成亂碼。
+      - name: PowerShell 安裝器語法（Windows PowerShell 5.1）
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('codex-model-router.ps1', 'claude-probe-diag.ps1')) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file).Path, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) {
+              $errors | ForEach-Object { Write-Error $_.ToString() }
+              exit 1
+            }
+            Write-Host "OK: $file parses under Windows PowerShell 5.1"
+          }
+
+      # BOM 在不在，ubuntu 那邊已經擋了；這裡驗的是它要防的那個後果——
+      # 5.1 少了 BOM 會改用 ANSI 代碼頁讀檔，安裝器的中文訊息整片亂碼。
+      # 作法是拿 5.1 的預設讀法跟明確指定 UTF-8 的讀法比對，不必寫出任何中文。
+      - name: PowerShell 5.1 讀檔編碼正確
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = (Resolve-Path 'codex-model-router.ps1').Path
+          $viaDefault = Get-Content -LiteralPath $path -Raw
+          $viaUtf8 = [IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding $false))
+          if ($viaDefault -ne $viaUtf8) {
+            Write-Error 'Windows PowerShell 5.1 did not read codex-model-router.ps1 as UTF-8 (missing BOM?)'
+            exit 1
+          }
+          Write-Host 'OK: Windows PowerShell 5.1 reads the installer as UTF-8'
