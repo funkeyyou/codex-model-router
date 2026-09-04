@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.12.0";
+const INSTALLER_VERSION = "1.13.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -2740,6 +2740,8 @@ const stats = {
   upstreamWebSocketFallbacks: 0,
   upstreamWebSocketCooldowns: 0,
   imagesSaved: 0,
+  imageRequests: 0,
+  lastImageStatus: null,
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
   translatedRequests: 0,
@@ -3144,6 +3146,46 @@ async function fetchModelUpstream(
   stats.lastOfficialStatus = upstream.status;
   if (upstream.status === 200) markAuthValidated(requestHeaders);
   return upstream;
+}
+
+// Codex 內建的 image_gen 工具打的是 /v1/images/generations。路由器原本只認
+// /healthz、/models 與 /responses，其餘一律回自己的 404——所以使用者看到的
+// 「內建圖片生成服務回傳 404」其實是路由器擋掉的，跟上游無關。
+//
+// 官方後端沒有這條路徑（officialBase 是 .../backend-api/codex），但自訂閘道有，
+// 因此一律轉給自訂閘道。閘道若不支援，它自己的錯誤訊息也比路由器的 404 有用。
+export const IMAGE_PATH_PATTERN = /^\/(?:v1\/)?images\/(?:generations|edits|variations)$/;
+
+async function handleImages(request, response, incomingUrl) {
+  // 與自訂模型同一套驗證，但只在請求真的帶了 ChatGPT 憑證時才驗。
+  // image_gen 是用戶端工具，未必會帶上 /responses 那組標頭；若因為缺標頭就擋下，
+  // 使用者只會從一個 404 換成一個 401，問題沒解決。路由器只聽 127.0.0.1，
+  // 且這條路徑花的是使用者自己的閘道金鑰，因此放行沒有標頭的請求。
+  if (authDigest(request.headers) && !(await validateOfficialAuth(request.headers))) {
+    writeJson(response, 401, {
+      error: { message: "需要 ChatGPT 身份验证", type: "auth_error" },
+    });
+    return;
+  }
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+
+  const abortController = new AbortController();
+  request.on("aborted", () => abortController.abort());
+
+  // 影像請求可能是 multipart（edits），因此原樣轉發位元組，不做解析。
+  const path = incomingUrl.pathname.startsWith("/v1/")
+    ? incomingUrl.pathname.slice(3)
+    : incomingUrl.pathname;
+  const upstream = await fetchCustom(
+    new URL(`${apiRoot}${path}${incomingUrl.search}`),
+    request.headers,
+    Buffer.concat(chunks),
+    abortController.signal,
+  );
+  stats.imageRequests += 1;
+  stats.lastImageStatus = upstream.status;
+  await streamUpstream(upstream, response);
 }
 
 async function handleResponses(request, response, incomingUrl) {
@@ -4186,6 +4228,10 @@ const server = http.createServer(async (request, response) => {
         incomingUrl.pathname.startsWith("/v1/responses"))
     ) {
       await handleResponses(request, response, incomingUrl);
+      return;
+    }
+    if (request.method === "POST" && IMAGE_PATH_PATTERN.test(incomingUrl.pathname)) {
+      await handleImages(request, response, incomingUrl);
       return;
     }
     writeJson(response, 404, { error: { message: "未找到", type: "not_found" } });

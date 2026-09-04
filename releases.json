@@ -1,6 +1,16 @@
 {
-  "latest": "1.12.0",
+  "latest": "1.13.0",
   "releases": [
+    {
+      "version": "1.13.0",
+      "date": "2026-09-04",
+      "changes": [
+        "修复官方模型无法生图：Codex 内建 image_gen 工具请求 /v1/images/generations，而路由器只认 /healthz、/models、/responses，其余一律回自己的 404——用户看到的「内建图片生成服务回传 404」就是被路由器挡掉的。",
+        "新增 /images/generations、/images/edits、/images/variations 的转发，一律转给自定义网关（官方后端没有这条路径）。",
+        "编辑端点的 multipart 请求原样转发，不做解析。",
+        "健康检查新增 imageRequests 与 lastImageStatus。"
+      ]
+    },
     {
       "version": "1.12.0",
       "date": "2026-09-04",
