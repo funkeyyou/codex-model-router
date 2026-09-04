@@ -5,160 +5,160 @@
       "version": "1.13.0",
       "date": "2026-09-04",
       "changes": [
-        "修复官方模型无法生图：Codex 内建 image_gen 工具请求 /v1/images/generations，而路由器只认 /healthz、/models、/responses，其余一律回自己的 404——用户看到的「内建图片生成服务回传 404」就是被路由器挡掉的。",
-        "新增 /images/generations、/images/edits、/images/variations 的转发，一律转给自定义网关（官方后端没有这条路径）。",
-        "编辑端点的 multipart 请求原样转发，不做解析。",
-        "健康检查新增 imageRequests 与 lastImageStatus。"
+        "修復官方模型無法生圖：Codex 內建 image_gen 工具請求 /v1/images/generations，而路由器只認 /healthz、/models、/responses，其餘一律回自己的 404——使用者看到的「內建圖片生成服務回傳 404」就是被路由器擋掉的。",
+        "新增 /images/generations、/images/edits、/images/variations 的轉發，一律轉給自訂閘道（官方後端沒有這條路徑）。",
+        "編輯端點的 multipart 請求原樣轉發，不做解析。",
+        "健康檢查新增 imageRequests 與 lastImageStatus。"
       ]
     },
     {
       "version": "1.12.0",
       "date": "2026-09-04",
       "changes": [
-        "网关自行生成的图片不再石沉大海：转译成 Codex 内建的 view_image 调用，图片会显示出来。",
-        "生成的图片同时落地保存，默认存到 ~/Downloads，可用 settings.json 的 imageOutputDir 更改。",
-        "本机合成的 view_image 调用与其输出在送往上游前剥除，避免上游因不认识该工具而拒绝整轮请求。",
-        "健康检查新增 imagesSaved、viewImageCallsInjected、viewImageCallsStripped 计数。",
-        "可用 settings.json 的 viewImageBridge = false 关闭转译，只保留存档。"
+        "閘道自行生成的圖片不再石沉大海：轉譯成 Codex 內建的 view_image 呼叫，圖片會顯示出來。",
+        "生成的圖片同時落地儲存，預設存到 ~/Downloads，可用 settings.json 的 imageOutputDir 更改。",
+        "本機合成的 view_image 呼叫與其輸出在送往上游前剝除，避免上游因不認識該工具而拒絕整輪請求。",
+        "健康檢查新增 imagesSaved、viewImageCallsInjected、viewImageCallsStripped 計數。",
+        "可用 settings.json 的 viewImageBridge = false 關閉轉譯，只保留存檔。"
       ]
     },
     {
       "version": "1.11.0",
       "date": "2026-09-04",
       "changes": [
-        "Claude 模型显示推理摘要：这些模型默认 display=omitted，思考区块照送但文字为空，现在明确请求 summarized。",
-        "转译层把摘要串成 reasoning_summary 事件并写入 reasoning 项目的 summary 字段，Codex 才看得到（encrypted_content 只负责往返）。",
-        "安装时探测是否支持 adaptive/summarized，不支持或探测失败时不显示，行为与之前一致。"
+        "Claude 模型顯示推理摘要：這些模型預設 display=omitted，思考區塊照送但文字為空，現在明確請求 summarized。",
+        "轉譯層把摘要串成 reasoning_summary 事件並寫入 reasoning 項目的 summary 字段，Codex 才看得到（encrypted_content 只負責往返）。",
+        "安裝時探測是否支援 adaptive/summarized，不支援或探測失敗時不顯示，行為與之前一致。"
       ]
     },
     {
       "version": "1.10.0",
       "date": "2026-09-04",
       "changes": [
-        "修复 Claude 模型的推理强度选择无效：thinking.budget_tokens 在较新模型上已被移除，网关会静默丢弃，导致在 Codex 里选 low 或 max 毫无差别，且一律跑在高强度。",
-        "安装时探测 output_config.effort，支持的话把五档直接透传；实测 low 档耗时从约 17 秒降到约 9.5 秒。",
-        "为 Claude 转译请求加上滚动缓存断点，对话历史不再每轮重算；实测约 2 万 token 的历史，未缓存输入从 19650 降到 2。",
-        "两项都在安装时探测，不支持的模型或网关自动沿用原有行为。"
+        "修復 Claude 模型的推理強度選擇無效：thinking.budget_tokens 在較新模型上已被移除，閘道會靜默丟棄，導致在 Codex 裡選 low 或 max 毫無差別，且一律跑在高強度。",
+        "安裝時探測 output_config.effort，支援的話把五檔直接透傳；實測 low 檔耗時從約 17 秒降到約 9.5 秒。",
+        "為 Claude 轉譯請求加上滾動快取斷點，對話歷史不再每輪重算；實測約 2 萬 token 的歷史，未快取輸入從 19650 降到 2。",
+        "兩項都在安裝時探測，不支援的模型或閘道自動沿用原有行為。"
       ]
     },
     {
       "version": "1.9.1",
       "date": "2026-09-04",
       "changes": [
-        "重新配置时，探测遇到暂时性故障（额度用尽、上游容量不足、超时、限流）不再删除已验证过的模型。",
-        "个别推理强度因暂时性故障未通过时，沿用上次已验证的结果，不再静默减档。",
-        "明确区分「暂时不可用」与「不受支持」，并在结束时列出所有沿用旧设置的项目。"
+        "重新配置時，探測遇到暫時性故障（額度用盡、上游容量不足、逾時、限流）不再刪除已驗證過的模型。",
+        "個別推理強度因暫時性故障未通過時，沿用上次已驗證的結果，不再靜默減檔。",
+        "明確區分「暫時不可用」與「不受支援」，並在結束時列出所有沿用舊設定的項目。"
       ]
     },
     {
       "version": "1.9.0",
       "date": "2026-09-04",
       "changes": [
-        "上游 WebSocket 连续握手失败后进入全局冷却，不再每条新连接都重试一次，减少每个新对话第一轮的等待。",
-        "上游恢复后立即解除冷却；健康检查新增 upstreamWebSocketCooldowns 计数。",
-        "修复 Claude 转译：网关回报的输出上限过小时，thinking 预算可能等于或超过 max_tokens 而被上游拒绝。",
-        "启动时截断过大的日志文件，避免长期出错时无限增长。",
-        "主动清理过期的已验证凭据摘要，凭据轮替后不再堆积。",
-        "加入自动化测试与 CI，确保两个平台的安装器内嵌载荷始终一致。"
+        "上游 WebSocket 連續握手失敗後進入全域冷卻，不再每條新連線都重試一次，減少每個新對話第一輪的等待。",
+        "上游恢復後立即解除冷卻；健康檢查新增 upstreamWebSocketCooldowns 計數。",
+        "修復 Claude 轉譯：閘道回報的輸出上限過小時，thinking 預算可能等於或超過 max_tokens 而被上游拒絕。",
+        "啟動時截斷過大的日誌檔案，避免長期出錯時無限增長。",
+        "主動清理過期的已驗證憑證摘要，憑證輪替後不再堆積。",
+        "加入自動化測試與 CI，確保兩個平台的安裝器內嵌負載始終一致。"
       ]
     },
     {
       "version": "1.8.0",
       "date": "2026-09-02",
       "changes": [
-        "安装器启动时显示已安装版本、当前安装器版本与线上最新版本。",
-        "自动比较版本，并列出从已安装版本到最新版之间的所有更新内容。",
-        "版本检查失败时明确显示离线状态，但不会阻塞安装、添加模型或状态检查。",
-        "旧安装器检测到较新的已安装版本时会停止操作，避免意外降级。",
-        "下载与版本检查改用 GitHub branch raw 端点，避免 main 分支的旧 CDN 缓存。"
+        "安裝器啟動時顯示已安裝版本、當前安裝器版本與線上最新版本。",
+        "自動比較版本，並列出從已安裝版本到最新版之間的所有更新內容。",
+        "版本檢查失敗時明確顯示離線狀態，但不會阻塞安裝、添加模型或狀態檢查。",
+        "舊安裝器檢測到較新的已安裝版本時會停止操作，避免意外降級。",
+        "下載與版本檢查改用 GitHub branch raw 端點，避免 main 分支的舊 CDN 快取。"
       ]
     },
     {
       "version": "1.7.1",
       "date": "2026-09-02",
       "changes": [
-        "修复不同 Codex task 共用 session_id 时互相覆盖对话历史的问题。",
-        "为每条 WebSocket 建立独立历史 namespace，避免工具接续后回复其他 task 的内容。"
+        "修復不同 Codex task 共用 session_id 時互相覆蓋對話歷史的問題。",
+        "為每條 WebSocket 建立獨立歷史 namespace，避免工具接續後回覆其他 task 的內容。"
       ]
     },
     {
       "version": "1.7.0",
       "date": "2026-09-02",
       "changes": [
-        "官方模型改用真正的上游 WebSocket，previous_response_id 接续只发送新增内容。",
-        "切换模型、切换连接或上游 WebSocket 不可用时，自动回退为完整历史重播。",
-        "补齐 Claude 输出历史，切换到其他模型时不再缺少上一轮回答。"
+        "官方模型改用真正的上游 WebSocket，previous_response_id 接續只發送新增內容。",
+        "切換模型、切換連線或上游 WebSocket 不可用時，自動回退為完整歷史重播。",
+        "補齊 Claude 輸出歷史，切換到其他模型時不再缺少上一輪回答。"
       ]
     },
     {
       "version": "1.6.4",
       "date": "2026-08-31",
       "changes": [
-        "撤回会影响正常重连的 1.6.1 防护，恢复稳定的完整历史续接行为。"
+        "撤回會影響正常重連的 1.6.1 防護，恢復穩定的完整歷史續接行為。"
       ]
     },
     {
       "version": "1.6.3",
       "date": "2026-08-31",
       "changes": [
-        "HTTP 回退路径也执行 Claude 转译，避免 WebSocket 失败后对话持续重新连接。"
+        "HTTP 回退路徑也執行 Claude 轉譯，避免 WebSocket 失敗後對話持續重新連線。"
       ]
     },
     {
       "version": "1.6.2",
       "date": "2026-08-31",
       "changes": [
-        "图片改用原生 image 内容区块发送，不再把 base64 当成普通文字。"
+        "圖片改用原生 image 內容區塊發送，不再把 base64 當成普通文字。"
       ]
     },
     {
       "version": "1.6.1",
       "date": "2026-08-31",
       "changes": [
-        "加入重连历史重复防护；该实现后来由 1.6.4 调整。"
+        "加入重連歷史重複防護；該實現後來由 1.6.4 調整。"
       ]
     },
     {
       "version": "1.6.0",
       "date": "2026-08-31",
       "changes": [
-        "新增独立的添加模型流程，保留现有 Base URL、API Key、端口与路由。",
-        "新增模型失败时自动恢复备份，不修改现有 Codex 配置。"
+        "新增獨立的添加模型流程，保留現有 Base URL、API Key、連接埠與路由。",
+        "新增模型失敗時自動恢復備份，不修改現有 Codex 配置。"
       ]
     },
     {
       "version": "1.5.4",
       "date": "2026-08-31",
       "changes": [
-        "支持 Codex Remote compaction v2，并在切换供应商时还原可移植的摘要内容。"
+        "支援 Codex Remote compaction v2，並在切換供應商時還原可移植的摘要內容。"
       ]
     },
     {
       "version": "1.5.3",
       "date": "2026-08-31",
       "changes": [
-        "当模型清单缺少 owned_by 时，改用模型名推断 Claude 并验证原生 messages 端点。"
+        "當模型清單缺少 owned_by 時，改用模型名推斷 Claude 並驗證原生 messages 端點。"
       ]
     },
     {
       "version": "1.5.2",
       "date": "2026-08-29",
       "changes": [
-        "Windows 安装器直接安全读取 API Key，并以 DPAPI 保护保存。"
+        "Windows 安裝器直接安全讀取 API Key，並以 DPAPI 保護儲存。"
       ]
     },
     {
       "version": "1.5.1",
       "date": "2026-08-29",
       "changes": [
-        "切出 Claude 路由时移除本机转译层生成的 item id，避免官方后端拒绝请求。"
+        "切出 Claude 路由時移除本機轉譯層生成的 item id，避免官方後端拒絕請求。"
       ]
     },
     {
       "version": "1.5.0",
       "date": "2026-08-29",
       "changes": [
-        "加入 Windows 安装器，并与 macOS 共用同一份 router 与 Claude 转译载荷。"
+        "加入 Windows 安裝器，並與 macOS 共用同一份 router 與 Claude 轉譯負載。"
       ]
     }
   ]

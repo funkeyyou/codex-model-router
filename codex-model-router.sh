@@ -21,13 +21,13 @@ find_node() {
 }
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "此安装器仅支持 macOS。Windows 请改用 codex-model-router.ps1。" >&2
+  echo "此安裝器僅支援 macOS。Windows 請改用 codex-model-router.ps1。" >&2
   exit 1
 fi
 
 NODE_BIN="$(find_node || true)"
 if [[ -z "${NODE_BIN}" ]]; then
-  echo "未找到 Node.js，请先安装 ChatGPT Desktop 或 Node.js。" >&2
+  echo "未找到 Node.js，請先安裝 ChatGPT Desktop 或 Node.js。" >&2
   exit 1
 fi
 
@@ -53,7 +53,7 @@ EXIT_STATUS=$?
 set -e
 if [[ ${ARG_COUNT} -eq 0 && -t 0 ]]; then
   echo
-  read -r -p "按回车键结束（窗口是否关闭取决于终端设置）..." _
+  read -r -p "按 Enter 鍵結束（視窗是否關閉取決於終端設定）..." _
 fi
 exit ${EXIT_STATUS}
 
@@ -83,9 +83,9 @@ import { stdin as input, stdout as output } from "node:process";
 const INSTALLER_VERSION = "1.13.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
-const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
+const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
 // 常駐方式：macOS 走 LaunchAgent；Windows 走工作排程器（登入時觸發）。
-const serviceKindLabel = isWindows ? "Windows 计划任务" : "LaunchAgent";
+const serviceKindLabel = isWindows ? "Windows 排程工作" : "LaunchAgent";
 const desktopAppName = isWindows ? "Codex 桌面版" : "ChatGPT Desktop";
 const PROVIDER_ID = "compat_router";
 const OFFICIAL_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -93,10 +93,10 @@ const DEFAULT_RELEASES_URL =
   "https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/releases.json";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const EFFORT_DESCRIPTIONS = {
-  low: "响应较快，使用较少推理",
-  medium: "平衡响应速度与推理深度",
-  high: "为复杂任务提供更深入的推理",
-  xhigh: "为高难度任务提供超高推理深度",
+  low: "響應較快，使用較少推理",
+  medium: "平衡響應速度與推理深度",
+  high: "為複雜任務提供更深入的推理",
+  xhigh: "為高難度任務提供超高推理深度",
   max: "最高推理深度",
 };
 
@@ -186,7 +186,7 @@ function shell(command, args, options = {}) {
   });
   if (options.allowFailure !== true && result.status !== 0) {
     const detail = (result.stderr || result.stdout || "").trim();
-    fail(`${command} 执行失败${detail ? `：${detail}` : ""}`);
+    fail(`${command} 執行失敗${detail ? `：${detail}` : ""}`);
   }
   return result;
 }
@@ -311,13 +311,13 @@ function readManifest() {
 
 function extractRouterSource() {
   if (!scriptPath || !existsSync(scriptPath)) {
-    fail("无法读取安装器源文件。" );
+    fail("無法讀取安裝器原始檔。" );
   }
   // .ps1 版本同樣內嵌這段負載；正規化換行讓兩種容器共用同一組標記。
   const source = readFileSync(scriptPath, "utf8").replaceAll("\r\n", "\n");
   const marker = "__CODEX_MODEL_ROUTER_ROUTER_JS__\n";
   const markerIndex = source.indexOf(marker);
-  if (markerIndex < 0) fail("安装器中缺少内嵌路由器代码。" );
+  if (markerIndex < 0) fail("安裝器中缺少內嵌路由器程式碼。" );
   const routerSource = source.slice(markerIndex + marker.length);
   const endMarker = "\n__CODEX_MODEL_ROUTER_BRIDGE_JS__";
   const endIndex = routerSource.lastIndexOf(endMarker);
@@ -326,12 +326,12 @@ function extractRouterSource() {
 
 function loadBridgeSource() {
   if (!scriptPath || !existsSync(scriptPath)) {
-    fail("无法读取安装器源文件。" );
+    fail("無法讀取安裝器原始檔。" );
   }
   const source = readFileSync(scriptPath, "utf8").replaceAll("\r\n", "\n");
   const marker = "__CODEX_MODEL_ROUTER_BRIDGE_JS__\n";
   const markerIndex = source.indexOf(marker);
-  if (markerIndex < 0) fail("安装器中缺少内嵌 Claude 转译代码。" );
+  if (markerIndex < 0) fail("安裝器中缺少內嵌 Claude 轉譯程式碼。" );
   const bridgeSource = source.slice(markerIndex + marker.length);
   const endMarker = "\n__CODEX_MODEL_ROUTER_EMBEDDED__";
   const endIndex = bridgeSource.lastIndexOf(endMarker);
@@ -399,10 +399,10 @@ function normalizeUrl(value) {
   try {
     parsed = new URL(value);
   } catch {
-    fail(`Base URL 无效：${value}`);
+    fail(`Base URL 無效：${value}`);
   }
   if (!/^https?:$/.test(parsed.protocol)) {
-    fail("Base URL 必须使用 http:// 或 https://。" );
+    fail("Base URL 必須使用 http:// 或 https://。" );
   }
   parsed.hash = "";
   parsed.search = "";
@@ -441,14 +441,14 @@ async function storeApiKey(service, baseUrl) {
   if (isWindows) {
     ensureDirectory(credentialsRoot);
     const target = credentialFileFor(service);
-    console.log("API Key 会用 Windows 凭据保护（DPAPI）以当前用户身份加密保存，" );
-    console.log("不会写入 config.toml 或安装器文件。" );
+    console.log("API Key 會用 Windows 憑證保護（DPAPI）以當前使用者身份加密儲存，" );
+    console.log("不會寫入 config.toml 或安裝器檔案。" );
     let apiKey = "";
     for (let attempt = 0; attempt < 3 && !apiKey; attempt += 1) {
-      if (attempt > 0) console.log("API Key 不能为空，请重新输入。" );
-      apiKey = await askSecret("API Key（输入不会显示）");
+      if (attempt > 0) console.log("API Key 不能為空，請重新輸入。" );
+      apiKey = await askSecret("API Key（輸入不會顯示）");
     }
-    if (!apiKey) fail("API Key 不能为空。" );
+    if (!apiKey) fail("API Key 不能為空。" );
     // 明文以管線交給 PowerShell 做 DPAPI 加密：不會出現在命令列或行程清單。
     const result = powershell(
       [
@@ -465,7 +465,7 @@ async function storeApiKey(service, baseUrl) {
       ].join("\n"),
       { input: apiKey, allowFailure: true },
     );
-    if (result.status === 2) fail("API Key 不能为空。" );
+    if (result.status === 2) fail("API Key 不能為空。" );
     if (result.status !== 0 || !existsSync(target)) {
       const detail = (result.stderr || "").trim().split(/\r?\n/)[0] || "";
       fail(`API Key 未能保存。${detail ? `${detail}` : ""}`);
@@ -475,8 +475,8 @@ async function storeApiKey(service, baseUrl) {
   }
 
   const label = `Codex 模型路由器：${new URL(baseUrl).host}`;
-  console.log("请在 macOS 钥匙串提示中输入 API Key。" );
-  console.log("API Key 不会写入 config.toml 或安装器文件。" );
+  console.log("請在 macOS 鑰匙圈提示中輸入 API Key。" );
+  console.log("API Key 不會寫入 config.toml 或安裝器檔案。" );
   const result = spawnSync(
     "/usr/bin/security",
     [
@@ -489,12 +489,12 @@ async function storeApiKey(service, baseUrl) {
       "-l",
       label,
       "-j",
-      "供 Codex 本机模型路由器使用",
+      "供 Codex 本機模型路由器使用",
       "-w",
     ],
     { stdio: "inherit" },
   );
-  if (result.status !== 0) fail("API Key 未能保存到钥匙串。" );
+  if (result.status !== 0) fail("API Key 未能儲存到鑰匙圈。" );
 }
 
 function readApiKey(service) {
@@ -515,7 +515,7 @@ function readApiKey(service) {
         "[Console]::Out.Write([Text.Encoding]::UTF8.GetString($plain))",
       ].join("\n"),
     ).stdout.trim();
-    if (!value) fail("保存的 API Key 解密后为空。" );
+    if (!value) fail("儲存的 API Key 解密後為空。" );
     return value;
   }
   return shell("/usr/bin/security", [
@@ -569,8 +569,8 @@ function assertInstallerNotOlder(installedVersion) {
   const comparison = compareVersions(INSTALLER_VERSION, installedVersion);
   if (comparison != null && comparison < 0) {
     fail(
-      `已安装版本 ${installedVersion} 比当前安装器 ${INSTALLER_VERSION} 更新。` +
-        "为避免降级，请重新下载最新版安装器。",
+      `已安裝版本 ${installedVersion} 比當前安裝器 ${INSTALLER_VERSION} 更新。` +
+        "為避免降級，請重新下載最新版安裝器。",
     );
   }
 }
@@ -585,10 +585,10 @@ export function terminalSafeText(value, maxLength = 320) {
 }
 
 export function normalizeReleaseCatalog(payload) {
-  if (!payload || typeof payload !== "object") fail("版本清单格式无效。");
+  if (!payload || typeof payload !== "object") fail("版本清單格式無效。");
   const latest = terminalSafeText(payload.latest, 32);
-  if (!versionParts(latest)) fail("版本清单缺少有效的 latest 版本。");
-  if (!Array.isArray(payload.releases)) fail("版本清单缺少 releases 数组。");
+  if (!versionParts(latest)) fail("版本清單缺少有效的 latest 版本。");
+  if (!Array.isArray(payload.releases)) fail("版本清單缺少 releases 陣列。");
 
   const releases = [];
   const seen = new Set();
@@ -609,7 +609,7 @@ export function normalizeReleaseCatalog(payload) {
       changes,
     });
   }
-  if (!seen.has(latest)) fail(`版本清单中找不到最新版本 ${latest} 的说明。`);
+  if (!seen.has(latest)) fail(`版本清單中找不到最新版本 ${latest} 的說明。`);
   releases.sort((left, right) => compareVersions(right.version, left.version));
   return { latest, releases };
 }
@@ -631,11 +631,11 @@ async function loadReleaseCatalog() {
         },
         4000,
       );
-      if (!response.ok) fail(`版本清单返回 HTTP ${response.status}。`);
+      if (!response.ok) fail(`版本清單回傳 HTTP ${response.status}。`);
       raw = await response.text();
     }
     if (Buffer.byteLength(raw, "utf8") > 128 * 1024) {
-      fail("版本清单超过大小限制。");
+      fail("版本清單超過大小限制。");
     }
     return normalizeReleaseCatalog(JSON.parse(raw));
   })();
@@ -668,46 +668,46 @@ async function printVersionSummary() {
   const manifest = readManifest();
   const installedVersion = terminalSafeText(manifest?.version, 32) || null;
   printHeading("版本信息");
-  console.log(`已安装版本：${installedVersion || "尚未安装"}`);
-  console.log(`当前安装器：${INSTALLER_VERSION}`);
+  console.log(`已安裝版本：${installedVersion || "尚未安裝"}`);
+  console.log(`當前安裝器：${INSTALLER_VERSION}`);
 
   let catalog;
   try {
     catalog = await loadReleaseCatalog();
   } catch {
-    console.log("线上最新版本：无法检查");
-    console.log("版本状态：网络不可用或 GitHub 版本清单暂时无法读取（不影响安装）");
+    console.log("線上最新版本：無法檢查");
+    console.log("版本狀態：網路不可用或 GitHub 版本清單暫時無法讀取（不影響安裝）");
     return;
   }
 
-  console.log(`线上最新版本：${catalog.latest}`);
+  console.log(`線上最新版本：${catalog.latest}`);
   const installerVsLatest = compareVersions(INSTALLER_VERSION, catalog.latest);
   const installedVsLatest = installedVersion
     ? compareVersions(installedVersion, catalog.latest)
     : null;
 
   if (installerVsLatest != null && installerVsLatest < 0) {
-    console.log(`版本状态：当前安装器已过期，请重新下载 ${catalog.latest}`);
+    console.log(`版本狀態：當前安裝器已過期，請重新下載 ${catalog.latest}`);
   } else if (!installedVersion) {
-    console.log(`版本状态：将安装 ${INSTALLER_VERSION}`);
+    console.log(`版本狀態：將安裝 ${INSTALLER_VERSION}`);
   } else if (installedVsLatest == null) {
-    console.log("版本状态：无法比较已安装版本，请重新运行最新版安装器");
+    console.log("版本狀態：無法比較已安裝版本，請重新執行最新版安裝器");
   } else if (installedVsLatest < 0) {
-    console.log(`版本状态：可更新 ${installedVersion} → ${catalog.latest}`);
+    console.log(`版本狀態：可更新 ${installedVersion} → ${catalog.latest}`);
   } else if (installedVsLatest === 0) {
-    console.log("版本状态：已是最新版本");
+    console.log("版本狀態：已是最新版本");
   } else {
-    console.log("版本状态：已安装版本比线上版本更新");
+    console.log("版本狀態：已安裝版本比線上版本更新");
   }
 
   const releases = releasesBetween(catalog, installedVersion);
   if (releases.length === 0) return;
   const heading =
     !installedVersion || installedVsLatest == null
-      ? "最新版本内容"
+      ? "最新版本內容"
       : installedVsLatest === 0
-        ? "当前版本内容"
-        : "更新内容";
+        ? "當前版本內容"
+        : "更新內容";
   console.log(`${heading}：`);
   for (const release of releases) {
     console.log(`  ${release.version}${release.date ? `（${release.date}）` : ""}`);
@@ -786,7 +786,7 @@ async function discoverApiRoot(baseUrl, apiKey) {
       }
       const models = parseModelList(JSON.parse(text));
       if (models.length === 0) {
-        failures.push(`${modelsUrl}：响应中没有模型 ID`);
+        failures.push(`${modelsUrl}：響應中沒有模型 ID`);
         continue;
       }
       return { apiRoot, models };
@@ -794,7 +794,7 @@ async function discoverApiRoot(baseUrl, apiKey) {
       failures.push(`${modelsUrl}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  fail(`无法发现可用模型。${failures.join("；")}`);
+  fail(`無法發現可用模型。${failures.join("；")}`);
 }
 
 function parseSelection(value, modelCount) {
@@ -812,17 +812,17 @@ function parseSelection(value, modelCount) {
       const low = Math.min(start, end);
       const high = Math.max(start, end);
       for (let number = low; number <= high; number += 1) {
-        if (number < 1 || number > modelCount) fail(`选择项 ${number} 超出范围。`);
+        if (number < 1 || number > modelCount) fail(`選擇項 ${number} 超出範圍。`);
         selected.add(number - 1);
       }
       continue;
     }
-    if (!/^\d+$/.test(part)) fail(`选择格式无效：${part}`);
+    if (!/^\d+$/.test(part)) fail(`選擇格式無效：${part}`);
     const number = Number(part);
-    if (number < 1 || number > modelCount) fail(`选择项 ${number} 超出范围。`);
+    if (number < 1 || number > modelCount) fail(`選擇項 ${number} 超出範圍。`);
     selected.add(number - 1);
   }
-  if (selected.size === 0) fail("没有选择任何模型。" );
+  if (selected.size === 0) fail("沒有選擇任何模型。" );
   return [...selected].sort((a, b) => a - b);
 }
 
@@ -834,7 +834,7 @@ async function selectModels(models) {
   const automaticSelection = env.CODEX_MODEL_ROUTER_TEST_MODELS;
   const answer =
     automaticSelection ||
-    (await ask("请输入模型编号，可使用逗号、范围，或输入 all 全选"));
+    (await ask("請輸入模型編號，可使用逗號、範圍，或輸入 all 全選"));
   return parseSelection(answer, models.length).map((index) => models[index]);
 }
 
@@ -983,14 +983,14 @@ async function probeModel(apiRoot, apiKey, model) {
         console.log("支持");
       } else if (isTransientProbeStatus(result.status)) {
         transientEfforts.push(effort);
-        console.log(`暂时不可用（HTTP ${result.status}）`);
+        console.log(`暫時不可用（HTTP ${result.status}）`);
       } else {
         console.log(`不支持（HTTP ${result.status}）`);
       }
     } catch (error) {
       // 逾時或連線層例外同樣只代表這次問不到。
       transientEfforts.push(effort);
-      console.log(`暂时不可用（${error instanceof Error ? error.message : String(error)}）`);
+      console.log(`暫時不可用（${error instanceof Error ? error.message : String(error)}）`);
     }
   }
 
@@ -1003,11 +1003,11 @@ async function probeModel(apiRoot, apiKey, model) {
     };
   }
 
-  process.stdout.write("  默认    ");
+  process.stdout.write("  預設    ");
   try {
     const result = await testResponse(apiRoot, apiKey, model, null);
     if (result.ok) {
-      console.log("支持，但不提供推理强度控制");
+      console.log("支援，但不提供推理強度控制");
       return { supported: true, efforts: [], stripReasoning: true, transientEfforts };
     }
     console.log(`不支持（HTTP ${result.status}）`);
@@ -1019,7 +1019,7 @@ async function probeModel(apiRoot, apiKey, model) {
       transient: isTransientProbeStatus(result.status),
     };
   } catch (error) {
-    console.log(`暂时不可用（${error instanceof Error ? error.message : String(error)}）`);
+    console.log(`暫時不可用（${error instanceof Error ? error.message : String(error)}）`);
     return { supported: false, efforts: [], stripReasoning: false, transientEfforts, transient: true };
   }
 }
@@ -1056,7 +1056,7 @@ function loadBundledCatalog() {
   );
   const catalog = JSON.parse(result.stdout);
   if (!Array.isArray(catalog?.models) || catalog.models.length === 0) {
-    fail("Codex 返回了空的内置模型目录。" );
+    fail("Codex 回傳了空的內建模型目錄。" );
   }
   return catalog;
 }
@@ -1098,8 +1098,8 @@ function customCatalogEntry(officialModels, route, index) {
     entry.effective_context_window_percent = 95;
   } else if (!exactTemplate) {
     console.log(
-      `  ⚠️  ${route.upstreamModel}：无法自动探测上下文上限，` +
-        `沿用模板值 ${entry.context_window}。如与实际不符请手动修改 models.json。`,
+      `  ⚠️  ${route.upstreamModel}：無法自動探測上下文上限，` +
+        `沿用模板值 ${entry.context_window}。如與實際不符請手動修改 models.json。`,
     );
   }
   if (Number.isFinite(route.maxOutputTokens) && route.maxOutputTokens > 0) {
@@ -1166,7 +1166,7 @@ async function codexRpc(method, params) {
       params: {
         clientInfo: {
           name: "codex_model_router_installer",
-          title: "Codex 模型路由器安装器",
+          title: "Codex 模型路由器安裝器",
           version: INSTALLER_VERSION,
         },
       },
@@ -1274,7 +1274,7 @@ function startLaunchAgent() {
     sleepSync(500 * (attempt + 1));
   }
   const detail = (lastResult?.stderr || lastResult?.stdout || "").trim();
-  fail(`无法启动 LaunchAgent${detail ? `：${detail}` : ""}`);
+  fail(`無法啟動 LaunchAgent${detail ? `：${detail}` : ""}`);
 }
 
 // --- Windows：工作排程器 + 隱藏視窗守護迴圈 --------------------------------
@@ -1318,7 +1318,7 @@ function taskXmlDocument() {
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Codex 模型路由器（本机回环代理）</Description>
+    <Description>Codex 模型路由器（本機回送代理）</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -1413,7 +1413,7 @@ function startScheduledTask() {
     sleepSync(500 * (attempt + 1));
   }
   const detail = (lastResult?.stderr || lastResult?.stdout || "").trim();
-  fail(`无法启动计划任务${detail ? `：${detail}` : ""}`);
+  fail(`無法啟動排程工作${detail ? `：${detail}` : ""}`);
 }
 
 // --- 平台分派 --------------------------------------------------------------
@@ -1482,7 +1482,7 @@ async function freePort(preferredPort = 48953) {
     });
     if (available) return port;
   }
-  fail("无法找到空闲的本机端口。" );
+  fail("無法找到空閒的本機連接埠。" );
 }
 
 async function waitForHealth(port) {
@@ -1498,7 +1498,7 @@ async function waitForHealth(port) {
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
   }
-  fail(`路由器健康检查失败：${lastError?.message || "未知错误"}`);
+  fail(`路由器健康檢查失敗：${lastError?.message || "未知錯誤"}`);
 }
 
 function verifyLogin() {
@@ -1508,7 +1508,7 @@ function verifyLogin() {
     env: { ...env, CODEX_HOME: codexHome },
   });
   if (result.status !== 0 || !/ChatGPT/i.test(`${result.stdout}\n${result.stderr}`)) {
-    fail("安装前必须先使用 ChatGPT 账号登录 Codex。" );
+    fail("安裝前必須先使用 ChatGPT 帳號登入 Codex。" );
   }
 }
 
@@ -1600,16 +1600,16 @@ export function resolveRouteWithPrevious(outcome, previous) {
 //   transient        失敗是否只是「這次問不到」（呼叫端可據此保留既有設定）
 //   transientEfforts 這次暫時問不到的推理強度
 async function buildRouteForModel(discovery, apiKey, model) {
-  printHeading(`正在测试 ${model}`);
+  printHeading(`正在測試 ${model}`);
   const owner = modelOwners.get(model) || "unknown";
   const ownerIsAnthropic = owner === "anthropic";
-  // /models 沒標供應商时按模型名推断，否则 Claude 会静默落到通用 Responses
-  // 路由——Codex 的 Code Mode 用 namespace 包装工具，那条路必然失败。
+  // /models 沒標供應商時按模型名推斷，否則 Claude 會靜默落到通用 Responses
+  // 路由——Codex 的 Code Mode 用 namespace 包裝工具，那條路必然失敗。
   const guessedAnthropic = !ownerIsAnthropic && owner === "unknown" && looksAnthropic(model);
 
   if (ownerIsAnthropic || guessedAnthropic) {
     if (guessedAnthropic) {
-      console.log("  供应商        /models 未标注，按模型名推断为 Anthropic");
+      console.log("  供應商        /models 未標註，按模型名推斷為 Anthropic");
     }
     // Claude 走本機轉譯：直接驗證原生 /messages。
     process.stdout.write("  原生 /messages  ");
@@ -1618,32 +1618,32 @@ async function buildRouteForModel(discovery, apiKey, model) {
       console.log("支持");
       process.stdout.write("  上下文上限    ");
       const contextWindow = await probeAnthropicContextWindow(discovery.apiRoot, apiKey, model);
-      console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "无法探测（将回退）");
-      process.stdout.write("  最大输出      ");
+      console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "無法探測（將回退）");
+      process.stdout.write("  最大輸出      ");
       const { maxOutput, canonicalId } = await probeAnthropicMaxOutput(discovery.apiRoot, apiKey, model);
       console.log(
         maxOutput
           ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
-          : "无法探测",
+          : "無法探測",
       );
 
-      // budget_tokens 在较新的模型上已被移除：官方直接 400，部分网关静默丢弃，
-      // 结果是 Codex 里选 low 或 max 毫无差别，而且一律跑在高强度。
-      // 支持 output_config 的话就直接透传五档，低强度才真的会变快。
-      process.stdout.write("  推理强度控制  ");
+      // budget_tokens 在較新的模型上已被移除：官方直接 400，部分閘道靜默丟棄，
+      // 結果是 Codex 裡選 low 或 max 毫無差別，而且一律跑在高強度。
+      // 支援 output_config 的話就直接透傳五檔，低強度才真的會變快。
+      process.stdout.write("  推理強度控制  ");
       const supportsOutputConfig = await probeAnthropicParam(
         discovery.apiRoot, apiKey, model, { output_config: { effort: "low" } },
       );
       console.log(
         supportsOutputConfig === true
-          ? "output_config.effort（五档直接透传）"
+          ? "output_config.effort（五檔直接透傳）"
           : supportsOutputConfig === false
-            ? "thinking.budget_tokens（该模型不支持 output_config）"
-            : "无法探测，保守使用 thinking.budget_tokens",
+            ? "thinking.budget_tokens（該模型不支援 output_config）"
+            : "無法探測，保守使用 thinking.budget_tokens",
       );
 
-      // 这些模型默认 display=omitted：thinking 区块照送，但文字是空的。
-      // 要 summarized 才能在 Codex 里看到推理摘要。
+      // 這些模型預設 display=omitted：thinking 區塊照送，但文字是空的。
+      // 要 summarized 才能在 Codex 裡看到推理摘要。
       let supportsSummary = null;
       if (supportsOutputConfig === true) {
         process.stdout.write("  推理摘要      ");
@@ -1653,24 +1653,24 @@ async function buildRouteForModel(discovery, apiKey, model) {
         );
         console.log(
           supportsSummary === true
-            ? "显示摘要"
+            ? "顯示摘要"
             : supportsSummary === false
-              ? "该模型不支持 adaptive/summarized，不显示"
-              : "无法探测，不显示",
+              ? "該模型不支援 adaptive/summarized，不顯示"
+              : "無法探測，不顯示",
         );
       }
 
-      // 对话历史每轮都会重送；没有滚动断点的话上游每轮都要重算整段历史。
-      process.stdout.write("  提示词缓存    ");
+      // 對話歷史每輪都會重送；沒有滾動斷點的話上游每輪都要重算整段歷史。
+      process.stdout.write("  提示詞快取    ");
       const supportsCache = await probeAnthropicParam(
         discovery.apiRoot, apiKey, model, { cache_control: { type: "ephemeral" } },
       );
       console.log(
         supportsCache === true
-          ? "支持滚动断点"
+          ? "支援滾動斷點"
           : supportsCache === false
-            ? "网关不接受顶层 cache_control，仅缓存系统提示词"
-            : "无法探测，仅缓存系统提示词",
+            ? "閘道不接受頂層 cache_control，僅快取系統提示詞"
+            : "無法探測，僅快取系統提示詞",
       );
 
       const route = {
@@ -1678,13 +1678,13 @@ async function buildRouteForModel(discovery, apiKey, model) {
         upstreamModel: model,
         displayName: model,
         providerHost: new URL(discovery.apiRoot).host,
-        // 轉譯後 effort 直接對應 thinking budget，五档皆可用。
+        // 轉譯後 effort 直接對應 thinking budget，五檔皆可用。
         efforts: ["low", "medium", "high", "xhigh", "max"],
         stripReasoning: false,
         translate: "anthropic",
         contextWindow,
         maxOutputTokens: maxOutput,
-        // 探测不出来时一律保守：沿用旧行为，不会因为猜错而整条路由 400。
+        // 探測不出來時一律保守：沿用舊行為，不會因為猜錯而整條路由 400。
         effortControl: supportsOutputConfig === true ? "output_config" : "thinking_budget",
         promptCache: supportsCache === true,
         reasoningSummary: supportsSummary === true,
@@ -1692,23 +1692,23 @@ async function buildRouteForModel(discovery, apiKey, model) {
       return { route, transient: false, transientEfforts: [] };
     }
 
-    console.log(`失败（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
+    console.log(`失敗（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
     if (guessedAnthropic) {
-      // 只是按名字猜的，探测不通不足以判定模型不可用，回退到通用路由。
-      console.log("  该网关没有可用的 Anthropic 原生端点，改用通用 Responses 路由重试。");
-      console.log("  注意：Codex 的 Code Mode 用 namespace 包装工具，部分网关会因此报错或丢工具。");
+      // 只是按名字猜的，探測不通不足以判定模型不可用，回退到通用路由。
+      console.log("  該閘道沒有可用的 Anthropic 原生端點，改用通用 Responses 路由重試。");
+      console.log("  注意：Codex 的 Code Mode 用 namespace 包裝工具，部分閘道會因此報錯或丟工具。");
     } else if (isTransientProbeStatus(probeResult.status)) {
       // 額度、上游容量或網路問題，而非模型真的不受支持。
-      console.log(`跳过 ${model}：上游暂时不可用，并非模型不受支持。`);
+      console.log(`跳過 ${model}：上游暫時不可用，並非模型不受支援。`);
       return { route: null, transient: true, transientEfforts: [] };
     } else if (probeResult.status === 401 || probeResult.status === 403) {
-      console.log(`跳过 ${model}：当前 API Key 无权访问该模型。`);
+      console.log(`跳過 ${model}：當前 API Key 無權存取該模型。`);
       return { route: null, transient: false, transientEfforts: [] };
     } else if (probeResult.status === 404) {
-      console.log(`跳过 ${model}：该网关未提供 Anthropic 原生 /messages 端点，无法本地转译。`);
+      console.log(`跳過 ${model}：該閘道未提供 Anthropic 原生 /messages 端點，無法本機轉譯。`);
       return { route: null, transient: false, transientEfforts: [] };
     } else {
-      console.log(`跳过 ${model}：Anthropic 原生端点探测未通过。`);
+      console.log(`跳過 ${model}：Anthropic 原生端點探測未通過。`);
       return { route: null, transient: false, transientEfforts: [] };
     }
   }
@@ -1717,8 +1717,8 @@ async function buildRouteForModel(discovery, apiKey, model) {
   if (!probe.supported) {
     console.log(
       probe.transient
-        ? `跳过 ${model}：上游暂时不可用，并非模型不受支持。`
-        : `跳过 ${model}：Responses API 探测未通过。`,
+        ? `跳過 ${model}：上游暫時不可用，並非模型不受支援。`
+        : `跳過 ${model}：Responses API 探測未通過。`,
     );
     return {
       route: null,
@@ -1741,10 +1741,10 @@ async function buildRouteForModel(discovery, apiKey, model) {
 async function install() {
   const existingManifest = readManifest();
   if (existingManifest?.version) assertInstallerNotOlder(existingManifest.version);
-  if (!codexBin) fail(`未找到 Codex CLI，请先安装 ${desktopAppName} 或 Codex CLI。`);
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
 
-  printHeading(existingManifest ? "重新配置 Codex 模型路由器" : "安装 Codex 模型路由器");
+  printHeading(existingManifest ? "重新配置 Codex 模型路由器" : "安裝 Codex 模型路由器");
   const defaultBaseUrl = existingManifest?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
   const baseUrl = normalizeUrl(
     env.CODEX_MODEL_ROUTER_BASE_URL ||
@@ -1754,7 +1754,7 @@ async function install() {
 
   if (keychainHas(keychainService)) {
     const update = await confirm(
-      `${secretStoreLabel}中已存在 API Key，是否替换？`,
+      `${secretStoreLabel}中已存在 API Key，是否替換？`,
       false,
     );
     if (update) await storeApiKey(keychainService, baseUrl);
@@ -1763,13 +1763,13 @@ async function install() {
   }
   const apiKey = readApiKey(keychainService);
 
-  console.log("正在发现可用模型..." );
+  console.log("正在發現可用模型..." );
   const discovery = await discoverApiRoot(baseUrl, apiKey);
   console.log(`API 根地址：${discovery.apiRoot}`);
   const selectedModels = await selectModels(discovery.models);
-  console.log("\n每个选中的模型最多会执行五次小型 Responses API 探测。" );
-  if (!(await confirm("是否继续进行能力探测？", true))) {
-    fail("已在修改配置前取消安装。" );
+  console.log("\n每個選中的模型最多會執行五次小型 Responses API 探測。" );
+  if (!(await confirm("是否繼續進行能力探測？", true))) {
+    fail("已在修改配置前取消安裝。" );
   }
 
   // 重新配置時，這次探測遇到的暫時性失敗不足以推翻上次已經驗過的結果。
@@ -1792,20 +1792,20 @@ async function install() {
     );
     if (!route) continue;
     if (kept === "model") {
-      console.log(`  保留 ${model} 的既有设置：本次失败属于暂时性问题，不改动已验证过的配置。`);
+      console.log(`  保留 ${model} 的既有設定：本次失敗屬於暫時性問題，不改動已驗證過的配置。`);
       keptModels.push(model);
     } else if (kept === "efforts") {
-      console.log(`  保留 ${model} 既有的推理强度：${restored.join(", ")}（本次为暂时性失败）。`);
+      console.log(`  保留 ${model} 既有的推理強度：${restored.join(", ")}（本次為暫時性失敗）。`);
       keptEfforts.push(`${model}: ${restored.join(", ")}`);
     }
     routes.push(route);
   }
-  if (routes.length === 0) fail("选中的模型均未通过 Responses API 探测。" );
+  if (routes.length === 0) fail("選中的模型均未通過 Responses API 探測。" );
   if (keptModels.length > 0 || keptEfforts.length > 0) {
-    console.log("\n本次探测遇到暂时性故障，以下项目沿用上次已验证的设置：" );
-    for (const model of keptModels) console.log(`  - ${model}（整个模型）`);
+    console.log("\n本次探測遇到暫時性故障，以下項目沿用上次已驗證的設定：" );
+    for (const model of keptModels) console.log(`  - ${model}（整個模型）`);
     for (const line of keptEfforts) console.log(`  - ${line}`);
-    console.log("  上游恢复后重跑一次安装器，即可用最新探测结果覆盖。" );
+    console.log("  上游恢復後重跑一次安裝器，即可用最新探測結果覆蓋。" );
   }
 
   const bundledCatalog = loadBundledCatalog();
@@ -1914,7 +1914,7 @@ async function install() {
     const visibleSlugs = new Set(effectiveCatalog.models?.map((model) => model.slug));
     for (const route of routes) {
       if (!visibleSlugs.has(route.pickerSlug)) {
-        fail(`Codex model/list 中缺少已安装模型：${route.pickerSlug}`);
+        fail(`Codex model/list 中缺少已安裝模型：${route.pickerSlug}`);
       }
     }
     writeJsonAtomic(manifestPath, manifest);
@@ -1955,23 +1955,23 @@ async function install() {
     throw error;
   }
 
-  printHeading("安装完成");
+  printHeading("安裝完成");
   console.log(`路由器：http://127.0.0.1:${port}`);
   console.log("已添加模型：");
   for (const route of routes) {
-    const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供应商默认值";
+    const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供應商預設值";
     console.log(`  - ${route.displayName}`);
-    console.log(`    选择器 ID：${route.pickerSlug}`);
-    console.log(`    推理强度：${effortText}`);
+    console.log(`    選擇器 ID：${route.pickerSlug}`);
+    console.log(`    推理強度：${effortText}`);
   }
-  console.log(`配置备份：${backupPath}`);
+  console.log(`配置備份：${backupPath}`);
   if (
     existingManifest?.keychainService &&
     existingManifest.keychainService !== keychainService &&
     !testMode
   ) {
     const removeOldKey = await confirm(
-      `是否从${secretStoreLabel}中删除上一个 Base URL 对应的 API Key？`,
+      `是否從${secretStoreLabel}中刪除上一個 Base URL 對應的 API Key？`,
       true,
     );
     if (removeOldKey) {
@@ -1981,9 +1981,9 @@ async function install() {
       );
     }
   }
-  console.log(`\n请完全退出并重新打开 ${desktopAppName}。`);
-  console.log("安装器继续使用内置 openai 供应商，因此 Remote 中的既有聊天仍会显示。" );
-  console.log("安装前由其他自定义供应商创建的任务，仍可能需要单独迁移。" );
+  console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
+  console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
+  console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
   console.log(`回退命令：${basename(scriptPath)} rollback`);
 }
 
@@ -1992,14 +1992,14 @@ async function install() {
 async function addModels() {
   const manifest = readManifest();
   if (manifest?.version) assertInstallerNotOlder(manifest.version);
-  if (!codexBin) fail(`未找到 Codex CLI，请先安装 ${desktopAppName} 或 Codex CLI。`);
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
 
   if (!manifest) {
-    fail("当前 CODEX_HOME 尚未安装 Codex 模型路由器，请先选择「安装或重新配置」。");
+    fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
   }
   if (!existsSync(settingsPath)) {
-    fail("找不到 settings.json，安装可能已损坏，请改用「安装或重新配置」。");
+    fail("找不到 settings.json，安裝可能已損壞，請改用「安裝或重新配置」。");
   }
 
   printHeading("添加模型");
@@ -2010,24 +2010,24 @@ async function addModels() {
   const port = Number(settings.port || manifest.port);
   console.log(`Base URL：${baseUrl}`);
   console.log(`端口：${port}`);
-  console.log(`已配置 ${existingRoutes.length} 个自定义模型：`);
+  console.log(`已配置 ${existingRoutes.length} 個自訂模型：`);
   for (const route of existingRoutes) {
     console.log(`  - ${route.displayName || route.upstreamModel}`);
   }
 
   const apiKey = readApiKey(keychainService);
-  console.log("\n正在发现可用模型...");
+  console.log("\n正在發現可用模型...");
   const discovery = await discoverApiRoot(baseUrl, apiKey);
   const configured = new Set(existingRoutes.map((route) => route.upstreamModel));
   const available = discovery.models.filter((model) => !configured.has(model));
   if (available.length === 0) {
-    fail("该 Base URL 上的模型都已配置，没有可添加的项。");
+    fail("該 Base URL 上的模型都已配置，沒有可添加的項。");
   }
 
   const selectedModels = await selectModels(available);
-  if (selectedModels.length === 0) fail("未选择任何模型。");
-  console.log("\n每个选中的模型最多会执行五次小型 Responses API 探测。");
-  if (!(await confirm("是否继续进行能力探测？", true))) {
+  if (selectedModels.length === 0) fail("未選擇任何模型。");
+  console.log("\n每個選中的模型最多會執行五次小型 Responses API 探測。");
+  if (!(await confirm("是否繼續進行能力探測？", true))) {
     fail("已在修改配置前取消。");
   }
 
@@ -2037,7 +2037,7 @@ async function addModels() {
     const { route } = await buildRouteForModel(discovery, apiKey, model);
     if (route) newRoutes.push(route);
   }
-  if (newRoutes.length === 0) fail("选中的模型均未通过探测，配置未改动。");
+  if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
 
   const routes = [...existingRoutes, ...newRoutes];
   const backupDir = join(backupsRoot, `add-model-${timestamp()}`);
@@ -2058,7 +2058,7 @@ async function addModels() {
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
   try {
-    // 路由器與轉譯層一併刷新，否则 settings.version 会与实际运行的代码对不上。
+    // 路由器與轉譯層一併刷新，否則 settings.version 會與實際執行的程式碼對不上。
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
     writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
@@ -2087,7 +2087,7 @@ async function addModels() {
       }
     }
   } catch (error) {
-    console.error("\n添加失败，正在还原之前的配置...");
+    console.error("\n添加失敗，正在還原之前的配置...");
     copyIfExists(join(backupDir, "router.mjs"), routerPath);
     copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
@@ -2103,28 +2103,28 @@ async function addModels() {
   printHeading("添加完成");
   console.log("本次新增：");
   for (const route of newRoutes) {
-    const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供应商默认值";
+    const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供應商預設值";
     console.log(`  - ${route.displayName}`);
-    console.log(`    选择器 ID：${route.pickerSlug}`);
-    console.log(`    推理强度：${effortText}`);
+    console.log(`    選擇器 ID：${route.pickerSlug}`);
+    console.log(`    推理強度：${effortText}`);
   }
-  console.log(`\n现共 ${routes.length} 个自定义模型。`);
-  console.log(`备份：${backupDir}`);
-  console.log(`\n请完全退出并重新打开 ${desktopAppName}。`);
+  console.log(`\n現共 ${routes.length} 個自訂模型。`);
+  console.log(`備份：${backupDir}`);
+  console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
 async function status() {
   const manifest = readManifest();
   if (!manifest) {
-    console.log("当前 CODEX_HOME 尚未安装 Codex 模型路由器。" );
+    console.log("當前 CODEX_HOME 尚未安裝 Codex 模型路由器。" );
     process.exitCode = 1;
     return;
   }
-  printHeading("Codex 模型路由器状态");
+  printHeading("Codex 模型路由器狀態");
   console.log(`API 根地址：${manifest.apiRoot}`);
   console.log(`路由器：http://127.0.0.1:${manifest.port}`);
   console.log(
-    `后台服务：${manifest.serviceName || manifest.launchLabel}（${serviceKindLabel}）`,
+    `背景服務：${manifest.serviceName || manifest.launchLabel}（${serviceKindLabel}）`,
   );
   if (isWindows) {
     const query = shell(
@@ -2132,32 +2132,32 @@ async function status() {
       ["/Query", "/TN", manifest.serviceName || taskName, "/FO", "LIST"],
       { allowFailure: true },
     );
-    const state = /^[^\S\n]*(?:Status|状态|狀態)[^\S\n]*[:：][^\S\n]*(.+)$/im.exec(
+    const state = /^[^\S\n]*(?:Status|狀態|狀態)[^\S\n]*[:：][^\S\n]*(.+)$/im.exec(
       query.stdout || "",
     );
     console.log(
-      `计划任务：${query.status === 0 ? state?.[1]?.trim() || "已注册" : "未注册"}`,
+      `排程工作：${query.status === 0 ? state?.[1]?.trim() || "已註冊" : "未註冊"}`,
     );
   }
-  console.log(`Codex 供应商：${manifest.providerId || "openai"}`);
-  // Codex 升级后自带的 Node/CLI 可能换到新的版本目录，旧路径会静默失效。
+  console.log(`Codex 供應商：${manifest.providerId || "openai"}`);
+  // Codex 升級後自帶的 Node/CLI 可能換到新的版本目錄，舊路徑會靜默失效。
   for (const [label, path] of [
     ["Node", manifest.nodeBin],
     ["Codex", manifest.codexBin],
   ]) {
     if (!path) continue;
-    const missing = existsSync(path) ? "" : "（文件已不存在，请重新运行安装器）";
+    const missing = existsSync(path) ? "" : "（檔案已不存在，請重新執行安裝器）";
     console.log(`${label}：${path}${missing}`);
   }
   try {
     const health = await waitForHealth(manifest.port);
-    console.log(`健康状态：${health.status === "ok" ? "正常" : health.status}`);
-    console.log(`请求数：${health.stats?.requests ?? 0}`);
-    console.log(`官方模型路由数：${health.stats?.official ?? 0}`);
-    console.log(`自定义模型路由数：${health.stats?.custom ?? 0}`);
-    console.log(`失败数：${health.stats?.failures ?? 0}`);
+    console.log(`健康狀態：${health.status === "ok" ? "正常" : health.status}`);
+    console.log(`請求數：${health.stats?.requests ?? 0}`);
+    console.log(`官方模型路由數：${health.stats?.official ?? 0}`);
+    console.log(`自訂模型路由數：${health.stats?.custom ?? 0}`);
+    console.log(`失敗數：${health.stats?.failures ?? 0}`);
   } catch (error) {
-    console.log(`健康状态：不可用（${error.message}）`);
+    console.log(`健康狀態：不可用（${error.message}）`);
   }
   console.log("模型：");
   for (const route of manifest.routes) {
@@ -2168,13 +2168,13 @@ async function status() {
 async function rollback() {
   const manifest = readManifest();
   if (!manifest) {
-    console.log("没有可回退的安装。" );
+    console.log("沒有可回退的安裝。" );
     return;
   }
   printHeading("回退 Codex 模型路由器");
-  console.log("只会还原由安装器管理的 Codex 配置项。" );
-  console.log(`完整配置备份：${manifest.configBackup}`);
-  if (!(await confirm("是否继续？", true))) return;
+  console.log("只會還原由安裝器管理的 Codex 配置項。" );
+  console.log(`完整配置備份：${manifest.configBackup}`);
+  if (!(await confirm("是否繼續？", true))) return;
 
   await writeConfigEdits(rollbackEdits(manifest.previousConfig));
   stopService();
@@ -2189,7 +2189,7 @@ async function rollback() {
   if (existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
 
   const removeKey = await confirm(
-    `是否从${secretStoreLabel}中删除自定义供应商的 API Key？`,
+    `是否從${secretStoreLabel}中刪除自訂供應商的 API Key？`,
     true,
   );
   if (removeKey) {
@@ -2197,8 +2197,8 @@ async function rollback() {
   }
 
   printHeading("回退完成");
-  console.log(`安装文件已封存至：${archiveDir}`);
-  console.log(`请完全退出并重新打开 ${desktopAppName}，然后创建一个新任务。`);
+  console.log(`安裝檔案已封存至：${archiveDir}`);
+  console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
 }
 
 function help() {
@@ -2210,28 +2210,28 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} status
   ${basename(scriptPath || "codex-model-router.command")} rollback
 
-安装时会询问：
+安裝時會詢問：
   1. 兼容 OpenAI 的 Base URL
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
 
-add 用于在已有安装上追加模型：沿用已保存的 Base URL、API Key 与端口，
-只探测新选的模型，不会重问设置，也不改动 config.toml。
+add 用於在已有安裝上追加模型：沿用已儲存的 Base URL、API Key 與連接埠，
+只探測新選的模型，不會重問設定，也不改動 config.toml。
 
-安装器会继续将官方 ChatGPT Codex 模型发送到 OpenAI，只有选中的
-自定义模型选择器 ID 才会发送到配置的供应商。Codex 仍使用内置
-openai 供应商 ID，以保持 Desktop 与手机 Remote 的既有聊天可见。
+安裝器會繼續將官方 ChatGPT Codex 模型發送到 OpenAI，只有選中的
+自訂模型選擇器 ID 才會發送到配置的供應商。Codex 仍使用內建
+openai 供應商 ID，以保持 Desktop 與手機 Remote 的既有聊天可見。
 `);
 }
 
 async function chooseAction() {
   printHeading("Codex 模型路由器");
-  console.log("  1. 安装或重新配置");
-  console.log("  2. 添加模型（保留现有配置）");
-  console.log("  3. 查看状态");
+  console.log("  1. 安裝或重新配置");
+  console.log("  2. 添加模型（保留現有配置）");
+  console.log("  3. 查看狀態");
   console.log("  4. 回退配置");
   console.log("  5. 退出");
-  const answer = await ask("请选择操作", "1");
+  const answer = await ask("請選擇操作", "1");
   const choices = {
     "1": "install",
     install: "install",
@@ -2250,7 +2250,7 @@ async function chooseAction() {
     quit: "exit",
   };
   const action = choices[answer.trim().toLowerCase()];
-  if (!action) fail(`无法识别的菜单选项：${answer}`);
+  if (!action) fail(`無法識別的選單選項：${answer}`);
   return action;
 }
 
@@ -2273,11 +2273,11 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
     else if (action === "status") await status();
     else if (action === "rollback" || action === "uninstall") await rollback();
-    else if (action === "exit") console.log("未进行任何修改。" );
+    else if (action === "exit") console.log("未進行任何修改。" );
     else if (action === "help" || action === "--help" || action === "-h") help();
-    else fail(`无法识别的命令：${action}`);
+    else fail(`無法識別的命令：${action}`);
   } catch (error) {
-    console.error(`\n错误：${error instanceof Error ? error.message : String(error)}`);
+    console.error(`\n錯誤：${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   }
 }
@@ -2444,8 +2444,8 @@ export function noteUpstreamWebSocketConnectFailure() {
   stats.upstreamWebSocketCooldowns += 1;
   process.stderr.write(
     "model-router-upstream-ws-cooldown:" +
-      `连续 ${upstreamWebSocketFailureStreak} 次握手失败，暂停 ` +
-      `${Math.round(upstreamWebSocketCooldownMs / 1000)} 秒内的上游 WebSocket 尝试\n`,
+      `連續 ${upstreamWebSocketFailureStreak} 次握手失敗，暫停 ` +
+      `${Math.round(upstreamWebSocketCooldownMs / 1000)} 秒內的上游 WebSocket 嘗試\n`,
   );
 }
 
@@ -2712,7 +2712,7 @@ function readStoredSecret() {
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     ).trim();
   }
-  if (!credentialPath) throw new Error("设置中缺少凭据文件路径");
+  if (!credentialPath) throw new Error("設定中缺少憑證檔案路徑");
   const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
   const script = [
     "$ErrorActionPreference = 'Stop'",
@@ -2747,7 +2747,7 @@ function getApiKey(forceRefresh = false) {
     return apiKeyCache.value;
   }
   const value = readStoredSecret();
-  if (!value) throw new Error("自定义供应商的凭据为空");
+  if (!value) throw new Error("自訂供應商的憑證為空");
   apiKeyCache = { value, expiresAt: now + tokenCacheTtlMs };
   return value;
 }
@@ -3017,7 +3017,7 @@ async function fetchModelUpstream(
     if (!(await validateOfficialAuth(requestHeaders))) {
       return new Response(
         JSON.stringify({
-          error: { message: "需要 ChatGPT 身份验证", type: "auth_error" },
+          error: { message: "需要 ChatGPT 身份驗證", type: "auth_error" },
         }),
         { status: 401, headers: { "content-type": "application/json" } },
       );
@@ -3058,7 +3058,7 @@ async function fetchModelUpstream(
   if (!authDigest(requestHeaders)) {
     return new Response(
       JSON.stringify({
-        error: { message: "需要 ChatGPT 身份验证", type: "auth_error" },
+        error: { message: "需要 ChatGPT 身份驗證", type: "auth_error" },
       }),
       { status: 401, headers: { "content-type": "application/json" } },
     );
@@ -3091,7 +3091,7 @@ async function handleImages(request, response, incomingUrl) {
   // 且這條路徑花的是使用者自己的閘道金鑰，因此放行沒有標頭的請求。
   if (authDigest(request.headers) && !(await validateOfficialAuth(request.headers))) {
     writeJson(response, 401, {
-      error: { message: "需要 ChatGPT 身份验证", type: "auth_error" },
+      error: { message: "需要 ChatGPT 身份驗證", type: "auth_error" },
     });
     return;
   }
@@ -3120,7 +3120,7 @@ async function handleResponses(request, response, incomingUrl) {
   const encoding = request.headers["content-encoding"];
   if (encoding && encoding !== "identity" && encoding !== "zstd") {
     writeJson(response, 415, {
-      error: { message: "不支持的请求内容编码", type: "router_error" },
+      error: { message: "不支援的請求內容編碼", type: "router_error" },
     });
     return;
   }
@@ -3132,7 +3132,7 @@ async function handleResponses(request, response, incomingUrl) {
   try {
     body = JSON.parse(decodedBody.toString("utf8"));
   } catch {
-    writeJson(response, 400, { error: { message: "JSON 格式无效", type: "router_error" } });
+    writeJson(response, 400, { error: { message: "JSON 格式無效", type: "router_error" } });
     return;
   }
 
@@ -3241,13 +3241,13 @@ export function parseWebSocketFrames(buffer) {
       if (cursor + 8 > buffer.length) break;
       const longLength = buffer.readBigUInt64BE(cursor);
       if (longLength > BigInt(maxWebSocketMessageBytes)) {
-        throw new Error("WebSocket 消息超过路由器限制");
+        throw new Error("WebSocket 訊息超過路由器限制");
       }
       payloadLength = Number(longLength);
       cursor += 8;
     }
     if (payloadLength > maxWebSocketMessageBytes) {
-      throw new Error("WebSocket 消息超过路由器限制");
+      throw new Error("WebSocket 訊息超過路由器限制");
     }
     const masked = (second & 0x80) !== 0;
     let mask = null;
@@ -3393,7 +3393,7 @@ async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyK
     }
     return;
   }
-  if (!upstream.body) throw new Error("WebSocket 上游响应没有正文");
+  if (!upstream.body) throw new Error("WebSocket 上游響應沒有內文");
 
   const onEvent = historyKey
     ? (event) => {
@@ -3490,7 +3490,7 @@ function officialWebSocketTarget() {
 
 function connectUpstreamWebSocket(requestHeaders, timeoutMs = 15000) {
   const target = officialWebSocketTarget();
-  if (!target.secure) throw new Error("上游 WebSocket 需要 HTTPS 端点");
+  if (!target.secure) throw new Error("上游 WebSocket 需要 HTTPS 端點");
   const key = randomBytes(16).toString("base64");
   const expectedAccept = createHash("sha1").update(key + websocketMagic).digest("base64");
   return new Promise((resolve, reject) => {
@@ -3508,7 +3508,7 @@ function connectUpstreamWebSocket(requestHeaders, timeoutMs = 15000) {
       socket.destroy();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
-    const timer = setTimeout(() => fail(new Error("上游 WebSocket 握手超时")), timeoutMs);
+    const timer = setTimeout(() => fail(new Error("上游 WebSocket 握手逾時")), timeoutMs);
     const onHandshakeData = (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
       const boundary = buffer.indexOf("\r\n\r\n");
@@ -3517,12 +3517,12 @@ function connectUpstreamWebSocket(requestHeaders, timeoutMs = 15000) {
       const remainder = buffer.subarray(boundary + 4);
       const status = Number(/^HTTP\/1\.[01]\s+(\d+)/.exec(headerText)?.[1]);
       if (status !== 101) {
-        fail(new Error("上游 WebSocket 握手失败 HTTP " + (status || "?")));
+        fail(new Error("上游 WebSocket 握手失敗 HTTP " + (status || "?")));
         return;
       }
       const acceptLine = /sec-websocket-accept:\s*(\S+)/i.exec(headerText)?.[1];
       if (acceptLine !== expectedAccept) {
-        fail(new Error("上游 WebSocket 握手校验失败"));
+        fail(new Error("上游 WebSocket 握手驗證失敗"));
         return;
       }
       settled = true;
@@ -3586,7 +3586,7 @@ function createUpstreamSession(socket, leftover) {
       if (frame.opcode === 0xa) continue;
       if (frame.opcode === 0x8) {
         socket.destroy();
-        markClosed("上游 WebSocket 已关闭");
+        markClosed("上游 WebSocket 已關閉");
         return;
       }
       if (frame.opcode === 0x1) fragments = [frame.payload];
@@ -3605,16 +3605,16 @@ function createUpstreamSession(socket, leftover) {
     }
   });
   socket.on("error", (error) => markClosed(error instanceof Error ? error.message : String(error)));
-  socket.on("close", () => markClosed("上游 WebSocket 连接结束"));
+  socket.on("close", () => markClosed("上游 WebSocket 連線結束"));
   session.send = (payload) => {
     if (session.closed || socket.destroyed || !socket.writable) {
-      throw new Error("上游 WebSocket 不可写");
+      throw new Error("上游 WebSocket 不可寫");
     }
     socket.write(encodeMaskedWebSocketFrame(0x1, JSON.stringify(payload)));
   };
   session.destroy = () => {
     if (!socket.destroyed) socket.destroy();
-    markClosed("本地关闭");
+    markClosed("本機關閉");
   };
   return session;
 }
@@ -3662,7 +3662,7 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
       return message.includes("previous_response_id");
     };
 
-    session.onClosed = (reason) => failHard(new Error(reason || "上游 WebSocket 中断"));
+    session.onClosed = (reason) => failHard(new Error(reason || "上游 WebSocket 中斷"));
     session.onEvent = (event) => {
       const type = String(event?.type || "");
       if (!flushed && (type === "error" || type === "response.failed") && isInvalidChain(event)) {
@@ -3703,7 +3703,7 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
 // 永遠停在「正在重新連線」，而且再也回不來——因為每次重試都是同一個結果。
 async function bridgeAnthropicToHttp(upstream, response, meta) {
   stats.lastCustomStatus = upstream.status;
-  if (!upstream.body) throw new Error("上游响应没有正文");
+  if (!upstream.body) throw new Error("上游響應沒有內文");
   response.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -3724,7 +3724,7 @@ async function bridgeAnthropicToHttp(upstream, response, meta) {
 
 async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = null) {
   stats.lastWebSocketStatus = upstream.status;
-  if (!upstream.body) throw new Error("WebSocket 上游响应没有正文");
+  if (!upstream.body) throw new Error("WebSocket 上游響應沒有內文");
   const tee = captureId
     ? async function* (src) {
         for await (const chunk of src) {
@@ -3995,7 +3995,7 @@ function handleWebSocketUpgrade(request, socket, head) {
     try {
       message = JSON.parse(payload.toString("utf8"));
     } catch {
-      closeWebSocket(socket, 1007, "JSON 无效");
+      closeWebSocket(socket, 1007, "JSON 無效");
       return;
     }
     if (message?.type === "response.cancel") {
@@ -4008,7 +4008,7 @@ function handleWebSocketUpgrade(request, socket, head) {
         error: {
           type: "unsupported_event",
           code: "unsupported_event",
-          message: "仅支持 response.create 和 response.cancel",
+          message: "僅支援 response.create 和 response.cancel",
         },
       });
       return;
@@ -4023,7 +4023,7 @@ function handleWebSocketUpgrade(request, socket, head) {
           error: {
             type: "response_in_progress",
             code: "response_in_progress",
-            message: "当前连接的待处理请求过多",
+            message: "當前連線的待處理請求過多",
           },
         });
         stats.responseInProgressRejects += 1;
@@ -4058,7 +4058,7 @@ function handleWebSocketUpgrade(request, socket, head) {
             error: {
               type: "router_error",
               code: "router_error",
-              message: `模型路由器的 WebSocket 桥接失败：${detail}`,
+              message: `模型路由器的 WebSocket 橋接失敗：${detail}`,
             },
           });
           // 網路層例外（fetch failed / terminated）同樣要送終止事件，
@@ -4095,7 +4095,7 @@ function handleWebSocketUpgrade(request, socket, head) {
         } else if (frame.opcode === 0x0 && fragmentOpcode != null) {
           fragmentChunks.push(frame.payload);
         } else {
-          closeWebSocket(socket, 1002, "帧类型不受支持");
+          closeWebSocket(socket, 1002, "幀類型不受支援");
           return;
         }
         const fragmentBytes = fragmentChunks.reduce(
@@ -4103,7 +4103,7 @@ function handleWebSocketUpgrade(request, socket, head) {
           0,
         );
         if (fragmentBytes > maxWebSocketMessageBytes) {
-          closeWebSocket(socket, 1009, "消息过大");
+          closeWebSocket(socket, 1009, "訊息過大");
           return;
         }
         if (frame.fin) {
@@ -4114,7 +4114,7 @@ function handleWebSocketUpgrade(request, socket, head) {
         }
       }
     } catch {
-      closeWebSocket(socket, 1002, "帧无效");
+      closeWebSocket(socket, 1002, "幀無效");
     }
   };
 
@@ -4176,7 +4176,7 @@ const server = http.createServer(async (request, response) => {
     process.stderr.write(`model-router-error:${message}\n`);
     if (!response.headersSent) {
       writeJson(response, 502, {
-        error: { message: "模型路由器的上游请求失败", type: "router_error" },
+        error: { message: "模型路由器的上游請求失敗", type: "router_error" },
       });
     } else if (!response.writableEnded) {
       response.end();

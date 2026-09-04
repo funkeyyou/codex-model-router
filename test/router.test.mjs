@@ -179,5 +179,5 @@ test("超過上限的訊框長度會擋下來，不會照著配置記憶體", ()
   header[0] = 0x81;
   header[1] = 127;
   header.writeBigUInt64BE(64n * 1024n * 1024n, 2);
-  assert.throws(() => parseWebSocketFrames(header), /超过路由器限制/);
+  assert.throws(() => parseWebSocketFrames(header), /超過路由器限制/);
 });

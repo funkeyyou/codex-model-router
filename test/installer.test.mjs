@@ -50,8 +50,8 @@ test("清單一律由新到舊排序", () => {
 });
 
 test("格式無效的清單一律拒收，不會半信半疑地往下走", () => {
-  assert.throws(() => normalizeReleaseCatalog(null), /格式无效/);
-  assert.throws(() => normalizeReleaseCatalog("字串"), /格式无效/);
+  assert.throws(() => normalizeReleaseCatalog(null), /格式無效/);
+  assert.throws(() => normalizeReleaseCatalog("字串"), /格式無效/);
   assert.throws(() => normalizeReleaseCatalog({ releases: [] }), /latest/);
   assert.throws(() => normalizeReleaseCatalog({ latest: "1.0.0" }), /releases/);
   // latest 指到一個清單裡沒有的版本 -> 使用者會看不到更新內容，直接視為壞掉。

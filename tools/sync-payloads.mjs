@@ -53,7 +53,7 @@ const installerVersion = /const INSTALLER_VERSION = "([^"]+)";/.exec(shell.text)
 if (!installerVersion) throw new Error("codex-model-router.sh 缺少 INSTALLER_VERSION");
 if (releases.latest !== installerVersion) {
   throw new Error(
-    `releases.json latest=${releases.latest} 与 INSTALLER_VERSION=${installerVersion} 不一致`,
+    `releases.json latest=${releases.latest} 與 INSTALLER_VERSION=${installerVersion} 不一致`,
   );
 }
 const payload = extractPayload(shell.text);
