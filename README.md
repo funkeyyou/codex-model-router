@@ -98,7 +98,9 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   約 17 秒降到約 9.5 秒。
 - **閘道生的圖不再石沉大海**——部分閘道會自行啟用 `image_generation`，回應帶著整張圖，
   但 Codex 只在自己發起生圖時才會建立可渲染項目，收到了也只是塞進歷史。路由器因此把它
-  翻成 Codex 的內建 `view_image` 呼叫：圖先落地（預設 `~/Downloads`，`imageOutputDir` 可改），
+  翻成 Codex 的內建 `view_image` 呼叫：圖先落地（預設是使用者的「下載」，安裝時解析後
+  寫進 `settings.json` 的 `imageOutputDir`，可自行改掉；Windows 會讀已知資料夾的實際
+  位置，「下載」被搬到別的磁碟也不會寫錯地方），
   再合成一次工具呼叫，Codex 就會產生 `ImageView` 項目顯示出來（在工具活動區塊裡），
   模型自己也拿得到那張圖。合成的呼叫用可辨識的 `call_id` 前綴，送往上游前連同輸出一起剝除
   ——上游不認得這個工具，留著會讓下一輪被拒。`viewImageBridge = false` 可只保留存檔。
@@ -167,6 +169,13 @@ powershell -ExecutionPolicy Bypass -File .\claude-probe-diag.ps1 <API_ROOT> <模
 該檔超過 5 MB 會就地清空（可用 `settings.json` 的 `maxLogBytes` 調整），因此長期
 出錯也不會把磁碟寫滿。
 
+這個檔是不帶 BOM 的 UTF-8。Windows PowerShell 5.1 的 `Get-Content` 預設用系統
+ANSI 代碼頁讀檔（跟主控台的 `chcp 65001` 無關），中文會整片變亂碼，要明講編碼：
+
+```powershell
+Get-Content "$env:USERPROFILE\.codex\model-router\router.err.log" -Tail 50 -Encoding UTF8
+```
+
 ## 需求
 
 - 相容 OpenAI 介面的供應商端點
@@ -203,9 +212,19 @@ npm run check   # 等同 CI：先驗負載同步，再跑測試
 
 ### CI
 
-`.github/workflows/ci.yml` 在 push 與 PR 上跑：負載同步檢查、測試（Node 22 與 24）、
-`.sh` 與 `.ps1` 的語法檢查，以及 `.ps1` 的 UTF-8 BOM 檢查。下面那兩件事之所以要
-自動擋，是因為它們壞掉都不會立刻報錯。
+`.github/workflows/ci.yml` 在 push 與 PR 上跑兩個 job：
+
+- **ubuntu**——負載同步檢查、測試（Node 22 與 24）、`.sh` 與 `.ps1` 的語法檢查，
+  以及 `.ps1` 的 UTF-8 BOM 檢查。
+- **windows**——同一份同步檢查與測試在 Windows 簽出上再跑一次，語法檢查改用
+  Windows 內建的 PowerShell 5.1，並確認 5.1 讀這支 `.ps1` 的編碼是對的。
+
+之所以要有第二個 job：使用者實際跑的是 5.1，但 CI 上的 `pwsh` 是 7，`??`、`?.`、
+三元運算子與 `&&` 在 7 上都合法、到了 5.1 才是語法錯誤。負載這邊也一樣——POSIX
+專用的路徑（拿 `/dev/null/nope` 當「寫不進去的目錄」是實際發生過的例子）在
+Windows 上會變成普通相對路徑，測試照樣綠燈，其實什麼都沒驗到。
+
+下面那兩件事之所以要自動擋，是因為它們壞掉都不會立刻報錯。
 
 **請不要手改 `.ps1`，也不要自己寫同步腳本。** 那個工具除了搬運文字，還負責兩件
 容易被忽略、壞掉又不會立刻報錯的事：
