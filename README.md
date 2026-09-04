@@ -96,6 +96,10 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   400，部分閘道靜默丟棄），結果是在 Codex 裡選 low 或 max 毫無差別、而且一律跑在高強度。
   安裝時會探測 `output_config.effort`，支援的話把五檔直接透傳。實測 low 檔耗時從
   約 17 秒降到約 9.5 秒。
+- **顯示推理摘要**——這些模型預設 `display` 是 `omitted`：thinking 區塊照樣送來，
+  但文字是空的。安裝時探測 `adaptive`／`summarized`，支援就明確要求摘要，並把它串成
+  `reasoning_summary` 事件、寫進 reasoning 項目的 `summary` 欄位——Codex 顯示的是
+  這個欄位，`encrypted_content` 只負責往返，兩者都要處理才看得到。
 - **對話歷史可被快取**——Anthropic 的快取前綴是 `tools → system → messages`，只在
   system 掛斷點的話，會長大的歷史每輪都要重算。安裝時探測頂層 `cache_control`，
   支援就加上滾動斷點。實測約 2 萬 token 的歷史，未快取輸入從 19650 降到 2。

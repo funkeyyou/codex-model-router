@@ -1,6 +1,15 @@
 {
-  "latest": "1.10.0",
+  "latest": "1.11.0",
   "releases": [
+    {
+      "version": "1.11.0",
+      "date": "2026-09-04",
+      "changes": [
+        "Claude 模型显示推理摘要：这些模型默认 display=omitted，思考区块照送但文字为空，现在明确请求 summarized。",
+        "转译层把摘要串成 reasoning_summary 事件并写入 reasoning 项目的 summary 字段，Codex 才看得到（encrypted_content 只负责往返）。",
+        "安装时探测是否支持 adaptive/summarized，不支持或探测失败时不显示，行为与之前一致。"
+      ]
+    },
     {
       "version": "1.10.0",
       "date": "2026-09-04",

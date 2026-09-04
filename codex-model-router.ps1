@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.10.0";
+const INSTALLER_VERSION = "1.11.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -1714,6 +1714,24 @@ async function buildRouteForModel(discovery, apiKey, model) {
             : "无法探测，保守使用 thinking.budget_tokens",
       );
 
+      // 这些模型默认 display=omitted：thinking 区块照送，但文字是空的。
+      // 要 summarized 才能在 Codex 里看到推理摘要。
+      let supportsSummary = null;
+      if (supportsOutputConfig === true) {
+        process.stdout.write("  推理摘要      ");
+        supportsSummary = await probeAnthropicParam(
+          discovery.apiRoot, apiKey, model,
+          { thinking: { type: "adaptive", display: "summarized" } },
+        );
+        console.log(
+          supportsSummary === true
+            ? "显示摘要"
+            : supportsSummary === false
+              ? "该模型不支持 adaptive/summarized，不显示"
+              : "无法探测，不显示",
+        );
+      }
+
       // 对话历史每轮都会重送；没有滚动断点的话上游每轮都要重算整段历史。
       process.stdout.write("  提示词缓存    ");
       const supportsCache = await probeAnthropicParam(
@@ -1741,6 +1759,7 @@ async function buildRouteForModel(discovery, apiKey, model) {
         // 探测不出来时一律保守：沿用旧行为，不会因为猜错而整条路由 400。
         effortControl: supportsOutputConfig === true ? "output_config" : "thinking_budget",
         promptCache: supportsCache === true,
+        reasoningSummary: supportsSummary === true,
       };
       return { route, transient: false, transientEfforts: [] };
     }
@@ -4445,6 +4464,11 @@ export function toAnthropicRequest(body, route) {
     // Codex 的 ultra 帶「自動任務委派」語意，Anthropic 沒有對應檔位，對到 max。
     const mapped = effort === "ultra" ? "max" : effort;
     if (ANTHROPIC_EFFORTS.has(mapped)) request.output_config = { effort: mapped };
+    // 這些模型預設 display 是 omitted：thinking 區塊照樣送來，但文字是空的。
+    // 要在 Codex 裡看到推理摘要就得明確要 summarized。
+    if (route?.reasoningSummary === true) {
+      request.thinking = { type: "adaptive", display: "summarized" };
+    }
   } else if (budget >= 1024) {
     request.thinking = { type: "enabled", budget_tokens: budget };
   }
@@ -4597,6 +4621,27 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
         const d = event.delta || {};
         if (d.type === "thinking_delta" && cur.kind === "thinking") {
           cur.thinking += d.thinking || "";
+          // display=summarized 時 thinking 才有文字。Codex 顯示的是 reasoning 的
+          // summary，不是 encrypted_content，所以要另外把摘要串出去。
+          if (d.thinking) {
+            if (!cur.summaryStarted) {
+              cur.summaryStarted = true;
+              send({
+                type: "response.reasoning_summary_part.added",
+                item_id: cur.itemId,
+                output_index: cur.index,
+                summary_index: 0,
+                part: { type: "summary_text", text: "" },
+              });
+            }
+            send({
+              type: "response.reasoning_summary_text.delta",
+              item_id: cur.itemId,
+              output_index: cur.index,
+              summary_index: 0,
+              delta: d.thinking,
+            });
+          }
         } else if (d.type === "signature_delta" && cur.kind === "thinking") {
           cur.signature += d.signature || "";
         } else if (d.type === "text_delta" && cur.kind === "text") {
@@ -4619,12 +4664,31 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       case "content_block_stop": {
         if (!cur) break;
         if (cur.kind === "thinking") {
+          if (cur.summaryStarted) {
+            send({
+              type: "response.reasoning_summary_text.done",
+              item_id: cur.itemId,
+              output_index: cur.index,
+              summary_index: 0,
+              text: cur.thinking,
+            });
+            send({
+              type: "response.reasoning_summary_part.done",
+              item_id: cur.itemId,
+              output_index: cur.index,
+              summary_index: 0,
+              part: { type: "summary_text", text: cur.thinking },
+            });
+          }
           const item = {
             id: cur.itemId,
             type: "reasoning",
             content: [],
             encrypted_content: encodeReasoning(cur.thinking, cur.signature),
-            summary: [],
+            // 摘要放進 summary 才會被顯示；encrypted_content 只負責往返。
+            summary: cur.summaryStarted
+              ? [{ type: "summary_text", text: cur.thinking }]
+              : [],
           };
           output.push(item);
           send({ type: "response.output_item.done", output_index: cur.index, item });
