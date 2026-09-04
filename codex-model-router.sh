@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.8.0";
+const INSTALLER_VERSION = "1.9.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 凭据保护（DPAPI）" : "macOS 钥匙串";
@@ -550,12 +550,12 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   }
 }
 
-function versionParts(value) {
+export function versionParts(value) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(value || "").trim());
   return match ? match.slice(1).map(Number) : null;
 }
 
-function compareVersions(left, right) {
+export function compareVersions(left, right) {
   const a = versionParts(left);
   const b = versionParts(right);
   if (!a || !b) return null;
@@ -575,7 +575,7 @@ function assertInstallerNotOlder(installedVersion) {
   }
 }
 
-function terminalSafeText(value, maxLength = 320) {
+export function terminalSafeText(value, maxLength = 320) {
   return String(value ?? "")
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
@@ -584,7 +584,7 @@ function terminalSafeText(value, maxLength = 320) {
     .slice(0, maxLength);
 }
 
-function normalizeReleaseCatalog(payload) {
+export function normalizeReleaseCatalog(payload) {
   if (!payload || typeof payload !== "object") fail("版本清单格式无效。");
   const latest = terminalSafeText(payload.latest, 32);
   if (!versionParts(latest)) fail("版本清单缺少有效的 latest 版本。");
@@ -642,7 +642,7 @@ async function loadReleaseCatalog() {
   return releaseCatalogPromise;
 }
 
-function releasesBetween(catalog, installedVersion) {
+export function releasesBetween(catalog, installedVersion) {
   const latestEntry = catalog.releases.find((entry) => entry.version === catalog.latest);
   if (!installedVersion || compareVersions(installedVersion, catalog.latest) === null) {
     return latestEntry ? [latestEntry] : [];
@@ -715,7 +715,7 @@ async function printVersionSummary() {
   }
 }
 
-function candidateApiRoots(baseUrl) {
+export function candidateApiRoots(baseUrl) {
   const normalized = normalizeUrl(baseUrl);
   const candidates = [];
   if (/\/v1$/i.test(new URL(normalized).pathname)) {
@@ -729,7 +729,7 @@ function candidateApiRoots(baseUrl) {
 // 模型 -> 供應商（取自 /models 的 owned_by），用來決定是否啟用 Anthropic 轉譯。
 const modelOwners = new Map();
 
-function normalizeOwner(owner) {
+export function normalizeOwner(owner) {
   const value = String(owner || "").toLowerCase();
   if (value.includes("anthropic")) return "anthropic";
   if (value.includes("openai")) return "openai";
@@ -745,7 +745,7 @@ function ownerOf(item) {
 // 有些閘道的 /models 完全不帶供應商欄位（例如直接回 Anthropic 格式的
 // {id, type, display_name, created_at}），此時只能從模型名推斷。
 // 猜錯是安全的：下面會先探測原生 /messages，不通就回退到通用 Responses 路由。
-function looksAnthropic(model) {
+export function looksAnthropic(model) {
   return /(^|[/:_-])(claude|anthropic)([/:._-]|$)/i.test(String(model || ""));
 }
 
@@ -1674,6 +1674,7 @@ async function install() {
     credentialPath: isWindows ? credentialFileFor(keychainService) : null,
     officialBaseUrl: OFFICIAL_BASE_URL,
     catalogPath,
+    logPath,
     port,
     routes,
   });
@@ -2069,29 +2070,32 @@ async function chooseAction() {
   return action;
 }
 
-try {
-  const versionAwareActions = new Set([
-    "install",
-    "setup",
-    "add",
-    "add-model",
-    "addmodel",
-    "status",
-  ]);
-  if (!requestedAction || versionAwareActions.has(requestedAction)) {
-    await printVersionSummary();
+// 測試會 import 本檔以驗證版本比較等純函式，此時不能真的執行安裝流程。
+if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
+  try {
+    const versionAwareActions = new Set([
+      "install",
+      "setup",
+      "add",
+      "add-model",
+      "addmodel",
+      "status",
+    ]);
+    if (!requestedAction || versionAwareActions.has(requestedAction)) {
+      await printVersionSummary();
+    }
+    const action = requestedAction || (await chooseAction());
+    if (action === "install" || action === "setup") await install();
+    else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
+    else if (action === "status") await status();
+    else if (action === "rollback" || action === "uninstall") await rollback();
+    else if (action === "exit") console.log("未进行任何修改。" );
+    else if (action === "help" || action === "--help" || action === "-h") help();
+    else fail(`无法识别的命令：${action}`);
+  } catch (error) {
+    console.error(`\n错误：${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
   }
-  const action = requestedAction || (await chooseAction());
-  if (action === "install" || action === "setup") await install();
-  else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
-  else if (action === "status") await status();
-  else if (action === "rollback" || action === "uninstall") await rollback();
-  else if (action === "exit") console.log("未进行任何修改。" );
-  else if (action === "help" || action === "--help" || action === "-h") help();
-  else fail(`无法识别的命令：${action}`);
-} catch (error) {
-  console.error(`\n错误：${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
 }
 
 __CODEX_MODEL_ROUTER_ROUTER_JS__
@@ -2100,7 +2104,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
-import { readFileSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
@@ -2125,6 +2129,7 @@ const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route
 const tokenCacheTtlMs = 5 * 60 * 1000;
 const authValidationTtlMs = 5 * 60 * 1000;
 const maxRememberedThreads = 2048;
+const maxValidatedAuthDigests = 64;
 const maxPendingMessages = 8;
 // --- 診斷用擷取（settings.captureDir 有值時才啟用，預設關閉）---
 const captureDir = typeof settings.captureDir === "string" && settings.captureDir
@@ -2152,6 +2157,50 @@ const closeOnUpstreamError = settings.closeOnUpstreamError === true;
 // previous_response_id 接續，每輪只送新項目，不必重送完整歷史。
 // 設 settings.upstreamWebSocket = false 可退回全 HTTP 行為。
 const upstreamWebSocketEnabled = settings.upstreamWebSocket !== false;
+
+// 上游 WebSocket 不通時的全域冷卻。
+//
+// upstreamDisabled 只記在單一條 Codex 連線上，所以上游持續回 404 的期間，
+// 每開一條新連線都會再賠一次 TLS 連線加握手才回退——成本落在每個新對話的
+// 第一輪。這裡改記在模組層：連續失敗達門檻就整個路由器暫停嘗試一段時間，
+// 期間直接走 HTTP，時間到再放行一次探測。
+// 握手成功會立刻清除，所以上游恢復後最多只慢一個冷卻週期。
+const upstreamWebSocketFailureThreshold =
+  Number(settings.upstreamWebSocketFailureThreshold) > 0
+    ? Number(settings.upstreamWebSocketFailureThreshold)
+    : 2;
+const upstreamWebSocketCooldownMs =
+  Number(settings.upstreamWebSocketCooldownMs) > 0
+    ? Number(settings.upstreamWebSocketCooldownMs)
+    : 5 * 60 * 1000;
+let upstreamWebSocketFailureStreak = 0;
+let upstreamWebSocketCooldownUntil = 0;
+
+export function upstreamWebSocketInCooldown() {
+  if (upstreamWebSocketCooldownUntil === 0) return false;
+  if (Date.now() < upstreamWebSocketCooldownUntil) return true;
+  // 冷卻到期：放行一次探測。成功就清零，失敗會再進一次冷卻。
+  upstreamWebSocketCooldownUntil = 0;
+  upstreamWebSocketFailureStreak = 0;
+  return false;
+}
+
+export function noteUpstreamWebSocketConnectFailure() {
+  upstreamWebSocketFailureStreak += 1;
+  if (upstreamWebSocketFailureStreak < upstreamWebSocketFailureThreshold) return;
+  upstreamWebSocketCooldownUntil = Date.now() + upstreamWebSocketCooldownMs;
+  stats.upstreamWebSocketCooldowns += 1;
+  process.stderr.write(
+    "model-router-upstream-ws-cooldown:" +
+      `连续 ${upstreamWebSocketFailureStreak} 次握手失败，暂停 ` +
+      `${Math.round(upstreamWebSocketCooldownMs / 1000)} 秒内的上游 WebSocket 尝试\n`,
+  );
+}
+
+export function noteUpstreamWebSocketConnected() {
+  upstreamWebSocketFailureStreak = 0;
+  upstreamWebSocketCooldownUntil = 0;
+}
 
 // Codex 的 WebSocket response.create 訊息含有若干「協定層」欄位，它們在
 // WebSocket 上合法，但不是 HTTP Responses API 的參數。本路由對上游一律使用
@@ -2186,7 +2235,7 @@ function isBridgeReasoning(item) {
   }
 }
 
-function stripBridgeReasoning(input) {
+export function stripBridgeReasoning(input) {
   if (!Array.isArray(input)) return { input, removed: 0 };
   const kept = input.filter((item) => !isBridgeReasoning(item));
   return { input: kept, removed: input.length - kept.length };
@@ -2198,13 +2247,13 @@ function stripBridgeReasoning(input) {
 // 上游發的 id 一律是小寫十六進位，因此「後綴帶大寫」足以辨識出自鑄的 id。
 // 這裡只拿掉 id 欄位而不動整個項目：Responses API 的輸入項本來就可以沒有 id，
 // 工具配對靠的是 call_id，內容因此完整保留。
-function isBridgeMintedId(value) {
+export function isBridgeMintedId(value) {
   if (typeof value !== "string") return false;
   const match = /^(?:msg|fc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
   return match !== null && /[A-Z]/.test(match[1]);
 }
 
-function stripBridgeItemIds(input) {
+export function stripBridgeItemIds(input) {
   if (!Array.isArray(input)) return { input, removed: 0 };
   let removed = 0;
   const mapped = input.map((item) => {
@@ -2221,7 +2270,7 @@ function stripBridgeItemIds(input) {
 // 轉譯層自己合成的 compaction 項目，其 encrypted_content 只有本機解得開。
 // 官方後端與其他供應商都認不得，必須在離開 Anthropic 路由前還原成一般訊息，
 // 否則壓縮過的對話一切回官方模型就整輪被拒。
-function rewriteBridgeCompaction(input) {
+export function rewriteBridgeCompaction(input) {
   if (!Array.isArray(input)) return { input, removed: 0 };
   let removed = 0;
   const mapped = input.map((item) => {
@@ -2238,7 +2287,7 @@ function rewriteBridgeCompaction(input) {
   return { input: removed > 0 ? mapped : input, removed };
 }
 
-function historyKeyFor(body, headers, connectionNamespace = null) {
+export function historyKeyFor(body, headers, connectionNamespace = null) {
   const sessionId = body?.client_metadata?.session_id;
   let logicalKey = typeof sessionId === "string" && sessionId ? sessionId : null;
   for (const name of ["thread-id", "session-id"]) {
@@ -2356,6 +2405,7 @@ const stats = {
   upstreamWebSocketIncremental: 0,
   upstreamWebSocketReplays: 0,
   upstreamWebSocketFallbacks: 0,
+  upstreamWebSocketCooldowns: 0,
   translatedRequests: 0,
   lastAuthProbeStatus: null,
   models: 0,
@@ -2497,12 +2547,27 @@ function authDigest(headers) {
     .digest("hex");
 }
 
-function markAuthValidated(headers) {
+export function markAuthValidated(headers) {
   const digest = authDigest(headers);
-  if (digest) validatedAuthDigests.set(digest, Date.now() + authValidationTtlMs);
+  if (!digest) return;
+  // 過期項目只在「同一個摘要再被查一次」時才會被刪。憑證輪替後舊摘要再也不會
+  // 被查到，就會一直留著。這裡在成長到上限時掃一次，掃完仍超出就汰換最舊的。
+  if (validatedAuthDigests.size >= maxValidatedAuthDigests) {
+    const now = Date.now();
+    for (const [key, expiresAt] of validatedAuthDigests) {
+      if (expiresAt <= now) validatedAuthDigests.delete(key);
+    }
+    while (validatedAuthDigests.size >= maxValidatedAuthDigests) {
+      const oldest = validatedAuthDigests.keys().next().value;
+      if (oldest === undefined) break;
+      validatedAuthDigests.delete(oldest);
+    }
+  }
+  validatedAuthDigests.delete(digest);
+  validatedAuthDigests.set(digest, Date.now() + authValidationTtlMs);
 }
 
-function hasValidatedAuth(headers) {
+export function hasValidatedAuth(headers) {
   const digest = authDigest(headers);
   if (!digest) return false;
   const expiresAt = validatedAuthDigests.get(digest);
@@ -2791,7 +2856,7 @@ async function handleResponses(request, response, incomingUrl) {
 const websocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const maxWebSocketMessageBytes = 32 * 1024 * 1024;
 
-function encodeWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
+export function encodeWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   let header;
   if (body.length <= 125) {
@@ -2851,7 +2916,7 @@ function closeWebSocket(socket, code = 1000, reason = "") {
   socket.end();
 }
 
-function parseWebSocketFrames(buffer) {
+export function parseWebSocketFrames(buffer) {
   const frames = [];
   let offset = 0;
   while (offset + 2 <= buffer.length) {
@@ -2996,7 +3061,7 @@ function startWebSocketHeartbeat(socket) {
 // 一律改送本機重建的完整歷史，等價於原本的 HTTP 行為。
 //
 // 客戶端送出的訊框必須加遮罩（RFC 6455），與伺服器端的 encodeWebSocketFrame 不同。
-function encodeMaskedWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
+export function encodeMaskedWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   let header;
   if (body.length <= 125) {
@@ -3338,6 +3403,8 @@ async function tryUpstreamWebSocketTurn(
       connectionState.upstreamDisabled = true;
       connectionState.session = null;
       stats.upstreamWebSocketFallbacks += 1;
+      // 握手失敗代表這個端點現在不可用，是全域現象而非這條連線的問題。
+      noteUpstreamWebSocketConnectFailure();
       process.stderr.write(
         "model-router-upstream-ws-unavailable:" +
           (error instanceof Error ? error.message : String(error)) +
@@ -3346,6 +3413,7 @@ async function tryUpstreamWebSocketTurn(
       return false;
     }
     connectionState.session = session;
+    noteUpstreamWebSocketConnected();
     stats.upstreamWebSocketConnects += 1;
   }
 
@@ -3430,6 +3498,7 @@ async function handleWebSocketResponseInner(
     upstreamWebSocketEnabled &&
     connectionState &&
     !connectionState.upstreamDisabled &&
+    !upstreamWebSocketInCooldown() &&
     message?.type === "response.create" &&
     chooseRoute(request.headers, message) == null &&
     authDigest(request.headers)
@@ -3720,12 +3789,39 @@ const server = http.createServer(async (request, response) => {
 
 server.on("upgrade", handleWebSocketUpgrade);
 
-server.listen(listenPort, listenHost, () => {
-  process.stderr.write(`model-router-ready:${listenHost}:${listenPort}\n`);
-});
+// launchd 與 schtasks 都只是把 stderr 以附加模式導進同一個檔案，沒有任何輪替。
+// 上游長時間出錯時會持續寫入，因此啟動時把過大的日誌就地截斷——同一個 inode，
+// 附加模式的後續寫入會從 0 重新開始，不會弄丟服務手上的檔案描述子。
+// 只在啟動時檢查一次就夠：日誌長得最快的情境正好是服務反覆重啟。
+const maxLogBytes =
+  Number(settings.maxLogBytes) > 0 ? Number(settings.maxLogBytes) : 5 * 1024 * 1024;
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
+export function truncateOversizedLog(logPath = settings.logPath) {
+  if (typeof logPath !== "string" || !logPath) return false;
+  try {
+    if (statSync(logPath).size <= maxLogBytes) return false;
+    writeFileSync(logPath, "");
+    return true;
+  } catch {
+    // 日誌不存在或不可寫都不該擋住啟動。
+    return false;
+  }
+}
+
+// 測試會 import 本檔以驗證純函式，但不能讓它真的佔用連接埠。
+// 這個旗標只跳過監聽與訊號處理，其餘模組載入行為完全一致。
+if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
+  if (truncateOversizedLog()) {
+    process.stderr.write(`model-router-log-truncated:${settings.logPath}\n`);
+  }
+
+  server.listen(listenPort, listenHost, () => {
+    process.stderr.write(`model-router-ready:${listenHost}:${listenPort}\n`);
+  });
+
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => server.close(() => process.exit(0)));
+  }
 }
 __CODEX_MODEL_ROUTER_BRIDGE_JS__
 // Codex Responses API <-> Anthropic Messages API 雙向轉譯。
@@ -4061,8 +4157,11 @@ export function toAnthropicRequest(body, route) {
   // 不可超過該模型實際允許的輸出上限，否則上游直接 400。
   if (modelMaxOutput) maxTokens = Math.min(maxTokens, modelMaxOutput);
   // 夾過之後 budget 可能反超 max_tokens，需同步縮小以維持 budget < max_tokens。
+  // 這裡不能設下限：閘道回報的輸出上限若小到連 headroom 都放不下，硬撐一個
+  // 1024 的 budget 會等於甚至超過 max_tokens，Anthropic 直接回 400。
+  // 縮到 1024 以下就讓下面的門檻自己關掉 thinking，換取這一輪仍能正常回答。
   if (budget && budget + OUTPUT_HEADROOM > maxTokens) {
-    budget = Math.max(1024, maxTokens - OUTPUT_HEADROOM);
+    budget = maxTokens - OUTPUT_HEADROOM;
   }
 
   const request = {

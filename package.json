@@ -1,0 +1,13 @@
+{
+  "name": "codex-model-router",
+  "version": "0.0.0",
+  "private": true,
+  "description": "開發用設定檔。發佈的成品是 codex-model-router.sh / .ps1 兩支單檔安裝器，不經 npm 安裝。",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "sync": "node tools/sync-payloads.mjs",
+    "check": "node tools/sync-payloads.mjs --check && npm test"
+  },
+  "license": "MIT"
+}

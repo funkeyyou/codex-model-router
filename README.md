@@ -97,6 +97,10 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   「上次完整輸入 + 該輪輸出 + 本次新項目」在本機重建等價的完整請求；每條
   WebSocket 都有獨立的歷史 namespace，背景任務即使重複使用同一個 `session_id`
   也不會覆蓋目前對話。
+- **上游不通時自動收斂重試**——官方的上游 WebSocket 連續握手失敗後，整個路由器
+  暫停嘗試一段時間並直接走 HTTP，避免每個新對話的第一輪都先賠一次握手；
+  上游恢復後立刻解除。門檻與冷卻時間可用 `settings.json` 的
+  `upstreamWebSocketFailureThreshold` 與 `upstreamWebSocketCooldownMs` 調整。
 - **連線保活**——長請求期間送出 WebSocket ping，避免客戶端閒置逾時。
 - **錯誤可見**——上游錯誤會轉為標準的 `response.failed` 事件，不會讓客戶端無聲卡住。
 
@@ -116,6 +120,10 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 
 `failures` 應恆為 0。`statefulFallbacks` 或 `responseFailedSent` 持續增加代表上游有狀況；
 `statefulRebuilds` 與 `queuedResponses` 增加屬正常。
+
+`upstreamWebSocketFallbacks` 增加代表官方的上游 WebSocket 當下不通，已自動回退 HTTP，
+功能不受影響。連續握手失敗達門檻後 `upstreamWebSocketCooldowns` 會加一，路由器接著
+一段時間內直接走 HTTP，不再每條新連線都重試；上游一旦恢復就立刻解除。
 
 實際埠號以 `status` 印出的為準：48953 被佔用時安裝器會自動往後找。
 
@@ -137,7 +145,9 @@ powershell -ExecutionPolicy Bypass -File .\claude-probe-diag.ps1 <API_ROOT> <模
 `status` 會印出實際使用的 Node 與 Codex 執行檔路徑。Windows 上如果 Codex 桌面版升級後
 換掉了自帶執行檔的版本目錄，這兩行會標示「檔案已不存在」——重跑一次安裝器即可修正。
 
-路由器的 stderr 記錄在 `<CODEX_HOME>/model-router/router.err.log`。
+路由器的 stderr 記錄在 `<CODEX_HOME>/model-router/router.err.log`。服務啟動時若發現
+該檔超過 5 MB 會就地清空（可用 `settings.json` 的 `maxLogBytes` 調整），因此長期
+出錯也不會把磁碟寫滿。
 
 ## 需求
 
@@ -159,6 +169,25 @@ node tools/sync-payloads.mjs --check   # 只比對，有落差就以非零狀態
 
 發布新版本時也要更新 `releases.json` 的 `latest` 與對應更新說明；同步工具會驗證
 `latest` 是否和安裝器內的 `INSTALLER_VERSION` 一致。
+
+### 測試
+
+測試直接把 `.sh` 裡的三段負載取出來 import，所以測到的一定是會發佈出去的那份
+（repo 裡沒有獨立的 `router.mjs`，那些檔案只在安裝後存在於 `CODEX_HOME`）。
+
+```bash
+npm test     # node --test，無需安裝任何相依套件
+npm run check   # 等同 CI：先驗負載同步，再跑測試
+```
+
+安裝器與路由器的頂層本來就有副作用（跑安裝流程、佔用連接埠），測試靠
+`CODEX_MODEL_ROUTER_IMPORT_ONLY=1` 擋掉，其餘模組載入行為完全一致。
+
+### CI
+
+`.github/workflows/ci.yml` 在 push 與 PR 上跑：負載同步檢查、測試（Node 22 與 24）、
+`.sh` 與 `.ps1` 的語法檢查，以及 `.ps1` 的 UTF-8 BOM 檢查。下面那兩件事之所以要
+自動擋，是因為它們壞掉都不會立刻報錯。
 
 **請不要手改 `.ps1`，也不要自己寫同步腳本。** 那個工具除了搬運文字，還負責兩件
 容易被忽略、壞掉又不會立刻報錯的事：
