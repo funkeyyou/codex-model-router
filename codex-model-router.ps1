@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.15.3";
+const INSTALLER_VERSION = "1.15.4";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -3083,6 +3083,7 @@ const stats = {
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
   translatedRequests: 0,
+  imagesOmitted: 0,
   lastAuthProbeStatus: null,
   models: 0,
   official: 0,
@@ -3435,10 +3436,9 @@ async function fetchModelUpstream(
     stats.custom += 1;
     if (route.translate === "anthropic") {
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
-      const { request: anthropicRequest, freeform, compaction } = toAnthropicRequest(
-        effectiveBody,
-        route,
-      );
+      const { request: anthropicRequest, freeform, compaction, imagesOmitted } =
+        toAnthropicRequest(effectiveBody, route);
+      if (imagesOmitted > 0) stats.imagesOmitted += imagesOmitted;
       meta.translate = "anthropic";
       meta.freeform = freeform;
       meta.compaction = compaction;
@@ -4784,6 +4784,100 @@ function toImageBlock(url) {
   return null;
 }
 
+// 單次請求的圖片數量一旦超過 20 張，Anthropic 會把每張圖的尺寸上限從 8000
+// 收緊到 2000 像素。實測（同一張合成 PNG，只改高度與張數）：
+//   20 張 / 2048px -> 通過
+//   21 張 / 2048px -> exceed max allowed size for many-image requests: 2000 pixels
+//   21 張 / 1800px -> 通過
+// iPhone 截圖是 942 x 2048，只超出 48 個像素就整輪被打回來。
+//
+// 路由器是純 Node 行程，沒有影像解碼器可以縮圖（macOS 有 sips，Windows 沒有
+// 對應的東西，兩邊行為會不一致），因此改為控制張數：只保留最新的 20 張，更舊
+// 的換成佔位文字。張數壓到上限以內之後尺寸限制自動回到 8000 像素，最近那幾張
+// 截圖就能以原始解析度送出去。
+const MAX_IMAGES_PER_REQUEST = 20;
+// 就算只有一張，超過 8000 像素一樣會被拒；整頁長截圖很容易超過。
+const MAX_IMAGE_DIMENSION = 8000;
+const IMAGE_OMITTED_COUNT = "(圖片已省略：超出單次請求的圖片數量上限)";
+const IMAGE_OMITTED_SIZE = "(圖片已省略：尺寸超過單張上限)";
+
+// 只讀檔頭就夠了，不需要解碼整張圖。認不出來的格式回 null，一律當作合規，
+// 寧可讓上游去判斷，也不要在這裡誤刪使用者的圖。
+function imageDimensions(base64) {
+  if (typeof base64 !== "string" || !base64) return null;
+  let head;
+  try {
+    head = Buffer.from(base64.slice(0, 4096), "base64");
+  } catch {
+    return null;
+  }
+  if (head.length >= 24 && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e) {
+    return [head.readUInt32BE(16), head.readUInt32BE(20)];
+  }
+  if (head.length >= 10 && head[0] === 0xff && head[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < head.length) {
+      if (head[i] !== 0xff) {
+        i += 1;
+        continue;
+      }
+      const marker = head[i + 1];
+      // SOF0..SOF15，扣掉 DHT(c4) / JPG(c8) / DAC(cc) 這幾個不是框架標頭的。
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return [head.readUInt16BE(i + 7), head.readUInt16BE(i + 5)];
+      }
+      const length = head.readUInt16BE(i + 2);
+      if (length < 2) return null;
+      i += 2 + length;
+    }
+    return null;
+  }
+  if (head.length >= 10 && head.subarray(0, 3).toString("latin1") === "GIF") {
+    return [head.readUInt16LE(6), head.readUInt16LE(8)];
+  }
+  return null;
+}
+
+// 圖片可能直接掛在訊息底下，也可能包在 tool_result 的 content 陣列裡，兩種都要
+// 找得到。回傳的順序就是對話順序，因此「最舊的」永遠排在前面。
+function collectImageSlots(messages) {
+  const slots = [];
+  const walk = (blocks) => {
+    if (!Array.isArray(blocks)) return;
+    blocks.forEach((block, index) => {
+      if (block?.type === "image") slots.push({ blocks, index });
+      else if (Array.isArray(block?.content)) walk(block.content);
+    });
+  };
+  for (const message of messages) walk(message.content);
+  return slots;
+}
+
+function applyImageBudget(messages) {
+  const slots = collectImageSlots(messages);
+  if (slots.length === 0) return 0;
+  let omitted = 0;
+  const omit = (slot, text) => {
+    slot.blocks[slot.index] = { type: "text", text };
+    omitted += 1;
+  };
+  // 先處理單張就超標的，這種無論總數多少都會被拒。
+  const kept = [];
+  for (const slot of slots) {
+    const image = slot.blocks[slot.index];
+    const size = image?.source?.type === "base64" ? imageDimensions(image.source.data) : null;
+    if (size && (size[0] > MAX_IMAGE_DIMENSION || size[1] > MAX_IMAGE_DIMENSION)) {
+      omit(slot, IMAGE_OMITTED_SIZE);
+    } else {
+      kept.push(slot);
+    }
+  }
+  // 再把張數壓到上限以內，丟最舊的。
+  const excess = kept.length - MAX_IMAGES_PER_REQUEST;
+  for (let i = 0; i < excess; i += 1) omit(kept[i], IMAGE_OMITTED_COUNT);
+  return omitted;
+}
+
 function toAnthropicBlocks(content) {
   if (typeof content === "string") {
     return content ? [{ type: "text", text: content }] : [];
@@ -5056,6 +5150,8 @@ export function toAnthropicRequest(body, route) {
     messages.unshift({ role: "user", content: [{ type: "text", text: "." }] });
   }
 
+  const imagesOmitted = applyImageBudget(messages);
+
   const { tools, freeform } = toAnthropicTools(codexTools);
 
   const effort = body?.reasoning?.effort;
@@ -5123,7 +5219,7 @@ export function toAnthropicRequest(body, route) {
     request.thinking = { type: "enabled", budget_tokens: budget };
   }
 
-  return { request, freeform, compaction };
+  return { request, freeform, compaction, imagesOmitted };
 }
 
 // ---------------------------------------------------------------- 回應方向

@@ -158,6 +158,10 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 
 `oversizeRejects` 增加代表有請求因為太大而被路由器擋下來，沒有送往上游。
 
+`imagesOmitted` 增加代表有圖片在送出前被換成佔位文字。單次請求超過 20 張圖時，上游會把
+每張圖的尺寸上限從 8000 收緊到 2000 像素（iPhone 截圖 942 x 2048 就會超過），因此路由器
+只保留最新的 20 張；單張任一邊超過 8000 像素的也會被換掉。
+
 `truncatedUpstreamStreams` 增加代表上游在送出終止事件前就把串流結束掉了（閘道中斷回應
 最常見）。這種情況讀取端只看到乾淨的 EOF、不是例外，所以路由器會補一個 `response.failed`
 讓客戶端明確收尾，而不是無聲斷線。
