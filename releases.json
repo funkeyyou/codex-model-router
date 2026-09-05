@@ -1,6 +1,18 @@
 {
-  "latest": "1.15.4",
+  "latest": "1.16.0",
   "releases": [
+    {
+      "version": "1.16.0",
+      "date": "2026-09-06",
+      "changes": [
+        "修復網路查詢完全不能用：Codex 的網路查詢是 POST {base_url}/alpha/search，而路由器的 HTTP 分派只認 /healthz、/models、/responses 與生圖端點，其餘一律回 404。openai_base_url 是全域設定，所以官方模型一樣查不了，跟選哪個模型無關。",
+        "同一組 alpha 端點還有筆記與歷史（/alpha/notes/v2/*、/alpha/history/v2/*），過去也都被這個 404 打掉，而且失敗得很安靜。",
+        "不認得的路徑改為原樣轉送官方後端——Codex 只設定一個 base URL，凡是送到這裡而路由器沒有特別處理的東西本來就都是要給官方後端的。順帶免疫未來新增的端點。",
+        "修復帶推理的歷史被整輪拒絕：messages.N: The final block in an assistant message cannot be `thinking`。一輪被中斷、或那一輪只產出推理就換使用者說話時，歷史裡會留下最後一個區塊是 thinking 的 assistant 訊息。",
+        "送出前剝掉結尾的 thinking 區塊（沒有後續輸出的推理留著也沒有意義），剝完變空的訊息一併移除，並把相鄰的同角色訊息合併以維持 user／assistant 交替。",
+        "健康檢查新增 officialPassthroughs 與 trailingThinkingTrimmed。"
+      ]
+    },
     {
       "version": "1.15.4",
       "date": "2026-09-05",

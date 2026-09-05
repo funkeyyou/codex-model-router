@@ -256,9 +256,11 @@ test("非物件 schema 包裝成 object（Anthropic 只收物件）", () => {
 // --- reasoning 與 compaction 的往返 -----------------------------------------
 
 test("reasoning 的 encrypted_content 還原成 thinking 區塊", () => {
+  // 結尾不能是 thinking，所以補一則 assistant 輸出讓形狀合法。
   const request = build([
     userMessage("x"),
     { type: "reasoning", encrypted_content: encodeReasoning("想一下", "sig-1") },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "答案" }] },
   ]);
   assert.deepEqual(request.messages.at(-1).content[0],
     { type: "thinking", thinking: "想一下", signature: "sig-1" });

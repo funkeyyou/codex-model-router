@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.15.4";
+const INSTALLER_VERSION = "1.16.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -3084,6 +3084,8 @@ const stats = {
   viewImageCallsStripped: 0,
   translatedRequests: 0,
   imagesOmitted: 0,
+  officialPassthroughs: 0,
+  trailingThinkingTrimmed: 0,
   lastAuthProbeStatus: null,
   models: 0,
   official: 0,
@@ -3330,7 +3332,37 @@ function rewriteCustomBody(body, route) {
   return rewritten;
 }
 
-function targetUrl(custom, incomingUrl) {
+// Codex 只設定一個 base URL，凡是送到這裡而路由器沒有特別處理的路徑，本來就都是
+// 要給官方後端的：網路查詢走 POST /v1/alpha/search，筆記與歷史走
+// /v1/alpha/notes/v2/* 與 /v1/alpha/history/v2/*。原本一律回 404，等於把這幾組
+// 功能整組打掉，而且失敗得很安靜——只有呼叫端看得到那個 404。
+//
+// 這裡不自己驗證身分，原樣轉送即可：官方後端本來就會自己判斷。
+async function proxyToOfficial(request, response, incomingUrl) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  const raw = Buffer.concat(chunks);
+  let body = raw;
+  if (request.headers["content-encoding"] === "zstd") {
+    try {
+      body = zstdDecompressSync(raw);
+    } catch {
+      body = raw;
+    }
+  }
+  const init = {
+    method: request.method,
+    headers: buildOfficialHeaders(request.headers),
+    redirect: "manual",
+  };
+  if (body.length > 0) init.body = body;
+  const upstream = await fetch(targetUrl(false, incomingUrl), init);
+  stats.officialPassthroughs += 1;
+  stats.lastOfficialStatus = upstream.status;
+  await streamUpstream(upstream, response);
+}
+
+export function targetUrl(custom, incomingUrl) {
   const path = incomingUrl.pathname.startsWith("/v1/")
     ? incomingUrl.pathname.slice(3)
     : incomingUrl.pathname;
@@ -3436,9 +3468,10 @@ async function fetchModelUpstream(
     stats.custom += 1;
     if (route.translate === "anthropic") {
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
-      const { request: anthropicRequest, freeform, compaction, imagesOmitted } =
-        toAnthropicRequest(effectiveBody, route);
+      const { request: anthropicRequest, freeform, compaction, imagesOmitted,
+        thinkingTrimmed } = toAnthropicRequest(effectiveBody, route);
       if (imagesOmitted > 0) stats.imagesOmitted += imagesOmitted;
+      if (thinkingTrimmed > 0) stats.trailingThinkingTrimmed += thinkingTrimmed;
       meta.translate = "anthropic";
       meta.freeform = freeform;
       meta.compaction = compaction;
@@ -4666,7 +4699,7 @@ const server = http.createServer(async (request, response) => {
       await handleImages(request, response, incomingUrl);
       return;
     }
-    writeJson(response, 404, { error: { message: "未找到", type: "not_found" } });
+    await proxyToOfficial(request, response, incomingUrl);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const aborted =
@@ -4851,6 +4884,37 @@ function collectImageSlots(messages) {
   };
   for (const message of messages) walk(message.content);
   return slots;
+}
+
+// Anthropic 不接受最後一個區塊是 thinking 的 assistant 訊息：
+//   messages.N: The final block in an assistant message cannot be `thinking`.
+// 一輪被中斷、或那一輪只產出推理就換使用者說話時，歷史裡就會留下這種訊息。
+// 沒有後續內容的推理留著也沒有意義（簽章要配合同一輪的輸出才有用），直接剝掉。
+// 剝完可能整則變空，空訊息同樣會被拒，因此順手移除並把相鄰的同角色訊息合併——
+// Anthropic 要求 user 與 assistant 交替出現。
+const THINKING_BLOCK_TYPES = new Set(["thinking", "redacted_thinking"]);
+
+export function normalizeAssistantMessages(messages) {
+  let trimmed = 0;
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    while (
+      message.content.length > 0 &&
+      THINKING_BLOCK_TYPES.has(message.content[message.content.length - 1]?.type)
+    ) {
+      message.content.pop();
+      trimmed += 1;
+    }
+  }
+  const merged = [];
+  for (const message of messages) {
+    if (!Array.isArray(message.content) || message.content.length === 0) continue;
+    const last = merged[merged.length - 1];
+    if (last && last.role === message.role) last.content.push(...message.content);
+    else merged.push(message);
+  }
+  messages.splice(0, messages.length, ...merged);
+  return trimmed;
 }
 
 function applyImageBudget(messages) {
@@ -5145,6 +5209,8 @@ export function toAnthropicRequest(body, route) {
   // 壓縮同一份提示詞，產出的摘要格式才會跟官方一致。
   if (compaction) push("user", { type: "text", text: COMPACTION_PROMPT });
 
+  const thinkingTrimmed = normalizeAssistantMessages(messages);
+
   // Anthropic 要求首個訊息必須是 user。
   if (!messages.length || messages[0].role !== "user") {
     messages.unshift({ role: "user", content: [{ type: "text", text: "." }] });
@@ -5219,7 +5285,7 @@ export function toAnthropicRequest(body, route) {
     request.thinking = { type: "enabled", budget_tokens: budget };
   }
 
-  return { request, freeform, compaction, imagesOmitted };
+  return { request, freeform, compaction, imagesOmitted, thinkingTrimmed };
 }
 
 // ---------------------------------------------------------------- 回應方向
