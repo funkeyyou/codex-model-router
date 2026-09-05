@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.15.2";
+const INSTALLER_VERSION = "1.15.3";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -2481,6 +2481,30 @@ function captureAppend(id, suffix, data) {
 
 const closeOnUpstreamError = settings.closeOnUpstreamError === true;
 
+// 上游對單次請求有尺寸上限（Anthropic 的 Messages API 是 32 MB）。超過時閘道只會
+// 回一個通用的 5xx，客戶端看不出原因，而且會一直重試——每次重試都把整份歷史再上傳
+// 一遍。實測一條長對話：完整歷史 37.6 MB，其中 91% 是累積的工具輸出，重試 31 次等於
+// 白傳 1.1 GB，而且不可能成功。這裡在送出前就擋下來，並且說清楚是什麼原因。
+//
+// 只擋自訂路由：官方後端的上限不同，不該拿 Anthropic 的數字去限制它。
+const maxUpstreamRequestBytes =
+  Number(settings.maxUpstreamRequestBytes) > 0
+    ? Number(settings.maxUpstreamRequestBytes)
+    : 32 * 1024 * 1024;
+
+export function upstreamRequestTooLarge(bytes, limit = maxUpstreamRequestBytes) {
+  return Number.isFinite(bytes) && bytes > limit;
+}
+
+export function oversizeMessage(bytes, limit) {
+  const mb = (value) => (value / (1024 * 1024)).toFixed(1);
+  return (
+    `這一輪要送往上游的請求有 ${mb(bytes)} MB，超過 ${mb(limit)} MB 的上限。` +
+    "這條對話累積的歷史已經大到送不出去（通常是工具輸出佔掉絕大部分），" +
+    "重試不會有幫助，請改開一條新對話。"
+  );
+}
+
 // --- 模型目錄的自動更新 -----------------------------------------------------
 //
 // config.toml 的 model_catalog_json 指著 models.json，而那份是安裝當下用
@@ -2963,6 +2987,7 @@ const stats = {
   statefulFallbacks: 0,
   responseFailedSent: 0,
   truncatedUpstreamStreams: 0,
+  oversizeRejects: 0,
   websocketOnlyFieldsStripped: 0,
   queuedResponses: 0,
   responseInProgressRejects: 0,
@@ -3349,14 +3374,21 @@ async function fetchModelUpstream(
       meta.requestBody = effectiveBody;
       meta.anthropicRequest = anthropicRequest;
       stats.translatedRequests += 1;
+      const anthropicBody = Buffer.from(JSON.stringify(anthropicRequest));
+      if (upstreamRequestTooLarge(anthropicBody.length)) {
+        return oversizeResponse(anthropicBody.length);
+      }
       const translated = await fetchCustom(
         new URL(`${apiRoot}/messages`),
         requestHeaders,
-        Buffer.from(JSON.stringify(anthropicRequest)),
+        anthropicBody,
         signal,
       );
       stats.lastCustomStatus = translated.status;
       return translated;
+    }
+    if (upstreamRequestTooLarge(outboundBody.length)) {
+      return oversizeResponse(outboundBody.length);
     }
     const upstream = await fetchCustom(
       targetUrl(true, incomingUrl),
@@ -3529,6 +3561,23 @@ function sendWebSocketFrame(socket, opcode, payload) {
 }
 
 // Codex 不處理 type:"error"（日誌: unhandled responses event），只送它會無聲卡死。
+// 413 會被既有的錯誤路徑接住：HTTP 那條原樣轉發，WebSocket 那條轉成
+// type:"error" 加 response.failed。因此這裡不必自己處理兩種傳輸。
+function oversizeResponse(bytes) {
+  stats.oversizeRejects += 1;
+  process.stderr.write(`model-router-request-too-large:${bytes}\n`);
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: oversizeMessage(bytes, maxUpstreamRequestBytes),
+        type: "router_error",
+        code: "request_too_large",
+      },
+    }),
+    { status: 413, headers: { "content-type": "application/json" } },
+  );
+}
+
 // response.failed 是 Responses API 標準的失敗終止事件，Codex 有對應處理。
 // 所有錯誤路徑都必須經過這裡，否則就會留下卡死的缺口。
 function responseFailedEvent(code, message) {

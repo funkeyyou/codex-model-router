@@ -1,6 +1,15 @@
 {
-  "latest": "1.15.2",
+  "latest": "1.15.3",
   "releases": [
+    {
+      "version": "1.15.3",
+      "date": "2026-09-05",
+      "changes": [
+        "對話大到送不出去時，改在送出前就擋下來並說清楚原因。原本只會把閘道那句通用的「Upstream request failed」轉出去，使用者看不出是尺寸問題，Codex 也會每 8 秒重試一次、每次重傳整份歷史。",
+        "上限預設 32 MB（Anthropic Messages API 的值），可用 settings.json 的 maxUpstreamRequestBytes 調整；只作用於自訂路由，官方後端的上限不同。",
+        "健康檢查新增 oversizeRejects。"
+      ]
+    },
     {
       "version": "1.15.2",
       "date": "2026-09-05",

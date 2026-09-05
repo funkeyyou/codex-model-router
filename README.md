@@ -135,7 +135,9 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
 - **錯誤可見**——上游錯誤會轉為標準的 `response.failed` 事件，不會讓客戶端無聲卡住。
   這包含最難察覺的一種：閘道在回應中途把串流丟掉。此時讀取端收到的是乾淨的 EOF 而不是
   例外，狀態碼當初又是 200，兩種既有的錯誤處理都接不到——三條串流路徑因此都會在讀完後
-  確認終止事件真的送出去了，沒有就補上。
+  確認終止事件真的送出去了，沒有就補上。同樣地，請求大到上游一定會拒收時，
+  在送出前就擋下來並講明原因——否則客戶端只會收到閘道那句通用的錯誤，然後不停重試，
+  每次都把整份歷史再上傳一遍。
 
 ## 健康檢查
 
@@ -153,6 +155,8 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 
 `failures` 應恆為 0。`statefulFallbacks` 或 `responseFailedSent` 持續增加代表上游有狀況；
 `statefulRebuilds` 與 `queuedResponses` 增加屬正常。
+
+`oversizeRejects` 增加代表有請求因為太大而被路由器擋下來，沒有送往上游。
 
 `truncatedUpstreamStreams` 增加代表上游在送出終止事件前就把串流結束掉了（閘道中斷回應
 最常見）。這種情況讀取端只看到乾淨的 EOF、不是例外，所以路由器會補一個 `response.failed`
@@ -192,6 +196,18 @@ ANSI 代碼頁讀檔（跟主控台的 `chcp 65001` 無關），中文會整片�
 ```powershell
 Get-Content "$env:USERPROFILE\.codex\model-router\router.err.log" -Tail 50 -Encoding UTF8
 ```
+
+### 某條對話一直失敗，但新開的對話正常
+
+長對話的歷史會大到送不出去。Codex 走 WebSocket 時用 `previous_response_id` 接續，
+每輪只送新項目；一旦退回 HTTPS，它就得把整份歷史重送——同一條對話，實測差了 208 倍
+（181 KB 對 37.6 MB）。
+
+超過上限時路由器會直接回一段說明，帶著實際大小。這種情況重試沒有用，歷史只會愈來愈大，
+請改開一條新對話。`/compact` 也救不了：壓縮請求本身一樣要送整份歷史。
+
+絕大部分的體積來自累積的工具輸出——實測那條對話 622 個項目裡，166 筆工具輸出就佔了
+34.3 MB，是總量的 91%。
 
 ### 選擇器裡看不到某個官方模型
 
