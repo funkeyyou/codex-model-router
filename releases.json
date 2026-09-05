@@ -1,6 +1,15 @@
 {
-  "latest": "1.15.0",
+  "latest": "1.15.1",
   "releases": [
+    {
+      "version": "1.15.1",
+      "date": "2026-09-05",
+      "changes": [
+        "修復上游串流被截斷時客戶端無聲卡死：閘道在回應中途把串流丟掉時，讀取端看到的是乾淨的 EOF 而不是例外，原本的錯誤處理（拋例外、非 2xx）兩種都接不到，於是連線就這樣關掉，Codex 只顯示「stream disconnected before completion」。",
+        "三條串流路徑讀完後都會確認終止事件真的送出去了，沒有就補一個 response.failed 說明串流被截斷。",
+        "健康檢查新增 truncatedUpstreamStreams。"
+      ]
+    },
     {
       "version": "1.15.0",
       "date": "2026-09-05",

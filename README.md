@@ -123,6 +123,9 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   `upstreamWebSocketFailureThreshold` 與 `upstreamWebSocketCooldownMs` 調整。
 - **連線保活**——長請求期間送出 WebSocket ping，避免客戶端閒置逾時。
 - **錯誤可見**——上游錯誤會轉為標準的 `response.failed` 事件，不會讓客戶端無聲卡住。
+  這包含最難察覺的一種：閘道在回應中途把串流丟掉。此時讀取端收到的是乾淨的 EOF 而不是
+  例外，狀態碼當初又是 200，兩種既有的錯誤處理都接不到——三條串流路徑因此都會在讀完後
+  確認終止事件真的送出去了，沒有就補上。
 
 ## 健康檢查
 
@@ -140,6 +143,10 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 
 `failures` 應恆為 0。`statefulFallbacks` 或 `responseFailedSent` 持續增加代表上游有狀況；
 `statefulRebuilds` 與 `queuedResponses` 增加屬正常。
+
+`truncatedUpstreamStreams` 增加代表上游在送出終止事件前就把串流結束掉了（閘道中斷回應
+最常見）。這種情況讀取端只看到乾淨的 EOF、不是例外，所以路由器會補一個 `response.failed`
+讓客戶端明確收尾，而不是無聲斷線。
 
 `upstreamWebSocketFallbacks` 增加代表官方的上游 WebSocket 當下不通，已自動回退 HTTP，
 功能不受影響。連續握手失敗達門檻後 `upstreamWebSocketCooldowns` 會加一，路由器接著

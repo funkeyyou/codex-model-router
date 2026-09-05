@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.15.0";
+const INSTALLER_VERSION = "1.15.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -2859,6 +2859,7 @@ const stats = {
   upstreamErrorCloses: 0,
   statefulFallbacks: 0,
   responseFailedSent: 0,
+  truncatedUpstreamStreams: 0,
   websocketOnlyFieldsStripped: 0,
   queuedResponses: 0,
   responseInProgressRejects: 0,
@@ -3402,8 +3403,8 @@ function sendWebSocketFrame(socket, opcode, payload) {
 // Codex 不處理 type:"error"（日誌: unhandled responses event），只送它會無聲卡死。
 // response.failed 是 Responses API 標準的失敗終止事件，Codex 有對應處理。
 // 所有錯誤路徑都必須經過這裡，否則就會留下卡死的缺口。
-function sendResponseFailed(socket, code, message) {
-  sendWebSocketJson(socket, {
+function responseFailedEvent(code, message) {
+  return {
     type: "response.failed",
     sequence_number: 0,
     response: {
@@ -3416,8 +3417,35 @@ function sendResponseFailed(socket, code, message) {
       output: [],
       usage: null,
     },
-  });
+  };
+}
+
+function sendResponseFailed(socket, code, message) {
+  sendWebSocketJson(socket, responseFailedEvent(code, message));
   stats.responseFailedSent += 1;
+}
+
+// 上游串流可以在沒送出任何終止事件的情況下「乾淨」結束——代理把串流丟掉時，
+// 讀取端看到的是 EOF 而不是例外，所以 catch 接不到；非 2xx 的檢查也早就過了，
+// 因為標頭當初是 200。此時若就這樣收工關閉連線，Codex 只會看到
+// 「websocket closed by server before response.completed」，等同無聲卡死。
+// 凡是逐塊讀上游串流的地方，讀完都要確認終止事件真的送出去了。
+const terminalEventTypes = new Set([
+  "response.completed",
+  "response.failed",
+  "response.incomplete",
+  "error",
+]);
+
+export function isTerminalEvent(event) {
+  return terminalEventTypes.has(event?.type);
+}
+
+const truncatedStreamMessage = "上游串流在送出終止事件前就結束";
+
+function noteTruncatedStream() {
+  stats.truncatedUpstreamStreams += 1;
+  process.stderr.write("model-router-upstream-stream-truncated\n");
 }
 
 function sendWebSocketJson(socket, payload) {
@@ -3564,7 +3592,7 @@ function emitViewImageCall(socket, injection) {
   stats.viewImageCallsInjected += 1;
 }
 
-async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyKey = null) {
+export async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyKey = null) {
   stats.lastWebSocketStatus = upstream.status;
   if (upstream.status < 200 || upstream.status >= 300) {
     const rawText = await upstream.text();
@@ -3604,13 +3632,13 @@ async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyK
   }
   if (!upstream.body) throw new Error("WebSocket 上游響應沒有內文");
 
-  const onEvent = historyKey
-    ? (event) => {
-        if (event?.type === "response.output_item.done" && event.item) {
-          appendHistoryOutput(historyKey, event.item);
-        }
-      }
-    : null;
+  let sawTerminal = false;
+  const onEvent = (event) => {
+    if (isTerminalEvent(event)) sawTerminal = true;
+    if (historyKey && event?.type === "response.output_item.done" && event.item) {
+      appendHistoryOutput(historyKey, event.item);
+    }
+  };
   const imageState = { pending: [], maxIndex: -1 };
   const decoder = new TextDecoder();
   let pending = "";
@@ -3630,6 +3658,10 @@ async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyK
   if (pending.trim()) {
     assignInjectionIndices(imageState);
     sendSseBlockToWebSocket(socket, pending, onEvent, imageState);
+  }
+  if (!sawTerminal) {
+    noteTruncatedStream();
+    sendResponseFailed(socket, "upstream_stream_truncated", truncatedStreamMessage);
   }
 }
 
@@ -3910,7 +3942,7 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
 // HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回
 // HTTPS；此時若把 Anthropic 的原生事件原樣送回，客戶端解不開，該對話就會
 // 永遠停在「正在重新連線」，而且再也回不來——因為每次重試都是同一個結果。
-async function bridgeAnthropicToHttp(upstream, response, meta) {
+export async function bridgeAnthropicToHttp(upstream, response, meta) {
   stats.lastCustomStatus = upstream.status;
   if (!upstream.body) throw new Error("上游響應沒有內文");
   response.writeHead(200, {
@@ -3918,9 +3950,11 @@ async function bridgeAnthropicToHttp(upstream, response, meta) {
     "cache-control": "no-cache",
     connection: "keep-alive",
   });
+  let sawTerminal = false;
   await bridgeAnthropicStream(
     upstream.body,
     (event) => {
+      if (isTerminalEvent(event)) sawTerminal = true;
       if (event?.type === "response.output_item.done" && event.item) {
         appendHistoryOutput(meta.historyKey, event.item);
       }
@@ -3928,10 +3962,15 @@ async function bridgeAnthropicToHttp(upstream, response, meta) {
     },
     meta,
   );
+  if (!sawTerminal) {
+    noteTruncatedStream();
+    const event = responseFailedEvent("upstream_stream_truncated", truncatedStreamMessage);
+    response.write("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n");
+  }
   response.end();
 }
 
-async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = null) {
+export async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = null) {
   stats.lastWebSocketStatus = upstream.status;
   if (!upstream.body) throw new Error("WebSocket 上游響應沒有內文");
   const tee = captureId
@@ -3942,10 +3981,12 @@ async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = nu
         }
       }
     : null;
+  let sawTerminal = false;
   await bridgeAnthropicStream(
     tee ? tee(upstream.body) : upstream.body,
     (event) => {
       captureAppend(captureId, "response.sse", `data: ${JSON.stringify(event)}\n\n`);
+      if (isTerminalEvent(event)) sawTerminal = true;
       // 轉譯路由同樣要把輸出記進本機歷史，否則之後切到其他模型時，
       // 重建的歷史會少掉 Claude 這一輪的回答與工具呼叫。
       if (event?.type === "response.output_item.done" && event.item) {
@@ -3956,6 +3997,10 @@ async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = nu
     },
     meta,
   );
+  if (!sawTerminal) {
+    noteTruncatedStream();
+    sendResponseFailed(socket, "upstream_stream_truncated", truncatedStreamMessage);
+  }
 }
 
 async function handleWebSocketResponse(
