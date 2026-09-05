@@ -79,3 +79,47 @@ test("bundled 回空的官方清單時拒絕合併（寧可維持舊目錄）", 
   // 只有自訂項目也算沒有官方模型
   assert.throws(() => mergeCatalog({ models: [{ slug: "custom/x" }] }, current), /沒有官方模型/);
 });
+
+// --- 強制列出 ---------------------------------------------------------------
+// bundled 把尚未普及的模型標成 hide，但能不能用是後端依帳號決定的；
+// model_catalog_json 會蓋掉那個決定，帳號有權限也看不到。
+
+test("指定的模型會被強制改成 list", () => {
+  const merged = mergeCatalog(
+    { models: [{ slug: "gpt-6-astra", visibility: "hide", priority: 1 }] },
+    { models: [] },
+    ["gpt-6-astra"],
+  );
+  assert.equal(merged.models[0].visibility, "list");
+});
+
+test("沒指定的模型維持原本的 visibility", () => {
+  const merged = mergeCatalog(
+    {
+      models: [
+        { slug: "gpt-6-astra", visibility: "hide" },
+        { slug: "gpt-daybreak-blue-latest", visibility: "hide" },
+        { slug: "gpt-5.6-sol", visibility: "list" },
+      ],
+    },
+    { models: [] },
+    ["gpt-6-astra"],
+  );
+  assert.deepEqual(
+    merged.models.map((m) => [m.slug, m.visibility]),
+    [["gpt-6-astra", "list"], ["gpt-daybreak-blue-latest", "hide"], ["gpt-5.6-sol", "list"]],
+  );
+});
+
+test("不影響原始物件，其餘欄位保留", () => {
+  const fresh = { models: [{ slug: "gpt-6-astra", visibility: "hide", context_window: 272000 }] };
+  const merged = mergeCatalog(fresh, { models: [] }, ["gpt-6-astra"]);
+  assert.equal(fresh.models[0].visibility, "hide", "來源不該被改動");
+  assert.equal(merged.models[0].context_window, 272000);
+});
+
+test("沒有這個設定時行為不變", () => {
+  const fresh = { models: [{ slug: "gpt-6-astra", visibility: "hide" }] };
+  assert.equal(mergeCatalog(fresh, { models: [] }).models[0].visibility, "hide");
+  assert.equal(mergeCatalog(fresh, { models: [] }, []).models[0].visibility, "hide");
+});

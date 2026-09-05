@@ -1,6 +1,14 @@
 {
-  "latest": "1.14.0",
+  "latest": "1.15.0",
   "releases": [
+    {
+      "version": "1.15.0",
+      "date": "2026-09-05",
+      "changes": [
+        "新增 settings.json 的 forceListedModels：把指定的官方模型強制顯示在選擇器裡。",
+        "bundled 目錄會把尚未普及的模型標成 hide，但實際能不能用是後端依帳號決定的；model_catalog_json 會蓋掉那個決定，於是帳號明明有權限也看不到（手機能看到就是因為它直接問後端）。"
+      ]
+    },
     {
       "version": "1.14.0",
       "date": "2026-09-05",

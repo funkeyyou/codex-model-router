@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.14.0";
+const INSTALLER_VERSION = "1.15.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -2472,9 +2472,15 @@ export function catalogNeedsRefresh(binMtimeMs, catalogMtimeMs) {
 
 // 官方項目整批換新，自訂項目沿用檔案裡既有的那份——那是安裝時探測出來的結果，
 // 路由器沒有重新探測的條件，也不該重複實作 customCatalogEntry（複製一份必然漂移）。
-export function mergeCatalog(freshCatalog, currentCatalog) {
+export function mergeCatalog(freshCatalog, currentCatalog, forceListed = []) {
   const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
-  const official = (freshCatalog?.models || []).filter((model) => !isCustom(model));
+  const forced = new Set(forceListed);
+  const official = (freshCatalog?.models || [])
+    .filter((model) => !isCustom(model))
+    // bundled 目錄把尚未普及的模型標成 hide，實際能不能用是後端依帳號決定的。
+    // model_catalog_json 會蓋掉那個決定，於是帳號明明有權限也看不到（手機看得到
+    // 就是因為它直接問後端）。這裡讓使用者把特定模型強制列出來。
+    .map((model) => (forced.has(model.slug) ? { ...model, visibility: "list" } : model));
   const custom = (currentCatalog?.models || []).filter(isCustom);
   if (official.length === 0) throw new Error("bundled 目錄沒有官方模型");
   // 自訂項目要排在新的官方模型之後，否則新模型會把它們擠掉。
@@ -2513,6 +2519,7 @@ function refreshCatalogIfStale() {
     const merged = mergeCatalog(
       JSON.parse(raw),
       JSON.parse(readFileSync(settings.catalogPath, "utf8")),
+      Array.isArray(settings.forceListedModels) ? settings.forceListedModels : [],
     );
     // 先寫暫存再改名：Codex 可能正在讀這個檔。
     const temporary = settings.catalogPath + ".tmp";
