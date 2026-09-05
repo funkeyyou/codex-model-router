@@ -64,6 +64,8 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 ```
 
+> 回退前請先看「[回退之後，用過 Claude 模型的舊對話會壞掉](#回退之後用過-claude-模型的舊對話會壞掉)」。
+
 ## 平台差異
 
 安裝流程、模型探測、路由與 Claude 轉譯在兩個平台完全相同，差別只有這兩項：
@@ -182,6 +184,33 @@ ANSI 代碼頁讀檔（跟主控台的 `chcp 65001` 無關），中文會整片�
 ```powershell
 Get-Content "$env:USERPROFILE\.codex\model-router\router.err.log" -Tail 50 -Encoding UTF8
 ```
+
+### 回退之後，用過 Claude 模型的舊對話會壞掉
+
+症狀是切回官方模型後，該對話每次都被擋下來：
+
+```
+Invalid 'input[60].id': 'cmp_PTzs...'. Expected an ID that contains letters,
+numbers, underscores, or dashes, but this value contained additional characters.
+```
+
+（`cmp_` 也可能是 `msg_`、`fc_`、`rs_`。官方那句「contained additional
+characters」講得不準，那些 id 其實只有英數字和底線。）
+
+原因是轉譯層會自鑄項目 id：Anthropic 的原生事件沒有 Codex 要的那些 id，本機轉譯時
+只能自己生。這些項目留在 Codex 的對話歷史裡，而**路由器本來就會在把請求送往非
+Anthropic 路由前，把它們改寫或剝除掉**——健康檢查的 `bridgeIdsStripped` 與
+`bridgeCompactionRewritten` 數的就是這件事。
+
+回退等於把這個清理層一起移掉，於是 Codex 會把原封不動的歷史直接送給官方後端，然後
+被拒。這不是回退沒做乾淨——歷史存在 Codex 那邊，不在路由器管得到的範圍。
+
+兩種解法：
+
+- **重新安裝路由器**，清理層回來，那條對話就能接著用；
+- 或**開一條新對話**。用過 Claude 模型的舊對話，只要不裝路由器就救不回來。
+
+沒用過 Claude 模型的對話不受影響。
 
 ## 需求
 
