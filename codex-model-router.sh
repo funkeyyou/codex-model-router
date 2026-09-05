@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.13.0";
+const INSTALLER_VERSION = "1.14.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1895,6 +1895,8 @@ async function install() {
     catalogPath,
     logPath,
     imageOutputDir: resolveImageOutputDir(),
+    // 路由器要靠它重新產生模型目錄；Codex 更新後 bundled 清單才跟得上。
+    codexBin,
     port,
     routes,
   });
@@ -2326,7 +2328,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
-import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2375,6 +2377,93 @@ function captureAppend(id, suffix, data) {
 }
 
 const closeOnUpstreamError = settings.closeOnUpstreamError === true;
+
+// --- 模型目錄的自動更新 -----------------------------------------------------
+//
+// config.toml 的 model_catalog_json 指著 models.json，而那份是安裝當下用
+// `codex debug models --bundled` 產生的快照。ChatGPT Desktop 之後更新、內建了新
+// 模型，這個檔不會跟著動，選單裡就永遠看不到——而且失敗是靜默的，使用者只會
+// 以為官方還沒推給自己。
+//
+// bundled 清單只有在 Codex 執行檔本身變更時才會變，因此用「執行檔比目錄新」當
+// 觸發條件：平常只是一次 stat，真的更新了才 spawn 一次。重建後目錄的 mtime 會
+// 晚於執行檔，不會反覆觸發。
+const codexBinPath = typeof settings.codexBin === "string" ? settings.codexBin : null;
+const catalogRefreshEnabled = settings.catalogRefresh !== false;
+const catalogRetryCooldownMs = 10 * 60 * 1000;
+let catalogRetryAfter = 0;
+
+export function catalogNeedsRefresh(binMtimeMs, catalogMtimeMs) {
+  if (!Number.isFinite(binMtimeMs) || !Number.isFinite(catalogMtimeMs)) return false;
+  return binMtimeMs > catalogMtimeMs;
+}
+
+// 官方項目整批換新，自訂項目沿用檔案裡既有的那份——那是安裝時探測出來的結果，
+// 路由器沒有重新探測的條件，也不該重複實作 customCatalogEntry（複製一份必然漂移）。
+export function mergeCatalog(freshCatalog, currentCatalog) {
+  const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
+  const official = (freshCatalog?.models || []).filter((model) => !isCustom(model));
+  const custom = (currentCatalog?.models || []).filter(isCustom);
+  if (official.length === 0) throw new Error("bundled 目錄沒有官方模型");
+  // 自訂項目要排在新的官方模型之後，否則新模型會把它們擠掉。
+  const maxPriority = Math.max(0, ...official.map((model) => Number(model.priority) || 0));
+  const renumbered = custom.map((model, index) => ({
+    ...model,
+    priority: maxPriority + index + 1,
+  }));
+  return { ...freshCatalog, models: [...official, ...renumbered] };
+}
+
+function refreshCatalogIfStale() {
+  if (!catalogRefreshEnabled || !codexBinPath) return false;
+  if (Date.now() < catalogRetryAfter) return false;
+  let binMtime;
+  let catalogMtime;
+  try {
+    binMtime = statSync(codexBinPath).mtimeMs;
+    catalogMtime = statSync(settings.catalogPath).mtimeMs;
+  } catch {
+    return false;
+  }
+  if (!catalogNeedsRefresh(binMtime, catalogMtime)) return false;
+
+  try {
+    const raw = execFileSync(
+      codexBinPath,
+      ["debug", "models", "--bundled", "-c", "model_catalog_json=null", "-c", 'model_provider="openai"'],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        env: { ...process.env, CODEX_HOME: dirname(routerDirectory) },
+        timeout: 30000,
+      },
+    );
+    const merged = mergeCatalog(
+      JSON.parse(raw),
+      JSON.parse(readFileSync(settings.catalogPath, "utf8")),
+    );
+    // 先寫暫存再改名：Codex 可能正在讀這個檔。
+    const temporary = settings.catalogPath + ".tmp";
+    writeFileSync(temporary, JSON.stringify(merged), { mode: 0o600 });
+    renameSync(temporary, settings.catalogPath);
+    stats.catalogRefreshes += 1;
+    stats.catalogModels = merged.models.length;
+    process.stderr.write(
+      `model-router-catalog-refreshed:${merged.models.length} 個模型\n`,
+    );
+    return true;
+  } catch (error) {
+    // 失敗就先冷卻，避免每次檢查都 spawn 一次。
+    catalogRetryAfter = Date.now() + catalogRetryCooldownMs;
+    stats.catalogRefreshFailures += 1;
+    process.stderr.write(
+      "model-router-catalog-refresh-failed:" +
+        (error instanceof Error ? error.message : String(error)) +
+        "\n",
+    );
+    return false;
+  }
+}
 
 // --- 生圖結果的轉譯 ---------------------------------------------------------
 //
@@ -2707,6 +2796,9 @@ const stats = {
   upstreamWebSocketCooldowns: 0,
   imagesSaved: 0,
   imageRequests: 0,
+  catalogRefreshes: 0,
+  catalogRefreshFailures: 0,
+  catalogModels: 0,
   lastImageStatus: null,
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
@@ -4185,6 +4277,7 @@ const server = http.createServer(async (request, response) => {
       (incomingUrl.pathname === "/models" || incomingUrl.pathname === "/v1/models")
     ) {
       stats.models += 1;
+      refreshCatalogIfStale();
       writeJson(response, 200, JSON.parse(readFileSync(settings.catalogPath, "utf8")));
       return;
     }
@@ -4249,6 +4342,11 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
   if (truncateOversizedLog()) {
     process.stderr.write(`model-router-log-truncated:${settings.logPath}\n`);
   }
+
+  // ChatGPT Desktop 更新完成的當下就重建目錄，等使用者重開 Codex 時已經是新的。
+  refreshCatalogIfStale();
+  const catalogTimer = setInterval(refreshCatalogIfStale, 5 * 60 * 1000);
+  if (typeof catalogTimer.unref === "function") catalogTimer.unref();
 
   server.listen(listenPort, listenHost, () => {
     process.stderr.write(`model-router-ready:${listenHost}:${listenPort}\n`);

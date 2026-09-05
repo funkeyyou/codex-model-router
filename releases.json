@@ -1,6 +1,18 @@
 {
-  "latest": "1.13.0",
+  "latest": "1.14.0",
   "releases": [
+    {
+      "version": "1.14.0",
+      "date": "2026-09-05",
+      "changes": [
+        "修復 Codex 更新後新模型不出現在選擇器裡：模型目錄原本是安裝當下的快照，之後永不更新，而且失敗是靜默的。",
+        "路由器改為在 Codex 執行檔變更時自動重建目錄——平常只是一次 stat，真的更新了才重新產生。",
+        "官方模型整批換新，自訂模型沿用安裝時探測出的設定，並重新編號排在新模型之後。",
+        "bundled 目錄回空的官方清單時拒絕合併，寧可保留舊目錄。",
+        "健康檢查新增 catalogRefreshes、catalogRefreshFailures、catalogModels。",
+        "可用 settings.json 的 catalogRefresh = false 關閉。"
+      ]
+    },
     {
       "version": "1.13.0",
       "date": "2026-09-04",
