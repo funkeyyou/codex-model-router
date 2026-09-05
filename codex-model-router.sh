@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.15.1";
+const INSTALLER_VERSION = "1.15.2";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1076,6 +1076,95 @@ function defaultEffort(efforts) {
   return "none";
 }
 
+// Codex 在 Windows 上每次更新都裝進新的版本雜湊目錄，所以不能只記住當下那支
+// 執行檔——路由器得知道去哪裡找最新的。
+function codexBinSearchDir() {
+  if (!isWindows) return null;
+  return join(localAppData(), "OpenAI", "Codex", "bin");
+}
+
+// bundled 目錄把尚未普及的模型標成 hide，但實際能不能用是後端依帳號決定的；
+// model_catalog_json 會蓋掉後端的判斷，於是帳號有權限也看不到。
+function applyForcedVisibility(models, forceListed) {
+  if (!Array.isArray(forceListed) || forceListed.length === 0) return models;
+  const forced = new Set(forceListed);
+  return models.map((model) =>
+    forced.has(model.slug) ? { ...model, visibility: "list" } : model,
+  );
+}
+
+// 使用者可以在 settings.json 裡調的旋鈕。安裝器用固定欄位重寫整個檔案，因此
+// 沒列在這裡的東西每次重裝都會靜默消失——README 明文寫給使用者調的
+// maxLogBytes、viewImageBridge、upstreamWebSocket* 全都在內。
+// imageOutputDir 與 forceListedModels 不列在這：前者由 resolveImageOutputDir
+// 處理（沒設過時還要算預設值），後者安裝時會重新詢問。
+const preservedSettingKeys = [
+  "captureDir",
+  "catalogRefresh",
+  "closeOnUpstreamError",
+  "heartbeatIntervalMs",
+  "maxLogBytes",
+  "upstreamWebSocket",
+  "upstreamWebSocketCooldownMs",
+  "upstreamWebSocketFailureThreshold",
+  "viewImageBridge",
+];
+
+function readSettingsIfExists() {
+  try {
+    return JSON.parse(readFileSync(settingsPath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function preservedSettings() {
+  const previous = readSettingsIfExists();
+  const kept = {};
+  for (const key of preservedSettingKeys) {
+    if (previous[key] !== undefined) kept[key] = previous[key];
+  }
+  return kept;
+}
+
+// 安裝器一直看得到 visibility，卻從沒告訴使用者有東西被藏起來——於是
+// 「Codex 更新後新模型不見了」變成一個查不出原因的症狀。這裡直接列出來讓
+// 使用者決定，比留一個藏在 settings.json 裡的旋鈕有用得多。
+async function chooseForcedModels(officialModels, previous) {
+  const hidden = officialModels.filter((model) => model.visibility === "hide");
+  const previousList = Array.isArray(previous) ? previous : [];
+  if (hidden.length === 0) return previousList.filter((slug) => slug);
+
+  printHeading("隱藏的官方模型");
+  console.log("以下模型被 Codex 的內建目錄標成隱藏，預設不會出現在選擇器裡：\n");
+  hidden.forEach((model, index) => {
+    const mark = previousList.includes(model.slug) ? "（目前已強制顯示）" : "";
+    console.log(`  ${index + 1}. ${model.display_name || model.slug}`);
+    console.log(`     ${model.slug} ${mark}`);
+  });
+  console.log(
+    "\n能不能用是後端依帳號決定的，跟這份目錄無關。強制顯示後若帳號其實沒有權限，",
+  );
+  console.log("選了會在請求時失敗——改回來就好，不影響其他模型。" );
+
+  const answer = (
+    await ask("要強制顯示哪幾個？逗號分隔編號、all 全選、留空都不顯示", "")
+  ).trim();
+  if (!answer) return [];
+  if (answer.toLowerCase() === "all") return hidden.map((model) => model.slug);
+
+  const chosen = [];
+  for (const piece of answer.split(/[,，\s]+/).filter(Boolean)) {
+    const index = Number(piece);
+    if (!Number.isInteger(index) || index < 1 || index > hidden.length) {
+      fail(`選擇超出範圍：${piece}`);
+    }
+    const slug = hidden[index - 1].slug;
+    if (!chosen.includes(slug)) chosen.push(slug);
+  }
+  return chosen;
+}
+
 function loadBundledCatalog() {
   const result = shell(
     codexBin,
@@ -1845,9 +1934,14 @@ async function install() {
   }
 
   const bundledCatalog = loadBundledCatalog();
-  const officialModels = bundledCatalog.models.filter(
+  const discoveredOfficial = bundledCatalog.models.filter(
     (model) => !String(model.slug).startsWith("custom/"),
   );
+  const forceListedModels = await chooseForcedModels(
+    discoveredOfficial,
+    readSettingsIfExists().forceListedModels,
+  );
+  const officialModels = applyForcedVisibility(discoveredOfficial, forceListedModels);
   const customModels = routes.map((route, index) =>
     customCatalogEntry(officialModels, route, index),
   );
@@ -1896,9 +1990,15 @@ async function install() {
     logPath,
     imageOutputDir: resolveImageOutputDir(),
     // 路由器要靠它重新產生模型目錄；Codex 更新後 bundled 清單才跟得上。
+    // codexBinDir 是搜尋目錄：Windows 的 codexBin 指向版本雜湊子目錄，更新後
+    // 那支的 mtime 從此凍結，只認它等於偵測不到任何更新。
     codexBin,
+    codexBinDir: codexBinSearchDir(),
+    forceListedModels,
     port,
     routes,
+    // 使用者自己調過的旋鈕不能被重裝洗掉。
+    ...preservedSettings(),
   });
   writeServiceDefinition(port);
 
@@ -2089,8 +2189,11 @@ async function addModels() {
   copyIfExists(manifestPath, join(backupDir, "install.json"));
 
   const bundledCatalog = loadBundledCatalog();
-  const officialModels = bundledCatalog.models.filter(
-    (model) => !String(model.slug).startsWith("custom/"),
+  // 這裡不重問隱藏模型（add 的用意就是不重問設定），但既有的選擇要沿用，
+  // 否則加一個模型就會把強制顯示的那些又藏回去。
+  const officialModels = applyForcedVisibility(
+    bundledCatalog.models.filter((model) => !String(model.slug).startsWith("custom/")),
+    settings.forceListedModels,
   );
   const customModels = routes.map((route, index) =>
     customCatalogEntry(officialModels, route, index),
@@ -2328,7 +2431,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
-import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2388,7 +2491,51 @@ const closeOnUpstreamError = settings.closeOnUpstreamError === true;
 // bundled 清單只有在 Codex 執行檔本身變更時才會變，因此用「執行檔比目錄新」當
 // 觸發條件：平常只是一次 stat，真的更新了才 spawn 一次。重建後目錄的 mtime 會
 // 晚於執行檔，不會反覆觸發。
-const codexBinPath = typeof settings.codexBin === "string" ? settings.codexBin : null;
+const pinnedCodexBin = typeof settings.codexBin === "string" ? settings.codexBin : null;
+const codexBinSearchDir =
+  typeof settings.codexBinDir === "string" ? settings.codexBinDir : null;
+const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
+
+// Windows 的 Codex 每次更新都裝進一個新的版本雜湊目錄，舊目錄原封不動留著。
+// 把安裝當下記下的那支執行檔當成新鮮度來源，等於這個功能永遠不會觸發：它的
+// mtime 從此凍結，而目錄是安裝時才寫的，必然比它新。所以每次檢查都重新解析
+// 一次「目前最新的那支」，而不是相信安裝時釘死的路徑。
+// macOS 不受影響（app bundle 內的路徑固定，更新時 mtime 會變），但同一套邏輯
+// 對它也是安全的：搜尋目錄留空時就只剩釘死的那支。
+export function newestCodexBinary(pinned, searchDir, entries = null, stat = statSync) {
+  const candidates = [];
+  if (pinned) candidates.push(pinned);
+  if (searchDir) {
+    let listing = entries;
+    if (listing === null) {
+      try {
+        listing = readdirSync(searchDir, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => entry.name);
+      } catch {
+        listing = [];
+      }
+    }
+    for (const name of listing) candidates.push(join(searchDir, name, codexBinaryName));
+    candidates.push(join(searchDir, codexBinaryName));
+  }
+  let best = null;
+  let bestMtime = -1;
+  for (const candidate of candidates) {
+    let mtime;
+    try {
+      mtime = stat(candidate).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (mtime > bestMtime) {
+      bestMtime = mtime;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 const catalogRefreshEnabled = settings.catalogRefresh !== false;
 const catalogRetryCooldownMs = 10 * 60 * 1000;
 let catalogRetryAfter = 0;
@@ -2420,9 +2567,35 @@ export function mergeCatalog(freshCatalog, currentCatalog, forceListed = []) {
   return { ...freshCatalog, models: [...official, ...renumbered] };
 }
 
+// forceListedModels 原本只在重建時套用，而重建的條件是「執行檔比目錄新」——
+// 安裝完必然不成立。於是設了這個選項不會有任何反應，得剛好等到下次 Codex 更新。
+// 這裡補上第二個觸發條件：目錄裡只要還有「該強制列出、卻沒列出」的模型就重建。
+// （反向不成立：某個 slug 從清單移除後，目錄裡那個 list 會留到下次真正重建為止，
+// 因為判斷原始 visibility 需要 bundled 目錄，而那要 spawn 才拿得到。）
+export function forcedModelsPending(catalog, forceListed) {
+  if (!Array.isArray(forceListed) || forceListed.length === 0) return false;
+  const wanted = new Set(forceListed);
+  return (catalog?.models || []).some(
+    (model) => wanted.has(model?.slug) && model?.visibility !== "list",
+  );
+}
+
+function forcedModelsNeedApplying() {
+  try {
+    return forcedModelsPending(
+      JSON.parse(readFileSync(settings.catalogPath, "utf8")),
+      settings.forceListedModels,
+    );
+  } catch {
+    return false;
+  }
+}
+
 function refreshCatalogIfStale() {
-  if (!catalogRefreshEnabled || !codexBinPath) return false;
+  if (!catalogRefreshEnabled) return false;
   if (Date.now() < catalogRetryAfter) return false;
+  const codexBinPath = newestCodexBinary(pinnedCodexBin, codexBinSearchDir);
+  if (!codexBinPath) return false;
   let binMtime;
   let catalogMtime;
   try {
@@ -2431,7 +2604,9 @@ function refreshCatalogIfStale() {
   } catch {
     return false;
   }
-  if (!catalogNeedsRefresh(binMtime, catalogMtime)) return false;
+  if (!catalogNeedsRefresh(binMtime, catalogMtime) && !forcedModelsNeedApplying()) {
+    return false;
+  }
 
   try {
     const raw = execFileSync(
@@ -3285,6 +3460,12 @@ async function handleResponses(request, response, incomingUrl) {
   });
 
   const meta = {};
+  // 擷取原本只蓋 WebSocket 路徑。但 Codex 反覆握手失敗後會退回 HTTPS，之後所有
+  // 請求都走這裡——上游在這條路上出錯時，開了擷取也一個檔案都拿不到。
+  const captureId = captureNext(
+    typeof body.model === "string" && routeMap.has(body.model) ? "custom-http" : "official-http",
+  );
+  captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
   const upstream = await fetchModelUpstream(
     request.headers,
     incomingUrl,
@@ -3293,8 +3474,27 @@ async function handleResponses(request, response, incomingUrl) {
     abortController.signal,
     meta,
   );
+  if (meta.anthropicRequest) {
+    captureWrite(
+      captureId,
+      "anthropic-request.json",
+      JSON.stringify(meta.anthropicRequest, null, 2),
+    );
+  }
+  captureWrite(captureId, "upstream-status.txt", `${upstream.status}\n`);
   if (meta.translate === "anthropic" && upstream.status >= 200 && upstream.status < 300) {
     await bridgeAnthropicToHttp(upstream, response, meta);
+    return;
+  }
+  // 只有開了擷取才走這條：把上游的錯誤內文留下來再原樣回覆。上游錯誤的正文
+  // 常比客戶端顯示的那一行詳細，而它一旦串出去就沒了。
+  if (captureId && (upstream.status < 200 || upstream.status >= 300)) {
+    const text = await upstream.text();
+    captureWrite(captureId, "upstream-error.txt", text);
+    response.writeHead(upstream.status, {
+      "content-type": upstream.headers.get("content-type") || "application/json",
+    });
+    response.end(text);
     return;
   }
   await streamUpstream(upstream, response);

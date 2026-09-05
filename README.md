@@ -123,6 +123,14 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   暫停嘗試一段時間並直接走 HTTP，避免每個新對話的第一輪都先賠一次握手；
   上游恢復後立刻解除。門檻與冷卻時間可用 `settings.json` 的
   `upstreamWebSocketFailureThreshold` 與 `upstreamWebSocketCooldownMs` 調整。
+- **模型目錄跟得上 Codex 更新**——`config.toml` 的 `model_catalog_json` 指著一份
+  安裝當下的快照，Codex 之後更新、內建了新模型，這個檔不會跟著動，選擇器裡就永遠
+  看不到，而且失敗是靜默的。路由器因此在 Codex 執行檔變更時自動重建目錄（平常只是
+  一次 stat）。`settings.json` 的 `catalogRefresh = false` 可關閉。
+- **被藏起來的官方模型可以叫出來**——內建目錄會把尚未普及的模型標成 `hide`，但實際
+  能不能用是後端依帳號決定的；`model_catalog_json` 會蓋掉後端的判斷，於是帳號明明
+  有權限也看不到（手機看得到就是因為它直接問後端）。安裝時會列出這些模型讓你選，
+  選擇記在 `settings.json` 的 `forceListedModels`。
 - **連線保活**——長請求期間送出 WebSocket ping，避免客戶端閒置逾時。
 - **錯誤可見**——上游錯誤會轉為標準的 `response.failed` 事件，不會讓客戶端無聲卡住。
   這包含最難察覺的一種：閘道在回應中途把串流丟掉。此時讀取端收到的是乾淨的 EOF 而不是
@@ -184,6 +192,26 @@ ANSI 代碼頁讀檔（跟主控台的 `chcp 65001` 無關），中文會整片�
 ```powershell
 Get-Content "$env:USERPROFILE\.codex\model-router\router.err.log" -Tail 50 -Encoding UTF8
 ```
+
+### 選擇器裡看不到某個官方模型
+
+Codex 的內建目錄會把尚未普及的模型標成 `hide`。沒裝路由器時 Codex 會直接問後端，
+帳號有權限就看得到；裝了之後 `model_catalog_json` 會蓋掉後端的判斷，於是同一個帳號
+在桌面版看不到、手機上卻看得到。
+
+重跑安裝器即可——它會列出所有被標成隱藏的模型讓你勾選，選中的會強制顯示。也可以直接
+編輯 `settings.json` 的 `forceListedModels`（一組 slug 字串），路由器發現目錄裡還有
+該顯示卻沒顯示的模型時會自動重建目錄。
+
+強制顯示只影響選擇器。能不能用仍然由後端決定，帳號沒權限的話選了會在請求時失敗。
+
+### 需要看路由器實際送出去的內容
+
+`settings.json` 設 `captureDir` 為一個目錄路徑，重啟路由器後每一輪都會落地成檔案：
+送往上游的請求、轉譯後的 Anthropic 請求、上游回應與錯誤內文。WebSocket 與 HTTP 兩條
+路徑都會擷取。
+
+這些檔案含有完整的對話內容，查完請自行刪除，並把 `captureDir` 拿掉。
 
 ### 回退之後，用過 Claude 模型的舊對話會壞掉
 
