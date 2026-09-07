@@ -37,6 +37,27 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 安裝時會詢問三件事：Base URL、API Key、以及要加入哪些模型。
 輸入 API Key 時畫面不會顯示任何字元（跟 `sudo` 一樣），貼上後直接按 Enter。
 
+## 升級
+
+已經裝過的話，日常升級用 `update`，不要重跑 `install`：
+
+```bash
+bash codex-model-router.sh update
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
+```
+
+`update` 只換掉路由器與轉譯層的程式碼並重寫服務定義，然後重啟服務並做健康檢查。
+Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，不會重問任何一項，也不會
+改動 `config.toml` 與 `models.json`。它不需要 Codex CLI，所以 Codex 更新後路徑改變
+也不影響升級。更新前的 `router.mjs`、`claude-bridge.mjs`、`settings.json`、
+`install.json` 與服務定義都會備份到 `~/.codex/backups/model-router/update-<時間戳>/`，
+任何一步失敗都會自動還原並重啟回原本的版本。
+
+`install` 保留給第一次安裝、換 Base URL 或 API Key、以及重新挑選模型的情況。
+
 ## 版本資訊與更新內容
 
 安裝器啟動時會顯示「已安裝版本」、「目前這支安裝器版本」與「GitHub 線上最新版本」。
@@ -53,6 +74,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 macOS：
 
 ```bash
+bash codex-model-router.sh update     # 升級程式碼，保留現有設定
 bash codex-model-router.sh status     # 檢視安裝狀態與健康度
 bash codex-model-router.sh rollback   # 回退（安裝檔會封存，不會刪除）
 ```
@@ -60,6 +82,7 @@ bash codex-model-router.sh rollback   # 回退（安裝檔會封存，不會刪�
 Windows：
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 ```

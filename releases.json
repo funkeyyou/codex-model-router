@@ -1,6 +1,19 @@
 {
-  "latest": "1.16.2",
+  "latest": "1.17.0",
   "releases": [
+    {
+      "version": "1.17.0",
+      "date": "2026-09-08",
+      "changes": [
+        "新增 update 命令：升級不必再重跑 install。過去唯一能換掉路由器程式碼的完整路徑是重新安裝，而 install 一定會重問 Base URL、API Key 與要加入哪些模型，等於每次升級都要把模型重新設定一遍。",
+        "update 只重寫 router.mjs、claude-bridge.mjs 與服務定義，然後重啟服務並做健康檢查；settings.json 除了 version 以外逐欄位保持不變，install.json 只更新 version 與 updatedAt。自訂模型、Base URL、API Key、連接埠、forceListedModels 與 maxLogBytes 等旋鈕全部沿用。",
+        "update 不讀 config.toml、models.json，也不需要 Codex CLI——安裝時記下的 codexBin 會在 Codex 自我更新換掉版本雜湊目錄後失效，升級不該被那個卡住。",
+        "更新前備份 router.mjs、claude-bridge.mjs、settings.json、install.json 與服務定義到 backups/model-router/update-<時間戳>/；寫檔、重啟或健康檢查任一步失敗都會還原並重啟回原版本。",
+        "升級改為原地重啟（schtasks /End + /Run、launchctl bootstrap），不再重新註冊服務。schtasks /Create 需要工作物件的寫入權，而工作若以系統管理員身分建立，一般使用者只有讀取權，未提權執行會 Access is denied——埠與路徑沒變的升級根本不需要重新註冊。服務定義只在逐位元組比對確實不同時才重寫，重寫失敗會退回舊定義、原地重啟並提示需要提權才能套用新定義。",
+        "update 與 add 的還原路徑不再吞掉重啟失敗：還原後會確認健康檢查，真的起不來就明確印出手動啟動指令與影響範圍。先前是靜默忽略，結果「更新失敗」會變成「更新失敗而且路由器停著」，所有經過本機埠的請求都會卡死。",
+        "選單新增「2. 更新到最新版本（保留現有配置）」，其後選項順延；命令列同時接受 update 與 upgrade。已是同版本仍可執行，用來修復被改壞的安裝；安裝器比已安裝版本舊時一律拒絕，避免降級。"
+      ]
+    },
     {
       "version": "1.16.2",
       "date": "2026-09-08",

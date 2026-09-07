@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.16.2";
+const INSTALLER_VERSION = "1.17.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1647,6 +1647,52 @@ function startService() {
   else startLaunchAgent();
 }
 
+// 只重啟，不重新註冊服務。
+//
+// Windows 的 schtasks /Create 需要工作物件的寫入權；工作若是以系統管理員身分建立的，
+// 一般使用者對它只有讀取權，未提權執行就會 Access is denied——而 /End 與 /Run 可以。
+// 埠與路徑都沒變的升級根本不需要重新註冊，硬要重建只會讓升級無謂地需要提權，
+// 失敗時還會把服務停在停止狀態。macOS 的使用者網域 bootstrap 不需提權，維持原路徑。
+function restartServiceInPlace() {
+  if (!isWindows) {
+    startLaunchAgent();
+    return;
+  }
+  stopScheduledTask();
+  sleepSync(300);
+  let lastResult = null;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    lastResult = shell("schtasks.exe", ["/Run", "/TN", taskName], { allowFailure: true });
+    if (lastResult.status === 0) return;
+    sleepSync(500 * (attempt + 1));
+  }
+  const detail = (lastResult?.stderr || lastResult?.stdout || "").trim();
+  fail(`無法啟動排程工作${detail ? `：${detail}` : ""}`);
+}
+
+function manualStartHint() {
+  return isWindows
+    ? `schtasks /Run /TN ${taskName}`
+    : `launchctl kickstart -k ${launchDomain()}/${launchLabel}`;
+}
+
+// 服務定義逐位元組比對：一樣就完全不要碰註冊。
+function serviceDefinitionUnchanged(port) {
+  try {
+    if (!isWindows) {
+      return existsSync(plistPath) &&
+        readFileSync(plistPath, "utf8") === launchAgentPlist(port);
+    }
+    if (!existsSync(taskXmlPath) || !existsSync(launcherVbsPath)) return false;
+    return (
+      Buffer.compare(readFileSync(launcherVbsPath), utf16leWithBom(launcherVbsScript())) === 0 &&
+      Buffer.compare(readFileSync(taskXmlPath), utf16leWithBom(taskXmlDocument())) === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
 function stopService() {
   if (isWindows) stopScheduledTask();
   else stopLaunchAgent();
@@ -2286,8 +2332,8 @@ async function addModels() {
       updatedAt: new Date().toISOString(),
       routes,
     });
-    stopService();
-    startService();
+    // 路由變了但服務定義沒變，原地重啟就好——重新註冊需要提權，沒必要冒那個險。
+    restartServiceInPlace();
     await waitForHealth(port);
 
     const modelCheck = shell(codexBin, ["debug", "models"], {
@@ -2308,10 +2354,19 @@ async function addModels() {
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
     copyIfExists(join(backupDir, "models.json"), catalogPath);
     copyIfExists(join(backupDir, "install.json"), manifestPath);
+    // 還原完必須確認服務真的回來了。之前這裡吞掉例外，結果是
+    // 「添加失敗」變成「添加失敗而且路由器停著」，所有對話都會卡住。
     try {
-      stopService();
-      startService();
-    } catch {}
+      restartServiceInPlace();
+      await waitForHealth(port);
+      console.error("已還原到添加前的配置，路由器運作正常。");
+    } catch (restartError) {
+      console.error(
+        `\n嚴重：配置已還原，但路由器沒有起來（${restartError.message}）。\n` +
+          `請手動啟動：${manualStartHint()}\n` +
+          `在它恢復之前，所有經過 127.0.0.1:${port} 的請求都會失敗。`,
+      );
+    }
     throw error;
   }
 
@@ -2325,6 +2380,161 @@ async function addModels() {
   }
   console.log(`\n現共 ${routes.length} 個自訂模型。`);
   console.log(`備份：${backupDir}`);
+  console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
+}
+
+// 更新只換掉路由器與轉譯層的程式碼，其餘一律沿用。把「能不能更新、更新後的
+// 設定長什麼樣」抽成純函式，才驗得到既有路由與使用者旋鈕不會在更新中被洗掉——
+// 這正是以前只能走 install 重裝、每次都要重問 Base URL、API Key 與模型的原因。
+export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERSION) {
+  if (!manifest) return { ok: false, reason: "not-installed" };
+  if (!settings || typeof settings !== "object") return { ok: false, reason: "missing-settings" };
+
+  const routes = Array.isArray(settings.routes) ? settings.routes : [];
+  if (routes.length === 0) return { ok: false, reason: "no-routes" };
+
+  const port = Number(settings.port ?? manifest.port);
+  if (!Number.isFinite(port) || port <= 0) return { ok: false, reason: "bad-port" };
+
+  const installed = terminalSafeText(manifest.version, 32) || null;
+  const comparison = compareVersions(installerVersion, installed);
+  if (comparison != null && comparison < 0) {
+    return { ok: false, reason: "installer-older", installed };
+  }
+
+  return {
+    ok: true,
+    installed,
+    target: installerVersion,
+    // 版本相同仍然允許：用來修復被改壞或版本標記對不上的安裝。
+    alreadyCurrent: comparison === 0,
+    port,
+    routes,
+    // 只動 version，其餘欄位（routes、憑證位置、forceListedModels、
+    // maxLogBytes 等使用者旋鈕）原樣保留。
+    settings: { ...settings, version: installerVersion },
+    manifest: { ...manifest, version: installerVersion },
+  };
+}
+
+const UPDATE_FAILURES = {
+  "not-installed":
+    "當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。",
+  "missing-settings":
+    "找不到 settings.json，安裝可能已損壞，請改用「安裝或重新配置」。",
+  "no-routes":
+    "現有安裝沒有任何自訂模型，沒有可保留的設定，請改用「安裝或重新配置」。",
+  "bad-port":
+    "現有安裝沒有可用的連接埠設定，請改用「安裝或重新配置」。",
+};
+
+async function update() {
+  const manifest = readManifest();
+  const settings = existsSync(settingsPath)
+    ? JSON.parse(readFileSync(settingsPath, "utf8"))
+    : null;
+  const plan = planUpdate(manifest, settings);
+  if (!plan.ok) {
+    if (plan.reason === "installer-older") {
+      fail(
+        `已安裝版本 ${plan.installed} 比當前安裝器 ${INSTALLER_VERSION} 更新。` +
+          "為避免降級，請重新下載最新版安裝器。",
+      );
+    }
+    fail(UPDATE_FAILURES[plan.reason] || "無法更新現有安裝。");
+  }
+
+  printHeading("更新路由器");
+  console.log(`版本：${plan.installed || "未知"} → ${plan.target}`);
+  if (plan.alreadyCurrent) {
+    console.log("已是這個版本，將重新寫入一次程式碼與服務定義（可用於修復安裝）。");
+  }
+  console.log(`Base URL：${settings.baseUrl || manifest.baseUrl}`);
+  console.log(`端口：${plan.port}`);
+  console.log(`保留 ${plan.routes.length} 個自訂模型：`);
+  for (const route of plan.routes) {
+    console.log(`  - ${route.displayName || route.upstreamModel}`);
+  }
+  console.log(
+    "\n只會換掉路由器與轉譯層程式碼然後重啟；服務定義只有真的變了才會重寫。" +
+      "不重問 Base URL、API Key 與模型，也不改動 config.toml 與 models.json。",
+  );
+
+  const backupDir = join(backupsRoot, `update-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(routerPath, join(backupDir, "router.mjs"));
+  copyIfExists(bridgePath, join(backupDir, "claude-bridge.mjs"));
+  copyIfExists(settingsPath, join(backupDir, "settings.json"));
+  copyIfExists(manifestPath, join(backupDir, "install.json"));
+  for (const path of serviceArchivePaths()) {
+    copyIfExists(path, join(backupDir, basename(path)));
+  }
+
+  let health = null;
+  let serviceWarning = null;
+  try {
+    writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
+    chmodSync(routerPath, 0o600);
+    writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
+    chmodSync(bridgePath, 0o600);
+    writeJsonAtomic(settingsPath, plan.settings);
+    writeJsonAtomic(manifestPath, {
+      ...plan.manifest,
+      updatedAt: new Date().toISOString(),
+    });
+    if (serviceDefinitionUnchanged(plan.port)) {
+      // 常見情況：埠與路徑都沒變，重新註冊沒有意義，原地重啟即可（不需提權）。
+      restartServiceInPlace();
+    } else {
+      // 守護迴圈或啟動方式真的變了才重新註冊。這一步在 Windows 上可能因權限失敗，
+      // 失敗就把舊定義放回去並原地重啟——升級不該因為註冊不了而讓服務停擺。
+      try {
+        writeServiceDefinition(plan.port);
+        stopService();
+        startService();
+      } catch (registrationError) {
+        for (const path of serviceArchivePaths()) {
+          copyIfExists(join(backupDir, basename(path)), path);
+        }
+        restartServiceInPlace();
+        serviceWarning =
+          `服務定義有更新，但無法重新註冊（${registrationError.message}）。` +
+          "已沿用舊定義並重啟，路由器功能不受影響；" +
+          "要套用新的服務定義，請以系統管理員身分執行一次安裝或重新配置。";
+      }
+    }
+    health = await waitForHealth(plan.port);
+  } catch (error) {
+    console.error("\n更新失敗，正在還原更新前的檔案...");
+    copyIfExists(join(backupDir, "router.mjs"), routerPath);
+    copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
+    copyIfExists(join(backupDir, "settings.json"), settingsPath);
+    copyIfExists(join(backupDir, "install.json"), manifestPath);
+    for (const path of serviceArchivePaths()) {
+      copyIfExists(join(backupDir, basename(path)), path);
+    }
+    // 還原之後一定要把服務拉回來，而且不能默默吞掉失敗：
+    // 「更新失敗」還可以接受，「更新失敗而且路由器停著」會讓所有對話直接卡死。
+    try {
+      restartServiceInPlace();
+      await waitForHealth(plan.port);
+      console.error("已還原到更新前的版本，路由器運作正常。");
+    } catch (restartError) {
+      console.error(
+        `\n嚴重：檔案已還原，但路由器沒有起來（${restartError.message}）。\n` +
+          `請手動啟動：${manualStartHint()}\n` +
+          `在它恢復之前，所有經過 127.0.0.1:${plan.port} 的請求都會失敗。`,
+      );
+    }
+    throw error;
+  }
+
+  printHeading("更新完成");
+  console.log(`版本：${health?.version || plan.target}`);
+  console.log(`健康檢查：${health?.status || "未知"}`);
+  console.log(`保留 ${plan.routes.length} 個自訂模型，設定與 API Key 未變動。`);
+  console.log(`備份：${backupDir}`);
+  if (serviceWarning) console.log(`\n注意：${serviceWarning}`);
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
@@ -2421,6 +2631,7 @@ function help() {
 
 用法：
   ${basename(scriptPath || "codex-model-router.command")} install
+  ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} status
   ${basename(scriptPath || "codex-model-router.command")} rollback
@@ -2429,6 +2640,10 @@ function help() {
   1. 兼容 OpenAI 的 Base URL
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
+
+update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
+沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
+也不改動 config.toml 與 models.json。這是日常升級該用的命令。
 
 add 用於在已有安裝上追加模型：沿用已儲存的 Base URL、API Key 與連接埠，
 只探測新選的模型，不會重問設定，也不改動 config.toml。
@@ -2442,25 +2657,29 @@ openai 供應商 ID，以保持 Desktop 與手機 Remote 的既有聊天可見�
 async function chooseAction() {
   printHeading("Codex 模型路由器");
   console.log("  1. 安裝或重新配置");
-  console.log("  2. 添加模型（保留現有配置）");
-  console.log("  3. 查看狀態");
-  console.log("  4. 回退配置");
-  console.log("  5. 退出");
+  console.log("  2. 更新到最新版本（保留現有配置）");
+  console.log("  3. 添加模型（保留現有配置）");
+  console.log("  4. 查看狀態");
+  console.log("  5. 回退配置");
+  console.log("  6. 退出");
   const answer = await ask("請選擇操作", "1");
   const choices = {
     "1": "install",
     install: "install",
     setup: "install",
-    "2": "add",
+    "2": "update",
+    update: "update",
+    upgrade: "update",
+    "3": "add",
     add: "add",
     "add-model": "add",
     addmodel: "add",
-    "3": "status",
+    "4": "status",
     status: "status",
-    "4": "rollback",
+    "5": "rollback",
     rollback: "rollback",
     uninstall: "rollback",
-    "5": "exit",
+    "6": "exit",
     exit: "exit",
     quit: "exit",
   };
@@ -2475,6 +2694,8 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     const versionAwareActions = new Set([
       "install",
       "setup",
+      "update",
+      "upgrade",
       "add",
       "add-model",
       "addmodel",
@@ -2485,6 +2706,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     }
     const action = requestedAction || (await chooseAction());
     if (action === "install" || action === "setup") await install();
+    else if (action === "update" || action === "upgrade") await update();
     else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
     else if (action === "status") await status();
     else if (action === "rollback" || action === "uninstall") await rollback();
