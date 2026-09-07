@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.16.1";
+const INSTALLER_VERSION = "1.16.2";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -3396,12 +3396,13 @@ async function fetchModelUpstream(
     stats.custom += 1;
     if (route.translate === "anthropic") {
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
-      const { request: anthropicRequest, freeform, compaction, imagesOmitted,
+      const { request: anthropicRequest, freeform, toolTargets, compaction, imagesOmitted,
         thinkingTrimmed } = toAnthropicRequest(effectiveBody, route);
       if (imagesOmitted > 0) stats.imagesOmitted += imagesOmitted;
       if (thinkingTrimmed > 0) stats.trailingThinkingTrimmed += thinkingTrimmed;
       meta.translate = "anthropic";
       meta.freeform = freeform;
+      meta.toolTargets = toolTargets;
       meta.compaction = compaction;
       meta.model = body.model;
       meta.requestBody = effectiveBody;
@@ -4891,22 +4892,29 @@ function toAnthropicBlocks(content) {
   return blocks;
 }
 
-// additional_tools 內含 namespace 巢狀，攤平成單層。
-// Codex 認的工具真名是 `<namespace>__<tool>`（例如 mcp__cua_repl__js、web__run），
-// 只有預設命名空間 functions 底下才是裸名。攤平時如果把前綴丟掉，模型會照裸名回呼，
-// Codex 端查無此工具就回 "unsupported call: <name>"——Computer Use 的 js / js_reset
-// 就是這樣整組失效的。
-function flattenTools(items, out = [], prefix = "") {
+// Anthropic 沒有 Responses 的 namespace 工具型別，所以送往上游時要用唯一別名攤平；
+// 回到 Codex 時再靠 targets 拆回 { namespace, name }。Codex 的 function_call /
+// custom_tool_call 把 namespace 放在獨立欄位，不能把完整別名直接塞進 name。
+function toolAlias(namespace, name) {
+  return namespace && namespace !== "functions" ? `${namespace}__${name}` : name;
+}
+
+function flattenTools(items, out = [], namespace = null, targets = new Map()) {
   for (const tool of items || []) {
     if (tool?.type === "namespace") {
-      const nested =
-        tool.name && tool.name !== "functions" ? `${prefix}${tool.name}__` : prefix;
-      flattenTools(tool.tools, out, nested);
+      const nested = !tool.name || (tool.name === "functions" && !namespace)
+        ? namespace
+        : (namespace ? `${namespace}__${tool.name}` : tool.name);
+      flattenTools(tool.tools, out, nested, targets);
     } else if (tool?.name) {
-      out.push(prefix ? { ...tool, name: `${prefix}${tool.name}` } : tool);
+      const alias = toolAlias(namespace, tool.name);
+      out.push(alias === tool.name ? tool : { ...tool, name: alias });
+      targets.set(alias, namespace
+        ? { name: tool.name, namespace }
+        : { name: tool.name });
     }
   }
-  return out;
+  return { tools: out, targets };
 }
 
 // Codex 的 type:"custom" 是自由格式工具（input 為原始字串），
@@ -5053,6 +5061,7 @@ export function toAnthropicRequest(body, route) {
   const systemParts = [];
   const messages = [];
   let codexTools = [];
+  let toolTargets = new Map();
   let compaction = false;
 
   // 同 role 的連續區塊必須合併，否則 Anthropic 會拒絕。
@@ -5069,9 +5078,12 @@ export function toAnthropicRequest(body, route) {
 
   for (const item of inputItems) {
     switch (item?.type) {
-      case "additional_tools":
-        codexTools = flattenTools(item.tools);
+      case "additional_tools": {
+        const flattened = flattenTools(item.tools);
+        codexTools = flattened.tools;
+        toolTargets = flattened.targets;
         break;
+      }
 
       case "message": {
         if (item.role === "developer" || item.role === "system") {
@@ -5101,7 +5113,7 @@ export function toAnthropicRequest(body, route) {
         push("assistant", {
           type: "tool_use",
           id: item.call_id,
-          name: item.name,
+          name: toolAlias(item.namespace, item.name),
           input: { [FREEFORM_KEY]: typeof item.input === "string" ? item.input : "" },
         });
         break;
@@ -5109,13 +5121,25 @@ export function toAnthropicRequest(body, route) {
       case "function_call": {
         let input = {};
         try { input = JSON.parse(item.arguments || "{}"); } catch {}
-        push("assistant", { type: "tool_use", id: item.call_id, name: item.name, input });
+        push("assistant", {
+          type: "tool_use",
+          id: item.call_id,
+          name: toolAlias(item.namespace, item.name),
+          input,
+        });
         break;
       }
 
       case "custom_tool_call_output":
       case "function_call_output": {
         const blocks = toAnthropicBlocks(item.output);
+        // 從另一個 Codex 任務轉送進來的訊息會以 function_call_output 表示，
+        // 但沒有 call_id；它不是某次工具呼叫的結果，不能產生缺 tool_use_id 的
+        // Anthropic tool_result。保留成普通 user 內容，模型才能收到轉送的指示。
+        if (!item.call_id) {
+          for (const block of blocks) push("user", block);
+          break;
+        }
         push("user", {
           type: "tool_result",
           tool_use_id: item.call_id,
@@ -5222,7 +5246,7 @@ export function toAnthropicRequest(body, route) {
     request.thinking = { type: "enabled", budget_tokens: budget };
   }
 
-  return { request, freeform, compaction, imagesOmitted, thinkingTrimmed };
+  return { request, freeform, toolTargets, compaction, imagesOmitted, thinkingTrimmed };
 }
 
 // ---------------------------------------------------------------- 回應方向
@@ -5255,7 +5279,7 @@ function mapUsage(anthropicUsage) {
  * 讀取 Anthropic 的 SSE 串流，逐一產生 Codex Responses 事件。
  * @param {AsyncIterable<Uint8Array>} upstreamBody
  * @param {(event: object) => void} emit
- * @param {{model: string, requestBody: object, freeform: Set<string>, compaction?: boolean}} ctx
+ * @param {{model: string, requestBody: object, freeform: Set<string>, toolTargets?: Map<string, {name: string, namespace?: string}>, compaction?: boolean}} ctx
  */
 export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   const responseId = randomId("resp_", 55);
@@ -5346,20 +5370,25 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           });
         } else if (block.type === "tool_use") {
           const isFreeform = ctx.freeform.has(block.name);
+          const target = ctx.toolTargets?.get(block.name);
           cur = {
             kind: isFreeform ? "custom_tool" : "function_tool",
             itemId: randomId("fc_", 54),
             callId: block.id,
-            name: block.name,
+            name: target?.name || block.name,
+            namespace: target?.namespace || null,
             json: "",
             index: outputIndex,
           };
+          const identity = cur.namespace
+            ? { name: cur.name, namespace: cur.namespace }
+            : { name: cur.name };
           send({
             type: "response.output_item.added",
             output_index: outputIndex,
             item: isFreeform
-              ? { id: cur.itemId, type: "custom_tool_call", status: "in_progress", call_id: cur.callId, input: "", name: cur.name }
-              : { id: cur.itemId, type: "function_call", status: "in_progress", call_id: cur.callId, arguments: "", name: cur.name },
+              ? { id: cur.itemId, type: "custom_tool_call", status: "in_progress", call_id: cur.callId, input: "", ...identity }
+              : { id: cur.itemId, type: "function_call", status: "in_progress", call_id: cur.callId, arguments: "", ...identity },
           });
         }
         break;
@@ -5475,14 +5504,30 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
             const input = typeof parsed[FREEFORM_KEY] === "string" ? parsed[FREEFORM_KEY] : (cur.json || "");
             send({ type: "response.custom_tool_call_input.delta", delta: input, item_id: cur.itemId, output_index: cur.index });
             send({ type: "response.custom_tool_call_input.done", input, item_id: cur.itemId, output_index: cur.index });
-            const item = { id: cur.itemId, type: "custom_tool_call", status: "completed", call_id: cur.callId, input, name: cur.name };
+            const item = {
+              id: cur.itemId,
+              type: "custom_tool_call",
+              status: "completed",
+              call_id: cur.callId,
+              input,
+              name: cur.name,
+              ...(cur.namespace ? { namespace: cur.namespace } : {}),
+            };
             output.push(item);
             send({ type: "response.output_item.done", output_index: cur.index, item });
           } else {
             const args = JSON.stringify(parsed);
             send({ type: "response.function_call_arguments.delta", delta: args, item_id: cur.itemId, output_index: cur.index });
             send({ type: "response.function_call_arguments.done", arguments: args, item_id: cur.itemId, output_index: cur.index });
-            const item = { id: cur.itemId, type: "function_call", status: "completed", call_id: cur.callId, arguments: args, name: cur.name };
+            const item = {
+              id: cur.itemId,
+              type: "function_call",
+              status: "completed",
+              call_id: cur.callId,
+              arguments: args,
+              name: cur.name,
+              ...(cur.namespace ? { namespace: cur.namespace } : {}),
+            };
             output.push(item);
             send({ type: "response.output_item.done", output_index: cur.index, item });
           }

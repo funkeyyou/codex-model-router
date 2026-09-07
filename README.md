@@ -92,8 +92,10 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
 - **Claude 模型本機轉譯**——部分閘道的 Responses 相容層對 Claude 有缺陷：有的串流回
   `stream_options` 錯誤、非串流內容為空；有的會把 Codex Code Mode 的 `namespace`
   工具包裝原樣轉給 Anthropic 而被拒（`Input tag 'namespace' does not match...`），
-  導致模型調不到任何工具。此時改走 Anthropic 原生 `/v1/messages` 並在本機做雙向轉譯
-  （含把 namespace 攤平），同時掛上 `cache_control` 以啟用提示快取。
+  導致模型調不到任何工具。此時改走 Anthropic 原生 `/v1/messages` 並在本機做雙向轉譯：
+  送往 Anthropic 時把 namespace 編成不重名的工具別名，回到 Codex 時再拆回獨立的
+  `name` 與 `namespace` 欄位，歷史重播也做相同的反向轉換；同時掛上 `cache_control`
+  以啟用提示快取。
 - **推理強度真的會生效**——`thinking.budget_tokens` 在較新的模型上已被移除（官方直接
   400，部分閘道靜默丟棄），結果是在 Codex 裡選 low 或 max 毫無差別、而且一律跑在高強度。
   安裝時會探測 `output_config.effort`，支援的話把五檔直接透傳。實測 low 檔耗時從

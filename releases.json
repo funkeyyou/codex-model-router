@@ -1,14 +1,24 @@
 {
-  "latest": "1.16.1",
+  "latest": "1.16.2",
   "releases": [
+    {
+      "version": "1.16.2",
+      "date": "2026-09-08",
+      "changes": [
+        "真正修復 translate=anthropic 路由的 Computer Use 與其他 namespace 工具：Responses 的正確工具呼叫是分開的 name 與 namespace 欄位，例如 name=js、namespace=mcp__cua_repl；1.16.1 只把它組成 Anthropic 可辨識的唯一別名，回程卻把整串 mcp__cua_repl__js 塞進 name，Codex 仍會回 unsupported call。",
+        "送往 Anthropic 時繼續使用 `<namespace>__<name>` 避免不同 namespace 的同名工具互撞，並保存別名到 Codex target 的映射；收到 tool_use 後拆回原始 name 與 namespace，function_call 與 custom_tool_call 的串流 added、done 及最終 output 全部一致。",
+        "歷史裡已成功執行的 namespaced tool call 再送回 Anthropic 時會重新合成同一別名，不會在第二輪因工具名不一致而失敗。預設 functions 命名空間仍維持 exec、wait 等裸名。",
+        "修復從另一個 Codex 任務轉送訊息時的相容性：這類內容以沒有 call_id 的 function_call_output 傳入，現在還原為普通 user 內容，不再組成缺少 tool_use_id、會被 Anthropic 直接拒絕的 tool_result。",
+        "補上 namespace 雙向往返、同名碰撞、freeform 工具、歷史重播與原始物件不變的回歸測試；README 同步說明實際轉譯方式。"
+      ]
+    },
     {
       "version": "1.16.1",
       "date": "2026-09-08",
       "changes": [
-        "修復 Computer Use 整組不能用：Codex 的工具清單不在 tools 欄位，而是放在 input 的 additional_tools 裡，並且是有命名空間的巢狀結構。工具真名是 `<namespace>__<tool>`，只有預設命名空間 functions 底下才是裸名。轉譯層攤平巢狀時把命名空間丟掉，模型收到的是裸名 js，照著回呼過去 Codex 查無此工具，回 \"unsupported call: js\"。",
-        "實際送出的工具只有五個：exec、wait、request_user_input 在 functions 底下，攤平成裸名剛好正確，所以看起來一切正常；js 與 js_reset 在 mcp__cua_repl 底下，兩個都叫不到。瀏覽器控制的三個外掛（browser、chrome、unified-computer-use）全部匯流到這兩個工具，所以瀏覽器與桌面自動化是全滅的，而且失敗訊息只說工具不存在，看不出跟路由器有關。",
-        "攤平時改為逐層累積 `<namespace>__` 前綴，functions 維持裸名；freeform 集合同步登記完整名稱，回程才判得出該還原成 custom_tool_call。原始工具物件不就地修改。",
-        "只影響 translate=anthropic 的路由。原樣轉送的路由本來就不碰工具清單，不受影響。"
+        "第一階段修正 namespace 攤平：送往 Anthropic 時以 `<namespace>__<tool>` 形成唯一別名，預設 functions 命名空間仍維持裸名；freeform 集合同步使用該別名。",
+        "這一版尚未把 Anthropic 回傳的別名拆回 Responses 所需的獨立 name 與 namespace，因此 Computer Use 仍會回 unsupported call；完整修復在 1.16.2。",
+        "只影響 translate=anthropic 的路由；原樣轉送的路由不碰工具清單。"
       ]
     },
     {

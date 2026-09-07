@@ -157,6 +157,23 @@ test("空的工具輸出補上佔位文字（Anthropic 不收空 content）", ()
   assert.deepEqual(request.messages.at(-1).content[0].content, [{ type: "text", text: "(no output)" }]);
 });
 
+test("沒有 call_id 的轉送輸出還原成 user 內容，不產生無效 tool_result", () => {
+  const request = build([
+    {
+      type: "function_call_output",
+      name: "send_message_to_thread",
+      namespace: "codex_app",
+      output: "<codex_delegation>請驗證瀏覽器工具</codex_delegation>",
+    },
+  ]);
+  const blocks = request.messages.flatMap((message) => message.content);
+  assert.equal(blocks.some((block) => block.type === "tool_result"), false);
+  assert.equal(
+    blocks.some((block) => block.type === "text" && block.text.includes("請驗證瀏覽器工具")),
+    true,
+  );
+});
+
 test("custom（自由格式）工具模擬成單一 string 參數", () => {
   const request = build([
     { type: "additional_tools", tools: [{ type: "custom", name: "shell", description: "run" }] },
