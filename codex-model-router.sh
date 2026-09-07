@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.16.0";
+const INSTALLER_VERSION = "1.16.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -4892,10 +4892,19 @@ function toAnthropicBlocks(content) {
 }
 
 // additional_tools 內含 namespace 巢狀，攤平成單層。
-function flattenTools(items, out = []) {
+// Codex 認的工具真名是 `<namespace>__<tool>`（例如 mcp__cua_repl__js、web__run），
+// 只有預設命名空間 functions 底下才是裸名。攤平時如果把前綴丟掉，模型會照裸名回呼，
+// Codex 端查無此工具就回 "unsupported call: <name>"——Computer Use 的 js / js_reset
+// 就是這樣整組失效的。
+function flattenTools(items, out = [], prefix = "") {
   for (const tool of items || []) {
-    if (tool?.type === "namespace") flattenTools(tool.tools, out);
-    else if (tool?.name) out.push(tool);
+    if (tool?.type === "namespace") {
+      const nested =
+        tool.name && tool.name !== "functions" ? `${prefix}${tool.name}__` : prefix;
+      flattenTools(tool.tools, out, nested);
+    } else if (tool?.name) {
+      out.push(prefix ? { ...tool, name: `${prefix}${tool.name}` } : tool);
+    }
   }
   return out;
 }

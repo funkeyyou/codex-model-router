@@ -1,6 +1,16 @@
 {
-  "latest": "1.16.0",
+  "latest": "1.16.1",
   "releases": [
+    {
+      "version": "1.16.1",
+      "date": "2026-09-08",
+      "changes": [
+        "修復 Computer Use 整組不能用：Codex 的工具清單不在 tools 欄位，而是放在 input 的 additional_tools 裡，並且是有命名空間的巢狀結構。工具真名是 `<namespace>__<tool>`，只有預設命名空間 functions 底下才是裸名。轉譯層攤平巢狀時把命名空間丟掉，模型收到的是裸名 js，照著回呼過去 Codex 查無此工具，回 \"unsupported call: js\"。",
+        "實際送出的工具只有五個：exec、wait、request_user_input 在 functions 底下，攤平成裸名剛好正確，所以看起來一切正常；js 與 js_reset 在 mcp__cua_repl 底下，兩個都叫不到。瀏覽器控制的三個外掛（browser、chrome、unified-computer-use）全部匯流到這兩個工具，所以瀏覽器與桌面自動化是全滅的，而且失敗訊息只說工具不存在，看不出跟路由器有關。",
+        "攤平時改為逐層累積 `<namespace>__` 前綴，functions 維持裸名；freeform 集合同步登記完整名稱，回程才判得出該還原成 custom_tool_call。原始工具物件不就地修改。",
+        "只影響 translate=anthropic 的路由。原樣轉送的路由本來就不碰工具清單，不受影響。"
+      ]
+    },
     {
       "version": "1.16.0",
       "date": "2026-09-06",
