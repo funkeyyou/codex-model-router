@@ -174,10 +174,20 @@ test("不完整的訊框整段留在 remainder，等下一塊資料", () => {
 });
 
 test("超過上限的訊框長度會擋下來，不會照著配置記憶體", () => {
-  // 64 位元長度分支宣告 64 MB，超過 32 MB 上限。
+  // 接收上限與上游門檻分離；超過 128 MB 仍在配置 payload 前擋下來。
   const header = Buffer.alloc(10);
   header[0] = 0x81;
   header[1] = 127;
-  header.writeBigUInt64BE(64n * 1024n * 1024n, 2);
+  header.writeBigUInt64BE(256n * 1024n * 1024n, 2);
   assert.throws(() => parseWebSocketFrames(header), /超過路由器限制/);
+});
+
+test("超過上游 32 MB 的本機訊框仍能接收，讓圖片預算有機會處理", () => {
+  const header = Buffer.alloc(10);
+  header[0] = 0x81;
+  header[1] = 127;
+  header.writeBigUInt64BE(34n * 1024n * 1024n, 2);
+  const parsed = parseWebSocketFrames(header);
+  assert.equal(parsed.frames.length, 0);
+  assert.equal(parsed.remainder.length, header.length);
 });

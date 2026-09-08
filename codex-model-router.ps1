@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.18.1";
+const INSTALLER_VERSION = "1.18.2";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -3009,10 +3009,132 @@ export function upstreamRequestTooLarge(bytes, limit = maxUpstreamRequestBytes) 
 export function oversizeMessage(bytes, limit) {
   const mb = (value) => (value / (1024 * 1024)).toFixed(1);
   return (
-    `這一輪要送往上游的請求有 ${mb(bytes)} MB，超過 ${mb(limit)} MB 的上限。` +
-    "這條對話累積的歷史已經大到送不出去（通常是工具輸出佔掉絕大部分），" +
-    "重試不會有幫助，請改開一條新對話。"
+    `這一輪要送往上游的請求仍有 ${mb(bytes)} MB，超過路由器設定的 ${mb(limit)} MB 上限。` +
+    "已嘗試縮減舊工具截圖；使用者圖片、近期截圖與文字內容會保留。" +
+    "請縮小近期圖片或附件，或將工作摘要帶到新對話；重試相同內容不會解除限制。"
   );
+}
+
+// token 預算無法控制 Base64 圖片的傳輸大小。先以最終上游 JSON 的 75% 上限
+// 作為目標，為後續工具往返留空間；只替換較舊的工具截圖，不碰使用者附件與文字。
+const recentToolImagesToKeep = 4;
+const historyImageDirectory = join(routerDirectory, "history-images");
+
+function inlineToolImage(block) {
+  if (block?.type === "image" && block.source?.type === "base64") {
+    return { data: block.source.data, mediaType: block.source.media_type };
+  }
+  if (block?.type !== "input_image") return null;
+  const url = block.image_url ?? block.url;
+  if (typeof url !== "string") return null;
+  const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/.exec(url);
+  return match ? { data: match[2], mediaType: match[1] } : null;
+}
+
+// 省略前保存原始圖片，檔名依內容定址，重試不會反覆寫出相同圖片。
+// 不下載 URL、不修改 Codex 歷史；若無法保存就留下圖片，不能給出不存在的回讀路徑。
+export function archiveHistoryImage(image, directory = historyImageDirectory) {
+  const extension = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" }[image?.mediaType];
+  if (!extension || typeof image.data !== "string" || !image.data) return null;
+  const buffer = Buffer.from(image.data, "base64");
+  if (!buffer.length || buffer.toString("base64") !== image.data) return null;
+  const digest = createHash("sha256").update(buffer).digest("hex");
+  const target = join(directory, `${digest}.${extension}`);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    writeFileSync(target, buffer, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (error.code !== "EEXIST" || !readFileSync(target).equals(buffer)) throw error;
+  }
+  return target;
+}
+
+function toolImageSlots(payload, anthropic) {
+  const slots = [];
+  const walk = (blocks, group) => {
+    if (!Array.isArray(blocks)) return;
+    blocks.forEach((block, index) => {
+      const image = inlineToolImage(block);
+      if (image) slots.push({ blocks, index, image, group });
+      else if (Array.isArray(block?.content)) walk(block.content, group);
+    });
+  };
+  if (anthropic) {
+    for (const message of payload.messages || []) {
+      for (const block of message.content || []) {
+        if (block.type === "tool_result") walk(block.content, block);
+      }
+    }
+  } else if (Array.isArray(payload.input)) {
+    for (const item of payload.input) {
+      if (item?.call_id && ["function_call_output", "custom_tool_call_output"].includes(item.type)) {
+        walk(item.output, item);
+      }
+    }
+  }
+  return slots;
+}
+
+export function budgetToolImages(payload, {
+  anthropic = false,
+  maxBytes = maxUpstreamRequestBytes,
+  archive = archiveHistoryImage,
+} = {}) {
+  const originalBuffer = Buffer.from(JSON.stringify(payload));
+  const result = {
+    request: payload, buffer: originalBuffer, originalBytes: originalBuffer.length,
+    imagesOmitted: 0, bytesSaved: 0, archiveFailures: 0,
+  };
+  const targetBytes = Math.floor(maxBytes * 0.75);
+  if (!Number.isFinite(targetBytes) || targetBytes <= 0 || originalBuffer.length <= targetBytes) return result;
+
+  // 只改送出的副本。Codex 與本機的增量重建仍保留完整歷史，之後可重新讀圖。
+  const copy = structuredClone(payload);
+  const slots = toolImageSlots(copy, anthropic);
+  const latestGroup = slots.at(-1)?.group;
+  let bytes = originalBuffer.length;
+  for (const slot of slots.slice(0, -recentToolImagesToKeep)) {
+    if (bytes <= targetBytes) break;
+    // 最新一次工具結果中的圖片可能是一組比較圖，整組保留，即使超過四張。
+    if (slot.group === latestGroup) continue;
+    const originalSize = Buffer.byteLength(JSON.stringify(slot.blocks[slot.index]));
+    if (originalSize < 1024) continue;
+    let savedPath;
+    try { savedPath = archive(slot.image); } catch { /* 保留無法封存的圖片。 */ }
+    if (typeof savedPath !== "string" || !savedPath) {
+      result.archiveFailures += 1;
+      continue;
+    }
+    const replacement = {
+      type: anthropic ? "text" : "input_text",
+      text: `(較舊的工具截圖已移出本輪請求以控制大小；原圖：${savedPath}。需要細節時可重新讀取原圖。)`,
+    };
+    const saved = originalSize - Buffer.byteLength(JSON.stringify(replacement));
+    if (saved <= 0) continue;
+    slot.blocks[slot.index] = replacement;
+    bytes -= saved;
+    result.imagesOmitted += 1;
+  }
+  if (result.imagesOmitted) {
+    result.request = copy;
+    result.buffer = Buffer.from(JSON.stringify(copy));
+    result.bytesSaved = originalBuffer.length - result.buffer.length;
+  }
+  return result;
+}
+
+function recordImageBudget(result) {
+  stats.toolImagesOmitted += result.imagesOmitted;
+  stats.toolImageBytesSaved += result.bytesSaved;
+  stats.imageArchiveFailures += result.archiveFailures;
+  stats.lastRequestBytesBeforeBudget = result.originalBytes;
+  stats.lastRequestBytesAfterBudget = result.buffer.length;
+  if (result.imagesOmitted || result.archiveFailures) {
+    process.stderr.write(
+      `model-router-image-budget:${result.originalBytes}->${result.buffer.length}` +
+      ` omitted=${result.imagesOmitted} archiveFailures=${result.archiveFailures}\n`,
+    );
+  }
 }
 
 // --- 模型目錄的自動更新 -----------------------------------------------------
@@ -3498,6 +3620,11 @@ const stats = {
   responseFailedSent: 0,
   truncatedUpstreamStreams: 0,
   oversizeRejects: 0,
+  toolImagesOmitted: 0,
+  toolImageBytesSaved: 0,
+  imageArchiveFailures: 0,
+  lastRequestBytesBeforeBudget: null,
+  lastRequestBytesAfterBudget: null,
   websocketOnlyFieldsStripped: 0,
   queuedResponses: 0,
   responseInProgressRejects: 0,
@@ -3841,7 +3968,7 @@ async function fetchCustom(target, headers, body, signal) {
   });
 }
 
-async function fetchModelUpstream(
+export async function fetchModelUpstream(
   requestHeaders,
   incomingUrl,
   body,
@@ -3916,9 +4043,11 @@ async function fetchModelUpstream(
       meta.compaction = compaction;
       meta.model = body.model;
       meta.requestBody = effectiveBody;
-      meta.anthropicRequest = anthropicRequest;
+      const budget = budgetToolImages(anthropicRequest, { anthropic: true });
+      recordImageBudget(budget);
+      meta.anthropicRequest = budget.request;
       stats.translatedRequests += 1;
-      const anthropicBody = Buffer.from(JSON.stringify(anthropicRequest));
+      const anthropicBody = budget.buffer;
       if (upstreamRequestTooLarge(anthropicBody.length)) {
         return oversizeResponse(anthropicBody.length);
       }
@@ -3931,6 +4060,9 @@ async function fetchModelUpstream(
       stats.lastCustomStatus = translated.status;
       return translated;
     }
+    const budget = budgetToolImages(outboundBodyObject);
+    recordImageBudget(budget);
+    outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {
       return oversizeResponse(outboundBody.length);
     }
@@ -4077,7 +4209,9 @@ async function handleResponses(request, response, incomingUrl) {
 }
 
 const websocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const maxWebSocketMessageBytes = 32 * 1024 * 1024;
+// 本機必須先收得到含舊截圖的完整請求，才有機會縮減；與上游 32 MB 門檻分開。
+// 仍設有限的接收上限，避免依不合理的訊框長度配置記憶體。
+const maxWebSocketMessageBytes = 128 * 1024 * 1024;
 
 export function encodeWebSocketFrame(opcode, payload = Buffer.alloc(0)) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);

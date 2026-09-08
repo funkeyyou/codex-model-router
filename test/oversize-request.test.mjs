@@ -7,8 +7,7 @@
 // 轉譯成 Anthropic 請求後 35.5 MB，超過 Messages API 的 32 MB 上限。
 // 重試 31 次 = 白傳 1.1 GB，而且不可能成功。
 //
-// 這一層的用意不是讓請求變得送得出去，是讓「送不出去」這件事講得清楚，
-// 並且在送出前就停下來。
+// 較舊工具截圖先由圖片預算縮減；仍超限時，最後這層才拒收並說明可行的處理方式。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -50,4 +49,6 @@ test("訊息要說明重試沒用，否則使用者只會一直按重試", () =>
   const message = oversizeMessage(37264963, 32 * MB);
   assert.match(message, /重試/);
   assert.match(message, /新對話/);
+  assert.match(message, /縮小近期圖片或附件/);
+  assert.match(message, /路由器設定/);
 });
