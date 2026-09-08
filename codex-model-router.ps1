@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.18.0";
+const INSTALLER_VERSION = "1.18.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1248,7 +1248,8 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // 沒列在這裡的東西每次重裝都會靜默消失——README 明文寫給使用者調的
 // maxLogBytes、viewImageBridge、upstreamWebSocket* 全都在內。
 // imageOutputDir 與 forceListedModels 不列在這：前者由 resolveImageOutputDir
-// 處理（沒設過時還要算預設值），後者安裝時會重新詢問。
+// 處理（沒設過時還要算預設值），後者由 install() 直接沿用既有值——安裝流程
+// 不再詢問隱藏模型，改由 hidden-models 命令單獨管理。
 const preservedSettingKeys = [
   "captureDir",
   "catalogRefresh",
@@ -1278,14 +1279,9 @@ function preservedSettings() {
   return kept;
 }
 
-// 安裝器一直看得到 visibility，卻從沒告訴使用者有東西被藏起來——於是
-// 「Codex 更新後新模型不見了」變成一個查不出原因的症狀。這裡直接列出來讓
-// 使用者決定，比留一個藏在 settings.json 裡的旋鈕有用得多。
-async function chooseForcedModels(
-  officialModels,
-  previous,
-  { preserveOnBlank = false } = {},
-) {
+// 隱藏模型只由 hidden-models 命令使用：安裝流程不該為了一個與 Base URL、
+// API Key、模型探測都無關的選項多問一次。
+async function chooseForcedModels(officialModels, previous) {
   const hidden = officialModels.filter((model) => model.visibility === "hide");
   const previousList = Array.isArray(previous) ? previous : [];
   if (hidden.length === 0) return previousList.filter((slug) => slug);
@@ -1302,11 +1298,13 @@ async function chooseForcedModels(
   );
   console.log("選了會在請求時失敗——改回來就好，不影響其他模型。" );
 
-  const prompt = preserveOnBlank
-    ? "要強制顯示哪幾個？逗號分隔編號、all 全選、none 清空、留空保留目前設定"
-    : "要強制顯示哪幾個？逗號分隔編號、all 全選、留空都不顯示";
-  const answer = (await ask(prompt, "")).trim();
-  if (!answer) return preserveOnBlank ? previousList : [];
+  const answer = (
+    await ask(
+      "要強制顯示哪幾個？逗號分隔編號、all 全選、none 清空、留空保留目前設定",
+      "",
+    )
+  ).trim();
+  if (!answer) return previousList;
   if (/^(none|0)$/i.test(answer)) return [];
   if (answer.toLowerCase() === "all") return hidden.map((model) => model.slug);
 
@@ -2140,7 +2138,9 @@ async function install() {
   const discoveredOfficial = bundledCatalog.models.filter(
     (model) => !String(model.slug).startsWith("custom/"),
   );
-  const forceListedModels = await chooseForcedModels(
+  // 安裝與重新配置都不問隱藏模型：那是獨立的 hidden-models 命令。
+  // 既有選擇仍要沿用，否則重裝一次就把強制顯示的模型又藏回去。
+  const forceListedModels = normalizeForceListedModels(
     discoveredOfficial,
     readSettingsIfExists().forceListedModels,
   );
@@ -2653,7 +2653,7 @@ async function manageHiddenModels() {
   );
   const chosen = normalizeForceListedModels(
     officialModels,
-    await chooseForcedModels(officialModels, previous, { preserveOnBlank: true }),
+    await chooseForcedModels(officialModels, previous),
   );
   const combinedCatalog = mergeCatalogForForcedModels(
     bundledCatalog,
