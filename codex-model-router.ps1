@@ -152,7 +152,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.17.0";
+const INSTALLER_VERSION = "1.18.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1157,12 +1157,91 @@ function codexBinSearchDir() {
 
 // bundled 目錄把尚未普及的模型標成 hide，但實際能不能用是後端依帳號決定的；
 // model_catalog_json 會蓋掉後端的判斷，於是帳號有權限也看不到。
-function applyForcedVisibility(models, forceListed) {
+export function applyForcedVisibility(models, forceListed) {
   if (!Array.isArray(forceListed) || forceListed.length === 0) return models;
   const forced = new Set(forceListed);
   return models.map((model) =>
     forced.has(model.slug) ? { ...model, visibility: "list" } : model,
   );
+}
+
+export function hiddenOfficialModels(catalog) {
+  return (catalog?.models || []).filter(
+    (model) =>
+      !String(model?.slug || "").startsWith("custom/") &&
+      model?.visibility === "hide",
+  );
+}
+
+export function normalizeForceListedModels(officialModels, forceListed) {
+  const known = new Set(
+    (officialModels || [])
+      .map((model) => model?.slug)
+      .filter(
+        (slug) =>
+          typeof slug === "string" &&
+          slug &&
+          !slug.startsWith("custom/"),
+      ),
+  );
+  const wanted = new Set(Array.isArray(forceListed) ? forceListed : []);
+  return (officialModels || [])
+    .map((model) => model?.slug)
+    .filter(
+      (slug) =>
+        typeof slug === "string" &&
+        known.has(slug) &&
+        wanted.has(slug),
+    );
+}
+
+// 只更新官方模型的 visibility，第三方 custom/* 項目原樣保留。
+// 這是獨立 hidden-models 命令與路由器自動刷新共用的資料契約。
+export function mergeCatalogForForcedModels(
+  freshCatalog,
+  currentCatalog,
+  forceListed = [],
+) {
+  const officialModels = (freshCatalog?.models || []).filter(
+    (model) => !String(model?.slug || "").startsWith("custom/"),
+  );
+  if (officialModels.length === 0) throw new Error("bundled 目錄沒有官方模型");
+  const official = applyForcedVisibility(
+    officialModels,
+    normalizeForceListedModels(officialModels, forceListed),
+  );
+  const custom = (currentCatalog?.models || []).filter((model) =>
+    String(model?.slug || "").startsWith("custom/"),
+  );
+  const maxPriority = Math.max(
+    0,
+    ...official.map((model) => Number(model.priority) || 0),
+  );
+  const renumbered = custom.map((model, index) => ({
+    ...model,
+    priority: maxPriority + index + 1,
+  }));
+  return { ...freshCatalog, models: [...official, ...renumbered] };
+}
+
+export function validateManagedCatalog(catalog, forceListed = [], customSlugs = []) {
+  const models = Array.isArray(catalog?.models) ? catalog.models : [];
+  const bySlug = new Map(
+    models
+      .filter((model) => typeof model?.slug === "string")
+      .map((model) => [model.slug, model]),
+  );
+  const hiddenForced = forceListed.filter(
+    (slug) => bySlug.get(slug)?.visibility === "hide",
+  );
+  const missingForced = forceListed.filter((slug) => !bySlug.has(slug));
+  const missingCustom = customSlugs.filter((slug) => !bySlug.has(slug));
+  return {
+    ok: hiddenForced.length === 0 && missingForced.length === 0 && missingCustom.length === 0,
+    hiddenForced,
+    missingForced,
+    missingCustom,
+  };
 }
 
 // 使用者可以在 settings.json 裡調的旋鈕。安裝器用固定欄位重寫整個檔案，因此
@@ -1202,7 +1281,11 @@ function preservedSettings() {
 // 安裝器一直看得到 visibility，卻從沒告訴使用者有東西被藏起來——於是
 // 「Codex 更新後新模型不見了」變成一個查不出原因的症狀。這裡直接列出來讓
 // 使用者決定，比留一個藏在 settings.json 裡的旋鈕有用得多。
-async function chooseForcedModels(officialModels, previous) {
+async function chooseForcedModels(
+  officialModels,
+  previous,
+  { preserveOnBlank = false } = {},
+) {
   const hidden = officialModels.filter((model) => model.visibility === "hide");
   const previousList = Array.isArray(previous) ? previous : [];
   if (hidden.length === 0) return previousList.filter((slug) => slug);
@@ -1219,10 +1302,12 @@ async function chooseForcedModels(officialModels, previous) {
   );
   console.log("選了會在請求時失敗——改回來就好，不影響其他模型。" );
 
-  const answer = (
-    await ask("要強制顯示哪幾個？逗號分隔編號、all 全選、留空都不顯示", "")
-  ).trim();
-  if (!answer) return [];
+  const prompt = preserveOnBlank
+    ? "要強制顯示哪幾個？逗號分隔編號、all 全選、none 清空、留空保留目前設定"
+    : "要強制顯示哪幾個？逗號分隔編號、all 全選、留空都不顯示";
+  const answer = (await ask(prompt, "")).trim();
+  if (!answer) return preserveOnBlank ? previousList : [];
+  if (/^(none|0)$/i.test(answer)) return [];
   if (answer.toLowerCase() === "all") return hidden.map((model) => model.slug);
 
   const chosen = [];
@@ -2538,6 +2623,122 @@ async function update() {
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
+async function manageHiddenModels() {
+  const manifest = readManifest();
+  if (manifest?.version) assertInstallerNotOlder(manifest.version);
+  if (!manifest) {
+    fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
+  }
+  if (!existsSync(settingsPath)) {
+    fail("找不到 settings.json，安裝可能已損壞，請改用「安裝或重新配置」。");
+  }
+  if (!existsSync(catalogPath)) {
+    fail("找不到 models.json，安裝可能已損壞，請改用「安裝或重新配置」。");
+  }
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  const currentCatalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+  const port = Number(settings.port ?? manifest.port);
+  if (!Number.isFinite(port) || port <= 0) fail("現有安裝沒有可用的連接埠設定。");
+
+  printHeading("管理隱藏的官方模型");
+  const bundledCatalog = loadBundledCatalog();
+  const officialModels = bundledCatalog.models.filter(
+    (model) => !String(model?.slug || "").startsWith("custom/"),
+  );
+  const previous = normalizeForceListedModels(
+    officialModels,
+    settings.forceListedModels,
+  );
+  const chosen = normalizeForceListedModels(
+    officialModels,
+    await chooseForcedModels(officialModels, previous, { preserveOnBlank: true }),
+  );
+  const combinedCatalog = mergeCatalogForForcedModels(
+    bundledCatalog,
+    currentCatalog,
+    chosen,
+  );
+  const customSlugs = (currentCatalog.models || [])
+    .filter((model) => String(model?.slug || "").startsWith("custom/"))
+    .map((model) => model.slug);
+  const unchanged =
+    JSON.stringify(previous) === JSON.stringify(chosen) &&
+    JSON.stringify(currentCatalog) === JSON.stringify(combinedCatalog);
+
+  if (unchanged) {
+    console.log("\n設定沒有變更，未重寫模型目錄或重啟路由器。");
+    console.log(`目前強制顯示 ${chosen.length} 個隱藏模型。`);
+    return;
+  }
+
+  const backupDir = join(backupsRoot, `hidden-models-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(settingsPath, join(backupDir, "settings.json"));
+  copyIfExists(catalogPath, join(backupDir, "models.json"));
+
+  let health = null;
+  try {
+    writeJsonAtomic(catalogPath, combinedCatalog);
+    writeJsonAtomic(settingsPath, { ...settings, forceListedModels: chosen });
+
+    const modelCheck = shell(codexBin, ["debug", "models"], {
+      env: { ...env, CODEX_HOME: codexHome },
+    });
+    const effectiveCatalog = JSON.parse(modelCheck.stdout);
+    const validation = validateManagedCatalog(
+      effectiveCatalog,
+      chosen,
+      customSlugs,
+    );
+    if (!validation.ok) {
+      const details = [
+        validation.missingForced.length
+          ? `目錄遺失：${validation.missingForced.join(", ")}`
+          : "",
+        validation.hiddenForced.length
+          ? `仍被隱藏：${validation.hiddenForced.join(", ")}`
+          : "",
+        validation.missingCustom.length
+          ? `自訂模型遺失：${validation.missingCustom.join(", ")}`
+          : "",
+      ].filter(Boolean).join("；");
+      fail(`Codex 模型目錄驗證失敗${details ? `：${details}` : ""}`);
+    }
+
+    restartServiceInPlace();
+    health = await waitForHealth(port);
+  } catch (error) {
+    console.error("\n隱藏模型設定失敗，正在還原之前的目錄...");
+    copyIfExists(join(backupDir, "settings.json"), settingsPath);
+    copyIfExists(join(backupDir, "models.json"), catalogPath);
+    try {
+      restartServiceInPlace();
+      await waitForHealth(port);
+      console.error("已還原原本的隱藏模型設定，路由器運作正常。");
+    } catch (restartError) {
+      console.error(
+        `\n嚴重：檔案已還原，但路由器沒有起來（${restartError.message}）。\n` +
+          `請手動啟動：${manualStartHint()}\n` +
+          `在它恢復之前，所有經過 127.0.0.1:${port} 的請求都會失敗。`,
+      );
+    }
+    throw error;
+  }
+
+  printHeading("隱藏模型設定完成");
+  console.log(
+    chosen.length
+      ? `已強制顯示 ${chosen.length} 個模型：${chosen.join(", ")}`
+      : "已恢復預設，不強制顯示任何隱藏模型。",
+  );
+  console.log(`健康檢查：${health?.status || "未知"}`);
+  console.log(`保留 ${customSlugs.length} 個自訂模型。`);
+  console.log(`備份：${backupDir}`);
+  console.log(`\n請完全退出並重新打開 ${desktopAppName}，模型選擇器才會刷新。`);
+}
+
 async function status() {
   const manifest = readManifest();
   if (!manifest) {
@@ -2633,6 +2834,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} install
   ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
+  ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} status
   ${basename(scriptPath || "codex-model-router.command")} rollback
 
@@ -2648,6 +2850,9 @@ update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層�
 add 用於在已有安裝上追加模型：沿用已儲存的 Base URL、API Key 與連接埠，
 只探測新選的模型，不會重問設定，也不改動 config.toml。
 
+hidden-models 用於單獨管理 Codex 內建目錄裡被標成隱藏的官方模型：
+只更新 forceListedModels 與模型目錄，保留自訂模型，不需要 Base URL 或 API Key。
+
 安裝器會繼續將官方 ChatGPT Codex 模型發送到 OpenAI，只有選中的
 自訂模型選擇器 ID 才會發送到配置的供應商。Codex 仍使用內建
 openai 供應商 ID，以保持 Desktop 與手機 Remote 的既有聊天可見。
@@ -2659,9 +2864,10 @@ async function chooseAction() {
   console.log("  1. 安裝或重新配置");
   console.log("  2. 更新到最新版本（保留現有配置）");
   console.log("  3. 添加模型（保留現有配置）");
-  console.log("  4. 查看狀態");
-  console.log("  5. 回退配置");
-  console.log("  6. 退出");
+  console.log("  4. 管理隱藏的官方模型");
+  console.log("  5. 查看狀態");
+  console.log("  6. 回退配置");
+  console.log("  7. 退出");
   const answer = await ask("請選擇操作", "1");
   const choices = {
     "1": "install",
@@ -2674,12 +2880,16 @@ async function chooseAction() {
     add: "add",
     "add-model": "add",
     addmodel: "add",
-    "4": "status",
+    "4": "hidden-models",
+    hidden: "hidden-models",
+    "hidden-models": "hidden-models",
+    "unhide-models": "hidden-models",
+    "5": "status",
     status: "status",
-    "5": "rollback",
+    "6": "rollback",
     rollback: "rollback",
     uninstall: "rollback",
-    "6": "exit",
+    "7": "exit",
     exit: "exit",
     quit: "exit",
   };
@@ -2699,6 +2909,9 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       "add",
       "add-model",
       "addmodel",
+      "hidden-models",
+      "hidden",
+      "unhide-models",
       "status",
     ]);
     if (!requestedAction || versionAwareActions.has(requestedAction)) {
@@ -2708,6 +2921,9 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     if (action === "install" || action === "setup") await install();
     else if (action === "update" || action === "upgrade") await update();
     else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
+    else if (action === "hidden-models" || action === "hidden" || action === "unhide-models") {
+      await manageHiddenModels();
+    }
     else if (action === "status") await status();
     else if (action === "rollback" || action === "uninstall") await rollback();
     else if (action === "exit") console.log("未進行任何修改。" );

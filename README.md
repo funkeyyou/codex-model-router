@@ -75,6 +75,7 @@ macOS：
 
 ```bash
 bash codex-model-router.sh update     # 升級程式碼，保留現有設定
+bash codex-model-router.sh hidden-models # 單獨管理被隱藏的官方模型
 bash codex-model-router.sh status     # 檢視安裝狀態與健康度
 bash codex-model-router.sh rollback   # 回退（安裝檔會封存，不會刪除）
 ```
@@ -83,6 +84,7 @@ Windows：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 hidden-models
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 ```
@@ -249,6 +251,23 @@ Codex 的內建目錄會把尚未普及的模型標成 `hide`。沒裝路由器�
 該顯示卻沒顯示的模型時會自動重建目錄。
 
 強制顯示只影響選擇器。能不能用仍然由後端決定，帳號沒權限的話選了會在請求時失敗。
+
+如果只想管理隱藏模型，不想重新探測或重設任何自訂模型，可以單獨執行：
+
+```bash
+bash codex-model-router.sh hidden-models
+```
+
+Windows：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 hidden-models
+```
+
+這個命令只會重新讀取 Codex 的 bundled 模型目錄，更新 `forceListedModels` 與
+`models.json`，保留既有的 `custom/*` 模型；寫入前會備份，完成後會驗證目錄並重啟路由器。
+它不需要 Base URL 或 API Key。選擇時留空會保留目前設定，輸入 `none` 才會全部恢復為隱藏。
+執行完請完全退出並重新打開 Codex Desktop，模型選擇器才會刷新。
 
 ### 需要看路由器實際送出去的內容
 

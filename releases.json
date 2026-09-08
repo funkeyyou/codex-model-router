@@ -1,6 +1,16 @@
 {
-  "latest": "1.17.0",
+  "latest": "1.18.0",
   "releases": [
+    {
+      "version": "1.18.0",
+      "date": "2026-09-08",
+      "changes": [
+        "新增 hidden-models 命令：把 Codex 內建目錄裡被標成隱藏的官方模型獨立列出與管理，不必重新輸入 Base URL、API Key 或重新探測第三方模型。",
+        "隱藏模型設定只更新 forceListedModels 與模型目錄，既有 custom/* 模型原樣保留，並在寫入後用 Codex model/list 驗證。",
+        "隱藏模型目錄更新具備原子寫入、備份、服務重啟與失敗還原；完成後只需重新打開 Codex Desktop 讓選擇器刷新。",
+        "選單新增「管理隱藏的官方模型」，macOS 與 Windows 使用同一份實作。"
+      ]
+    },
     {
       "version": "1.17.0",
       "date": "2026-09-08",
