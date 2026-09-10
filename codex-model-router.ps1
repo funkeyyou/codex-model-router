@@ -233,9 +233,6 @@ function ensureDirectory(path, mode = 0o700) {
 }
 
 function writeJsonAtomic(path, value, mode = 0o600) {
-  if (path === catalogPath && readSettingsIfExists().millionTokenContext === true) {
-    value = applyMillionTokenContext(value);
-  }
   const temporaryPath = `${path}.tmp-${process.pid}`;
   writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, {
     mode,
@@ -1176,16 +1173,6 @@ export function hiddenOfficialModels(catalog) {
   );
 }
 
-export function applyMillionTokenContext(catalog) {
-  if (!Array.isArray(catalog?.models) || !catalog.models.length) fail("模型目錄無效。");
-  return { ...catalog, models: catalog.models.map((model) => ({
-    ...model,
-    context_window: 1000000,
-    max_context_window: 1000000,
-    max_output_tokens: 128000,
-    effective_context_window_percent: 95,
-  })) };
-}
 
 export function normalizeForceListedModels(officialModels, forceListed) {
   const known = new Set(
@@ -1265,7 +1252,6 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // 處理（沒設過時還要算預設值），後者由 install() 直接沿用既有值——安裝流程
 // 不再詢問隱藏模型，改由 hidden-models 命令單獨管理。
 const preservedSettingKeys = [
-  "millionTokenContext",
   "captureDir",
   "catalogRefresh",
   "closeOnUpstreamError",
@@ -2754,59 +2740,34 @@ async function manageHiddenModels() {
   console.log(`\n請完全退出並重新打開 ${desktopAppName}，模型選擇器才會刷新。`);
 }
 
-async function configureMillionTokenContext() {
-  const manifest = readManifest();
-  if (!manifest || !existsSync(settingsPath) || !existsSync(catalogPath)) {
-    fail("請先安裝路由器。");
-  }
-  assertInstallerNotOlder(manifest.version);
+export async function configureMillionTokenContext() {
   if (!codexBin) fail("未找到 Codex CLI。");
-  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-  const catalog = applyMillionTokenContext(JSON.parse(readFileSync(catalogPath, "utf8")));
   const userConfig = await readUserConfig();
   const previous = deepGet(userConfig.config, "model_context_window");
-  const port = Number(settings.port ?? manifest.port);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) fail("連接埠設定無效。");
-  console.log("全部模型：上下文 1,000,000 tokens（95% 安全餘量），最大輸出 128,000 tokens。上游仍須支援這些上限。");
+  if (previous.value === 1000000) {
+    console.log("全域上下文已是 1,000,000 tokens，無需修改。");
+    return;
+  }
   const backupDir = join(backupsRoot, `context-1m-${timestamp()}`);
   ensureDirectory(backupDir);
-  copyIfExists(settingsPath, join(backupDir, "settings.json"));
-  copyIfExists(catalogPath, join(backupDir, "models.json"));
   copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
-  let configAttempted = false;
   try {
-    writeJsonAtomic(settingsPath, {
-      ...settings, millionTokenContext: true,
-      routes: settings.routes.map((route) => ({
-        ...route, contextWindow: 1000000, maxOutputTokens: 128000,
-      })),
-    });
-    writeJsonAtomic(catalogPath, catalog);
-    configAttempted = true;
     await writeConfigEdits([{ keyPath: "model_context_window", value: 1000000 }]);
-    restartServiceInPlace();
-    await waitForHealth(port);
-  } catch (error) {
-    copyIfExists(join(backupDir, "settings.json"), settingsPath);
-    copyIfExists(join(backupDir, "models.json"), catalogPath);
-    if (configAttempted) {
-      try {
-        await writeConfigEdits([
-          { keyPath: "model_context_window", value: previous.present ? previous.value : null },
-        ]);
-      } catch (configError) {
-        console.error(`全域配置還原失敗：${configError.message}；備份：${backupDir}`);
-      }
+    const verified = await readUserConfig();
+    if (deepGet(verified.config, "model_context_window").value !== 1000000) {
+      fail("全域上下文配置驗證失敗。");
     }
+  } catch (error) {
     try {
-      restartServiceInPlace();
-      await waitForHealth(port);
+      await writeConfigEdits([
+        { keyPath: "model_context_window", value: previous.present ? previous.value : null },
+      ]);
     } catch (restoreError) {
-      console.error(`還原後服務啟動失敗：${restoreError.message}；請執行 ${manualStartHint()}`);
+      console.error(`配置還原失敗：${restoreError.message}；備份：${backupDir}`);
     }
     throw error;
   }
-  console.log(`已設定 ${catalog.models.length} 個模型。備份：${backupDir}`);
+  console.log(`全域 model_context_window 已設為 1000000。備份：${backupDir}`);
   console.log(`請完全退出並重新打開 ${desktopAppName}，再建立新任務。`);
 }
 
@@ -2939,8 +2900,8 @@ async function chooseAction() {
   console.log("  4. 管理隱藏的官方模型");
   console.log("  5. 查看狀態");
   console.log("  6. 回退配置");
-  console.log("  7. 退出");
-  console.log("  8. 設定上下文 100 萬／最大輸出 128000");
+  console.log("  7. 設定全域上下文 100 萬");
+  console.log("  8. 退出");
   const answer = await ask("請選擇操作", "1");
   const choices = {
     "1": "install",
@@ -2962,8 +2923,8 @@ async function chooseAction() {
     "6": "rollback",
     rollback: "rollback",
     uninstall: "rollback",
-    "7": "exit",
-    "8": "context-1m",
+    "7": "context-1m",
+    "8": "exit",
     "context-1m": "context-1m",
     exit: "exit",
     quit: "exit",
@@ -3040,12 +3001,6 @@ const keychainService = settings.keychainService;
 const keychainAccount = settings.keychainAccount || "codex";
 const credentialPath = settings.credentialPath || null;
 const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route]));
-if (settings.millionTokenContext === true) {
-  for (const route of routeMap.values()) {
-    route.contextWindow = 1000000;
-    route.maxOutputTokens = 128000;
-  }
-}
 const tokenCacheTtlMs = 5 * 60 * 1000;
 const authValidationTtlMs = 5 * 60 * 1000;
 const maxRememberedThreads = 2048;
@@ -3285,7 +3240,7 @@ export function catalogNeedsRefresh(binMtimeMs, catalogMtimeMs) {
 
 // 官方項目整批換新，自訂項目沿用檔案裡既有的那份——那是安裝時探測出來的結果，
 // 路由器沒有重新探測的條件，也不該重複實作 customCatalogEntry（複製一份必然漂移）。
-export function mergeCatalog(freshCatalog, currentCatalog, forceListed = [], millionTokenContext = settings.millionTokenContext === true) {
+export function mergeCatalog(freshCatalog, currentCatalog, forceListed = []) {
   const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
   const forced = new Set(forceListed);
   const official = (freshCatalog?.models || [])
@@ -3302,11 +3257,7 @@ export function mergeCatalog(freshCatalog, currentCatalog, forceListed = [], mil
     ...model,
     priority: maxPriority + index + 1,
   }));
-  const models = [...official, ...renumbered];
-  return { ...freshCatalog, models: millionTokenContext ? models.map((model) => ({
-    ...model, context_window: 1000000, max_context_window: 1000000,
-    max_output_tokens: 128000, effective_context_window_percent: 95,
-  })) : models };
+  return { ...freshCatalog, models: [...official, ...renumbered] };
 }
 
 // forceListedModels 原本只在重建時套用，而重建的條件是「執行檔比目錄新」——
