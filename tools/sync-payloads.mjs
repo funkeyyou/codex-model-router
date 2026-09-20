@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 把 codex-model-router.sh 內嵌的三段 JavaScript 同步到 codex-model-router.ps1。
+// 把 codex-model-router.sh 內嵌的四段 JavaScript 同步到 codex-model-router.ps1。
 //
 //   node tools/sync-payloads.mjs           # 寫入 .ps1
 //   node tools/sync-payloads.mjs --check   # 只比對，有落差就以非零狀態結束

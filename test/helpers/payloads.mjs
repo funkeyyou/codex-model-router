@@ -1,4 +1,4 @@
-// 把 codex-model-router.sh 內嵌的三段 JavaScript 取出成真的模組，供測試 import。
+// 把 codex-model-router.sh 內嵌的 JavaScript 取出成真的模組，供測試 import。
 //
 // 測試一律針對 .sh —— 它是負載的唯一真實來源。直接讀 repo 裡的獨立 .mjs 檔會
 // 測到不存在的東西（那些檔案只在安裝後才存在於 CODEX_HOME）。
@@ -14,7 +14,8 @@ const shellPath = join(repoRoot, "codex-model-router.sh");
 const MARKERS = {
   installer: ["__CODEX_MODEL_ROUTER_INSTALLER_JS__", "__CODEX_MODEL_ROUTER_ROUTER_JS__"],
   router: ["__CODEX_MODEL_ROUTER_ROUTER_JS__", "__CODEX_MODEL_ROUTER_BRIDGE_JS__"],
-  bridge: ["__CODEX_MODEL_ROUTER_BRIDGE_JS__", "__CODEX_MODEL_ROUTER_EMBEDDED__"],
+  bridge: ["__CODEX_MODEL_ROUTER_BRIDGE_JS__", "__CODEX_MODEL_ROUTER_IMAGEGEN_JS__"],
+  imagegen: ["__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", "__CODEX_MODEL_ROUTER_EMBEDDED__"],
 };
 
 // 與安裝器的 awk 同樣的切法：起始標記的下一行起，到結束標記的前一行為止。
@@ -81,6 +82,7 @@ export async function loadPayloads() {
     installer: await load("installer"),
     router: await load("router"),
     bridge: await load("bridge"),
+    imagegen: await load("imagegen"),
   };
   return cached;
 }

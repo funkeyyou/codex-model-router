@@ -36,6 +36,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 
 安裝時會詢問三件事：Base URL、API Key、以及要加入哪些模型。
 輸入 API Key 時畫面不會顯示任何字元（跟 `sudo` 一樣），貼上後直接按 Enter。
+路由器安裝成功後，另會詢問是否使用中轉 API 生圖，預設為否；同意後才偵測圖片模型並安裝獨立技能。
 
 ## 升級
 
@@ -57,6 +58,8 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 `install.json` 與服務定義都會備份到 `~/.codex/backups/model-router/update-<時間戳>/`，
 需要遷移名稱時也會備份 `models.json`。
 任何一步失敗都會自動還原並重啟回原本的版本。
+已啟用的中轉生圖技能也會獨立備份與更新，保留手動修改的檔案；技能更新失敗時維持原狀並提示，
+不影響已完成的路由器更新。尚未啟用的技能不會被 `update` 自動安裝。
 
 `install` 保留給第一次安裝、換 Base URL 或 API Key、以及重新挑選模型的情況。
 
@@ -75,7 +78,7 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 `bash codex-model-router.sh context-1m` 執行；Windows 使用
 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 context-1m`。
 功能會備份使用者配置，只將全域 `model_context_window` 設為 1000000，並讀回驗證。
-最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 8 項為退出。
+最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 8 項為中轉 API 生圖，第 9 項為退出。
 完成後重新開啟桌面版並建立新任務。配置不會增加上游模型本身的能力或帳號權限。
 
 不帶參數執行會出現選單，也可以直接指定動作。
@@ -85,6 +88,7 @@ macOS：
 ```bash
 bash codex-model-router.sh update     # 升級程式碼，保留現有設定
 bash codex-model-router.sh hidden-models # 單獨管理被隱藏的官方模型
+bash codex-model-router.sh imagegen   # 單獨添加／設定中轉 API 生圖
 bash codex-model-router.sh status     # 檢視安裝狀態與健康度
 bash codex-model-router.sh rollback   # 回退（安裝檔會封存，不會刪除）
 ```
@@ -94,11 +98,66 @@ Windows：
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 hidden-models
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 imagegen
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 ```
 
 > 回退前請先看「[回退之後，用過 Claude 模型的舊對話會壞掉](#回退之後用過-claude-模型的舊對話會壞掉)」。
+
+## 中轉 API 生圖（可選）
+
+安裝時同意啟用，或事後選擇選單第 8 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
+不修改官方 `.system/imagegen`，也不需要內建 `image_gen` 工具。請求經本機路由器使用已保存的
+API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案內含生圖額度。
+
+設定時先以目前 API Key 查詢上游 `/models`，只展示下列三個模型中有出現在清單的選項。
+辨識原始模型名稱及供應商前綴，例如 `ark/gpt-image-2.5-flare`。三個都沒有時顯示
+「沒有偵測到支援的圖片模型，無法添加」，不建立技能；驗證失敗或網路不通則顯示查詢錯誤。
+模型出現在清單只代表此 Key 可以列出它；設定不會進行付費生圖測試，實際生成仍取決於上游權限、配額及服務狀態。
+
+| 選項 | API 模型 ID | 選用方向 |
+| --- | --- | --- |
+| Image 2 | `gpt-image-2` | 上一代模型，保留給既有流程或相容需求 |
+| Image 2.5 Sunburst | `gpt-image-2.5-sunburst` | 偏重編輯精準度，適合精細改圖與保留原圖細節 |
+| Image 2.5 Flare | `gpt-image-2.5-flare` | 偏重速度，適合一般生圖與快速迭代 |
+
+可以多選，輸入顯示的編號（例如 `1,2`）或 `all`。只選一個就固定使用；多選時由 AI 按需求
+在命令中明確指定，使用者指定優先。命令拒絕未勾選的模型，失敗不會自動切換模型或重送付費請求。
+模型差異參考 [OpenAI 圖片指南](https://developers.openai.com/api/docs/guides/image-generation)，速度與價格以中轉商為準。
+
+技能安裝在 `$CODEX_HOME/skills/router-imagegen/`（未設定 `CODEX_HOME` 時為 `~/.codex/skills/router-imagegen/`），
+內含 `SKILL.md`、模型設定、UI 資訊與 `scripts/imagegen.mjs` 命令。不含 API Key，不需 Python 或額外套件。
+新任務中可直接說：
+
+```text
+使用 $router-imagegen 幫我畫一隻貓。
+使用 $router-imagegen 的 Sunburst 修改這張圖片，只替換背景。
+```
+
+也可用安裝器選定的 Node 執行技能目錄內的命令：
+
+```bash
+node "$HOME/.codex/skills/router-imagegen/scripts/imagegen.mjs" list
+node "$HOME/.codex/skills/router-imagegen/scripts/imagegen.mjs" generate --model flare --prompt-file prompt.txt --out cat.png
+node "$HOME/.codex/skills/router-imagegen/scripts/imagegen.mjs" edit --model sunburst --prompt-file edit.txt --image cat.png --out cat-v2.png
+```
+
+Windows 範例（`node` 不在 PATH 時，使用生成的 `SKILL.md` 內記錄的完整 Node 路徑）：
+
+```powershell
+node "$env:USERPROFILE\.codex\skills\router-imagegen\scripts\imagegen.mjs" list
+node "$env:USERPROFILE\.codex\skills\router-imagegen\scripts\imagegen.mjs" generate --model flare --prompt-file prompt.txt --out cat.png
+```
+
+每次生成一張圖，預設 `size=auto`、`quality=auto`、輸出 PNG，保留已存在的輸出檔。
+`--image` 可重複提供參考圖，`--dry-run` 不送出生成請求。`--model` 省略時，生圖依
+Flare → Sunburst → Image 2、改圖依 Sunburst → Flare → Image 2，使用第一個已啟用模型。
+上游需支援 Images API 的 JSON／multipart 請求與 `b64_json` 圖片回應。
+
+重新執行 `imagegen` 可更換勾選模型；輸入 `none` 或執行 `imagegen-disable` 可停用，技能會封存到
+`$CODEX_HOME/backups/model-router/`。`rollback` 也會封存由此路由器建立的技能。手動修改會保留，
+同名但不屬於此路由器的技能不會被覆寫。重新開任務讓技能清單刷新，必要時重開 Codex。
 
 ## 平台差異
 
@@ -349,7 +408,7 @@ Anthropic 路由前，把它們改寫或剝除掉**——健康檢查的 `bridge
 
 ## 開發
 
-`codex-model-router.sh` 是三段內嵌 JavaScript（installer / router / claude-bridge）的
+`codex-model-router.sh` 是四段內嵌 JavaScript（installer / router / claude-bridge / imagegen）的
 唯一真實來源，`codex-model-router.ps1` 只是把同一段文字包進 PowerShell 註解區塊。
 改完 `.sh` 之後要同步過去：
 
@@ -363,7 +422,7 @@ node tools/sync-payloads.mjs --check   # 只比對，有落差就以非零狀態
 
 ### 測試
 
-測試直接把 `.sh` 裡的三段負載取出來 import，所以測到的一定是會發佈出去的那份
+測試直接把 `.sh` 裡的四段負載取出來 import，所以測到的一定是會發佈出去的那份
 （repo 裡沒有獨立的 `router.mjs`，那些檔案只在安裝後存在於 `CODEX_HOME`）。
 
 ```bash
@@ -395,7 +454,7 @@ Windows 上會變成普通相對路徑，測試照樣綠燈，其實什麼都沒
 
 - `.ps1` 開頭必須保留 UTF-8 BOM。PowerShell 5.1 少了 BOM 會改用 ANSI 代碼頁讀檔，
   安裝器的所有中文訊息都會變成亂碼。
-- 三段負載要整批同步。只同步其中一段（例如只改了 installer 就只搬 installer）
+- 四段負載要整批同步。只同步其中一段（例如只改了 installer 就只搬 installer）
   會讓 Windows 版靜默停留在舊的 router 或 claude-bridge。
 
 換行由 `.gitattributes` 統一成 LF；混進 CRLF 會讓 `--check` 在不同平台的簽出上誤報。

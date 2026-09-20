@@ -62,9 +62,12 @@ __CODEX_MODEL_ROUTER_INSTALLER_JS__
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  cpSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -80,7 +83,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.19.1";
+const INSTALLER_VERSION = "1.20.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -120,6 +123,13 @@ const bridgePath = join(installRoot, "claude-bridge.mjs");
 const settingsPath = join(installRoot, "settings.json");
 const catalogPath = join(installRoot, "models.json");
 const logPath = join(installRoot, "router.err.log");
+const relaySkillRoot = join(codexHome, "skills", "router-imagegen");
+const RELAY_IMAGEGEN_OWNER = "codex-model-router";
+export const RELAY_IMAGE_MODELS = [
+  { id: "gpt-image-2", label: "Image 2", description: "上一代圖片模型，適合既有流程與相容需求。" },
+  { id: "gpt-image-2.5-sunburst", label: "Image 2.5 Sunburst", description: "偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。" },
+  { id: "gpt-image-2.5-flare", label: "Image 2.5 Flare", description: "偏重速度，適合一般生圖與快速迭代。" },
+];
 const installHash = createHash("sha256")
   .update(codexHome)
   .digest("hex")
@@ -369,9 +379,18 @@ function loadBridgeSource() {
   const markerIndex = source.indexOf(marker);
   if (markerIndex < 0) fail("安裝器中缺少內嵌 Claude 轉譯程式碼。" );
   const bridgeSource = source.slice(markerIndex + marker.length);
-  const endMarker = "\n__CODEX_MODEL_ROUTER_EMBEDDED__";
+  const endMarker = "\n__CODEX_MODEL_ROUTER_IMAGEGEN_JS__";
   const endIndex = bridgeSource.lastIndexOf(endMarker);
   return endIndex < 0 ? bridgeSource : bridgeSource.slice(0, endIndex);
+}
+
+export function loadImagegenSource(sourcePath = scriptPath) {
+  const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_IMAGEGEN_JS__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__");
+  if (start < 0 || end <= start) fail("安裝器中缺少中轉生圖命令。");
+  return source.slice(start + marker.length, end) + "\n";
 }
 
 async function ask(question, defaultValue = null) {
@@ -2282,6 +2301,7 @@ async function install() {
   console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
   console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
   console.log(`回退命令：${basename(scriptPath)} rollback`);
+  await offerInstalledRelayImagegen();
 }
 
 // 在既有安裝上追加模型：沿用已保存的 Base URL、API Key、端口與既有路由，
@@ -2583,6 +2603,9 @@ async function update() {
   if (namesChanged) console.log("沒有上游前綴的預設模型名稱已補上 api/。");
   console.log(`備份：${backupDir}`);
   if (serviceWarning) console.log(`\n注意：${serviceWarning}`);
+  try { refreshRelayImagegen(); } catch (error) {
+    console.error(`路由器已更新，中轉生圖技能保持原狀：${error.message}`);
+  }
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
@@ -2702,6 +2725,232 @@ async function manageHiddenModels() {
   console.log(`\n請完全退出並重新打開 ${desktopAppName}，模型選擇器才會刷新。`);
 }
 
+export function selectRelayImageModels(answer, available = RELAY_IMAGE_MODELS) {
+  return parseSelection(answer, available.length).map((index) => available[index].id);
+}
+
+function relayConfig(root = relaySkillRoot, expectedSettings = settingsPath) {
+  if (!existsSync(root)) return null;
+  if (lstatSync(root).isSymbolicLink()) fail(`中轉生圖技能目錄是符號連結，未修改：${root}`);
+  let config;
+  try { config = JSON.parse(readFileSync(join(root, "config.json"), "utf8")); } catch {}
+  if (config?.managedBy !== RELAY_IMAGEGEN_OWNER || config.routerSettingsPath !== expectedSettings) {
+    fail(`技能目錄已存在且不是此路由器管理，未覆寫：${root}`);
+  }
+  return config;
+}
+
+function imagegenShellCommand(nodePath, program, platform = process.platform) {
+  const quote = (value) => platform === "win32"
+    ? psQuote(value) : `'${String(value).replaceAll("'", "'\\''")}'`;
+  return `${platform === "win32" ? "& " : ""}${quote(nodePath)} ${quote(program)}`;
+}
+
+export function renderRelayImageSkill({ root, nodePath, models, platform = process.platform }) {
+  const command = imagegenShellCommand(nodePath, join(root, "scripts", "imagegen.mjs"), platform);
+  const selected = RELAY_IMAGE_MODELS.filter((model) => models.includes(model.id));
+  return [
+    "---",
+    "name: router-imagegen",
+    "description: 透過使用者已啟用的中轉 API 生成或編輯圖片，適用於免費帳號或內建 image_gen 不可用的生圖需求，以及明確指定中轉生圖或 router-imagegen 的任務。",
+    "---", "", "# 中轉 API 生圖", "",
+    "此技能由使用者在路由器安裝器中選擇啟用，使用中轉供應商的圖片 API 並依其規則計費。",
+    "執行命令只連到本機路由器，由路由器讀取已保存的憑證；不需要 OPENAI_API_KEY，也不要讀出或複製金鑰。",
+    "若使用者指定官方內建工具或其他供應商，遵從其選擇。本技能不修改官方 imagegen。", "",
+    "## 模型選擇", "",
+    ...selected.map((model) => `- ${model.label}（${model.id}）：${model.description}`), "",
+    "只使用 config.json 中已勾選的模型。每次先執行下面的 list 命令確認最新清單。",
+    "若只有一個模型就固定使用；有多個時由 AI 按需求選擇，並以 --model 明確指定。",
+    "使用者明確指定的模型優先；若未啟用，說明並請使用者從安裝器設定，不擅自啟用。",
+    "一般生圖／快速迭代優先 Flare；需要精確修改或保留原圖細節時優先 Sunburst。",
+    "Image 2 用於使用者指定、既有流程或相容需求。只從已啟用模型中選擇，速度與費用以中轉商實際回應為準。", "",
+    "若省略 --model，命令的生圖預設依 Flare → Sunburst → Image 2，改圖依 Sunburst → Flare → Image 2，選第一個已啟用模型。AI 應明確指定，不以這個順序代替需求判斷。", "",
+    "## 執行", "",
+    "把提示詞寫進 UTF-8 檔案，避免 shell 引號與特殊字元影響內容。使用絕對路徑。",
+    "新圖片用 generate；改圖或帶參考圖用 edit，先查看本機參考圖，並寫清楚要保留及修改的部分。",
+    "以下路徑與 MODEL 請換成實際值；只需 Node.js，不需要 Python 或額外套件。", "",
+    "```" + (platform === "win32" ? "powershell" : "bash"),
+    `${command} list`,
+    `${command} generate --model MODEL --prompt-file 'prompt.txt' --out 'output.png'`,
+    `${command} edit --model MODEL --prompt-file 'prompt.txt' --image 'reference.png' --out 'output-v2.png'`,
+    "```", "",
+    "--image 可重複提供；--quality 支援 auto、low、medium、high，兩個 2.5 模型另支援 xhigh、max。",
+    "--size 可用 auto 或 WIDTHxHEIGHT；--background 可用 auto、opaque、transparent；--output-format 可用 png、jpeg、webp。",
+    "--dry-run 只檢查參數，不送出圖片 API 請求。命令每次只生成一張圖，預設逾時 300 秒。",
+    "已存在的輸出檔會被拒絕；換新檔名保留原圖。生成失敗或逾時時回報原因，不自動換模型重送，以免重複計費。",
+    "成功後查看輸出圖片，確認符合需求，再以絕對路徑顯示圖片，並告知使用的模型及檔案位置。",
+    "如果 Node 路徑已因桌面版更新失效，重新執行路由器 update 會刷新此技能。", "",
+  ].join("\n");
+}
+
+// 此功能獨立提交／還原，不把技能寫檔失敗變成整個路由器安裝失敗。
+export function installRelayImageSkill({ models, aliases = {}, root = relaySkillRoot,
+  settingsFile = settingsPath, backupRoot = backupsRoot, nodePath = nodeBin,
+  sourcePath = scriptPath, platform = process.platform } = {}) {
+  const allowed = new Set(RELAY_IMAGE_MODELS.map((model) => model.id));
+  if (!Array.isArray(models) || !models.length || models.some((model) => !allowed.has(model))) {
+    fail("中轉生圖只支援 Image 2、Sunburst、Flare，至少選擇一個。");
+  }
+  models = [...new Set(models)];
+  const previous = relayConfig(root, settingsFile);
+  for (const name of ["scripts", "agents", "config.json"]) {
+    const path = join(root, name);
+    if (existsSync(path) && lstatSync(path).isSymbolicLink()) fail(`技能路徑是符號連結，未修改：${path}`);
+  }
+  const files = {
+    "SKILL.md": renderRelayImageSkill({ root, nodePath, models, platform }),
+    "scripts/imagegen.mjs": loadImagegenSource(sourcePath),
+    "agents/openai.yaml": [
+      "interface:", '  display_name: "中轉 API 生圖"',
+      '  short_description: "沿用路由器憑證生成或編輯圖片，從已啟用模型中依需求選擇"',
+      '  default_prompt: "使用 $router-imagegen 依照我的需求生成圖片。"', "",
+    ].join("\n"),
+  };
+  const sha = (value) => createHash("sha256").update(value).digest("hex");
+  const hashes = {};
+  const preserved = [];
+  for (const [name, content] of Object.entries(files)) {
+    const path = join(root, name);
+    if (existsSync(path) && lstatSync(path).isSymbolicLink()) fail(`技能檔案是符號連結，未修改：${path}`);
+    if (previous && existsSync(path) && sha(readFileSync(path)) !== previous.hashes?.[name]) {
+      preserved.push(name);
+      hashes[name] = previous.hashes?.[name] || null;
+    } else hashes[name] = sha(content);
+  }
+  const upstreamModels = Object.fromEntries(models.map((model) => {
+    const upstream = aliases[model] || previous?.upstreamModels?.[model] || model;
+    if (upstream !== model && !(typeof upstream === "string" && upstream.endsWith(`/${model}`) && !/[\s?#]/.test(upstream))) {
+      fail(`無效的圖片模型對應：${model}`);
+    }
+    return [model, upstream];
+  }));
+  ensureDirectory(dirname(root));
+  ensureDirectory(backupRoot);
+  const backup = join(backupRoot, `imagegen-${timestamp()}`);
+  const stage = mkdtempSync(join(dirname(root), ".router-imagegen-stage-"));
+  let movedOld = false;
+  try {
+    if (previous) cpSync(root, stage, { recursive: true, dereference: false });
+    for (const [name, content] of Object.entries(files)) {
+      if (preserved.includes(name)) continue;
+      ensureDirectory(dirname(join(stage, name)));
+      writeFileSync(join(stage, name), content, { mode: 0o600 });
+    }
+    const config = { managedBy: RELAY_IMAGEGEN_OWNER, version: INSTALLER_VERSION,
+      routerSettingsPath: settingsFile, models, upstreamModels, hashes };
+    writeJsonAtomic(join(stage, "config.json"), config);
+    if (previous) {
+      ensureDirectory(backup);
+      renameSync(root, join(backup, "router-imagegen"));
+      movedOld = true;
+    }
+    renameSync(stage, root);
+    return { root, config, preserved, backup: movedOld ? backup : null };
+  } catch (error) {
+    if (movedOld && !existsSync(root)) renameSync(join(backup, "router-imagegen"), root);
+    throw error;
+  } finally {
+    if (existsSync(stage)) rmSync(stage, { recursive: true, force: true });
+  }
+}
+
+export function archiveRelayImageSkill(destination, root = relaySkillRoot, settingsFile = settingsPath) {
+  if (!relayConfig(root, settingsFile)) return false;
+  ensureDirectory(destination);
+  renameSync(root, join(destination, "router-imagegen"));
+  return true;
+}
+
+export function resolveRelayImageAliases(models, availableModels) {
+  return Object.fromEntries(models.map((model) => [model,
+    availableModels.includes(model) ? model : availableModels.find((id) => id.endsWith(`/${model}`)) || model,
+  ]));
+}
+
+export function detectRelayImageModels(availableModels) {
+  const ids = Array.isArray(availableModels) ? availableModels.filter((id) => typeof id === "string" && !/[\s\x00-\x1f\x7f?#]/.test(id)) : [];
+  const aliases = resolveRelayImageAliases(RELAY_IMAGE_MODELS.map((model) => model.id), ids);
+  return RELAY_IMAGE_MODELS.filter((model) => ids.includes(aliases[model.id]))
+    .map((model) => ({ ...model, upstreamModel: aliases[model.id] }));
+}
+
+async function discoverRelayImageModels() {
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  let response;
+  try {
+    response = await fetch(`${String(settings.apiRoot).replace(/\/$/, "")}/models`, {
+      headers: { authorization: `Bearer ${readApiKey(settings.keychainService)}` },
+      redirect: "manual", signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) fail(`無法驗證此 API Key 的圖片模型（HTTP ${response.status}），未修改生圖設定。`);
+    let payload;
+    try { payload = await response.json(); } catch { fail("上游模型清單無法解析，未修改生圖設定。"); }
+    if (!Array.isArray(payload?.data) && !Array.isArray(payload?.models)) fail("上游未返回有效模型清單，未修改生圖設定。");
+    return detectRelayImageModels(parseModelList(payload));
+  } catch (error) {
+    if (response) throw error;
+    fail("無法讀取中轉模型清單，請檢查 API Key、網路與供應商狀態；未修改生圖設定。");
+  }
+}
+
+async function configureRelayImagegen() {
+  if (!readManifest() || !existsSync(settingsPath)) fail("請先安裝路由器，再添加中轉 API 生圖。");
+  const current = relayConfig();
+  printHeading("中轉 API 生圖");
+  console.log("沿用現有中轉 Base URL 與憑證，費用由中轉供應商計算；此步驟只安裝技能，不生成圖片。");
+  console.log("正在使用目前 API Key 偵測圖片模型...");
+  const available = await discoverRelayImageModels();
+  if (!available.length) {
+    console.log("沒有偵測到支援的圖片模型，無法添加。此 API Key 的模型清單未列出 Image 2、Sunburst 或 Flare。");
+    if (current) console.log("現有技能未修改；需要停用時可執行 imagegen-disable。");
+    return;
+  }
+  available.forEach((model, index) => console.log(`  ${index + 1}. ${model.label} — ${model.description}\n     ${model.upstreamModel}`));
+  console.log("可複選：多個模型交由 AI 依需求選擇，使用者指定優先；只選一個就固定使用。");
+  const preferred = available.findIndex((model) => model.id === "gpt-image-2.5-flare");
+  const defaultChoice = current?.models?.map((id) => available.findIndex((model) => model.id === id) + 1).filter(Boolean).join(",") || String(preferred >= 0 ? preferred + 1 : 1);
+  const answer = await ask("選擇顯示的模型編號（逗號分隔或 all；none 停用；cancel 返回）", defaultChoice);
+  if (/^cancel$/i.test(answer)) return;
+  if (/^none$/i.test(answer)) {
+    if (!current) { console.log("中轉 API 生圖尚未啟用。"); return; }
+    const backup = join(backupsRoot, `imagegen-disabled-${timestamp()}`);
+    archiveRelayImageSkill(backup);
+    console.log(`已停用，技能可從備份恢復：${backup}`);
+    return;
+  }
+  const models = selectRelayImageModels(answer, available);
+  const aliases = Object.fromEntries(available.filter((model) => models.includes(model.id)).map((model) => [model.id, model.upstreamModel]));
+  const result = installRelayImageSkill({ models, aliases });
+  console.log(`已啟用 $router-imagegen：${result.root}`);
+  if (result.backup) console.log(`備份：${result.backup}`);
+  if (result.preserved.length) console.log(`保留手動修改的檔案：${result.preserved.join(", ")}`);
+  console.log("請建立新任務使用 $router-imagegen；若尚未出現，重新啟動 Codex。已確認此 Key 的模型清單，尚未進行付費生圖測試。");
+}
+
+export async function offerRelayImagegen({ existing = null, consent, configure, refresh } = {}) {
+  if (existing) { await refresh(existing); return true; }
+  if (!(await consent())) return false;
+  await configure();
+  return true;
+}
+
+function refreshRelayImagegen() {
+  const existing = relayConfig();
+  if (!existing) return;
+  const result = installRelayImageSkill({ models: existing.models, aliases: existing.upstreamModels });
+  console.log(`中轉生圖技能已更新${result.preserved.length ? `（保留手動檔案：${result.preserved.join(", ")}）` : ""}。`);
+}
+
+async function offerInstalledRelayImagegen() {
+  try {
+    await offerRelayImagegen({ existing: relayConfig(), refresh: configureRelayImagegen,
+      consent: () => input.isTTY ? confirm("是否使用中轉 API 生圖？將新增獨立技能並沿用現有憑證，圖片按供應商計費", false) : false,
+      configure: configureRelayImagegen });
+  } catch (error) {
+    console.error(`路由器已安裝，中轉生圖設定未完成：${error.message}。可稍後從選單第 8 項設定。`);
+  }
+}
+
 export async function configureMillionTokenContext() {
   if (!codexBin) fail("未找到 Codex CLI。");
   const userConfig = await readUserConfig();
@@ -2783,6 +3032,10 @@ async function status() {
   for (const route of manifest.routes) {
     console.log(`  - ${route.displayName} -> ${route.upstreamModel}`);
   }
+  try {
+    const imagegen = relayConfig();
+    console.log(`中轉 API 生圖：${imagegen ? imagegen.models.join(", ") : "未啟用（可從選單第 8 項添加）"}`);
+  } catch (error) { console.log(`中轉 API 生圖：${error.message}`); }
 }
 
 async function rollback() {
@@ -2802,6 +3055,9 @@ async function rollback() {
 
   const archiveDir = join(backupsRoot, `rollback-${timestamp()}`);
   ensureDirectory(archiveDir);
+  try { archiveRelayImageSkill(archiveDir); } catch (error) {
+    console.error(`中轉生圖技能未移動：${error.message}`);
+  }
   for (const path of serviceArchivePaths()) {
     if (path.startsWith(installRoot)) continue;
     if (existsSync(path)) renameSync(path, join(archiveDir, basename(path)));
@@ -2830,6 +3086,8 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} context-1m
+  ${basename(scriptPath || "codex-model-router.command")} imagegen
+  ${basename(scriptPath || "codex-model-router.command")} imagegen-disable
   ${basename(scriptPath || "codex-model-router.command")} status
   ${basename(scriptPath || "codex-model-router.command")} rollback
 
@@ -2837,6 +3095,7 @@ function help() {
   1. 兼容 OpenAI 的 Base URL
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
+路由器安裝成功後可選擇啟用中轉 API 生圖；預設不啟用，之後可從選單第 8 項添加。
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
 沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
@@ -2848,6 +3107,10 @@ add 用於在已有安裝上追加模型：沿用已儲存的 Base URL、API Key
 
 hidden-models 用於單獨管理 Codex 內建目錄裡被標成隱藏的官方模型：
 只更新 forceListedModels 與模型目錄，保留自訂模型，不需要 Base URL 或 API Key。
+
+imagegen 用於添加／設定中轉生圖技能 $router-imagegen，沿用現有憑證，不需 OPENAI_API_KEY。
+可複選 Image 2、Image 2.5 Sunburst、Image 2.5 Flare；多選時由 AI 按需求指定模型。
+輸入 none 可停用並封存技能，cancel 返回；設定不會進行付費生圖。
 
 安裝器會繼續將官方 ChatGPT Codex 模型發送到 OpenAI，只有選中的
 自訂模型選擇器 ID 才會發送到配置的供應商。Codex 仍使用內建
@@ -2864,7 +3127,8 @@ async function chooseAction() {
   console.log("  5. 查看狀態");
   console.log("  6. 回退配置");
   console.log("  7. 設定全域上下文 100 萬");
-  console.log("  8. 退出");
+  console.log("  8. 中轉 API 生圖（添加／設定）");
+  console.log("  9. 退出");
   const answer = await ask("請選擇操作", "1");
   const choices = {
     "1": "install",
@@ -2887,7 +3151,10 @@ async function chooseAction() {
     rollback: "rollback",
     uninstall: "rollback",
     "7": "context-1m",
-    "8": "exit",
+    "8": "imagegen",
+    imagegen: "imagegen",
+    "relay-imagegen": "imagegen",
+    "9": "exit",
     "context-1m": "context-1m",
     exit: "exit",
     quit: "exit",
@@ -2911,6 +3178,8 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       "hidden-models",
       "hidden",
       "unhide-models",
+      "imagegen",
+      "relay-imagegen",
       "status",
     ]);
     if (!requestedAction || versionAwareActions.has(requestedAction)) {
@@ -2918,6 +3187,11 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     }
     const action = requestedAction || (await chooseAction());
     if (action === "context-1m") await configureMillionTokenContext();
+    else if (action === "imagegen" || action === "relay-imagegen") await configureRelayImagegen();
+    else if (action === "imagegen-disable") {
+      const backup = join(backupsRoot, `imagegen-disabled-${timestamp()}`);
+      console.log(archiveRelayImageSkill(backup) ? `已停用中轉生圖，技能已封存至：${backup}` : "中轉生圖尚未啟用。");
+    }
     else if (action === "install" || action === "setup") await install();
     else if (action === "update" || action === "upgrade") await update();
     else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
@@ -4248,6 +4522,7 @@ async function handleImages(request, response, incomingUrl) {
 
   const abortController = new AbortController();
   request.on("aborted", () => abortController.abort());
+  response.on("close", () => { if (!response.writableFinished) abortController.abort(); });
 
   // 影像請求可能是 multipart（edits），因此原樣轉發位元組，不做解析。
   const path = incomingUrl.pathname.startsWith("/v1/")
@@ -6406,6 +6681,200 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       try { event = JSON.parse(line[1]); } catch { continue; }
       handle(event);
     }
+  }
+}
+__CODEX_MODEL_ROUTER_IMAGEGEN_JS__
+// 獨立圖片命令：只連本機路由器，不讀取或儲存 API Key。
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, extname, resolve, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+export const IMAGE_MODELS = ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"];
+const MODEL_ALIASES = {
+  image2: IMAGE_MODELS[0], "image-2": IMAGE_MODELS[0],
+  sunburst: IMAGE_MODELS[1], "image2.5-sunburst": IMAGE_MODELS[1],
+  flare: IMAGE_MODELS[2], "image2.5-flare": IMAGE_MODELS[2],
+};
+const HELP = `中轉 API 生圖（不需要 OPENAI_API_KEY）
+  imagegen.mjs list
+  imagegen.mjs generate --model flare --prompt-file prompt.txt --out output.png
+  imagegen.mjs edit --model sunburst --prompt-file prompt.txt --image input.png --out output-v2.png
+
+模型只可從安裝時勾選的 Image 2、Sunburst、Flare 選擇。
+--model 可用完整模型 ID 或 image2 / sunburst / flare。
+--image 可重複提供（最多 16 張 PNG、JPEG 或 WebP），edit 必須提供至少一張。
+--prompt 與 --prompt-file 二擇一；提示詞上限 32000 字元。
+--size auto 或 WIDTHxHEIGHT；--quality auto / low / medium / high / xhigh / max。
+--background auto / opaque / transparent；--output-format png / jpeg / webp。
+Image 2 不支援 xhigh / max。透明背景需使用 PNG 或 WebP。
+--timeout 秒數（預設 300，最多 1800）；--dry-run 只檢查、不生成圖片。
+每次生成一張圖片，不覆寫已有檔案，不自動重試或切換模型。
+`;
+
+export function parseImagegenArgs(args) {
+  if (!args.length || args.includes("--help") || args[0] === "help") return { action: "help" };
+  const options = { action: args[0], images: [], quality: "auto", size: "auto", background: "auto", timeout: 300 };
+  if (!["list", "generate", "edit"].includes(options.action)) throw new Error("未知命令；請使用 list、generate 或 edit。");
+  const names = { "--model": "model", "--prompt": "prompt", "--prompt-file": "promptFile", "--out": "out",
+    "--size": "size", "--quality": "quality", "--background": "background", "--output-format": "format", "--timeout": "timeout" };
+  for (let i = 1; i < args.length; i++) {
+    const flag = args[i];
+    if (flag === "--dry-run") { options.dryRun = true; continue; }
+    if (flag !== "--image" && !names[flag]) throw new Error(`未知參數：${flag}`);
+    const value = args[++i];
+    if (!value || value.startsWith("--")) throw new Error(`${flag} 缺少值。`);
+    if (flag === "--image") options.images.push(resolve(value));
+    else options[names[flag]] = value;
+  }
+  return options;
+}
+
+export function chooseImageModel(config, requested, action) {
+  const enabled = config?.models;
+  if (!Array.isArray(enabled) || !enabled.length || enabled.some((id) => !IMAGE_MODELS.includes(id))) {
+    throw new Error("圖片模型設定無效，請從路由器選單重新設定中轉 API 生圖。");
+  }
+  if (requested) {
+    const name = requested.toLowerCase();
+    const id = MODEL_ALIASES[name] || name;
+    if (!enabled.includes(id)) throw new Error("此圖片模型未啟用；請從已勾選的模型中選擇，或在路由器選單重新設定。");
+    return id;
+  }
+  const priority = action === "edit" ? [IMAGE_MODELS[1], IMAGE_MODELS[2], IMAGE_MODELS[0]] : [IMAGE_MODELS[2], IMAGE_MODELS[1], IMAGE_MODELS[0]];
+  return priority.find((id) => enabled.includes(id));
+}
+
+function fileImageFormat(bytes) {
+  if (bytes.length >= 8 && bytes.subarray(0, 8).toString("hex") === "89504e470d0a1a0a") return "png";
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpeg";
+  if (bytes.length >= 12 && bytes.subarray(0, 4).toString() === "RIFF" && bytes.subarray(8, 12).toString() === "WEBP") return "webp";
+  return null;
+}
+
+async function responseJson(response) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of response.body || []) {
+    bytes += chunk.length;
+    if (bytes > 128 * 1024 * 1024) throw new Error("圖片 API 回應超過 128 MiB，未保存輸出。");
+    chunks.push(Buffer.from(chunk));
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { throw new Error(`圖片 API 返回非 JSON 內容（HTTP ${response.status}），請檢查供應商是否支援 Images API。`); }
+}
+
+function apiError(payload, status) {
+  // 供應商可能把敏感參數放進錯誤字串；只回傳短訊息並遮蔽常見憑證格式。
+  const message = String(payload?.error?.message || payload?.message || "請檢查模型支援、供應商配額與路由器狀態。")
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 600);
+  return new Error(`中轉圖片 API HTTP ${status}：${message}`);
+}
+
+export async function runRelayImagegen(args, {
+  configPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "config.json"),
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const options = parseImagegenArgs(args);
+  if (options.action === "help") return { help: HELP };
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if (config.managedBy !== "codex-model-router" || typeof config.routerSettingsPath !== "string") {
+    throw new Error("此命令尚未由路由器安裝器配置。");
+  }
+  const model = chooseImageModel(config, options.model, options.action);
+  const upstreamModel = config.upstreamModels?.[model] || model;
+  if (upstreamModel !== model && !(typeof upstreamModel === "string" && upstreamModel.endsWith(`/${model}`) && !/[\s?#]/.test(upstreamModel))) {
+    throw new Error("圖片模型對應無效，請重新設定中轉生圖。");
+  }
+  if (options.action === "list") return { models: config.models, upstreamModels: config.upstreamModels,
+    defaultGenerate: chooseImageModel(config, null, "generate"), defaultEdit: chooseImageModel(config, null, "edit") };
+
+  const settings = JSON.parse(readFileSync(config.routerSettingsPath, "utf8"));
+  const port = Number(settings.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("路由器端口無效，請重新配置路由器。");
+  if (Boolean(options.prompt) === Boolean(options.promptFile)) throw new Error("請擇一提供 --prompt 或 --prompt-file。");
+  const prompt = options.promptFile ? readFileSync(resolve(options.promptFile), "utf8") : options.prompt;
+  if (!prompt.trim() || [...prompt].length > 32000) throw new Error("提示詞不可為空且最多 32000 字元。");
+  if (!options.out) throw new Error("請以 --out 指定新的輸出檔案。");
+  const ext = extname(options.out).slice(1).toLowerCase();
+  const format = options.format || (ext === "jpg" ? "jpeg" : ext) || "png";
+  if (!["png", "jpeg", "webp"].includes(format)) throw new Error("輸出格式只支援 png、jpeg、webp。");
+  if (ext && (ext === "jpg" ? "jpeg" : ext) !== format) throw new Error("--out 副檔名與 --output-format 不一致。");
+  const out = resolve(ext ? options.out : `${options.out}.${format}`);
+  if (existsSync(out)) throw new Error(`輸出檔已存在，請換一個檔名：${out}`);
+  const qualities = model === IMAGE_MODELS[0] ? ["auto", "low", "medium", "high"] : ["auto", "low", "medium", "high", "xhigh", "max"];
+  if (!qualities.includes(options.quality)) throw new Error(`此模型不支援 quality=${options.quality}。`);
+  if (!["auto", "opaque", "transparent"].includes(options.background)) throw new Error("background 只支援 auto、opaque、transparent。");
+  if (options.background === "transparent" && format === "jpeg") throw new Error("透明背景需使用 PNG 或 WebP。");
+  if (options.size !== "auto") {
+    const match = /^(\d+)x(\d+)$/.exec(options.size);
+    const [width, height] = match ? match.slice(1).map(Number) : [0, 0];
+    if (!width || !height || width % 16 || height % 16 || Math.max(width, height) > 3840 ||
+        Math.max(width, height) > Math.min(width, height) * 3 || width * height < 655360 || width * height > 8294400) {
+      throw new Error("尺寸需為 auto 或有效的 WIDTHxHEIGHT：邊長為 16 倍數、最長 3840、比例不超過 3:1、總像素 655360–8294400。");
+    }
+  }
+  const timeout = Number(options.timeout);
+  if (!Number.isFinite(timeout) || timeout < 1 || timeout > 1800) throw new Error("timeout 必須介於 1 至 1800 秒。");
+  if (options.action === "edit" && !options.images.length) throw new Error("edit 至少需要一個 --image。");
+  if (options.action === "generate" && options.images.length) throw new Error("帶參考圖請使用 edit 命令。");
+  if (options.images.length > 16) throw new Error("最多提供 16 張圖片。");
+  const inputs = options.images.map((path) => {
+    if (!statSync(path).isFile() || statSync(path).size >= 50 * 1024 * 1024) throw new Error("每張參考圖必須是小於 50 MiB 的檔案。");
+    const bytes = readFileSync(path);
+    const type = fileImageFormat(bytes);
+    if (!type) throw new Error("參考圖只支援 PNG、JPEG 或 WebP。");
+    return { path, bytes, type };
+  });
+  const origin = `http://127.0.0.1:${port}`;
+  const endpoint = `${origin}/v1/images/${options.action === "edit" ? "edits" : "generations"}`;
+  const payload = { model: upstreamModel, prompt, n: 1, size: options.size,
+    quality: options.quality, background: options.background, output_format: format };
+  if (options.dryRun) return { dryRun: true, model, upstreamModel, endpoint, out, inputImages: inputs.length };
+  mkdirSync(dirname(out), { recursive: true });
+  let health;
+  try {
+    const response = await fetchImpl(`${origin}/healthz`, { signal: AbortSignal.timeout(5000), redirect: "error" });
+    health = await response.json();
+    if (!response.ok || health?.status !== "ok" || typeof health.stats?.imageRequests !== "number") throw new Error("health");
+  } catch { throw new Error("本機圖片路由不可用；請從路由器選單檢查狀態或執行 update，沒有送出生圖請求。"); }
+  let body = JSON.stringify(payload);
+  const headers = { "content-type": "application/json" };
+  if (options.action === "edit") {
+    body = new FormData();
+    for (const [name, value] of Object.entries(payload)) body.set(name, String(value));
+    for (const image of inputs) body.append("image[]", new Blob([image.bytes], { type: `image/${image.type}` }), basename(image.path));
+    delete headers["content-type"];
+  }
+  let response;
+  let result;
+  try {
+    response = await fetchImpl(endpoint, { method: "POST", headers, body, redirect: "error", signal: AbortSignal.timeout(timeout * 1000) });
+    result = await responseJson(response);
+  } catch (error) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") throw new Error("圖片請求逾時；上游可能仍在處理，未自動重試以避免重複計費。");
+    throw error;
+  }
+  if (!response.ok) throw apiError(result, response.status);
+  const data = result?.data?.[0]?.b64_json;
+  if (typeof data !== "string" || !data || !/^[A-Za-z0-9+/\s]+={0,2}$/.test(data)) {
+    throw new Error("上游未返回有效的 b64_json 圖片，請確認供應商支援 GPT Image 的 Images API 回應格式。");
+  }
+  const bytes = Buffer.from(data, "base64");
+  const actualFormat = fileImageFormat(bytes);
+  if (actualFormat !== format) throw new Error("上游回傳的圖片格式與要求不符，未寫入輸出檔。");
+  writeFileSync(out, bytes, { mode: 0o600, flag: "wx" });
+  return { model, upstreamModel, path: out, bytes: bytes.length };
+}
+
+if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
+  try {
+    const result = await runRelayImagegen(process.argv.slice(2));
+    console.log(result.help || JSON.stringify(result, null, 2));
+  } catch (error) {
+    console.error(`中轉生圖失敗：${error.message}`);
+    process.exitCode = 1;
   }
 }
 __CODEX_MODEL_ROUTER_EMBEDDED__
