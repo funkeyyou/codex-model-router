@@ -80,7 +80,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.19.0";
+const INSTALLER_VERSION = "1.19.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1060,13 +1060,38 @@ async function probeModel(apiRoot, apiKey, model) {
   }
 }
 
-function pickerSlug(model) {
+export function pickerSlug(model) {
   const readable = model
     .replace(/[^A-Za-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 44) || "model";
   const digest = createHash("sha256").update(model).digest("hex").slice(0, 8);
   return `custom/${readable}-${digest}`;
+}
+
+export function withDefaultModelPrefix(route) {
+  if (typeof route?.upstreamModel !== "string" || !route.upstreamModel) return route;
+  const model = route.upstreamModel;
+  // 只補自動產生的顯示名稱；上游 ID、選擇器 ID 與使用者手動取的名稱都保留。
+  if (model.includes("/")) return route.displayName ? route : { ...route, displayName: model };
+  if (route.displayName && route.displayName !== model) return route;
+  return { ...route, displayName: `api/${model}` };
+}
+
+export function prefixCatalogDisplayNames(catalog, routes) {
+  if (!Array.isArray(catalog?.models)) return catalog;
+  const bySlug = new Map(routes.map((route) => [route.pickerSlug, withDefaultModelPrefix(route)]));
+  let changed = false;
+  const models = catalog.models.map((model) => {
+    const route = bySlug.get(model.slug);
+    if (!String(model.slug).startsWith("custom/") || !route ||
+        route.upstreamModel.includes("/") ||
+        (model.display_name && model.display_name !== route.upstreamModel) ||
+        model.display_name === route.displayName) return model;
+    changed = true;
+    return { ...model, display_name: route.displayName };
+  });
+  return changed ? { ...catalog, models } : catalog;
 }
 
 function defaultEffort(efforts) {
@@ -1270,7 +1295,7 @@ function loadBundledCatalog() {
   return catalog;
 }
 
-function customCatalogEntry(officialModels, route, index) {
+export function customCatalogEntry(officialModels, route, index) {
   const lastSegment = route.upstreamModel.split("/").at(-1);
   const exactTemplate = officialModels.find(
     (model) => model.slug === route.upstreamModel || model.slug === lastSegment,
@@ -1281,7 +1306,7 @@ function customCatalogEntry(officialModels, route, index) {
     officialModels[0];
   const entry = structuredClone(exactTemplate || fallbackTemplate);
   entry.slug = route.pickerSlug;
-  entry.display_name = route.displayName;
+  entry.display_name = withDefaultModelPrefix(route).displayName;
   entry.description = `${route.upstreamModel}，由 ${route.providerHost} 提供`;
   entry.default_reasoning_level = defaultEffort(route.efforts);
   entry.supported_reasoning_levels = route.efforts.map((effort) => ({
@@ -1931,7 +1956,7 @@ async function buildRouteForModel(discovery, apiKey, model) {
       const route = {
         pickerSlug: pickerSlug(model),
         upstreamModel: model,
-        displayName: model,
+        displayName: withDefaultModelPrefix({ upstreamModel: model }).displayName || model,
         providerHost: new URL(discovery.apiRoot).host,
         // 轉譯後 effort 直接對應 thinking budget，五檔皆可用。
         efforts: ["low", "medium", "high", "xhigh", "max"],
@@ -1984,7 +2009,7 @@ async function buildRouteForModel(discovery, apiKey, model) {
   const route = {
     pickerSlug: pickerSlug(model),
     upstreamModel: model,
-    displayName: model,
+    displayName: withDefaultModelPrefix({ upstreamModel: model }).displayName || model,
     providerHost: new URL(discovery.apiRoot).host,
     efforts: probe.efforts,
     stripReasoning: probe.stripReasoning,
@@ -2053,7 +2078,7 @@ async function install() {
       console.log(`  保留 ${model} 既有的推理強度：${restored.join(", ")}（本次為暫時性失敗）。`);
       keptEfforts.push(`${model}: ${restored.join(", ")}`);
     }
-    routes.push(route);
+    routes.push(withDefaultModelPrefix(route));
   }
   if (routes.length === 0) fail("選中的模型均未通過 Responses API 探測。" );
   if (keptModels.length > 0 || keptEfforts.length > 0) {
@@ -2397,14 +2422,14 @@ async function addModels() {
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
-// 更新只換掉路由器與轉譯層的程式碼，其餘一律沿用。把「能不能更新、更新後的
+// 更新程式碼並遷移預設顯示名稱，其餘一律沿用。把「能不能更新、更新後的
 // 設定長什麼樣」抽成純函式，才驗得到既有路由與使用者旋鈕不會在更新中被洗掉——
 // 這正是以前只能走 install 重裝、每次都要重問 Base URL、API Key 與模型的原因。
 export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERSION) {
   if (!manifest) return { ok: false, reason: "not-installed" };
   if (!settings || typeof settings !== "object") return { ok: false, reason: "missing-settings" };
 
-  const routes = Array.isArray(settings.routes) ? settings.routes : [];
+  const routes = Array.isArray(settings.routes) ? settings.routes.map(withDefaultModelPrefix) : [];
   if (routes.length === 0) return { ok: false, reason: "no-routes" };
 
   const port = Number(settings.port ?? manifest.port);
@@ -2424,10 +2449,12 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
     alreadyCurrent: comparison === 0,
     port,
     routes,
-    // 只動 version，其餘欄位（routes、憑證位置、forceListedModels、
-    // maxLogBytes 等使用者旋鈕）原樣保留。
-    settings: { ...settings, version: installerVersion },
-    manifest: { ...manifest, version: installerVersion },
+    // 只有預設顯示名稱會補 api/；所有上游 ID、憑證、模型能力與使用者旋鈕保留。
+    settings: { ...settings, routes, version: installerVersion },
+    manifest: {
+      ...manifest, version: installerVersion,
+      ...(Array.isArray(manifest.routes) ? { routes: manifest.routes.map(withDefaultModelPrefix) } : {}),
+    },
   };
 }
 
@@ -2457,6 +2484,9 @@ async function update() {
     }
     fail(UPDATE_FAILURES[plan.reason] || "無法更新現有安裝。");
   }
+  const currentCatalog = existsSync(catalogPath) ? JSON.parse(readFileSync(catalogPath, "utf8")) : null;
+  const updatedCatalog = prefixCatalogDisplayNames(currentCatalog, plan.routes);
+  const namesChanged = updatedCatalog !== currentCatalog;
 
   printHeading("更新路由器");
   console.log(`版本：${plan.installed || "未知"} → ${plan.target}`);
@@ -2471,7 +2501,7 @@ async function update() {
   }
   console.log(
     "\n只會換掉路由器與轉譯層程式碼然後重啟；服務定義只有真的變了才會重寫。" +
-      "不重問 Base URL、API Key 與模型，也不改動 config.toml 與 models.json。",
+      "不重問 Base URL、API Key 與模型，也不改動 config.toml；模型目錄只會補上預設 api/ 顯示前綴。",
   );
 
   const backupDir = join(backupsRoot, `update-${timestamp()}`);
@@ -2480,6 +2510,7 @@ async function update() {
   copyIfExists(bridgePath, join(backupDir, "claude-bridge.mjs"));
   copyIfExists(settingsPath, join(backupDir, "settings.json"));
   copyIfExists(manifestPath, join(backupDir, "install.json"));
+  if (namesChanged) copyIfExists(catalogPath, join(backupDir, "models.json"));
   for (const path of serviceArchivePaths()) {
     copyIfExists(path, join(backupDir, basename(path)));
   }
@@ -2492,6 +2523,7 @@ async function update() {
     writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
     chmodSync(bridgePath, 0o600);
     writeJsonAtomic(settingsPath, plan.settings);
+    if (namesChanged) writeJsonAtomic(catalogPath, updatedCatalog);
     writeJsonAtomic(manifestPath, {
       ...plan.manifest,
       updatedAt: new Date().toISOString(),
@@ -2524,6 +2556,7 @@ async function update() {
     copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
     copyIfExists(join(backupDir, "install.json"), manifestPath);
+    if (namesChanged) copyIfExists(join(backupDir, "models.json"), catalogPath);
     for (const path of serviceArchivePaths()) {
       copyIfExists(join(backupDir, basename(path)), path);
     }
@@ -2546,7 +2579,8 @@ async function update() {
   printHeading("更新完成");
   console.log(`版本：${health?.version || plan.target}`);
   console.log(`健康檢查：${health?.status || "未知"}`);
-  console.log(`保留 ${plan.routes.length} 個自訂模型，設定與 API Key 未變動。`);
+  console.log(`保留 ${plan.routes.length} 個自訂模型，上游 ID、模型能力與 API Key 未變動。`);
+  if (namesChanged) console.log("沒有上游前綴的預設模型名稱已補上 api/。");
   console.log(`備份：${backupDir}`);
   if (serviceWarning) console.log(`\n注意：${serviceWarning}`);
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
@@ -2806,7 +2840,8 @@ function help() {
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
 沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
-也不改動 config.toml 與 models.json。這是日常升級該用的命令。
+不改動 config.toml；models.json 只會為無前綴的預設名稱補上 api/，保留模型 ID 與能力。
+這是日常升級該用的命令。
 
 add 用於在已有安裝上追加模型：沿用已儲存的 Base URL、API Key 與連接埠，
 只探測新選的模型，不會重問設定，也不改動 config.toml。
@@ -3400,6 +3435,7 @@ const websocketOnlyFields = [
 // 這裡以「上次完整輸入 + 該輪產生的輸出 + 本次新項目」在本機重建等價請求。
 const threadHistories = new Map();
 const maxRememberedHistories = 32;
+const maxResponsesPerHistory = 4;
 
 // 轉譯層為了讓 Anthropic 的 thinking 簽章能往返，把 {thinking, signature}
 // 編碼進 reasoning 的 encrypted_content。官方後端驗不過這種內容
@@ -3485,30 +3521,43 @@ export function historyKeyFor(body, headers, connectionNamespace = null) {
   return logicalKey;
 }
 
-function setHistory(key, input) {
-  if (!key) return;
-  threadHistories.delete(key);
-  threadHistories.set(key, {
-    input: Array.isArray(input) ? input.slice() : [],
-    output: [],
-  });
+// 每次嘗試持有自己的暫存副本。只有成功終止才保存，失敗、取消或換傳輸重送
+// 都不會改到 previous_response_id 指向的歷史，也不會把同一份工具結果再加一次。
+function prepareHistory(key, input, previousId = null) {
+  if (!key) return null;
+  const items = typeof input === "string" ? [{ role: "user", content: input }] : input;
+  return { key, input: Array.isArray(items) ? items.slice() : [], output: [], previousId };
+}
+
+function rememberHistoryEvent(history, event) {
+  if (!history || history.completed) return;
+  const replayable = (item) => item && typeof item === "object" &&
+    (item.type !== "reasoning" || item.encrypted_content);
+  if (event?.type === "response.output_item.done" && replayable(event.item)) {
+    history.output.push(event.item);
+  }
+  if (event?.type !== "response.completed" && event?.type !== "response.incomplete") return;
+  const responseId = event.response?.id;
+  if (typeof responseId !== "string" || !responseId) return;
+  if (Array.isArray(event.response.output) && event.response.output.length) {
+    history.output = event.response.output.filter(replayable);
+  }
+  history.completed = true;
+  const responses = history.previousId
+    ? threadHistories.get(history.key) || new Map()
+    : new Map();
+  responses.delete(responseId);
+  responses.set(responseId, history);
+  while (responses.size > maxResponsesPerHistory) responses.delete(responses.keys().next().value);
+  threadHistories.delete(history.key);
+  threadHistories.set(history.key, responses);
   while (threadHistories.size > maxRememberedHistories) {
-    const oldest = threadHistories.keys().next().value;
-    if (oldest === undefined) break;
-    threadHistories.delete(oldest);
+    threadHistories.delete(threadHistories.keys().next().value);
   }
 }
 
-function appendHistoryOutput(key, item) {
-  const history = key ? threadHistories.get(key) : null;
-  if (!history || !item || typeof item !== "object") return;
-  // reasoning 項目要能在後續請求中被接受，必須帶 encrypted_content。
-  if (item.type === "reasoning" && !item.encrypted_content) return;
-  history.output.push(item);
-}
-
-function rebuildStatefulInput(key, incomingInput) {
-  const history = key ? threadHistories.get(key) : null;
+function rebuildStatefulInput(key, incomingInput, previousId) {
+  const history = key ? threadHistories.get(key)?.get(previousId) : null;
   if (!history || history.input.length === 0) return null;
   const incoming = Array.isArray(incomingInput) ? incomingInput : [];
   return [...history.input, ...history.output, ...incoming];
@@ -3629,10 +3678,88 @@ const stats = {
   lastModel: null,
   lastReasoningEffort: null,
   lastForwardedReasoningEffort: null,
+  lastError: null,
 };
 const validatedAuthDigests = new Map();
 const threadRoutes = new Map();
 let apiKeyCache = null;
+
+class RouterRequestError extends Error {
+  constructor(status, code, message, phase = "request", upstreamStatus = null) {
+    super(message);
+    Object.assign(this, { status, code, phase, upstreamStatus });
+  }
+}
+
+export function describeRouterError(error) {
+  if (error instanceof RouterRequestError) {
+    const { status, code, message, phase, upstreamStatus } = error;
+    return { status, code, message, phase, upstreamStatus, causeCode: null };
+  }
+  const chain = [];
+  const visit = (value, depth = 0) => {
+    if (!value || depth > 5 || chain.includes(value)) return;
+    chain.push(value);
+    visit(value.cause, depth + 1);
+    for (const nested of Array.isArray(value.errors) ? value.errors.slice(0, 8) : []) {
+      visit(nested, depth + 1);
+    }
+  };
+  visit(error);
+  const codes = chain.map((item) => item.code).filter(
+    (code) => typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code),
+  );
+  let status = 502;
+  let code = "upstream_network_error";
+  let message = "無法完成上游請求，請檢查網路或稍後重試。";
+  let causeCode = codes.find((value) => /TIMEOUT|ETIMEDOUT/.test(value));
+  if (causeCode || chain.some((item) => item.name === "TimeoutError")) {
+    status = 504;
+    code = "upstream_timeout";
+    message = "上游請求逾時，請檢查網路或稍後重試。";
+  } else if ((causeCode = codes.find((value) => /^(ENOTFOUND|EAI_AGAIN)$/.test(value)))) {
+    code = "upstream_dns_error";
+    message = "無法解析上游主機名稱（DNS），請檢查網路、DNS 或 Base URL。";
+  } else if ((causeCode = codes.find((value) => /CERT|TLS|SSL|VERIFY_LEAF|SELF_SIGNED/.test(value)))) {
+    code = "upstream_tls_error";
+    message = "上游 TLS／憑證驗證失敗，請檢查伺服器憑證、系統時間或代理設定。";
+  } else if ((causeCode = codes.find((value) => /^(ECONNREFUSED|ECONNRESET|EPIPE|ENETUNREACH|EHOSTUNREACH|UND_ERR_SOCKET)$/.test(value)))) {
+    code = "upstream_connection_error";
+    message = "上游連線失敗或中斷，請檢查上游服務、網路或代理設定。";
+  }
+  return {
+    status, code, message, phase: error?.phase || "request",
+    causeCode: causeCode || codes[0] || null, upstreamStatus: null,
+  };
+}
+
+function recordRouterError(error, context = {}, countFailure = true) {
+  const details = describeRouterError(error);
+  const requestId = randomBytes(8).toString("hex");
+  const endpoint = details.phase === "auth_probe" || context.route !== "custom" ? officialBase : apiRoot;
+  const record = {
+    at: new Date().toISOString(), requestId,
+    transport: context.transport || null, route: context.route || null,
+    model: typeof context.model === "string" ? context.model.slice(0, 160) : null,
+    upstreamHost: new URL(endpoint).host,
+    ...details,
+  };
+  // 不記錄原始例外訊息、標頭、Key 或請求內文；cause.code 已足夠定位網路故障。
+  stats.lastError = record;
+  if (countFailure) stats.failures += 1;
+  process.stderr.write(`model-router-error:${JSON.stringify(record)}\n`);
+  return { ...details, requestId };
+}
+
+function recordUpstreamFailure(upstream, context) {
+  if (upstream.status < 400) return;
+  const status = upstream.status;
+  const code = status === 401 || status === 403 ? "upstream_auth_rejected"
+    : status === 429 ? "upstream_rate_limited" : "upstream_http_error";
+  recordRouterError(new RouterRequestError(
+    status, code, `上游服務返回 HTTP ${status}。`, "upstream", status,
+  ), context);
+}
 
 function writeJson(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json" });
@@ -3787,24 +3914,45 @@ export function hasValidatedAuth(headers) {
   return true;
 }
 
-async function validateOfficialAuth(requestHeaders) {
+async function validateOfficialAuth(requestHeaders, signal) {
   if (hasValidatedAuth(requestHeaders)) return true;
-  if (!authDigest(requestHeaders)) return false;
+  if (!authDigest(requestHeaders)) {
+    throw new RouterRequestError(401, "chatgpt_auth_required", "需要 ChatGPT 身份驗證。", "auth_probe");
+  }
   let upstream;
+  const timeout = AbortSignal.timeout(15000);
+  const probeSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  stats.lastAuthProbeStatus = null;
   try {
     upstream = await fetch(`${officialBase}/models`, {
       headers: buildOfficialHeaders(requestHeaders),
       redirect: "manual",
+      signal: probeSignal,
     });
-  } catch {
+    await upstream.arrayBuffer();
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason;
     stats.authProbeFailures += 1;
-    return false;
+    throw Object.assign(new Error("ChatGPT 驗證探測失敗", { cause: error }), { phase: "auth_probe" });
   }
-  await upstream.arrayBuffer();
   stats.lastAuthProbeStatus = upstream.status;
-  // 這支端點缺少 client_version 參數時會回 400，但未授權一律是 401/403。
-  // 因此只有明確的未授權才視為驗證失敗，否則參數問題會讓所有自訂模型被誤擋。
-  if (upstream.status === 401 || upstream.status === 403) return false;
+  if (upstream.status === 401 || upstream.status === 403) {
+    stats.authProbeFailures += 1;
+    throw new RouterRequestError(
+      upstream.status, "chatgpt_auth_rejected",
+      `ChatGPT 身份驗證遭拒（HTTP ${upstream.status}），請檢查登入狀態或帳號權限。`,
+      "auth_probe", upstream.status,
+    );
+  }
+  // 缺少 client_version 會回 400，沿用相容處理；服務故障或重新導向不能快取成驗證成功。
+  if (!upstream.ok && upstream.status !== 400) {
+    stats.authProbeFailures += 1;
+    throw new RouterRequestError(
+      upstream.status === 429 ? 429 : 503, "auth_probe_unavailable",
+      `ChatGPT 驗證服務暫時不可用（HTTP ${upstream.status}），請稍後重試。`,
+      "auth_probe", upstream.status,
+    );
+  }
   markAuthValidated(requestHeaders);
   return true;
 }
@@ -3834,6 +3982,13 @@ function rememberedRoute(headers) {
 function chooseRoute(headers, body) {
   if (typeof body?.model === "string" && routeMap.has(body.model)) {
     return routeMap.get(body.model);
+  }
+  if (typeof body?.model === "string" && body.model.startsWith("custom/")) {
+    throw new RouterRequestError(
+      404, "custom_model_not_configured",
+      "此自訂模型未配置或路由已遺失，請重新添加模型，並在新任務中選擇已配置的模型。",
+      "routing",
+    );
   }
   if (typeof body?.model === "string") return null;
   return rememberedRoute(headers);
@@ -3900,14 +4055,29 @@ export function targetUrl(custom, incomingUrl) {
   return new URL(`${base}${path}${incomingUrl.search}`);
 }
 
-async function streamUpstream(upstream, response) {
+async function streamUpstream(upstream, response, history = null) {
   response.writeHead(upstream.status, filteredResponseHeaders(upstream.headers));
   if (!upstream.body) {
     response.end();
     return;
   }
+  const observe = history && upstream.ok && upstream.headers.get("content-type")?.includes("text/event-stream")
+    ? observeResponsesSse((event) => rememberHistoryEvent(history, event))
+    : null;
+  const jsonChunks = history && upstream.ok && !observe ? [] : null;
   for await (const chunk of upstream.body) {
+    observe?.write(chunk);
+    if (jsonChunks) jsonChunks.push(Buffer.from(chunk));
     if (!response.write(chunk)) await once(response, "drain");
+  }
+  observe?.finish();
+  if (jsonChunks) {
+    try {
+      const result = JSON.parse(Buffer.concat(jsonChunks).toString("utf8"));
+      if (result.status === "completed" || result.status === "incomplete") {
+        rememberHistoryEvent(history, { type: `response.${result.status}`, response: result });
+      }
+    } catch { /* 非 Responses JSON 不作歷史保存，仍原樣回傳。 */ }
   }
   response.end();
 }
@@ -3945,26 +4115,26 @@ export async function fetchModelUpstream(
   rememberRoute(requestHeaders, route);
   const isCustom = route != null;
 
-  // previous_response_id 需要真正的 WebSocket 上游；本路由對上游一律使用 HTTP，
-  // 官方後端與第三方閘道都會拒絕。因此在此統一改寫成等價的完整請求，
-  // 三條路徑（官方 / 自訂 / Anthropic 轉譯）共用同一份歷史。
+  // HTTP 回退與第三方上游不保證支援 previous_response_id，從對應的成功回合重播。
   const historyKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
   meta.historyKey = historyKey;
   let effectiveBody = body;
   if (body?.previous_response_id) {
-    const rebuilt = rebuildStatefulInput(historyKey, body.input);
+    const rebuilt = rebuildStatefulInput(historyKey, body.input, body.previous_response_id);
     if (rebuilt) {
       effectiveBody = { ...body, input: rebuilt };
       delete effectiveBody.previous_response_id;
-      setHistory(historyKey, rebuilt);
       stats.statefulRebuilds += 1;
     } else {
-      // 無可用歷史時維持原樣，交由上游報錯 + 關閉連線讓 Codex 重送完整歷史。
       stats.statefulRebuildMisses += 1;
+      throw new RouterRequestError(
+        409, "router_history_unavailable",
+        "找不到 previous_response_id 對應的完整歷史，請重連並重送完整對話。",
+        "history",
+      );
     }
-  } else {
-    setHistory(historyKey, body.input);
   }
+  meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
@@ -3987,14 +4157,7 @@ export async function fetchModelUpstream(
     outboundBodyObject?.reasoning?.effort ?? null;
 
   if (isCustom) {
-    if (!(await validateOfficialAuth(requestHeaders))) {
-      return new Response(
-        JSON.stringify({
-          error: { message: "需要 ChatGPT 身份驗證", type: "auth_error" },
-        }),
-        { status: 401, headers: { "content-type": "application/json" } },
-      );
-    }
+    await validateOfficialAuth(requestHeaders, signal);
     stats.custom += 1;
     if (route.translate === "anthropic") {
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
@@ -4023,6 +4186,7 @@ export async function fetchModelUpstream(
         signal,
       );
       stats.lastCustomStatus = translated.status;
+      recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model });
       return translated;
     }
     const budget = budgetToolImages(outboundBodyObject);
@@ -4038,6 +4202,7 @@ export async function fetchModelUpstream(
       signal,
     );
     stats.lastCustomStatus = upstream.status;
+    recordUpstreamFailure(upstream, { transport: meta.transport, route: "custom", model: body?.model });
     return upstream;
   }
 
@@ -4058,6 +4223,7 @@ export async function fetchModelUpstream(
     signal,
   });
   stats.lastOfficialStatus = upstream.status;
+  recordUpstreamFailure(upstream, { transport: meta.transport, route: "official", model: body?.model });
   if (upstream.status === 200) markAuthValidated(requestHeaders);
   return upstream;
 }
@@ -4075,12 +4241,8 @@ async function handleImages(request, response, incomingUrl) {
   // image_gen 是用戶端工具，未必會帶上 /responses 那組標頭；若因為缺標頭就擋下，
   // 使用者只會從一個 404 換成一個 401，問題沒解決。路由器只聽 127.0.0.1，
   // 且這條路徑花的是使用者自己的閘道金鑰，因此放行沒有標頭的請求。
-  if (authDigest(request.headers) && !(await validateOfficialAuth(request.headers))) {
-    writeJson(response, 401, {
-      error: { message: "需要 ChatGPT 身份驗證", type: "auth_error" },
-    });
-    return;
-  }
+  request.routerContext.route = "custom";
+  if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
 
@@ -4121,6 +4283,9 @@ async function handleResponses(request, response, incomingUrl) {
     writeJson(response, 400, { error: { message: "JSON 格式無效", type: "router_error" } });
     return;
   }
+  request.routerContext.model = body?.model;
+  request.routerContext.route = typeof body?.model === "string" && body.model.startsWith("custom/")
+    ? "custom" : "official";
 
   const abortController = new AbortController();
   let finished = false;
@@ -4132,7 +4297,7 @@ async function handleResponses(request, response, incomingUrl) {
     if (!finished) abortController.abort();
   });
 
-  const meta = {};
+  const meta = { transport: "http" };
   // 擷取原本只蓋 WebSocket 路徑。但 Codex 反覆握手失敗後會退回 HTTPS，之後所有
   // 請求都走這裡——上游在這條路上出錯時，開了擷取也一個檔案都拿不到。
   const captureId = captureNext(
@@ -4170,7 +4335,7 @@ async function handleResponses(request, response, incomingUrl) {
     response.end(text);
     return;
   }
-  await streamUpstream(upstream, response);
+  await streamUpstream(upstream, response, meta.history);
 }
 
 const websocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -4330,12 +4495,40 @@ export function parseWebSocketFrames(buffer) {
   return { frames, remainder: buffer.subarray(offset) };
 }
 
-function sendSseBlockToWebSocket(socket, block, onEvent = null, imageState = null) {
-  const data = block
+function sseData(block) {
+  return block
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).trimStart())
     .join("\n");
+}
+
+function observeResponsesSse(onEvent) {
+  const decoder = new TextDecoder();
+  let pending = "";
+  const parse = (block) => {
+    const data = sseData(block);
+    if (data && data !== "[DONE]") onEvent(JSON.parse(data));
+  };
+  return {
+    write(chunk) {
+      pending += decoder.decode(chunk, { stream: true });
+      for (;;) {
+        const match = /\r?\n\r?\n/.exec(pending);
+        if (!match) break;
+        parse(pending.slice(0, match.index));
+        pending = pending.slice(match.index + match[0].length);
+      }
+    },
+    finish() {
+      pending += decoder.decode();
+      if (pending.trim()) parse(pending);
+    },
+  };
+}
+
+function sendSseBlockToWebSocket(socket, block, onEvent = null, imageState = null) {
+  const data = sseData(block);
   if (!data || data === "[DONE]") return;
   const parsed = JSON.parse(data);
   if (onEvent) onEvent(parsed);
@@ -4412,7 +4605,7 @@ function emitViewImageCall(socket, injection) {
   stats.viewImageCallsInjected += 1;
 }
 
-export async function bridgeSseToWebSocket(upstream, socket, captureId = null, historyKey = null) {
+export async function bridgeSseToWebSocket(upstream, socket, captureId = null, history = null) {
   stats.lastWebSocketStatus = upstream.status;
   if (upstream.status < 200 || upstream.status >= 300) {
     const rawText = await upstream.text();
@@ -4455,9 +4648,7 @@ export async function bridgeSseToWebSocket(upstream, socket, captureId = null, h
   let sawTerminal = false;
   const onEvent = (event) => {
     if (isTerminalEvent(event)) sawTerminal = true;
-    if (historyKey && event?.type === "response.output_item.done" && event.item) {
-      appendHistoryOutput(historyKey, event.item);
-    }
+    rememberHistoryEvent(history, event);
   };
   const imageState = { pending: [], maxIndex: -1 };
   const decoder = new TextDecoder();
@@ -4569,7 +4760,9 @@ function connectUpstreamWebSocket(requestHeaders, timeoutMs = 15000) {
       socket.destroy();
       reject(error instanceof Error ? error : new Error(String(error)));
     };
-    const timer = setTimeout(() => fail(new Error("上游 WebSocket 握手逾時")), timeoutMs);
+    const timer = setTimeout(() => fail(Object.assign(
+      new Error("上游 WebSocket 握手逾時"), { code: "ETIMEDOUT" },
+    )), timeoutMs);
     const onHandshakeData = (chunk) => {
       buffer = Buffer.concat([buffer, chunk]);
       const boundary = buffer.indexOf("\r\n\r\n");
@@ -4578,7 +4771,10 @@ function connectUpstreamWebSocket(requestHeaders, timeoutMs = 15000) {
       const remainder = buffer.subarray(boundary + 4);
       const status = Number(/^HTTP\/1\.[01]\s+(\d+)/.exec(headerText)?.[1]);
       if (status !== 101) {
-        fail(new Error("上游 WebSocket 握手失敗 HTTP " + (status || "?")));
+        fail(new RouterRequestError(
+          502, "upstream_websocket_rejected", `上游 WebSocket 握手失敗（HTTP ${status || "未知"}）。`,
+          "websocket_handshake", status || null,
+        ));
         return;
       }
       const acceptLine = /sec-websocket-accept:\s*(\S+)/i.exec(headerText)?.[1];
@@ -4665,7 +4861,7 @@ function createUpstreamSession(socket, leftover) {
       if (session.onEvent) session.onEvent(event);
     }
   });
-  socket.on("error", (error) => markClosed(error instanceof Error ? error.message : String(error)));
+  socket.on("error", markClosed);
   socket.on("close", () => markClosed("上游 WebSocket 連線結束"));
   session.send = (payload) => {
     if (session.closed || socket.destroyed || !socket.writable) {
@@ -4702,7 +4898,9 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
       session.onEvent = null;
       session.onClosed = null;
       signal?.removeEventListener("abort", onAbort);
-      reject(error instanceof Error ? error : new Error(String(error)));
+      const failure = error instanceof Error ? error : new Error(String(error));
+      failure.eventsForwarded = flushed;
+      reject(failure);
     };
     const onAbort = () => {
       if (settled) return;
@@ -4723,7 +4921,9 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
       return message.includes("previous_response_id");
     };
 
-    session.onClosed = (reason) => failHard(new Error(reason || "上游 WebSocket 中斷"));
+    session.onClosed = (reason) => failHard(reason instanceof Error ? reason : Object.assign(
+      new Error(reason || "上游 WebSocket 中斷"), { code: "ECONNRESET" },
+    ));
     session.onEvent = (event) => {
       const type = String(event?.type || "");
       if (!flushed && (type === "error" || type === "response.failed") && isInvalidChain(event)) {
@@ -4733,7 +4933,7 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
       if (flushed) onEvent(event);
       else buffered.push(event);
       if (type === "response.in_progress") flush();
-      if (type === "response.completed") {
+      if (type === "response.completed" || type === "response.incomplete") {
         flush();
         const responseId = event?.response?.id;
         if (typeof responseId === "string" && responseId) session.responseIds.add(responseId);
@@ -4775,9 +4975,7 @@ export async function bridgeAnthropicToHttp(upstream, response, meta) {
     upstream.body,
     (event) => {
       if (isTerminalEvent(event)) sawTerminal = true;
-      if (event?.type === "response.output_item.done" && event.item) {
-        appendHistoryOutput(meta.historyKey, event.item);
-      }
+      rememberHistoryEvent(meta.history, event);
       response.write("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n");
     },
     meta,
@@ -4807,11 +5005,7 @@ export async function bridgeAnthropicToWebSocket(upstream, socket, meta, capture
     (event) => {
       captureAppend(captureId, "response.sse", `data: ${JSON.stringify(event)}\n\n`);
       if (isTerminalEvent(event)) sawTerminal = true;
-      // 轉譯路由同樣要把輸出記進本機歷史，否則之後切到其他模型時，
-      // 重建的歷史會少掉 Claude 這一輪的回答與工具呼叫。
-      if (event?.type === "response.output_item.done" && event.item) {
-        appendHistoryOutput(meta.historyKey, event.item);
-      }
+      rememberHistoryEvent(meta.history, event);
       sendWebSocketJson(socket, event);
       stats.websocketEvents += 1;
     },
@@ -4872,11 +5066,7 @@ async function tryUpstreamWebSocketTurn(
       stats.upstreamWebSocketFallbacks += 1;
       // 握手失敗代表這個端點現在不可用，是全域現象而非這條連線的問題。
       noteUpstreamWebSocketConnectFailure();
-      process.stderr.write(
-        "model-router-upstream-ws-unavailable:" +
-          (error instanceof Error ? error.message : String(error)) +
-          "\n",
-      );
+      recordRouterError(error, { transport: "upstream-websocket", route: "official", model: message?.model }, false);
       return false;
     }
     connectionState.session = session;
@@ -4886,19 +5076,17 @@ async function tryUpstreamWebSocketTurn(
 
   // 只有這條上游連線自己產生過的 id 才能接續；其餘情況一律重播完整歷史。
   const canChain = Boolean(previousId && session.responseIds.has(previousId));
+  const fullInput = previousId
+    ? rebuildStatefulInput(historyKey, message.input, previousId)
+    : message.input;
+  let history = null;
   const buildPayload = (chain) => {
     let outgoing = { ...message };
+    history = fullInput ? prepareHistory(historyKey, fullInput, previousId) : null;
     if (chain) {
-      // 接續：沿用 Codex 的增量 input 與 previous_response_id，
-      // 但本機歷史仍要補齊，供之後回退或切換路由時使用。
-      const rebuilt = rebuildStatefulInput(historyKey, message.input);
-      if (rebuilt) setHistory(historyKey, rebuilt);
       stats.upstreamWebSocketIncremental += 1;
     } else {
-      const rebuilt = previousId ? rebuildStatefulInput(historyKey, message.input) : null;
-      const input = rebuilt || message.input;
-      setHistory(historyKey, input);
-      outgoing = { ...outgoing, input };
+      outgoing = { ...outgoing, input: fullInput };
       delete outgoing.previous_response_id;
       if (previousId) stats.upstreamWebSocketReplays += 1;
     }
@@ -4909,14 +5097,14 @@ async function tryUpstreamWebSocketTurn(
   };
 
   const forward = (event) => {
-    if (event?.type === "response.output_item.done" && event.item) {
-      appendHistoryOutput(historyKey, event.item);
-    }
+    rememberHistoryEvent(history, event);
     sendWebSocketJson(socket, event);
     stats.websocketEvents += 1;
   };
 
   for (const chain of canChain ? [true, false] : [false]) {
+    // 沒有完整歷史時，交給 HTTP 回退的明確錯誤處理，不能把增量冒充完整輸入。
+    if (!chain && previousId && !fullInput) return false;
     let outcome;
     try {
       outcome = await runUpstreamWebSocketTurn(session, buildPayload(chain), {
@@ -4928,12 +5116,10 @@ async function tryUpstreamWebSocketTurn(
       connectionState.upstreamDisabled = true;
       connectionState.session = null;
       session.destroy();
+      // 已把本輪內容送給 Codex 時不能再透明重播，否則會產生兩套輸出／工具呼叫。
+      if (error.eventsForwarded) throw error;
       stats.upstreamWebSocketFallbacks += 1;
-      process.stderr.write(
-        "model-router-upstream-ws-error:" +
-          (error instanceof Error ? error.message : String(error)) +
-          "\n",
-      );
+      recordRouterError(error, { transport: "upstream-websocket", route: "official", model: message?.model }, false);
       return false;
     }
     if (outcome.ok) {
@@ -4951,7 +5137,7 @@ async function tryUpstreamWebSocketTurn(
   return false;
 }
 
-async function handleWebSocketResponseInner(
+export async function handleWebSocketResponseInner(
   request,
   socket,
   incomingUrl,
@@ -4994,7 +5180,7 @@ async function handleWebSocketResponseInner(
   );
   captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
   const stopHeartbeat = startWebSocketHeartbeat(socket);
-  const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null };
+  const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null, transport: "websocket" };
   try {
     const upstream = await fetchModelUpstream(
       request.headers,
@@ -5011,7 +5197,7 @@ async function handleWebSocketResponseInner(
     if (meta.translate === "anthropic" && upstream.status >= 200 && upstream.status < 300) {
       await bridgeAnthropicToWebSocket(upstream, socket, meta, captureId);
     } else {
-      await bridgeSseToWebSocket(upstream, socket, captureId, meta.historyKey);
+      await bridgeSseToWebSocket(upstream, socket, captureId, meta.history);
     }
   } finally {
     stopHeartbeat();
@@ -5124,20 +5310,26 @@ function handleWebSocketUpgrade(request, socket, head) {
       .catch((error) => {
         const aborted = error instanceof Error && error.name === "AbortError";
         if (!aborted) {
-          stats.failures += 1;
-          process.stderr.write(`model-router-websocket-error:${error}\n`);
-          const detail = error instanceof Error ? error.message : String(error);
+          const detail = recordRouterError(error, {
+            transport: "websocket", model: message?.model,
+            route: typeof message?.model === "string" && message.model.startsWith("custom/") ? "custom" : "official",
+          });
+          const messageText = `${detail.message}（診斷 ID：${detail.requestId}）`;
           sendWebSocketJson(socket, {
             type: "error",
             error: {
               type: "router_error",
-              code: "router_error",
-              message: `模型路由器的 WebSocket 橋接失敗：${detail}`,
+              code: detail.code,
+              message: messageText,
             },
           });
           // 網路層例外（fetch failed / terminated）同樣要送終止事件，
           // 否則 Codex 會停在「思考中」直到 idle timeout 才重試。
-          sendResponseFailed(socket, "router_error", detail);
+          sendResponseFailed(socket, detail.code, messageText);
+          if (detail.code === "router_history_unavailable") {
+            stats.statefulFallbacks += 1;
+            closeWebSocket(socket, 1011, "history unavailable");
+          }
         }
       })
       .finally(() => {
@@ -5205,6 +5397,7 @@ function handleWebSocketUpgrade(request, socket, head) {
 
 const server = http.createServer(async (request, response) => {
   stats.requests += 1;
+  request.routerContext = { transport: "http", route: "official" };
   try {
     const incomingUrl = new URL(request.url || "/", `http://${listenHost}:${listenPort}`);
     if (request.method === "GET" && incomingUrl.pathname === "/healthz") {
@@ -5247,11 +5440,13 @@ const server = http.createServer(async (request, response) => {
       if (!response.writableEnded) response.end();
       return;
     }
-    stats.failures += 1;
-    process.stderr.write(`model-router-error:${message}\n`);
+    const detail = recordRouterError(error, request.routerContext);
     if (!response.headersSent) {
-      writeJson(response, 502, {
-        error: { message: "模型路由器的上游請求失敗", type: "router_error" },
+      writeJson(response, detail.status, {
+        error: {
+          message: `${detail.message}（診斷 ID：${detail.requestId}）`,
+          type: "router_error", code: detail.code, request_id: detail.requestId,
+        },
       });
     } else if (!response.writableEnded) {
       response.end();
@@ -5260,6 +5455,7 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.on("upgrade", handleWebSocketUpgrade);
+export { server as routerServer };
 
 // launchd 與 schtasks 都只是把 stderr 以附加模式導進同一個檔案，沒有任何輪替。
 // 上游長時間出錯時會持續寫入，因此啟動時把過大的日誌就地截斷——同一個 inode，

@@ -51,9 +51,11 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 
 `update` 只換掉路由器與轉譯層的程式碼並重寫服務定義，然後重啟服務並做健康檢查。
 Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，不會重問任何一項，也不會
-改動 `config.toml` 與 `models.json`。它不需要 Codex CLI，所以 Codex 更新後路徑改變
+改動 `config.toml`。從 1.19.1 起，會為沒有上游前綴的預設模型名稱補上 `api/`，
+`models.json` 只修改這些顯示名稱，模型 ID、能力與手動名稱保留。它不需要 Codex CLI，所以 Codex 更新後路徑改變
 也不影響升級。更新前的 `router.mjs`、`claude-bridge.mjs`、`settings.json`、
 `install.json` 與服務定義都會備份到 `~/.codex/backups/model-router/update-<時間戳>/`，
+需要遷移名稱時也會備份 `models.json`。
 任何一步失敗都會自動還原並重啟回原本的版本。
 
 `install` 保留給第一次安裝、換 Base URL 或 API Key、以及重新挑選模型的情況。
@@ -116,6 +118,17 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
 
 ## 功能
 
+- **區分自訂模型名稱**——上游模型名稱沒有 `/` 前綴時，預設在選單顯示為 `api/模型名`；
+  例如 `gpt-test` 顯示為 `api/gpt-test`，`ark/gpt-test` 則保持原樣。
+  請求仍使用上游原名，既有 `custom/*` 選擇器 ID 不變，舊對話不需要改模型 ID。
+  手動取過的顯示名稱保留。未配置的 `custom/*` 會直接回報路由遺失，不會轉送官方。
+- **重試保留正確歷史**——成功終止後才保存對話快照，502、網路失敗、串流截斷與取消
+  不會將半輪內容混入後續重試。官方 WebSocket 接續遭拒後重播、或回退 HTTP 時，也不會
+  重複加入工具結果；若對應快照已不存在，會明確要求重新送出完整對話。
+- **可定位的網路錯誤**——DNS、TLS、連線中斷、逾時與登入驗證遭拒分開回報，附診斷 ID。
+  `/healthz` 的 `stats.lastError` 與 `router.err.log` 可對照時間、上游主機、階段與原因碼，
+  診斷紀錄不包含金鑰、認證標頭或對話內容。ChatGPT 驗證探測設有 15 秒上限，暫時性
+  故障不會被誤報為需要重新登入，也不會快取成驗證成功。
 - **自動偵測上下文上限**——Anthropic 模型透過供應商的驗證錯誤精確取得（該探測不計費），
   其餘沿用官方同名模板；找不到時明確警告，不會靜默填入錯誤的預設值。
 - **自動判斷是否需要轉譯**——優先依 `/v1/models` 的 `owned_by`；部分自架閘道完全不回

@@ -155,7 +155,14 @@ test("實際轉送路徑與增量重建都使用縮減後的請求，原本超�
   const received = [];
   globalThis.fetch = async (url, options) => {
     received.push({ url: String(url), bytes: options.body.length, body: JSON.parse(options.body) });
-    return new Response("ok", { status: 200 });
+    const events = String(url).endsWith("/messages") ? [
+      { type: "message_start", message: { usage: { input_tokens: 1 } } },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+      { type: "message_stop" },
+    ] : [{ type: "response.completed", response: { id: "response-previous", status: "completed", output: [] } }];
+    return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+      headers: { "content-type": "text/event-stream" },
+    });
   };
   t.after(() => {
     globalThis.fetch = originalFetch;
@@ -173,7 +180,13 @@ test("實際轉送路徑與增量重建都使用縮減後的請求，原本超�
     assert.ok(received.at(-1).bytes < MAX);
     assert.match(JSON.stringify(received.at(-1).body), /history-images/);
     if (route.translate) assert.deepEqual(meta.anthropicRequest, received.at(-1).body);
-    const next = { model: route.pickerSlug, client_metadata: full.client_metadata, previous_response_id: "response-previous", input: [{ type: "compaction_trigger" }] };
+    const chunks = [];
+    const socket = { destroyed: false, writable: true, write(chunk) { chunks.push(Buffer.from(chunk)); } };
+    if (route.translate) await instance.bridgeAnthropicToWebSocket(first, socket, meta);
+    else await instance.bridgeSseToWebSocket(first, socket, null, meta.history);
+    const events = instance.parseWebSocketFrames(Buffer.concat(chunks)).frames.map((frame) => JSON.parse(frame.payload));
+    const previousId = events.find((event) => event.type === "response.completed").response.id;
+    const next = { model: route.pickerSlug, client_metadata: full.client_metadata, previous_response_id: previousId, input: [{ type: "compaction_trigger" }] };
     const second = await instance.fetchModelUpstream(headers, inputUrl, next, Buffer.from(JSON.stringify(next)), undefined, {});
     assert.equal(second.status, 200);
     assert.ok(received.at(-1).bytes < MAX);

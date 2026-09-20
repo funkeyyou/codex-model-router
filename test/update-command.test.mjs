@@ -1,8 +1,8 @@
 // update 命令的決策邏輯。
 //
 // 這個命令存在的理由就是「升級不必重新設定模型」，所以這裡盯的不是它有沒有跑完，
-// 而是更新後的設定除了版本號以外一模一樣：路由、憑證位置、連接埠與使用者自己調過
-// 的旋鈕都不能在升級中被洗掉。
+// 而是已完成預設名稱遷移後，設定除了版本號以外一模一樣：路由、憑證位置、連接埠與
+// 使用者旋鈕不能在升級中被洗掉。首次 api/ 名稱遷移另由 model-prefix.test.mjs 驗證。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -12,8 +12,8 @@ const { installer } = await loadPayloads();
 const { planUpdate } = installer;
 
 const routes = [
-  { pickerSlug: "custom/claude-a", upstreamModel: "claude-a", displayName: "claude-a", translate: "anthropic" },
-  { pickerSlug: "custom/gpt-b", upstreamModel: "gpt-b", displayName: "gpt-b" },
+  { pickerSlug: "custom/claude-a", upstreamModel: "claude-a", displayName: "api/claude-a", translate: "anthropic" },
+  { pickerSlug: "custom/gpt-b", upstreamModel: "gpt-b", displayName: "api/gpt-b" },
 ];
 
 const settings = () => ({
@@ -37,7 +37,7 @@ const manifest = () => ({
   routes: structuredClone(routes),
 });
 
-test("更新只改版本號，其餘設定逐欄位保持不變", () => {
+test("預設名稱已遷移時，更新只改版本號，其餘設定逐欄位保持不變", () => {
   const before = settings();
   const plan = planUpdate(manifest(), before, "1.17.0");
   assert.equal(plan.ok, true);
