@@ -132,17 +132,35 @@ test("已同意的安裝會沿用授權刷新，不再重問同意", async () =>
   assert.equal(refreshed, true);
 });
 
-async function setupThroughCommand(t, { ids = [], status = 200, answer = "all" } = {}) {
+const probePng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
+
+async function setupThroughCommand(t, { ids = [], status = 200, testModels = "all",
+  imageResponses = {}, arkModels = [], routes = [], existingModels = null, extraEnv = {} } = {}) {
   const { home, options } = fixture(t);
   const requests = [];
-  const server = http.createServer((request, response) => {
-    requests.push({ path: request.url, auth: request.headers.authorization });
+  const server = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null;
+    requests.push({ path: request.url, method: request.method, auth: request.headers.authorization, body });
     response.setHeader("content-type", "application/json");
     if (request.url === "/releases") {
-      response.end(JSON.stringify({ latest: "1.20.0", releases: [{ version: "1.20.0", changes: ["fixture"] }] }));
-    } else {
+      response.end(JSON.stringify({ latest: "1.20.1", releases: [{ version: "1.20.1", changes: ["fixture"] }] }));
+    } else if (request.url === "/v1/models") {
       response.statusCode = status;
       response.end(JSON.stringify({ data: ids.map((id) => ({ id })) }));
+    } else if (request.url === "/v1/images/generations") {
+      const result = imageResponses[body.model] || { status: 404, payload: { error: { message: "model_not_found" } } };
+      response.statusCode = result.status || 200;
+      response.end(JSON.stringify(result.payload || { data: [{ b64_json: probePng.toString("base64") }] }));
+    } else if (request.url === "/v2/extend/image/ark_gpt_image/generations") {
+      if (arkModels.includes(body.model)) response.end(JSON.stringify({ task_id: "img_gen_fixture" }));
+      else { response.statusCode = 403; response.end(JSON.stringify({ error: "unavailable" })); }
+    } else if (request.url === "/v2/extend/image/ark_gpt_image/tasks/img_gen_fixture") {
+      response.end(JSON.stringify({ task_id: "img_gen_fixture", status: "succeeded", result: { images: [{ url: "https://images.example/fixture.png" }] } }));
+    } else {
+      response.statusCode = 404;
+      response.end("{}");
     }
   });
   server.listen(0, "127.0.0.1");
@@ -152,58 +170,182 @@ async function setupThroughCommand(t, { ids = [], status = 200, answer = "all" }
   const routerDir = join(home, "model-router");
   mkdirSync(routerDir);
   writeFileSync(join(routerDir, "install.json"), JSON.stringify({ version: "1.20.0" }));
-  writeFileSync(options.settingsFile, JSON.stringify({ apiRoot: origin + "/v1", port: 48953, keychainService: "fixture" }));
+  writeFileSync(options.settingsFile, JSON.stringify({ apiRoot: origin + "/v1", port: 48953, keychainService: "fixture", routes }));
+  if (existingModels) installer.installRelayImageSkill({ ...options, models: existingModels });
   const before = readFileSync(options.settingsFile);
+  const configBefore = existingModels ? readFileSync(join(options.root, "config.json")) : null;
   const env = { ...process.env, CODEX_HOME: home, CODEX_MODEL_ROUTER_HOME: routerDir,
     CODEX_MODEL_ROUTER_SCRIPT_PATH: sourcePath, CODEX_MODEL_ROUTER_NODE_BIN: process.execPath,
-    CODEX_MODEL_ROUTER_TEST_API_KEY: "fixture-key", CODEX_MODEL_ROUTER_RELEASES_URL: origin + "/releases" };
+    CODEX_MODEL_ROUTER_TEST_API_KEY: "fixture-key", CODEX_MODEL_ROUTER_RELEASES_URL: origin + "/releases", ...extraEnv };
   delete env.CODEX_MODEL_ROUTER_IMPORT_ONLY;
   delete env.CODEX_MODEL_ROUTER_BASE_URL;
-  const child = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "imagegen"], { env, stdio: ["pipe", "pipe", "pipe"] });
+  // 只在測試子行程替換圖片下載；產品程式不提供繞過公開 URL 驗證的環境開關。
+  const preload = join(home, "mock-image-download.mjs");
+  writeFileSync(preload, [
+    'import https from "node:https";', 'import dns from "node:dns/promises";',
+    'import { Readable } from "node:stream";', 'import { EventEmitter } from "node:events";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'dns.lookup = async () => [{ address: "93.184.216.34", family: 4 }];',
+    'https.get = (url, options, callback) => {',
+    '  if (String(url) !== "https://images.example/fixture.png" || options.headers.authorization) throw new Error("unexpected image download");',
+    '  const request = new EventEmitter();',
+    `  queueMicrotask(() => { const response = Readable.from([Buffer.from(${JSON.stringify(probePng.toString("base64"))}, "base64")]); response.statusCode = 200; response.headers = {}; callback(response); });`,
+    '  return request;', '};', 'syncBuiltinESMExports();',
+  ].join("\n"));
+  const child = spawn(process.execPath, ["--import", preload, join(payloadDir, "installer.mjs"), "imagegen"], { env, stdio: ["pipe", "pipe", "pipe"] });
   let output = "";
-  let answered = false;
+  const replies = [
+    { marker: "選擇要偵測的模型編號", answer: testModels },
+  ];
   child.stdout.on("data", (chunk) => {
     output += chunk;
-    if (!answered && output.includes("選擇顯示的模型編號")) { answered = true; child.stdin.end(answer + "\n"); }
+    for (const reply of replies) {
+      if (reply.sent || !output.includes(reply.marker)) continue;
+      reply.sent = true;
+      child.stdin.write(reply.answer + "\n");
+    }
   });
   child.stderr.on("data", (chunk) => { output += chunk; });
   const timeout = setTimeout(() => child.kill(), 10000);
-  const [code] = await once(child, "exit");
+  const [code] = await once(child, "close");
   clearTimeout(timeout);
   assert.deepEqual(readFileSync(options.settingsFile), before);
-  return { code, output, root: options.root, requests };
+  assert.doesNotMatch(output, /是否同意|清單未列出的圖片模型前綴|選擇顯示的模型編號/);
+  return { code, output, root: options.root, routerDir, requests, configBefore };
 }
 
-test("命令先用已保存 Key 偵測；只展示清單中存在的圖片模型並正確映射選號", async (t) => {
-  const result = await setupThroughCommand(t, { ids: ["ark/" + all[2], "gpt-6-astra"], answer: "1" });
+test("選 all 時測三個模型，只讓成功回圖的模型可選，正確映射動態選號", async (t) => {
+  const result = await setupThroughCommand(t, { ids: ["ark/" + all[2], "gpt-6-astra"],
+    imageResponses: { ["ark/" + all[2]]: {} } });
   assert.equal(result.code, 0, result.output);
-  assert.match(result.output, /1\. Image 2.5 Flare/);
-  assert.doesNotMatch(result.output, /Sunburst|上一代圖片模型/);
+  const choices = result.output.split("以下已選模型通過生圖測試，將自動添加：")[1];
+  assert.match(choices, /1\. Image 2.5 Flare/);
+  assert.doesNotMatch(choices, /Sunburst|上一代圖片模型/);
   const config = JSON.parse(readFileSync(join(result.root, "config.json"), "utf8"));
   assert.deepEqual(config.models, [all[2]]);
   assert.equal(config.upstreamModels[all[2]], "ark/" + all[2]);
-  assert.deepEqual(result.requests.filter((request) => request.path === "/v1/models"), [{ path: "/v1/models", auth: "Bearer fixture-key" }]);
-  assert.equal(result.requests.some((request) => /images/.test(request.path)), false);
+  assert.equal(config.apiMode, "images");
+  assert.equal(result.requests.some((r) => r.path.includes("ark_gpt_image")), false);
+  assert.equal(result.requests.find((request) => request.path === "/v1/models").auth, "Bearer fixture-key");
+  const paid = result.requests.filter((request) => /images/.test(request.path));
+  assert.deepEqual(paid.map((request) => request.body.model), all.map((id) => "ark/" + id));
+  for (const request of paid) {
+    assert.equal(request.auth, "Bearer fixture-key");
+    assert.equal(request.body.n, 1);
+    assert.equal(request.body.quality, "low");
+    assert.equal(request.body.size, "1024x1024");
+  }
   assert.doesNotMatch(result.output, /fixture-key/);
 });
 
-test("三個模型都沒有時明確說無法添加，不建立技能", async (t) => {
+test("清單沒有圖片模型時，依既有路由前綴實測成功後仍可添加，保留測試圖片", async (t) => {
+  const result = await setupThroughCommand(t, { ids: ["ark/gpt-6-astra"], routes: [{ upstreamModel: "ark/gpt-6-astra" }],
+    testModels: "2,3", imageResponses: Object.fromEntries(all.map((id) => ["ark/" + id, {}])) });
+  assert.equal(result.code, 0, result.output);
+  const config = JSON.parse(readFileSync(join(result.root, "config.json"), "utf8"));
+  assert.deepEqual(config.models, all.slice(1));
+  assert.equal(config.upstreamModels[all[1]], "ark/" + all[1]);
+  const probeDir = join(result.routerDir, "imagegen-probes");
+  const generated = fs.readdirSync(join(probeDir, fs.readdirSync(probeDir)[0]));
+  assert.deepEqual(generated.sort(), all.slice(1).map((id) => `${id}.png`).sort());
+  assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), all.slice(1).map((id) => "ark/" + id));
+  assert.match(result.output, /每種介面最多測 2 次/);
+});
+
+test("只選 Flare 就只測一次，即使重複填編號也不重送；未選模型不觸發前綴問題", async (t) => {
+  const result = await setupThroughCommand(t, { ids: ["ark/" + all[2]], testModels: "3,3",
+    imageResponses: Object.fromEntries(all.map((id) => ["ark/" + id, {}])) });
+  assert.equal(result.code, 0, result.output);
+  assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), ["ark/" + all[2]]);
+  assert.match(result.output, /每種介面最多測 1 次/);
+  assert.doesNotMatch(result.output, /清單未列出的圖片模型前綴/);
+  const config = JSON.parse(readFileSync(join(result.root, "config.json"), "utf8"));
+  assert.deepEqual(config.models, [all[2]]);
+});
+
+test("測試選擇留空時，新設定預選 Flare，既有設定只預選已啟用模型", async (t) => {
+  for (const existingModels of [null, [all[0], all[1]]]) {
+    const result = await setupThroughCommand(t, { ids: all, testModels: "", existingModels,
+      imageResponses: Object.fromEntries(all.map((id) => [id, {}])) });
+    assert.equal(result.code, 0, result.output);
+    assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), existingModels || [all[2]]);
+  }
+});
+
+test("選測模型時取消或輸入無效編號，不查上游模型、不生圖、不更動技能", async (t) => {
+  for (const testModels of ["cancel", "4"]) {
+    const result = await setupThroughCommand(t, { testModels, existingModels: [all[2]] });
+    assert.equal(result.code, testModels === "cancel" ? 0 : 1, result.output);
+    assert.equal(result.requests.some((r) => r.path.startsWith("/v1/")), false);
+    assert.deepEqual(readFileSync(join(result.root, "config.json")), result.configBefore);
+  }
+});
+
+test("已選模型通用失敗時只回退同一模型，未選模型不測不添加", async (t) => {
+  const result = await setupThroughCommand(t, { ids: all, testModels: "2",
+    imageResponses: { [all[0]]: {}, [all[2]]: {} } });
+  assert.equal(result.code, 0, result.output);
+  assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), [all[1]]);
+  assert.deepEqual(result.requests.filter((r) => r.path.endsWith("/ark_gpt_image/generations")).map((r) => r.body.model), [all[1]]);
+  assert.match(result.output, /沒找到可用模型/);
+  assert.equal(existsSync(result.root), false);
+});
+
+test("兩種流程都未通過時只顯示沒找到可用模型，不建立技能", async (t) => {
   const result = await setupThroughCommand(t, { ids: ["gpt-6-astra", "gpt-image-1.5"] });
   assert.equal(result.code, 0, result.output);
-  assert.match(result.output, /沒有偵測到支援的圖片模型，無法添加/);
+  assert.match(result.output, /沒找到可用模型/);
+  assert.doesNotMatch(result.output, /HTTP 404|model_not_found|unavailable/);
+  assert.equal(result.requests.filter((r) => r.method === "POST").length, 6);
+  const diagnostic = JSON.parse(readFileSync(join(result.routerDir, "imagegen-last-check.json"), "utf8"));
+  assert.equal(diagnostic.checks.length, 6);
+  assert.ok(diagnostic.checks.every((check) => check.ok === false && typeof check.error === "string"));
+  assert.doesNotMatch(JSON.stringify(diagnostic), /fixture-key|authorization/);
   assert.equal(existsSync(result.root), false);
+  assert.equal(existsSync(join(result.routerDir, "imagegen-probes")), false);
 });
 
-test("模型清單 401 不冒充『沒有模型』，也不先建立技能", async (t) => {
-  const result = await setupThroughCommand(t, { status: 401 });
-  assert.equal(result.code, 1, result.output);
-  assert.match(result.output, /HTTP 401/);
-  assert.doesNotMatch(result.output, /沒有偵測到/);
-  assert.equal(existsSync(result.root), false);
-});
-
-test("發現模型後取消，仍不建立技能", async (t) => {
-  const result = await setupThroughCommand(t, { ids: all, answer: "cancel" });
+test("模型清單不可用時仍自動推斷前綴，不詢問額外問題", async (t) => {
+  const result = await setupThroughCommand(t, { status: 401, routes: [{ upstreamModel: "akr/gpt-6-astra" }], imageResponses: { ["akr/" + all[0]]: {} } });
   assert.equal(result.code, 0, result.output);
+  assert.doesNotMatch(result.output, /HTTP 401/);
+  const config = JSON.parse(readFileSync(join(result.root, "config.json"), "utf8"));
+  assert.deepEqual(config.upstreamModels, { [all[0]]: "akr/" + all[0] });
+});
+
+test("通用全部失敗後自動用 Ark 查任務並下載，記住模式與成功模型", async (t) => {
+  const result = await setupThroughCommand(t, { ids: ["ark/gpt-6-astra"], testModels: "2,3", arkModels: [all[2]] });
+  assert.equal(result.code, 0, result.output);
+  const posts = result.requests.filter((r) => r.method === "POST");
+  assert.deepEqual(posts.map((r) => r.body.model), ["ark/" + all[1], "ark/" + all[2], all[1], all[2]]);
+  for (const r of posts.filter((r) => r.path.includes("ark_gpt_image"))) {
+    assert.deepEqual(Object.keys(r.body).sort(), ["model", "output_format", "prompt"]);
+  }
+  assert.equal(result.requests.filter((r) => r.path.includes("/tasks/")).length, 1);
+  const config = JSON.parse(readFileSync(join(result.root, "config.json"), "utf8"));
+  assert.equal(config.apiMode, "ark-task");
+  assert.deepEqual(config.models, [all[2]]);
+  assert.deepEqual(config.upstreamModels, { [all[2]]: all[2] });
+});
+
+test("none 直接停用，不查模型也不生圖", async (t) => {
+  const result = await setupThroughCommand(t, { testModels: "none", existingModels: [all[2]] });
+  assert.equal(result.code, 0, result.output);
+  assert.equal(result.requests.some((request) => request.path !== "/releases"), false);
+  assert.equal(existsSync(result.root), false);
+});
+
+test("兩種實測都失敗時保留完整既有生圖設定", async (t) => {
+  const result = await setupThroughCommand(t, { ids: all, existingModels: [all[0]] });
+  assert.equal(result.code, 0, result.output);
+  assert.deepEqual(readFileSync(join(result.root, "config.json")), result.configBefore);
+});
+
+test("HTTP 200 卻沒有圖片時不讓模型成為可選項", async (t) => {
+  const result = await setupThroughCommand(t, { ids: all,
+    imageResponses: Object.fromEntries(all.map((id) => [id, { payload: { data: [] } }])) });
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /沒找到可用模型/);
+  assert.doesNotMatch(result.output, /選擇顯示的模型編號/);
   assert.equal(existsSync(result.root), false);
 });

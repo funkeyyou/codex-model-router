@@ -111,10 +111,22 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 不修改官方 `.system/imagegen`，也不需要內建 `image_gen` 工具。請求經本機路由器使用已保存的
 API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案內含生圖額度。
 
-設定時先以目前 API Key 查詢上游 `/models`，只展示下列三個模型中有出現在清單的選項。
-辨識原始模型名稱及供應商前綴，例如 `ark/gpt-image-2.5-flare`。三個都沒有時顯示
-「沒有偵測到支援的圖片模型，無法添加」，不建立技能；驗證失敗或網路不通則顯示查詢錯誤。
-模型出現在清單只代表此 Key 可以列出它；設定不會進行付費生圖測試，實際生成仍取決於上游權限、配額及服務狀態。
+設定時先選擇要偵測的模型（可複選），工具會自動測試並添加成功的項目。
+先使用目前 API Key 呼叫通用 `/v1/images/generations`；已選模型全部未通過時，才自動改測 Ark 任務介面。
+只測試勾選的模型，只有成功取得 PNG 圖片的模型才會添加；未選模型不會測試，也不會作為失敗後的替代。
+通用介面只要有一個成功，就保留這次成功的模型，不再額外呼叫 Ark。
+新設定預選 Flare，已有技能則預選目前啟用的模型；也可輸入 `all` 選擇全部三個。
+`/models` 只協助判斷名稱與前綴；即使清單沒有圖片模型或查詢失敗，也能進行實測。
+清單未列出的模型自動沿用既有設定中的共同前綴；無法推斷時使用原始模型名稱。
+清單已列出的模型保留原始名稱。Ark 任務介面使用這三個模型的原始 ID。
+
+**偵測會真的生圖，可能產生費用。** 選完模型後自動執行，不再詢問介面類型、前綴或測試確認。
+每個已選模型每種介面最多提交一次；選一個最多兩次、選兩個最多四次，通用成功時不會執行第二輪。
+通用測試使用一張 `1024x1024`、`quality=low`、PNG；Ark 每次單張，尺寸與品質由上游決定。每次最多等待 300 秒。
+同一介面內不自動重送，Ark 查詢任務不會重新提交。成功的測試圖片保留在 `$CODEX_HOME/model-router/imagegen-probes/<時間戳>/`。
+兩種流程都未通過就顯示「沒找到可用模型」，不新增技能，現有生圖設定保留。
+最近一次偵測的內部錯誤會保存到 `$CODEX_HOME/model-router/imagegen-last-check.json`，不含 API Key，方便診斷而不增加畫面提示。
+測試只能確認當下文字生圖可用，尚未測試編輯端點，也不保證日後配額或服務狀態。
 
 | 選項 | API 模型 ID | 選用方向 |
 | --- | --- | --- |
@@ -122,7 +134,9 @@ API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案�
 | Image 2.5 Sunburst | `gpt-image-2.5-sunburst` | 偏重編輯精準度，適合精細改圖與保留原圖細節 |
 | Image 2.5 Flare | `gpt-image-2.5-flare` | 偏重速度，適合一般生圖與快速迭代 |
 
-可以多選，輸入顯示的編號（例如 `1,2`）或 `all`。只選一個就固定使用；多選時由 AI 按需求
+偵測前可輸入模型編號（例如 `1,2`）或 `all`；輸入 `cancel` 返回，不送生圖請求。
+成功後自動添加通過的已選模型並記住介面類型，正式生圖不會重新探測或切換介面重送。
+只啟用一個就固定使用；多選時由 AI 按需求
 在命令中明確指定，使用者指定優先。命令拒絕未勾選的模型，失敗不會自動切換模型或重送付費請求。
 模型差異參考 [OpenAI 圖片指南](https://developers.openai.com/api/docs/guides/image-generation)，速度與價格以中轉商為準。
 
@@ -153,9 +167,15 @@ node "$env:USERPROFILE\.codex\skills\router-imagegen\scripts\imagegen.mjs" gener
 每次生成一張圖，預設 `size=auto`、`quality=auto`、輸出 PNG，保留已存在的輸出檔。
 `--image` 可重複提供參考圖，`--dry-run` 不送出生成請求。`--model` 省略時，生圖依
 Flare → Sunburst → Image 2、改圖依 Sunburst → Flare → Image 2，使用第一個已啟用模型。
-上游需支援 Images API 的 JSON／multipart 請求與 `b64_json` 圖片回應。
+通用模式需支援 Images API 的 JSON／multipart 請求與 `b64_json` 圖片回應。
+Ark 模式使用同一供應商 origin 下的 `/v2/extend/image/ark_gpt_image/generations`、`edits` 及 `tasks/{task_id}`：
+提交取得任務編號後查詢結果，再下載公開 HTTPS 圖片；下載不附帶 API Key，並驗證目的位址與圖片格式。
+若代理 DNS 返回 `198.18.0.0/15` 假 IP，會透過 Cloudflare HTTPS DNS 查詢該圖片網域的真實公開 IP，再驗證並固定連線位址；查詢不包含圖片路徑、簽名或 API Key。
+Ark 不支援指定尺寸／品質或透明背景，`--size`、`--quality` 須保持 `auto`，`--background` 使用 `auto` 或 `opaque`。
+改圖時命令將本機參考圖轉為 JSON Base64，API 仍經本機路由器讀取憑證；查詢或下載失敗不重新提交付費任務。
+舊路由器須先用新版安裝器執行 `update`，才能使用 Ark 任務端點；命令會在提交前檢查支援情況。
 
-重新執行 `imagegen` 可更換勾選模型；輸入 `none` 或執行 `imagegen-disable` 可停用，技能會封存到
+重新執行 `imagegen` 可重新選擇並自動實測模型；選擇模型時輸入 `none` 或直接執行 `imagegen-disable` 可停用（兩者都不生圖），技能會封存到
 `$CODEX_HOME/backups/model-router/`。`rollback` 也會封存由此路由器建立的技能。手動修改會保留，
 同名但不屬於此路由器的技能不會被覆寫。重新開任務讓技能清單刷新，必要時重開 Codex。
 
