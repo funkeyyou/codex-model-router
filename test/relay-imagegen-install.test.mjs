@@ -8,7 +8,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer, dir: payloadDir } = await loadPayloads();
@@ -192,7 +192,7 @@ async function setupThroughCommand(t, { ids = [], status = 200, testModels = "al
     `  queueMicrotask(() => { const response = Readable.from([Buffer.from(${JSON.stringify(probePng.toString("base64"))}, "base64")]); response.statusCode = 200; response.headers = {}; callback(response); });`,
     '  return request;', '};', 'syncBuiltinESMExports();',
   ].join("\n"));
-  const child = spawn(process.execPath, ["--import", preload, join(payloadDir, "installer.mjs"), "imagegen"], { env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(process.execPath, ["--import", pathToFileURL(preload).href, join(payloadDir, "installer.mjs"), "imagegen"], { env, stdio: ["pipe", "pipe", "pipe"] });
   let output = "";
   const replies = [
     { marker: "選擇要偵測的模型編號", answer: testModels },
