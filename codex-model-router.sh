@@ -83,7 +83,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.20.1";
+const INSTALLER_VERSION = "1.21.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -3314,6 +3314,34 @@ const authValidationTtlMs = 5 * 60 * 1000;
 const maxRememberedThreads = 2048;
 const maxValidatedAuthDigests = 64;
 const maxPendingMessages = 8;
+const maxHttpBodyBytes = Number.isSafeInteger(settings.maxHttpBodyBytes) && settings.maxHttpBodyBytes > 0
+  ? Math.min(settings.maxHttpBodyBytes, 512 * 1024 * 1024) : 128 * 1024 * 1024;
+
+// 在 Buffer.concat / 解壓 / JSON.parse 之前限制接收量；不可截掉內容後繼續送模型。
+export async function readRequestBody(request, limit = maxHttpBodyBytes) {
+  const chunks = [];
+  let bytes = 0;
+  const input = request.iterator ? request.iterator({ destroyOnReturn: false }) : request;
+  for await (const chunk of input) {
+    bytes += chunk.length;
+    if (bytes > limit) throw new RouterRequestError(413, "router_request_too_large", "本機接收的請求過大，請縮小附件或分批處理。", "request");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+export function decodeRequestBody(raw, encoding, limit = maxHttpBodyBytes) {
+  if (encoding && encoding !== "identity" && encoding !== "zstd") {
+    throw new RouterRequestError(415, "unsupported_content_encoding", "不支援的請求內容編碼。", "request");
+  }
+  if (raw.length > limit) throw new RouterRequestError(413, "router_request_too_large", "本機接收的請求過大。", "request");
+  if (encoding !== "zstd") return raw;
+  try { return zstdDecompressSync(raw, { maxOutputLength: limit }); }
+  catch (error) {
+    if (error.code === "ERR_BUFFER_TOO_LARGE") throw new RouterRequestError(413, "router_request_too_large", "解壓後的請求過大，請縮小附件。", "request");
+    throw new RouterRequestError(400, "invalid_compressed_body", "無法解壓請求內容。", "request");
+  }
+}
 // --- 診斷用擷取（settings.captureDir 有值時才啟用，預設關閉）---
 const captureDir = typeof settings.captureDir === "string" && settings.captureDir
   ? settings.captureDir
@@ -3781,6 +3809,23 @@ const websocketOnlyFields = [
 const threadHistories = new Map();
 const maxRememberedHistories = 32;
 const maxResponsesPerHistory = 4;
+const maxHistoryBytes = Number.isSafeInteger(settings.maxHistoryBytes) && settings.maxHistoryBytes > 0
+  ? settings.maxHistoryBytes : 128 * 1024 * 1024;
+const historyTtlMs = Number.isSafeInteger(settings.historyTtlMs) && settings.historyTtlMs > 0
+  ? settings.historyTtlMs : 30 * 60 * 1000;
+
+export function historyCacheInfo(now = Date.now()) {
+  let bytes = 0;
+  let count = 0;
+  for (const [key, responses] of threadHistories) {
+    for (const [id, history] of responses) {
+      if (history.expiresAt <= now) responses.delete(id);
+      else { bytes += history.bytes; count += 1; }
+    }
+    if (!responses.size) threadHistories.delete(key);
+  }
+  return { bytes, count, maxBytes: maxHistoryBytes, ttlMs: historyTtlMs };
+}
 
 // 轉譯層為了讓 Anthropic 的 thinking 簽章能往返，把 {thinking, signature}
 // 編碼進 reasoning 的 encrypted_content。官方後端驗不過這種內容
@@ -3875,10 +3920,17 @@ function prepareHistory(key, input, previousId = null) {
 }
 
 function rememberHistoryEvent(history, event) {
-  if (!history || history.completed) return;
+  if (!history || history.completed || history.disabled) return;
   const replayable = (item) => item && typeof item === "object" &&
     (item.type !== "reasoning" || item.encrypted_content);
   if (event?.type === "response.output_item.done" && replayable(event.item)) {
+    history.outputBytes = (history.outputBytes || 0) + Buffer.byteLength(JSON.stringify(event.item));
+    if (history.outputBytes > maxHistoryBytes) {
+      history.disabled = true;
+      history.input = [];
+      history.output = [];
+      return;
+    }
     history.output.push(event.item);
   }
   if (event?.type !== "response.completed" && event?.type !== "response.incomplete") return;
@@ -3888,23 +3940,40 @@ function rememberHistoryEvent(history, event) {
     history.output = event.response.output.filter(replayable);
   }
   history.completed = true;
+  historyCacheInfo();
+  const serialized = JSON.stringify({ input: history.input, output: history.output });
+  // 用位元組計帳的不可變快照，避免共享物件被後續轉譯修改；超限不保存半份歷史。
+  const bytes = Buffer.byteLength(serialized);
+  if (bytes > maxHistoryBytes) return;
+  const snapshot = { serialized, bytes, expiresAt: Date.now() + historyTtlMs };
   const responses = history.previousId
     ? threadHistories.get(history.key) || new Map()
     : new Map();
   responses.delete(responseId);
-  responses.set(responseId, history);
+  responses.set(responseId, snapshot);
   while (responses.size > maxResponsesPerHistory) responses.delete(responses.keys().next().value);
   threadHistories.delete(history.key);
   threadHistories.set(history.key, responses);
   while (threadHistories.size > maxRememberedHistories) {
     threadHistories.delete(threadHistories.keys().next().value);
   }
+  let total = historyCacheInfo().bytes;
+  while (total > maxHistoryBytes) {
+    const [key, oldest] = threadHistories.entries().next().value;
+    const [id, snapshot] = oldest.entries().next().value;
+    total -= snapshot.bytes;
+    oldest.delete(id);
+    if (!oldest.size) threadHistories.delete(key);
+  }
 }
 
 function rebuildStatefulInput(key, incomingInput, previousId) {
-  const history = key ? threadHistories.get(key)?.get(previousId) : null;
+  historyCacheInfo();
+  const snapshot = key ? threadHistories.get(key)?.get(previousId) : null;
+  const history = snapshot ? JSON.parse(snapshot.serialized) : null;
   if (!history || history.input.length === 0) return null;
-  const incoming = Array.isArray(incomingInput) ? incomingInput : [];
+  const incoming = typeof incomingInput === "string" ? [{ role: "user", content: incomingInput }]
+    : Array.isArray(incomingInput) ? incomingInput : [];
   return [...history.input, ...history.output, ...incoming];
 }
 
@@ -4038,6 +4107,9 @@ class RouterRequestError extends Error {
 }
 
 export function describeRouterError(error) {
+  if (error?.name === "BridgeRequestError") {
+    return { status: 422, code: "unsupported_bridge_input", message: error.message, phase: "translation", upstreamStatus: null, causeCode: null };
+  }
   if (error instanceof RouterRequestError) {
     const { status, code, message, phase, upstreamStatus } = error;
     return { status, code, message, phase, upstreamStatus, causeCode: null };
@@ -4370,21 +4442,14 @@ function rewriteCustomBody(body, route) {
 //
 // 這裡不自己驗證身分，原樣轉送即可：官方後端本來就會自己判斷。
 async function proxyToOfficial(request, response, incomingUrl) {
-  const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
-  const raw = Buffer.concat(chunks);
-  let body = raw;
-  if (request.headers["content-encoding"] === "zstd") {
-    try {
-      body = zstdDecompressSync(raw);
-    } catch {
-      body = raw;
-    }
-  }
+  const body = decodeRequestBody(await readRequestBody(request), request.headers["content-encoding"]);
+  const controller = new AbortController();
+  response.on("close", () => { if (!response.writableFinished) controller.abort(); });
   const init = {
     method: request.method,
     headers: buildOfficialHeaders(request.headers),
     redirect: "manual",
+    signal: controller.signal,
   };
   if (body.length > 0) init.body = body;
   const upstream = await fetch(targetUrl(false, incomingUrl), init);
@@ -4401,22 +4466,37 @@ export function targetUrl(custom, incomingUrl) {
   return new URL(`${base}${path}${incomingUrl.search}`);
 }
 
-async function streamUpstream(upstream, response, history = null) {
+export async function streamUpstream(upstream, response, history = null, responsesStream = false) {
   response.writeHead(upstream.status, filteredResponseHeaders(upstream.headers));
   if (!upstream.body) {
     response.end();
     return;
   }
-  const observe = history && upstream.ok && upstream.headers.get("content-type")?.includes("text/event-stream")
-    ? observeResponsesSse((event) => rememberHistoryEvent(history, event))
+  let sawTerminal = false;
+  const observe = (responsesStream || history) && upstream.ok && upstream.headers.get("content-type")?.includes("text/event-stream")
+    ? observeResponsesSse((event) => {
+      if (isTerminalEvent(event)) { sawTerminal = true; response.routerTerminalSent = true; }
+      rememberHistoryEvent(history, event);
+    })
     : null;
-  const jsonChunks = history && upstream.ok && !observe ? [] : null;
+  response.routerResponsesStream = Boolean(observe);
+  let jsonChunks = history && upstream.ok && !observe ? [] : null;
+  let jsonBytes = 0;
   for await (const chunk of upstream.body) {
     observe?.write(chunk);
-    if (jsonChunks) jsonChunks.push(Buffer.from(chunk));
+    if (jsonChunks) {
+      jsonBytes += chunk.length;
+      if (jsonBytes > maxHistoryBytes) jsonChunks = null;
+      else jsonChunks.push(Buffer.from(chunk));
+    }
     if (!response.write(chunk)) await once(response, "drain");
   }
   observe?.finish();
+  if (observe && !sawTerminal) {
+    noteTruncatedStream();
+    const event = responseFailedEvent("upstream_stream_truncated", truncatedStreamMessage);
+    response.write("\n\nevent: response.failed\ndata: " + JSON.stringify(event) + "\n\n");
+  }
   if (jsonChunks) {
     try {
       const result = JSON.parse(Buffer.concat(jsonChunks).toString("utf8"));
@@ -4619,8 +4699,7 @@ async function handleImages(request, response, incomingUrl) {
   // 且這條路徑花的是使用者自己的閘道金鑰，因此放行沒有標頭的請求。
   request.routerContext.route = "custom";
   if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
-  const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
+  const rawBody = await readRequestBody(request);
 
   const abortController = new AbortController();
   request.on("aborted", () => abortController.abort());
@@ -4633,7 +4712,7 @@ async function handleImages(request, response, incomingUrl) {
   const upstream = await fetchCustom(
     new URL(`${apiRoot}${path}${incomingUrl.search}`),
     request.headers,
-    Buffer.concat(chunks),
+    rawBody,
     abortController.signal,
   );
   stats.imageRequests += 1;
@@ -4649,13 +4728,12 @@ async function handleResponses(request, response, incomingUrl) {
     });
     return;
   }
-  const chunks = [];
-  for await (const chunk of request) chunks.push(chunk);
-  const encodedBody = Buffer.concat(chunks);
-  const decodedBody = encoding === "zstd" ? zstdDecompressSync(encodedBody) : encodedBody;
+  const encodedBody = await readRequestBody(request);
+  const decodedBody = decodeRequestBody(encodedBody, encoding);
   let body;
   try {
     body = JSON.parse(decodedBody.toString("utf8"));
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid request object");
   } catch {
     writeJson(response, 400, { error: { message: "JSON 格式無效", type: "router_error" } });
     return;
@@ -4712,7 +4790,7 @@ async function handleResponses(request, response, incomingUrl) {
     response.end(text);
     return;
   }
-  await streamUpstream(upstream, response, meta.history);
+  await streamUpstream(upstream, response, meta.history, true);
 }
 
 const websocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -5256,7 +5334,7 @@ function createUpstreamSession(socket, leftover) {
 // 送出一輪並轉發事件。回傳 { ok, retryWithReplay }。
 // 在收到 response.in_progress 之前先緩衝：若此時上游拒絕接續，Codex 尚未看到
 // 本輪任何事件，可以安全地改用完整歷史重送，不會產生半截輸出。
-function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
+export function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let flushed = false;
@@ -5285,6 +5363,8 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
         session.send({ type: "response.cancel" });
       } catch {}
       failHard(new Error("已取消"));
+      // 取消確認可能晚於下一輪，不能再共用這條連線的事件回呼。
+      session.destroy();
     };
     const flush = () => {
       if (flushed) return;
@@ -5313,7 +5393,16 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
       if (type === "response.completed" || type === "response.incomplete") {
         flush();
         const responseId = event?.response?.id;
-        if (typeof responseId === "string" && responseId) session.responseIds.add(responseId);
+        if (typeof responseId === "string" && responseId) {
+          session.responseIds.add(responseId);
+          session.responseModels ||= new Map();
+          session.responseModels.set(responseId, payload.model);
+          while (session.responseIds.size > 64) {
+            const oldest = session.responseIds.values().next().value;
+            session.responseIds.delete(oldest);
+            session.responseModels.delete(oldest);
+          }
+        }
         finish({ ok: true, retryWithReplay: false });
         return;
       }
@@ -5342,6 +5431,7 @@ function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) {
 export async function bridgeAnthropicToHttp(upstream, response, meta) {
   stats.lastCustomStatus = upstream.status;
   if (!upstream.body) throw new Error("上游響應沒有內文");
+  response.routerResponsesStream = true;
   response.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -5351,7 +5441,7 @@ export async function bridgeAnthropicToHttp(upstream, response, meta) {
   await bridgeAnthropicStream(
     upstream.body,
     (event) => {
-      if (isTerminalEvent(event)) sawTerminal = true;
+      if (isTerminalEvent(event)) { sawTerminal = true; response.routerTerminalSent = true; }
       rememberHistoryEvent(meta.history, event);
       response.write("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n");
     },
@@ -5452,7 +5542,7 @@ async function tryUpstreamWebSocketTurn(
   }
 
   // 只有這條上游連線自己產生過的 id 才能接續；其餘情況一律重播完整歷史。
-  const canChain = Boolean(previousId && session.responseIds.has(previousId));
+  const canChain = Boolean(previousId && session.responseIds.has(previousId) && session.responseModels?.get(previousId) === message.model);
   const fullInput = previousId
     ? rebuildStatefulInput(historyKey, message.input, previousId)
     : message.input;
@@ -5467,7 +5557,7 @@ async function tryUpstreamWebSocketTurn(
       delete outgoing.previous_response_id;
       if (previousId) stats.upstreamWebSocketReplays += 1;
     }
-    const sanitized = stripBridgeArtifacts({ input: outgoing.input });
+    const sanitized = stripRouterImageArtifacts(stripBridgeArtifacts({ input: outgoing.input }));
     outgoing.input = sanitized.input;
     outgoing.type = "response.create";
     return outgoing;
@@ -5620,6 +5710,7 @@ function handleWebSocketUpgrade(request, socket, head) {
   let fragmentChunks = [];
   let activeAbortController = null;
   const pendingMessages = [];
+  let pendingMessageBytes = 0;
   // 每條 Codex 連線對應一條上游 WebSocket；接續狀態不能跨連線共用。
   const connectionState = {
     session: null,
@@ -5654,7 +5745,7 @@ function handleWebSocketUpgrade(request, socket, head) {
     // completed 就會在同一條連線上送出下一個請求。若此時直接回 response_in_progress，
     // Codex 不處理該錯誤事件而會無聲卡死。因此改為排隊，仍維持逐一序列化執行。
     if (activeAbortController) {
-      if (pendingMessages.length >= maxPendingMessages) {
+      if (pendingMessages.length >= maxPendingMessages || pendingMessageBytes + payload.length > maxWebSocketMessageBytes) {
         sendWebSocketJson(socket, {
           type: "error",
           error: {
@@ -5666,7 +5757,8 @@ function handleWebSocketUpgrade(request, socket, head) {
         stats.responseInProgressRejects += 1;
         return;
       }
-      pendingMessages.push(message);
+      pendingMessages.push({ message, bytes: payload.length });
+      pendingMessageBytes += payload.length;
       stats.queuedResponses += 1;
       return;
     }
@@ -5712,7 +5804,10 @@ function handleWebSocketUpgrade(request, socket, head) {
       .finally(() => {
         activeAbortController = null;
         const next = pendingMessages.shift();
-        if (next && !socket.destroyed && socket.writable) startResponse(next);
+        if (next) {
+          pendingMessageBytes -= next.bytes;
+          if (!socket.destroyed && socket.writable) startResponse(next.message);
+        }
       });
   }
 
@@ -5782,6 +5877,7 @@ const server = http.createServer(async (request, response) => {
         status: "ok",
         version: settings.version,
         uptimeSeconds: Math.floor(process.uptime()),
+        historyCache: historyCacheInfo(),
         stats,
       });
       return;
@@ -5830,6 +5926,10 @@ const server = http.createServer(async (request, response) => {
         },
       });
     } else if (!response.writableEnded) {
+      if (response.routerResponsesStream && !response.routerTerminalSent) {
+        const event = responseFailedEvent(detail.code, `${detail.message}（診斷 ID：${detail.requestId}）`);
+        response.write("\n\nevent: response.failed\ndata: " + JSON.stringify(event) + "\n\n");
+      }
       response.end();
     }
   }
@@ -5868,6 +5968,8 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
   refreshCatalogIfStale();
   const catalogTimer = setInterval(refreshCatalogIfStale, 5 * 60 * 1000);
   if (typeof catalogTimer.unref === "function") catalogTimer.unref();
+  const historyTimer = setInterval(historyCacheInfo, Math.min(historyTtlMs, 60000));
+  historyTimer.unref();
 
   server.listen(listenPort, listenHost, () => {
     process.stderr.write(`model-router-ready:${listenHost}:${listenPort}\n`);
@@ -5878,6 +5980,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
   }
 }
 __CODEX_MODEL_ROUTER_BRIDGE_JS__
+import { createHash } from "node:crypto";
 // Codex Responses API <-> Anthropic Messages API 雙向轉譯。
 //
 // 存在的理由：部分閘道的 /v1/responses 與 /v1/chat/completions 相容層對
@@ -6057,6 +6160,20 @@ function applyImageBudget(messages) {
   return omitted;
 }
 
+function bridgeInputError(message) {
+  return Object.assign(new Error(message), { name: "BridgeRequestError" });
+}
+
+function parseToolArguments(value) {
+  let parsed;
+  try { parsed = typeof value === "string" ? JSON.parse(value || "{}") : value; }
+  catch { throw bridgeInputError("工具參數不是完整 JSON；未產生替代參數，請重新產生該工具呼叫。"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw bridgeInputError("工具參數必須是 JSON 物件；未執行該工具呼叫。");
+  }
+  return parsed;
+}
+
 function toAnthropicBlocks(content) {
   if (typeof content === "string") {
     return content ? [{ type: "text", text: content }] : [];
@@ -6068,12 +6185,37 @@ function toAnthropicBlocks(content) {
   }
   const blocks = [];
   for (const part of content) {
+    if (part?.type === "resource_link") {
+      blocks.push({ type: "text", text: JSON.stringify({ name: part.name, title: part.title, uri: part.uri, description: part.description }) });
+      continue;
+    }
+    if (part?.type === "resource" && typeof part.resource?.text === "string") {
+      blocks.push({ type: "text", text: part.resource.text });
+      continue;
+    }
+    if (part?.type === "image" && typeof part.data === "string" && typeof part.mimeType === "string") {
+      const image = toImageBlock(`data:${part.mimeType};base64,${part.data}`);
+      if (!image) throw bridgeInputError("Claude 無法解析這個工具圖片格式，請轉成 PNG、JPEG、GIF 或 WebP。");
+      blocks.push(image);
+      continue;
+    }
+    if (part?.type === "input_file") {
+      const data = typeof part.file_data === "string" && /^data:application\/pdf;base64,([A-Za-z0-9+/=\r\n]+)$/.exec(part.file_data);
+      if (data) blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: data[1] } });
+      else if (typeof part.file_url === "string" && /^https?:\/\//.test(part.file_url)) {
+        blocks.push({ type: "document", source: { type: "url", url: part.file_url } });
+      } else throw bridgeInputError("Claude 轉譯不支援這種檔案引用；請用本機檔案工具讀取內容，或提供 PDF data URL／公開文件 URL。");
+      continue;
+    }
     if (typeof part?.text === "string" && part.text) {
       blocks.push({ type: "text", text: part.text });
       continue;
     }
     const image = toImageBlock(part?.image_url ?? part?.url);
-    if (image) blocks.push(image);
+    if (image) { blocks.push(image); continue; }
+    if (part?.type && !["text", "input_text", "output_text"].includes(part.type)) {
+      throw bridgeInputError("Claude 轉譯收到不支援的內容類型；請先用對應工具讀取或轉換附件，再重送文字／圖片。");
+    }
   }
   return blocks;
 }
@@ -6081,8 +6223,13 @@ function toAnthropicBlocks(content) {
 // Anthropic 沒有 Responses 的 namespace 工具型別，所以送往上游時要用唯一別名攤平；
 // 回到 Codex 時再靠 targets 拆回 { namespace, name }。Codex 的 function_call /
 // custom_tool_call 把 namespace 放在獨立欄位，不能把完整別名直接塞進 name。
-function toolAlias(namespace, name) {
-  return namespace && namespace !== "functions" ? `${namespace}__${name}` : name;
+export function toolAlias(namespace, name) {
+  const ns = namespace && namespace !== "functions" ? namespace : null;
+  const alias = ns ? `${ns}__${name}` : name;
+  // 保留一般工具的既有名稱；有歧義、過長或含非法字元者改用固定長度別名。
+  if (typeof name === "string" && !name.includes("__") &&
+      typeof alias === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(alias) && !alias.startsWith("cmr_")) return alias;
+  return "cmr_" + createHash("sha256").update(JSON.stringify([ns, name])).digest("hex").slice(0, 60);
 }
 
 function flattenTools(items, out = [], namespace = null, targets = new Map()) {
@@ -6093,10 +6240,13 @@ function flattenTools(items, out = [], namespace = null, targets = new Map()) {
         : (namespace ? `${namespace}__${tool.name}` : tool.name);
       flattenTools(tool.tools, out, nested, targets);
     } else if (tool?.name) {
-      const alias = toolAlias(namespace, tool.name);
+      const effectiveNamespace = namespace || tool.namespace || null;
+      const alias = toolAlias(effectiveNamespace, tool.name);
+      const previous = out.findIndex((item) => item.name === alias);
+      if (previous >= 0) out.splice(previous, 1);
       out.push(alias === tool.name ? tool : { ...tool, name: alias });
-      targets.set(alias, namespace
-        ? { name: tool.name, namespace }
+      targets.set(alias, effectiveNamespace && effectiveNamespace !== "functions"
+        ? { name: tool.name, namespace: effectiveNamespace }
         : { name: tool.name });
     }
   }
@@ -6244,7 +6394,7 @@ export function toAnthropicRequest(body, route) {
     typeof route === "object" && Number.isFinite(route?.maxOutputTokens) && route.maxOutputTokens > 0
       ? route.maxOutputTokens
       : null;
-  const systemParts = [];
+  const systemParts = typeof body.instructions === "string" && body.instructions ? [body.instructions] : [];
   const messages = [];
   let codexTools = [];
   let toolTargets = new Map();
@@ -6262,12 +6412,30 @@ export function toAnthropicRequest(body, route) {
     ? [{ type: "message", role: "user", content: [{ type: "input_text", text: body.input }] }]
     : (Array.isArray(body.input) ? body.input : []);
 
+  // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
+  const toolDefinitions = [...(Array.isArray(body.tools) ? body.tools : [])];
+  for (const item of inputItems) if (item?.type === "additional_tools") toolDefinitions.push(...(item.tools || []));
+  ({ tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions));
+  const unavailable = [];
+  const inspectTools = (tools) => {
+    for (const tool of tools) {
+      if (tool?.type === "namespace") inspectTools(tool.tools || []);
+      else if (!["function", "custom"].includes(tool?.type)) unavailable.push(tool?.type || "unknown");
+    }
+  };
+  inspectTools(toolDefinitions);
+  if (unavailable.length) {
+    // 平台內建工具沒有可轉送的本機執行器。不可假裝已啟用，也不可改投另一個付費供應商。
+    systemParts.push("此 Claude 轉譯路由不提供以下平台內建工具：" +
+      [...new Set(unavailable)].map((name) => String(name).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64)).join(", ") +
+      "。只能呼叫本次實際提供的 function/custom 工具。需要生圖且已安裝 router-imagegen 技能時，可使用該技能；沒有可用工具時請明確說明，勿宣稱已完成。");
+  }
+  if (body.text?.format && body.text.format.type !== "text") {
+    throw bridgeInputError("Claude 轉譯尚未支援此結構化輸出格式，請改用文字或函式工具輸出。");
+  }
   for (const item of inputItems) {
-    switch (item?.type) {
+    switch (item?.type || (item?.role ? "message" : null)) {
       case "additional_tools": {
-        const flattened = flattenTools(item.tools);
-        codexTools = flattened.tools;
-        toolTargets = flattened.targets;
         break;
       }
 
@@ -6296,17 +6464,17 @@ export function toAnthropicRequest(body, route) {
       }
 
       case "custom_tool_call":
+        if (typeof item.input !== "string") throw bridgeInputError("歷史自由格式工具的 input 必須是字串，無法安全替換成空內容。");
         push("assistant", {
           type: "tool_use",
           id: item.call_id,
           name: toolAlias(item.namespace, item.name),
-          input: { [FREEFORM_KEY]: typeof item.input === "string" ? item.input : "" },
+          input: { [FREEFORM_KEY]: item.input },
         });
         break;
 
       case "function_call": {
-        let input = {};
-        try { input = JSON.parse(item.arguments || "{}"); } catch {}
+        const input = parseToolArguments(item.arguments ?? "{}");
         push("assistant", {
           type: "tool_use",
           id: item.call_id,
@@ -6348,6 +6516,7 @@ export function toAnthropicRequest(body, route) {
       }
 
       default:
+        if (item?.type) throw bridgeInputError("Claude 轉譯收到不支援的對話項目，無法安全省略；請用原模型完成該工具回合，或重送文字摘要。");
         break;
     }
   }
@@ -6418,6 +6587,15 @@ export function toAnthropicRequest(body, route) {
     if (body.tool_choice === "auto" || !body.tool_choice) request.tool_choice = { type: "auto" };
     else if (body.tool_choice === "required") request.tool_choice = { type: "any" };
     else if (body.tool_choice === "none") delete request.tools;
+    else if (typeof body.tool_choice === "object" && ["function", "custom"].includes(body.tool_choice?.type)) {
+      const name = toolAlias(body.tool_choice.namespace, body.tool_choice.name);
+      if (!tools.some((tool) => tool.name === name)) throw bridgeInputError("指定的工具不在這次可用工具清單內。");
+      request.tool_choice = { type: "tool", name };
+    } else throw bridgeInputError("Claude 轉譯不支援這個 tool_choice，請選用本次提供的函式工具。");
+    if (body.parallel_tool_calls === false && request.tool_choice) request.tool_choice.disable_parallel_tool_use = true;
+  }
+  if (!tools.length && body.tool_choice && !["auto", "none"].includes(body.tool_choice)) {
+    throw bridgeInputError("指定的工具在 Claude 轉譯路由中不可用。");
   }
   if (useOutputConfig) {
     // Codex 的 ultra 帶「自動任務委派」語意，Anthropic 沒有對應檔位，對到 max。
@@ -6525,11 +6703,13 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
 
   // 目前正在組裝的 content block
   let cur = null;
+  let failed = false;
 
   const decoder = new TextDecoder();
   let pending = "";
 
   const handle = (event) => {
+    if (failed) return;
     switch (event.type) {
       case "content_block_start": {
         const block = event.content_block || {};
@@ -6541,7 +6721,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
             item: { id: cur.itemId, type: "reasoning", content: [], encrypted_content: "", summary: [] },
           });
         } else if (block.type === "text") {
-          cur = { kind: "text", itemId: randomId("msg_", 54), text: "", index: outputIndex };
+          cur = { kind: "text", itemId: randomId("msg_", 54), text: block.text || "", index: outputIndex };
           send({
             type: "response.output_item.added",
             output_index: outputIndex,
@@ -6564,6 +6744,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
             name: target?.name || block.name,
             namespace: target?.namespace || null,
             json: "",
+            initialInput: block.input ?? {},
             index: outputIndex,
           };
           const identity = cur.namespace
@@ -6684,8 +6865,19 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           output.push(item);
           send({ type: "response.output_item.done", output_index: cur.index, item });
         } else if (cur.kind === "custom_tool" || cur.kind === "function_tool") {
-          let parsed = {};
-          try { parsed = JSON.parse(cur.json || "{}"); } catch {}
+          let parsed;
+          try {
+            parsed = parseToolArguments(cur.json || cur.initialInput);
+            if (cur.kind === "custom_tool" && typeof parsed[FREEFORM_KEY] !== "string") throw bridgeInputError("自由格式工具缺少字串 input。");
+          } catch {
+            failed = true;
+            suppress = false;
+            const response = base();
+            response.status = "failed";
+            response.error = { code: "invalid_tool_arguments", message: "上游工具參數不完整或格式錯誤；未產生替代參數，請重新產生該工具呼叫。" };
+            send({ type: "response.failed", response });
+            break;
+          }
           if (cur.kind === "custom_tool") {
             const input = typeof parsed[FREEFORM_KEY] === "string" ? parsed[FREEFORM_KEY] : (cur.json || "");
             send({ type: "response.custom_tool_call_input.delta", delta: input, item_id: cur.itemId, output_index: cur.index });
@@ -6760,7 +6952,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           response.status = "incomplete";
           response.incomplete_details = { reason: "max_output_tokens" };
         }
-        send({ type: "response.completed", response });
+        send({ type: response.status === "incomplete" ? "response.incomplete" : "response.completed", response });
         break;
       }
 

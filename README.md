@@ -179,6 +179,26 @@ Ark 不支援指定尺寸／品質或透明背景，`--size`、`--quality` 須�
 `$CODEX_HOME/backups/model-router/`。`rollback` 也會封存由此路由器建立的技能。手動修改會保留，
 同名但不屬於此路由器的技能不會被覆寫。重新開任務讓技能清單刷新，必要時重開 Codex。
 
+## 工具可用性與相容範圍
+
+路由器只能轉送 Codex 已提供的工具與請求，不能替帳號解鎖功能，或把未掛載的工具加進
+目前任務。OpenAI 的[工具文件](https://developers.openai.com/api/docs/guides/tools)也區分
+平台內建工具與由呼叫端執行的函式工具；改用 Claude Messages API 不會自動取得前者。
+
+| 功能 | 路由處理與限制 |
+| --- | --- |
+| 終端機、檔案編輯、MCP、瀏覽器等 function/custom 工具 | GPT 保留定義；Claude 做雙向轉譯，包含 namespace 與自由格式輸入。仍需 Codex 本身掛載工具並允許執行。 |
+| Codex 的搜尋、筆記、歷史 HTTP 端點 | 繼續送往官方後端，由官方驗證帳號權限；不會因選擇自訂模型而改用中轉 Key。 |
+| 平台內建 image_generation、web_search、file_search 等工具 | 自訂 GPT 依中轉能力而定；Claude 轉譯無法執行這些內建工具，會告知模型限制。明確強制使用不可用工具時回報 422，不自動改投其他供應商。 |
+| 中轉 API 生圖 | 使用已啟用的 router-imagegen 技能與既有 Images／Ark 路徑，無需內建 image_gen。 |
+| 圖片與 MCP 圖片結果 | Claude 支援 URL、data URL 及 MCP 的 data/mimeType 圖片區塊。圖片數量與大小限制仍適用。 |
+| PDF、MCP 資源 | PDF data URL／文件 URL 轉為 Claude document；MCP 文字資源與連結保留為文字，不額外下載。上游仍需支援文件功能。 |
+| 私有 file_id、音訊或未知內容類型 | Claude 轉譯明確回報不支援，不默默刪除。可先用本機讀檔／轉錄工具轉成文字或圖片。 |
+| 嚴格結構化輸出 | Claude 轉譯尚未適配，明確回報 422；請改用文字或函式工具。GPT 路徑維持原樣轉發。 |
+
+因此「模型看不到工具」應先查任務工具清單；「工具可見但執行失敗」才往權限、工具服務、
+路由及上游檢查。安裝路由器不會自動安裝所有 MCP／插件或更改其權限。
+
 ## 平台差異
 
 安裝流程、模型探測、路由與 Claude 轉譯在兩個平台完全相同，差別只有這兩項：
@@ -204,6 +224,12 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
 - **重試保留正確歷史**——成功終止後才保存對話快照，502、網路失敗、串流截斷與取消
   不會將半輪內容混入後續重試。官方 WebSocket 接續遭拒後重播、或回退 HTTP 時，也不會
   重複加入工具結果；若對應快照已不存在，會明確要求重新送出完整對話。
+  1.21.0 起取消會關閉該上游 WebSocket，避免遲到的舊事件混進下一輪；切換官方模型時
+  重播完整歷史。GPT 的 HTTP/SSE 回退同樣檢查終止事件，提早結束會明確回報失敗。
+  HTTP 接收與 zstd 解壓預設上限為 128 MiB；歷史快照依序列化位元組計帳，總預算
+  128 MiB、30 分鐘過期，同時保留原本最多 32 組、每組 4 個回應的限制。可在 settings.json
+  設定 `maxHttpBodyBytes`（最高 512 MiB）、`maxHistoryBytes`、`historyTtlMs`，重啟路由器後生效。
+  這些是路由器的資源限制，不改 Codex 的上下文設定；快照淘汰後要求完整重送，不截斷內容。
 - **可定位的網路錯誤**——DNS、TLS、連線中斷、逾時與登入驗證遭拒分開回報，附診斷 ID。
   `/healthz` 的 `stats.lastError` 與 `router.err.log` 可對照時間、上游主機、階段與原因碼，
   診斷紀錄不包含金鑰、認證標頭或對話內容。ChatGPT 驗證探測設有 15 秒上限，暫時性
@@ -220,6 +246,9 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   送往 Anthropic 時把 namespace 編成不重名的工具別名，回到 Codex 時再拆回獨立的
   `name` 與 `namespace` 欄位，歷史重播也做相同的反向轉換；同時掛上 `cache_control`
   以啟用提示快取。
+  1.21.0 起也接受頂層 `instructions` / `tools`、簡寫訊息、指定函式工具與
+  `parallel_tool_calls: false`。過長或容易碰撞的工具名稱使用穩定別名，回程還原原名稱。
+  工具 JSON 損壞或自由格式工具缺少字串輸入時回報失敗，不以空參數繼續執行。
 - **推理強度真的會生效**——`thinking.budget_tokens` 在較新的模型上已被移除（官方直接
   400，部分閘道靜默丟棄），結果是在 Codex 裡選 low 或 max 毫無差別、而且一律跑在高強度。
   安裝時會探測 `output_config.effort`，支援的話把五檔直接透傳。實測 low 檔耗時從
@@ -287,6 +316,9 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 `toolImagesOmitted` 與 `toolImageBytesSaved` 記錄圖片大小預算省下的舊工具截圖與位元組；
 `lastRequestBytesBeforeBudget` / `lastRequestBytesAfterBudget` 是最近一次自訂請求縮減前後的大小。
 `imageArchiveFailures` 增加代表原圖無法保存，這些圖片會留在請求中，不會被悄悄丟掉。
+
+`/healthz` 的 `historyCache` 顯示快照筆數、序列化位元組總量、預算及過期時間，
+不包含對話內容。此數字不是整個 Node.js 程序的實際記憶體占用量。
 
 `imagesOmitted` 增加代表有圖片在送出前被換成佔位文字。單次請求超過 20 張圖時，上游會把
 每張圖的尺寸上限從 8000 收緊到 2000 像素（iPhone 截圖 942 x 2048 就會超過），因此路由器

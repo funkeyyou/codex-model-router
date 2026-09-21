@@ -140,12 +140,11 @@ test("function_call 與 output 以 call_id 配對成 tool_use / tool_result", ()
   assert.deepEqual(toolResult.content, [{ type: "text", text: "找到 3 筆" }]);
 });
 
-test("壞掉的 arguments JSON 退成空物件，不整輪炸掉", () => {
-  const request = build([
+test("壞掉的歷史 arguments JSON 明確拒絕，不編造空物件", () => {
+  assert.throws(() => build([
     userMessage("x"),
     { type: "function_call", call_id: "c", name: "t", arguments: "{不是 JSON" },
-  ]);
-  assert.deepEqual(request.messages.at(-1).content[0].input, {});
+  ]), /工具參數不是完整 JSON/);
 });
 
 test("空的工具輸出補上佔位文字（Anthropic 不收空 content）", () => {
