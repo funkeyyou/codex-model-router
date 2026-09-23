@@ -36,7 +36,7 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
   await new Promise(resolve => reservation.listen(0, "127.0.0.1", resolve));
   const port = reservation.address().port;
   await new Promise(resolve => reservation.close(resolve));
-  const { dir } = await loadPayloads();
+  const { dir, installer } = await loadPayloads();
   for (const name of ["router.mjs", "bridge.mjs", "claude-bridge.mjs"]) copyFileSync(join(dir, name), join(runtime, name));
   const catalogPath = join(runtime, "models.json");
   writeFileSync(catalogPath, JSON.stringify({ models: [entry("old-model"), custom] }));
@@ -113,4 +113,14 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
   assert.ok(result.includes("gpt-6-luna"));
   assert.ok(result.includes(custom.slug));
   assert.equal(readFileSync(catalogPath, "utf8"), saved);
+  // 再添加 Claude，讓 Codex 磁碟快取刻意落後。使用正式安裝器的等待函式，
+  // 證明同一 app-server 讀到新增 slug 後才完成驗證，而非立即回滾。
+  offline = false;
+  const claude = entry("custom/ark-claude-opus-5-5-a03f5e88");
+  const updated = JSON.parse(saved);
+  updated.models.push(claude);
+  writeFileSync(catalogPath, JSON.stringify(updated));
+  const verified = await installer.codexRpc("model/list", { includeHidden: true },
+    result => installer.hasExpectedModels(result, [custom.slug, claude.slug]), bin, root);
+  assert.ok(verified.data.some(m => m.id === claude.slug));
 });

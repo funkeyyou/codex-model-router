@@ -83,7 +83,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.22.0";
+const INSTALLER_VERSION = "1.22.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1314,6 +1314,29 @@ function loadBundledCatalog() {
   return catalog;
 }
 
+export function catalogTemplates(bundled, current) {
+  const bySlug = new Map((bundled.models || []).filter(m => !m.slug.startsWith("custom/")).map(m => [m.slug, m]));
+  for (const model of current?.models || []) {
+    if (!model.slug.startsWith("custom/")) bySlug.set(model.slug, model);
+  }
+  return { ...bundled, models: [...bySlug.values()] };
+}
+
+function loadCatalogTemplates() {
+  const bundled = loadBundledCatalog();
+  try { return catalogTemplates(bundled, JSON.parse(readFileSync(catalogPath, "utf8"))); }
+  catch { return bundled; }
+}
+
+export function mergeAddedModels(officialModels, current, routes, newRoutes) {
+  const added = new Set(newRoutes.map(r => r.pickerSlug));
+  const previous = new Map((current?.models || []).map(m => [m.slug, m]));
+  return routes.map((route, index) => {
+    if (!added.has(route.pickerSlug) && previous.has(route.pickerSlug)) return previous.get(route.pickerSlug);
+    return customCatalogEntry(officialModels, route, index);
+  });
+}
+
 export function customCatalogEntry(officialModels, route, index) {
   const lastSegment = route.upstreamModel.split("/").at(-1);
   const exactTemplate = officialModels.find(
@@ -1351,9 +1374,11 @@ export function customCatalogEntry(officialModels, route, index) {
     entry.effective_context_window_percent = 95;
   } else if (!exactTemplate) {
     console.log(
-      `  ⚠️  ${route.upstreamModel}：無法自動探測上下文上限，` +
+      `  ⚠️  ${route.upstreamModel}：未取得中轉上下文上限，也沒有官方同名模板，` +
         `沿用模板值 ${entry.context_window}。如與實際不符請手動修改 models.json。`,
     );
+  } else {
+    console.log(`  ${route.upstreamModel}：沿用官方同名模板的上下文 ${entry.context_window} tokens（非中轉實測上限）。`);
   }
   if (Number.isFinite(route.maxOutputTokens) && route.maxOutputTokens > 0) {
     entry.max_output_tokens = route.maxOutputTokens;
@@ -1373,16 +1398,18 @@ function deepGet(object, path) {
   return { present: true, value: current };
 }
 
-async function codexRpc(method, params) {
-  const child = spawn(codexBin, ["app-server"], {
+export async function codexRpc(method, params, acceptResult = () => true, binary = codexBin, home = codexHome) {
+  const child = spawn(binary, ["app-server"], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...env, CODEX_HOME: codexHome },
+    env: { ...env, CODEX_HOME: home },
   });
   child.stderr.on("data", () => {});
   let buffer = "";
   let settled = false;
+  let retryTimer;
+  let timeout;
   const responsePromise = new Promise((resolvePromise, rejectPromise) => {
-    const timeout = setTimeout(() => {
+    timeout = setTimeout(() => {
       if (!settled) rejectPromise(new Error(`Timed out waiting for ${method}`));
     }, 30000);
     child.stdout.on("data", (chunk) => {
@@ -1400,6 +1427,12 @@ async function codexRpc(method, params) {
           continue;
         }
         if (message.id === 1) {
+          if (!message.error && !acceptResult(message.result)) {
+            retryTimer = setTimeout(() => {
+              if (!settled) child.stdin.write(`${JSON.stringify({ method, id: 1, params })}\n`);
+            }, 250);
+            continue;
+          }
           settled = true;
           clearTimeout(timeout);
           if (message.error) rejectPromise(new Error(message.error.message));
@@ -1430,7 +1463,24 @@ async function codexRpc(method, params) {
   try {
     return await responsePromise;
   } finally {
+    settled = true;
+    clearTimeout(timeout);
+    clearTimeout(retryTimer);
     child.kill("SIGTERM");
+  }
+}
+
+export function hasExpectedModels(result, expected) {
+  const models = new Set((result?.data || []).map(m => m.id));
+  return expected.every(slug => models.has(slug));
+}
+
+async function waitForPickerModels(routes) {
+  const expected = routes.map(r => r.pickerSlug);
+  try {
+    return await codexRpc("model/list", { includeHidden: true }, result => hasExpectedModels(result, expected));
+  } catch (error) {
+    throw new Error(`等待 Codex 模型清單同步失敗：${error.message}`);
   }
 }
 
@@ -2107,7 +2157,7 @@ async function install() {
     console.log("  上游恢復後重跑一次安裝器，即可用最新探測結果覆蓋。" );
   }
 
-  const bundledCatalog = loadBundledCatalog();
+  const bundledCatalog = loadCatalogTemplates();
   const discoveredOfficial = bundledCatalog.models.filter(
     (model) => !String(model.slug).startsWith("custom/"),
   );
@@ -2224,16 +2274,7 @@ async function install() {
       codexBin,
       nodeBin,
     };
-    const modelCheck = shell(codexBin, ["debug", "models"], {
-      env: { ...env, CODEX_HOME: codexHome },
-    });
-    const effectiveCatalog = JSON.parse(modelCheck.stdout);
-    const visibleSlugs = new Set(effectiveCatalog.models?.map((model) => model.slug));
-    for (const route of routes) {
-      if (!visibleSlugs.has(route.pickerSlug)) {
-        fail(`Codex model/list 中缺少已安裝模型：${route.pickerSlug}`);
-      }
-    }
+    await waitForPickerModels(routes);
     writeJsonAtomic(manifestPath, manifest);
   } catch (error) {
     if (configChanged && !existingManifest) {
@@ -2366,16 +2407,15 @@ async function addModels() {
   copyIfExists(catalogPath, join(backupDir, "models.json"));
   copyIfExists(manifestPath, join(backupDir, "install.json"));
 
-  const bundledCatalog = loadBundledCatalog();
+  const bundledCatalog = loadCatalogTemplates();
   // 這裡不重問隱藏模型（add 的用意就是不重問設定），但既有的選擇要沿用，
   // 否則加一個模型就會把強制顯示的那些又藏回去。
   const officialModels = applyForcedVisibility(
     bundledCatalog.models.filter((model) => !String(model.slug).startsWith("custom/")),
     settings.forceListedModels,
   );
-  const customModels = routes.map((route, index) =>
-    customCatalogEntry(officialModels, route, index),
-  );
+  const customModels = mergeAddedModels(officialModels,
+    JSON.parse(readFileSync(catalogPath, "utf8")), routes, newRoutes);
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
   try {
@@ -2396,17 +2436,7 @@ async function addModels() {
     restartServiceInPlace();
     await waitForHealth(port);
 
-    const modelCheck = shell(codexBin, ["debug", "models"], {
-      env: { ...env, CODEX_HOME: codexHome },
-    });
-    const visibleSlugs = new Set(
-      JSON.parse(modelCheck.stdout).models?.map((model) => model.slug),
-    );
-    for (const route of newRoutes) {
-      if (!visibleSlugs.has(route.pickerSlug)) {
-        fail(`Codex model/list 中缺少新增模型：${route.pickerSlug}`);
-      }
-    }
+    await waitForPickerModels(routes);
   } catch (error) {
     console.error("\n添加失敗，正在還原之前的配置...");
     copyIfExists(join(backupDir, "router.mjs"), routerPath);
