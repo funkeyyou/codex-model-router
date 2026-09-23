@@ -1,29 +1,11 @@
-// 模型目錄的自動更新。
-//
-// config.toml 的 model_catalog_json 指著 models.json，而那是安裝當下的快照。
-// ChatGPT Desktop 更新、內建新模型後這個檔不會動，選單裡就永遠看不到——實測：
-// 執行檔 9/5 11:07（bundled 11 個含 gpt-6-astra），models.json 9/4 17:01（10 個，沒有）。
+// 官方與自訂模型目錄的合併。啟動同步及錯誤回退另見 official-catalog.test.mjs。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { router } = await loadPayloads();
-const { catalogNeedsRefresh, mergeCatalog } = router;
-
-// --- 觸發條件 ---------------------------------------------------------------
-
-test("執行檔比目錄新才重建", () => {
-  assert.equal(catalogNeedsRefresh(2000, 1000), true, "更新過 -> 要重建");
-  assert.equal(catalogNeedsRefresh(1000, 2000), false, "目錄較新 -> 不動");
-  assert.equal(catalogNeedsRefresh(1000, 1000), false, "同時間 -> 不動");
-});
-
-test("拿不到時間就不動作（不猜）", () => {
-  for (const [a, b] of [[NaN, 1], [1, NaN], [undefined, 1], [1, null]]) {
-    assert.equal(catalogNeedsRefresh(a, b), false);
-  }
-});
+const { mergeCatalog } = router;
 
 // --- 合併 -------------------------------------------------------------------
 

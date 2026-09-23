@@ -83,7 +83,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.21.0";
+const INSTALLER_VERSION = "1.22.0";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -2188,7 +2188,8 @@ async function install() {
         keyPath: "openai_base_url",
         value: `http://127.0.0.1:${port}/v1`,
       },
-      { keyPath: "model_catalog_json", value: catalogPath },
+      // 讓 Codex 每次啟動向 /models 拉取；固定檔案會停用遠端清單刷新。
+      { keyPath: "model_catalog_json", value: null },
       { keyPath: `model_providers.${PROVIDER_ID}`, value: null },
     ]);
     configChanged = true;
@@ -2489,6 +2490,11 @@ const UPDATE_FAILURES = {
     "現有安裝沒有可用的連接埠設定，請改用「安裝或重新配置」。",
 };
 
+export function isManagedCatalogPath(value, managedPath) {
+  if (typeof value !== "string" || !value) return false;
+  return resolve(value) === resolve(managedPath);
+}
+
 async function update() {
   const manifest = readManifest();
   const settings = existsSync(settingsPath)
@@ -2507,6 +2513,11 @@ async function update() {
   const currentCatalog = existsSync(catalogPath) ? JSON.parse(readFileSync(catalogPath, "utf8")) : null;
   const updatedCatalog = prefixCatalogDisplayNames(currentCatalog, plan.routes);
   const namesChanged = updatedCatalog !== currentCatalog;
+  // 只遷移本工具管理的固定目錄，不移除使用者自行指定的其他目錄。
+  if (!codexBin) fail("此次更新需要 Codex CLI 讀取及遷移舊版模型目錄設定，請先確認 Codex 已安裝。");
+  const userConfig = await readUserConfig();
+  const previousCatalogPath = userConfig.config.model_catalog_json;
+  const migrateCatalog = isManagedCatalogPath(previousCatalogPath, catalogPath);
 
   printHeading("更新路由器");
   console.log(`版本：${plan.installed || "未知"} → ${plan.target}`);
@@ -2521,7 +2532,7 @@ async function update() {
   }
   console.log(
     "\n只會換掉路由器與轉譯層程式碼然後重啟；服務定義只有真的變了才會重寫。" +
-      "不重問 Base URL、API Key 與模型，也不改動 config.toml；模型目錄只會補上預設 api/ 顯示前綴。",
+      "不重問 Base URL、API Key 與模型；舊版固定模型目錄將遷移為啟動時同步官方清單。",
   );
 
   const backupDir = join(backupsRoot, `update-${timestamp()}`);
@@ -2530,6 +2541,7 @@ async function update() {
   copyIfExists(bridgePath, join(backupDir, "claude-bridge.mjs"));
   copyIfExists(settingsPath, join(backupDir, "settings.json"));
   copyIfExists(manifestPath, join(backupDir, "install.json"));
+  if (migrateCatalog) copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
   if (namesChanged) copyIfExists(catalogPath, join(backupDir, "models.json"));
   for (const path of serviceArchivePaths()) {
     copyIfExists(path, join(backupDir, basename(path)));
@@ -2537,6 +2549,7 @@ async function update() {
 
   let health = null;
   let serviceWarning = null;
+  let catalogConfigAttempted = false;
   try {
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
@@ -2570,8 +2583,18 @@ async function update() {
       }
     }
     health = await waitForHealth(plan.port);
+    if (migrateCatalog) {
+      catalogConfigAttempted = true;
+      await writeConfigEdits([{ keyPath: "model_catalog_json", value: null }]);
+      const verified = await readUserConfig();
+      if (verified.config.model_catalog_json != null) fail("固定模型目錄設定未成功移除。");
+    }
   } catch (error) {
     console.error("\n更新失敗，正在還原更新前的檔案...");
+    if (catalogConfigAttempted) {
+      try { await writeConfigEdits([{ keyPath: "model_catalog_json", value: previousCatalogPath }]); }
+      catch { console.error(`模型目錄設定還原失敗，原配置備份：${join(backupDir, "config.toml")}`); }
+    }
     copyIfExists(join(backupDir, "router.mjs"), routerPath);
     copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
@@ -2601,6 +2624,8 @@ async function update() {
   console.log(`健康檢查：${health?.status || "未知"}`);
   console.log(`保留 ${plan.routes.length} 個自訂模型，上游 ID、模型能力與 API Key 未變動。`);
   if (namesChanged) console.log("沒有上游前綴的預設模型名稱已補上 api/。");
+  if (migrateCatalog) console.log("已移除舊版固定模型目錄；重新開啟 Codex 時會同步官方清單並合併自訂模型。");
+  else if (previousCatalogPath) console.log("注意：保留了您自行設定的 model_catalog_json；該設定會停用啟動時同步模型清單。");
   console.log(`備份：${backupDir}`);
   if (serviceWarning) console.log(`\n注意：${serviceWarning}`);
   try { refreshRelayImagegen(); } catch (error) {
@@ -2669,6 +2694,10 @@ async function manageHiddenModels() {
     writeJsonAtomic(catalogPath, combinedCatalog);
     writeJsonAtomic(settingsPath, { ...settings, forceListedModels: chosen });
 
+    // 動態 /models 使用啟動時讀入的設定，驗證前先載入新選擇。
+    restartServiceInPlace();
+    health = await waitForHealth(port);
+
     const modelCheck = shell(codexBin, ["debug", "models"], {
       env: { ...env, CODEX_HOME: codexHome },
     });
@@ -2693,8 +2722,6 @@ async function manageHiddenModels() {
       fail(`Codex 模型目錄驗證失敗${details ? `：${details}` : ""}`);
     }
 
-    restartServiceInPlace();
-    health = await waitForHealth(port);
   } catch (error) {
     console.error("\n隱藏模型設定失敗，正在還原之前的目錄...");
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
@@ -3168,7 +3195,8 @@ function help() {
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
 沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
-不改動 config.toml；models.json 只會為無前綴的預設名稱補上 api/，保留模型 ID 與能力。
+會備份並移除本工具舊版寫入的 model_catalog_json，改由啟動時同步官方清單；其他配置保留。
+models.json 仍保留自訂模型與離線回退資料；無前綴的預設名稱會補上 api/。
 這是日常升級該用的命令。
 
 add 用於在已有安裝上追加模型：沿用已儲存的 Base URL、API Key 與連接埠，
@@ -3286,7 +3314,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
-import { readFileSync, readdirSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -3512,67 +3540,10 @@ function recordImageBudget(result) {
 
 // --- 模型目錄的自動更新 -----------------------------------------------------
 //
-// config.toml 的 model_catalog_json 指著 models.json，而那份是安裝當下用
-// `codex debug models --bundled` 產生的快照。ChatGPT Desktop 之後更新、內建了新
-// 模型，這個檔不會跟著動，選單裡就永遠看不到——而且失敗是靜默的，使用者只會
-// 以為官方還沒推給自己。
-//
-// bundled 清單只有在 Codex 執行檔本身變更時才會變，因此用「執行檔比目錄新」當
-// 觸發條件：平常只是一次 stat，真的更新了才 spawn 一次。重建後目錄的 mtime 會
-// 晚於執行檔，不會反覆觸發。
-const pinnedCodexBin = typeof settings.codexBin === "string" ? settings.codexBin : null;
-const codexBinSearchDir =
-  typeof settings.codexBinDir === "string" ? settings.codexBinDir : null;
-const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-
-// Windows 的 Codex 每次更新都裝進一個新的版本雜湊目錄，舊目錄原封不動留著。
-// 把安裝當下記下的那支執行檔當成新鮮度來源，等於這個功能永遠不會觸發：它的
-// mtime 從此凍結，而目錄是安裝時才寫的，必然比它新。所以每次檢查都重新解析
-// 一次「目前最新的那支」，而不是相信安裝時釘死的路徑。
-// macOS 不受影響（app bundle 內的路徑固定，更新時 mtime 會變），但同一套邏輯
-// 對它也是安全的：搜尋目錄留空時就只剩釘死的那支。
-export function newestCodexBinary(pinned, searchDir, entries = null, stat = statSync) {
-  const candidates = [];
-  if (pinned) candidates.push(pinned);
-  if (searchDir) {
-    let listing = entries;
-    if (listing === null) {
-      try {
-        listing = readdirSync(searchDir, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory())
-          .map((entry) => entry.name);
-      } catch {
-        listing = [];
-      }
-    }
-    for (const name of listing) candidates.push(join(searchDir, name, codexBinaryName));
-    candidates.push(join(searchDir, codexBinaryName));
-  }
-  let best = null;
-  let bestMtime = -1;
-  for (const candidate of candidates) {
-    let mtime;
-    try {
-      mtime = stat(candidate).mtimeMs;
-    } catch {
-      continue;
-    }
-    if (mtime > bestMtime) {
-      bestMtime = mtime;
-      best = candidate;
-    }
-  }
-  return best;
-}
-
+// Codex 啟動時透過 /models 取得清單。官方資料必須來自該請求的帳號，不能只用
+// bundled 快照，也不能跨重啟用 TTL 略過查詢。models.json 保留作為離線回退及
+// 自訂模型的來源，不再由 model_catalog_json 鎖住 Codex 的模型管理器。
 const catalogRefreshEnabled = settings.catalogRefresh !== false;
-const catalogRetryCooldownMs = 10 * 60 * 1000;
-let catalogRetryAfter = 0;
-
-export function catalogNeedsRefresh(binMtimeMs, catalogMtimeMs) {
-  if (!Number.isFinite(binMtimeMs) || !Number.isFinite(catalogMtimeMs)) return false;
-  return binMtimeMs > catalogMtimeMs;
-}
 
 // 官方項目整批換新，自訂項目沿用檔案裡既有的那份——那是安裝時探測出來的結果，
 // 路由器沒有重新探測的條件，也不該重複實作 customCatalogEntry（複製一份必然漂移）。
@@ -3596,84 +3567,82 @@ export function mergeCatalog(freshCatalog, currentCatalog, forceListed = []) {
   return { ...freshCatalog, models: [...official, ...renumbered] };
 }
 
-// forceListedModels 原本只在重建時套用，而重建的條件是「執行檔比目錄新」——
-// 安裝完必然不成立。於是設了這個選項不會有任何反應，得剛好等到下次 Codex 更新。
-// 這裡補上第二個觸發條件：目錄裡只要還有「該強制列出、卻沒列出」的模型就重建。
-// （反向不成立：某個 slug 從清單移除後，目錄裡那個 list 會留到下次真正重建為止，
-// 因為判斷原始 visibility 需要 bundled 目錄，而那要 spawn 才拿得到。）
-export function forcedModelsPending(catalog, forceListed) {
-  if (!Array.isArray(forceListed) || forceListed.length === 0) return false;
-  const wanted = new Set(forceListed);
-  return (catalog?.models || []).some(
-    (model) => wanted.has(model?.slug) && model?.visibility !== "list",
-  );
+export function mergeOfficialCatalog(fresh, current, forceListed = []) {
+  // 拒絕截斷、空清單、重複或冒充自訂模型的資料，不讓壞回應覆寫離線備份。
+  const seen = new Set();
+  if (!Array.isArray(fresh?.models) || !fresh.models.length) throw new Error("invalid_catalog");
+  for (const model of fresh.models) {
+    if (typeof model?.slug !== "string" || !model.slug || model.slug.startsWith("custom/") ||
+        seen.has(model.slug) || typeof model.display_name !== "string" ||
+        !["list", "hide"].includes(model.visibility) || !Array.isArray(model.supported_reasoning_levels)) {
+      throw new Error("invalid_catalog");
+    }
+    seen.add(model.slug);
+  }
+  // 只有使用者明確要求強制顯示的舊項目可補回；其他官方項目以帳號最新清單為準。
+  const forced = new Set(forceListed);
+  const retained = (current.models || []).filter(m => forced.has(m.slug) &&
+    !m.slug.startsWith("custom/") && !seen.has(m.slug));
+  return mergeCatalog({ ...fresh, models: [...fresh.models, ...retained] }, current, forceListed);
 }
 
-function forcedModelsNeedApplying() {
-  try {
-    return forcedModelsPending(
-      JSON.parse(readFileSync(settings.catalogPath, "utf8")),
-      settings.forceListedModels,
-    );
-  } catch {
-    return false;
+// 只合併同帳號、同 client_version 同時進行的查詢；完成後立刻移除，不會讓下一次
+// Codex 啟動命中路由器的舊快取。憑證只存在本次 fetch，不寫檔也不寫日誌。
+const catalogRequests = new Map();
+export async function refreshOfficialCatalog(requestHeaders, searchParams, fetchImpl = fetch) {
+  const current = () => JSON.parse(readFileSync(settings.catalogPath, "utf8"));
+  if (!catalogRefreshEnabled) return current();
+  const incoming = new Headers(requestHeaders);
+  const authorization = incoming.get("authorization");
+  if (!authorization?.startsWith("Bearer ")) return current();
+  const version = searchParams.get("client_version");
+  if (!version || !/^[0-9A-Za-z.+_-]{1,80}$/.test(version)) return current();
+  const headers = new Headers({ authorization, accept: "application/json" });
+  for (const name of ["chatgpt-account-id", "openai-organization", "openai-project", "user-agent", "originator"]) {
+    if (incoming.has(name)) headers.set(name, incoming.get(name));
   }
-}
-
-function refreshCatalogIfStale() {
-  if (!catalogRefreshEnabled) return false;
-  if (Date.now() < catalogRetryAfter) return false;
-  const codexBinPath = newestCodexBinary(pinnedCodexBin, codexBinSearchDir);
-  if (!codexBinPath) return false;
-  let binMtime;
-  let catalogMtime;
-  try {
-    binMtime = statSync(codexBinPath).mtimeMs;
-    catalogMtime = statSync(settings.catalogPath).mtimeMs;
-  } catch {
-    return false;
-  }
-  if (!catalogNeedsRefresh(binMtime, catalogMtime) && !forcedModelsNeedApplying()) {
-    return false;
-  }
-
-  try {
-    const raw = execFileSync(
-      codexBinPath,
-      ["debug", "models", "--bundled", "-c", "model_catalog_json=null", "-c", 'model_provider="openai"'],
-      {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        env: { ...process.env, CODEX_HOME: dirname(routerDirectory) },
-        timeout: 30000,
-      },
-    );
-    const merged = mergeCatalog(
-      JSON.parse(raw),
-      JSON.parse(readFileSync(settings.catalogPath, "utf8")),
-      Array.isArray(settings.forceListedModels) ? settings.forceListedModels : [],
-    );
-    // 先寫暫存再改名：Codex 可能正在讀這個檔。
-    const temporary = settings.catalogPath + ".tmp";
-    writeFileSync(temporary, JSON.stringify(merged), { mode: 0o600 });
-    renameSync(temporary, settings.catalogPath);
-    stats.catalogRefreshes += 1;
-    stats.catalogModels = merged.models.length;
-    process.stderr.write(
-      `model-router-catalog-refreshed:${merged.models.length} 個模型\n`,
-    );
-    return true;
-  } catch (error) {
-    // 失敗就先冷卻，避免每次檢查都 spawn 一次。
-    catalogRetryAfter = Date.now() + catalogRetryCooldownMs;
-    stats.catalogRefreshFailures += 1;
-    process.stderr.write(
-      "model-router-catalog-refresh-failed:" +
-        (error instanceof Error ? error.message : String(error)) +
-        "\n",
-    );
-    return false;
-  }
+  const key = createHash("sha256").update(JSON.stringify([...headers])).update(version).digest("hex");
+  if (catalogRequests.has(key)) return catalogRequests.get(key);
+  // 本機異常客戶端也不能製造無上限的背景查詢。
+  if (catalogRequests.size >= 8) return current();
+  const pending = (async () => {
+    let status = null;
+    try {
+      const url = new URL(`${officialBase}/models`);
+      url.searchParams.set("client_version", version);
+      const upstream = await fetchImpl(url, { headers, redirect: "manual", signal: AbortSignal.timeout(10000) });
+      status = upstream.status;
+      if (!upstream.ok) { await upstream.body?.cancel(); throw new Error("upstream_status"); }
+      const chunks = [];
+      let bytes = 0;
+      for await (const chunk of upstream.body) {
+        bytes += chunk.length;
+        if (bytes > 8 * 1024 * 1024) throw new Error("catalog_too_large");
+        chunks.push(chunk);
+      }
+      // 網路等待期間安裝器可能添加了模型；合併前重讀，不覆蓋它剛完成的變更。
+      const before = current();
+      const merged = mergeOfficialCatalog(JSON.parse(Buffer.concat(chunks).toString("utf8")), before,
+        Array.isArray(settings.forceListedModels) ? settings.forceListedModels : []);
+      if (JSON.stringify(merged) !== JSON.stringify(before)) {
+        const temporary = settings.catalogPath + ".tmp";
+        writeFileSync(temporary, JSON.stringify(merged), { mode: 0o600 });
+        renameSync(temporary, settings.catalogPath);
+      }
+      stats.catalogRefreshes += 1;
+      stats.catalogModels = merged.models.length;
+      stats.lastCatalogSync = { source: "official", status, at: new Date().toISOString() };
+      return merged;
+    } catch {
+      stats.catalogRefreshFailures += 1;
+      stats.lastCatalogSync = { source: "cache", status, at: new Date().toISOString() };
+      process.stderr.write(`model-router-catalog-refresh-failed:status=${status ?? "unavailable"};using-cache\n`);
+      return current();
+    }
+  })();
+  catalogRequests.set(key, pending);
+  try { return await pending; }
+  finally { catalogRequests.delete(key); }
 }
 
 // --- 生圖結果的轉譯 ---------------------------------------------------------
@@ -5887,8 +5856,9 @@ const server = http.createServer(async (request, response) => {
       (incomingUrl.pathname === "/models" || incomingUrl.pathname === "/v1/models")
     ) {
       stats.models += 1;
-      refreshCatalogIfStale();
-      writeJson(response, 200, JSON.parse(readFileSync(settings.catalogPath, "utf8")));
+      const catalog = await refreshOfficialCatalog(request.headers, incomingUrl.searchParams);
+      response.setHeader("cache-control", "no-store");
+      writeJson(response, 200, catalog);
       return;
     }
     if (
@@ -5964,10 +5934,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     process.stderr.write(`model-router-log-truncated:${settings.logPath}\n`);
   }
 
-  // ChatGPT Desktop 更新完成的當下就重建目錄，等使用者重開 Codex 時已經是新的。
-  refreshCatalogIfStale();
-  const catalogTimer = setInterval(refreshCatalogIfStale, 5 * 60 * 1000);
-  if (typeof catalogTimer.unref === "function") catalogTimer.unref();
+  // /models 在 Codex 啟動時同步官方資料；不再以 bundled 背景覆蓋較新的官方目錄。
   const historyTimer = setInterval(historyCacheInfo, Math.min(historyTtlMs, 60000));
   historyTimer.unref();
 

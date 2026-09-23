@@ -51,12 +51,13 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 ```
 
 `update` 只換掉路由器與轉譯層的程式碼並重寫服務定義，然後重啟服務並做健康檢查。
-Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，不會重問任何一項，也不會
-改動 `config.toml`。從 1.19.1 起，會為沒有上游前綴的預設模型名稱補上 `api/`，
-`models.json` 只修改這些顯示名稱，模型 ID、能力與手動名稱保留。它不需要 Codex CLI，所以 Codex 更新後路徑改變
-也不影響升級。更新前的 `router.mjs`、`claude-bridge.mjs`、`settings.json`、
+Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，不會重問任何一項。
+從 1.22.0 起，更新會透過 Codex CLI 備份並移除本工具舊版寫入的
+`model_catalog_json`，讓啟動時可以同步官方清單；其他全域配置與使用者自行指定的目錄保留。
+從 1.19.1 起，沒有上游前綴的預設模型名稱會補上 `api/`，自訂模型 ID、能力與手動名稱保留。
+更新前的 `router.mjs`、`claude-bridge.mjs`、`settings.json`、
 `install.json` 與服務定義都會備份到 `~/.codex/backups/model-router/update-<時間戳>/`，
-需要遷移名稱時也會備份 `models.json`。
+需要遷移名稱時也會備份 `models.json`，移除固定目錄設定前會備份 `config.toml`。
 任何一步失敗都會自動還原並重啟回原本的版本。
 已啟用的中轉生圖技能也會獨立備份與更新，保留手動修改的檔案；技能更新失敗時維持原狀並提示，
 不影響已完成的路由器更新。尚未啟用的技能不會被 `update` 自動安裝。
@@ -278,13 +279,15 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   暫停嘗試一段時間並直接走 HTTP，避免每個新對話的第一輪都先賠一次握手；
   上游恢復後立刻解除。門檻與冷卻時間可用 `settings.json` 的
   `upstreamWebSocketFailureThreshold` 與 `upstreamWebSocketCooldownMs` 調整。
-- **模型目錄跟得上 Codex 更新**——`config.toml` 的 `model_catalog_json` 指著一份
-  安裝當下的快照，Codex 之後更新、內建了新模型，這個檔不會跟著動，選擇器裡就永遠
-  看不到，而且失敗是靜默的。路由器因此在 Codex 執行檔變更時自動重建目錄（平常只是
-  一次 stat）。`settings.json` 的 `catalogRefresh = false` 可關閉。
+- **重啟時同步最新模型**——Codex 啟動向本機 `/models` 請求時，路由器先用該請求的
+  ChatGPT 登入資訊讀取官方清單，再合併既有 `custom/*` 模型與強制顯示設定。
+  Codex 啟動瞬間可能先顯示自己的快取，背景同步完成後再次開啟模型選單即可讀取新清單。
+  不需等待 Codex 執行檔更新；不呼叫推理或付費探測。不再配置固定 `model_catalog_json`。
+  官方查詢最長等待 10 秒；網路、登入或資料格式失敗時保留本地清單。
+  `settings.json` 的 `catalogRefresh = false` 可停用遠端同步，重啟路由器後生效。
+  `/healthz` 的 `stats.lastCatalogSync` 顯示最近一次來源、HTTP 狀態及時間，不含憑證。
 - **被藏起來的官方模型可以叫出來**——內建目錄會把尚未普及的模型標成 `hide`，但實際
-  能不能用是後端依帳號決定的；`model_catalog_json` 會蓋掉後端的判斷，於是帳號明明
-  有權限也看不到（手機看得到就是因為它直接問後端）。安裝時會列出這些模型讓你選，
+  能不能用是後端依帳號決定的。透過獨立的 `hidden-models` 選單可選擇強制顯示，
   選擇記在 `settings.json` 的 `forceListedModels`。
 - **連線保活**——長請求期間送出 WebSocket ping，避免客戶端閒置逾時。
 - **錯誤可見**——上游錯誤會轉為標準的 `response.failed` 事件，不會讓客戶端無聲卡住。
@@ -388,14 +391,13 @@ Get-Content "$env:USERPROFILE\.codex\model-router\router.err.log" -Tail 50 -Enco
 
 ### 選擇器裡看不到某個官方模型
 
-Codex 的內建目錄會把尚未普及的模型標成 `hide`。沒裝路由器時 Codex 會直接問後端，
-帳號有權限就看得到；裝了之後 `model_catalog_json` 會蓋掉後端的判斷，於是同一個帳號
-在桌面版看不到、手機上卻看得到。
+1.22.0 起，重新啟動 Codex 會向官方同步帳號最新模型清單。先更新路由器並重開 Codex；
+如果同步失敗，會使用本地清單，可從 `/healthz` 的 `stats.lastCatalogSync` 查看狀態。
+若自行配置了 `model_catalog_json`，它仍會阻止遠端同步；升級只移除本工具管理的固定目錄。
 
 用 `hidden-models` 命令即可——它會列出所有被標成隱藏的模型讓你勾選，選中的會強制顯示。
 安裝與重新配置不會詢問這一項，但既有選擇會原樣沿用。也可以直接編輯 `settings.json` 的
-`forceListedModels`（一組 slug 字串），路由器發現目錄裡還有該顯示卻沒顯示的模型時會自動
-重建目錄。
+`forceListedModels`（一組 slug 字串），重啟路由器及 Codex 後合併時會套用。
 
 強制顯示只影響選擇器。能不能用仍然由後端決定，帳號沒權限的話選了會在請求時失敗。
 
