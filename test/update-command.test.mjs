@@ -85,13 +85,18 @@ test("安裝器比已安裝版本舊時拒絕，避免降級", () => {
   assert.equal(plan.installed, "1.16.0");
 });
 
-test("尚未安裝、設定遺失、沒有模型、連接埠無效都不會盲目往下走", () => {
+test("尚未安裝、設定遺失、路由清單缺失、連接埠無效都不會盲目往下走", () => {
   assert.equal(planUpdate(null, settings(), "1.17.0").reason, "not-installed");
   assert.equal(planUpdate(manifest(), null, "1.17.0").reason, "missing-settings");
 
   const noRoutes = settings();
-  noRoutes.routes = [];
+  delete noRoutes.routes;
   assert.equal(planUpdate(manifest(), noRoutes, "1.17.0").reason, "no-routes");
+
+  const emptyRoutes = settings();
+  emptyRoutes.routes = [];
+  assert.equal(planUpdate(manifest(), emptyRoutes, "1.17.0").ok, true);
+  assert.deepEqual(planUpdate(manifest(), emptyRoutes, "1.17.0").settings.routes, []);
 
   const badPort = settings();
   badPort.port = 0;

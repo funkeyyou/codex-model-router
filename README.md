@@ -64,6 +64,15 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 
 `install` 保留給第一次安裝、換 Base URL 或 API Key、以及重新挑選模型的情況。
 
+`add` 只探測新選的模型；完成後，自訂模型會按本次探測清單的順序排列。
+已配置但未出現在本次清單的模型會留在後方，原有名稱與能力設定不變。
+
+`remove` 或選單第 4 項可複選刪除已配置的自訂模型；空白／`cancel` 返回，刪除前會再確認。
+安裝器先備份設定、模型目錄與路由程式，再移除選中的模型並驗證 Codex 選單；失敗會還原。
+官方模型、API Key 與中轉生圖技能不受影響；若刪除全域預設模型，會清除指向該模型的 `model` 設定。
+可以刪到零個自訂模型，日後仍可更新或重新添加。
+既有任務若仍使用已刪除的模型，需先切換模型才能繼續。
+
 ## 版本資訊與更新內容
 
 安裝器啟動時會顯示「已安裝版本」、「目前這支安裝器版本」與「GitHub 線上最新版本」。
@@ -75,11 +84,11 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 
 ## 其他指令
 
-選單第 7 項「設定全域上下文 100 萬」也可用
+選單第 6 項「設定全域上下文 100 萬」也可用
 `bash codex-model-router.sh context-1m` 執行；Windows 使用
 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 context-1m`。
 功能會備份使用者配置，只將全域 `model_context_window` 設為 1000000，並讀回驗證。
-最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 8 項為中轉 API 生圖，第 9 項為退出。
+最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 7 項為中轉 API 生圖，第 10 項為退出。
 完成後重新開啟桌面版並建立新任務。配置不會增加上游模型本身的能力或帳號權限。
 
 不帶參數執行會出現選單，也可以直接指定動作。
@@ -88,6 +97,8 @@ macOS：
 
 ```bash
 bash codex-model-router.sh update     # 升級程式碼，保留現有設定
+bash codex-model-router.sh add        # 添加自訂模型
+bash codex-model-router.sh remove     # 刪除自訂模型
 bash codex-model-router.sh hidden-models # 單獨管理被隱藏的官方模型
 bash codex-model-router.sh imagegen   # 單獨添加／設定中轉 API 生圖
 bash codex-model-router.sh status     # 檢視安裝狀態與健康度
@@ -98,6 +109,8 @@ Windows：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 add
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 remove
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 hidden-models
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 imagegen
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
@@ -108,7 +121,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 
 ## 中轉 API 生圖（可選）
 
-安裝時同意啟用，或事後選擇選單第 8 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
+安裝時同意啟用，或事後選擇選單第 7 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
 不修改官方 `.system/imagegen`，也不需要內建 `image_gen` 工具。請求經本機路由器使用已保存的
 API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案內含生圖額度。
 

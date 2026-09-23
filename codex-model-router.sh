@@ -83,7 +83,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.22.1";
+const INSTALLER_VERSION = "1.22.2";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -1337,6 +1337,18 @@ export function mergeAddedModels(officialModels, current, routes, newRoutes) {
   });
 }
 
+export function orderCustomModelsByDiscovery(officialModels, customModels, routes, discoveredModels) {
+  const upstreamBySlug = new Map(routes.map(route => [route.pickerSlug, route.upstreamModel]));
+  const rank = new Map(discoveredModels.map((model, index) => [model, index]));
+  const maxPriority = Math.max(0, ...officialModels.map(model => Number(model.priority) || 0));
+  return customModels
+    .map((model, index) => ({ model, index, rank: rank.get(upstreamBySlug.get(model.slug)) ?? Infinity }))
+    .sort((left, right) => left.rank === right.rank
+      ? left.index - right.index
+      : left.rank - right.rank)
+    .map(({ model }, index) => ({ ...model, priority: maxPriority + index + 1 }));
+}
+
 export function customCatalogEntry(officialModels, route, index) {
   const lastSegment = route.upstreamModel.split("/").at(-1);
   const exactTemplate = officialModels.find(
@@ -1470,15 +1482,16 @@ export async function codexRpc(method, params, acceptResult = () => true, binary
   }
 }
 
-export function hasExpectedModels(result, expected) {
+export function hasExpectedModels(result, expected, absent = []) {
   const models = new Set((result?.data || []).map(m => m.id));
-  return expected.every(slug => models.has(slug));
+  return expected.every(slug => models.has(slug)) && absent.every(slug => !models.has(slug));
 }
 
-async function waitForPickerModels(routes) {
+async function waitForPickerModels(routes, absent = []) {
   const expected = routes.map(r => r.pickerSlug);
   try {
-    return await codexRpc("model/list", { includeHidden: true }, result => hasExpectedModels(result, expected));
+    return await codexRpc("model/list", { includeHidden: true },
+      result => hasExpectedModels(result, expected, absent));
   } catch (error) {
     throw new Error(`等待 Codex 模型清單同步失敗：${error.message}`);
   }
@@ -2168,8 +2181,11 @@ async function install() {
     readSettingsIfExists().forceListedModels,
   );
   const officialModels = applyForcedVisibility(discoveredOfficial, forceListedModels);
-  const customModels = routes.map((route, index) =>
-    customCatalogEntry(officialModels, route, index),
+  const customModels = orderCustomModelsByDiscovery(
+    officialModels,
+    routes.map((route, index) => customCatalogEntry(officialModels, route, index)),
+    routes,
+    discovery.models,
   );
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
@@ -2414,8 +2430,12 @@ async function addModels() {
     bundledCatalog.models.filter((model) => !String(model.slug).startsWith("custom/")),
     settings.forceListedModels,
   );
-  const customModels = mergeAddedModels(officialModels,
-    JSON.parse(readFileSync(catalogPath, "utf8")), routes, newRoutes);
+  const customModels = orderCustomModelsByDiscovery(
+    officialModels,
+    mergeAddedModels(officialModels, JSON.parse(readFileSync(catalogPath, "utf8")), routes, newRoutes),
+    routes,
+    discovery.models,
+  );
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
   try {
@@ -2473,6 +2493,162 @@ async function addModels() {
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
+export function planRemoveModels(manifest, settings, catalog, selectedSlugs) {
+  if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
+    fail("安裝設定或模型目錄不完整，無法刪除模型。");
+  }
+  if (!Array.isArray(selectedSlugs) || selectedSlugs.length === 0) {
+    fail("沒有選擇要刪除的模型。");
+  }
+  const selected = new Set(selectedSlugs);
+  const routesBySlug = new Map(settings.routes.map(route => [route.pickerSlug, route]));
+  for (const slug of selected) {
+    if (typeof slug !== "string" || !slug.startsWith("custom/") || !routesBySlug.has(slug)) {
+      fail(`所選模型不是已配置的自訂模型：${slug}`);
+    }
+  }
+  const routes = settings.routes.filter(route => !selected.has(route.pickerSlug));
+  return {
+    removed: settings.routes.filter(route => selected.has(route.pickerSlug)),
+    settings: { ...settings, version: INSTALLER_VERSION, routes },
+    manifest: { ...manifest, version: INSTALLER_VERSION, routes },
+    catalog: { ...catalog, models: catalog.models.filter(model => !selected.has(model.slug)) },
+  };
+}
+
+export function removedDefaultModel(config, selectedSlugs) {
+  const configured = deepGet(config, "model");
+  return configured.present && selectedSlugs.includes(configured.value) ? configured.value : null;
+}
+
+async function removeModels() {
+  const manifest = readManifest();
+  if (manifest?.version) assertInstallerNotOlder(manifest.version);
+  if (!manifest || !existsSync(settingsPath) || !existsSync(catalogPath)) {
+    fail("尚未安裝路由器，或設定檔不完整，請先檢查安裝狀態。");
+  }
+  if (!existsSync(routerPath) || !existsSync(bridgePath)) {
+    fail("路由器程式檔案不完整，請先執行 update 修復安裝。");
+  }
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+  if (!Array.isArray(settings.routes) || !Array.isArray(catalog.models)) {
+    fail("安裝設定或模型目錄不完整，無法刪除模型。");
+  }
+  const catalogOrder = new Map(catalog.models.map((model, index) => [model.slug, index]));
+  const available = settings.routes
+    .filter(route => String(route?.pickerSlug || "").startsWith("custom/"))
+    .sort((left, right) => {
+      const a = catalogOrder.get(left.pickerSlug) ?? Infinity;
+      const b = catalogOrder.get(right.pickerSlug) ?? Infinity;
+      return a === b ? 0 : a - b;
+    });
+  printHeading("刪除自訂模型");
+  if (available.length === 0) {
+    console.log("目前沒有可刪除的自訂模型。");
+    return;
+  }
+  available.forEach((route, index) => {
+    console.log(`${String(index + 1).padStart(3)}. ${route.displayName || route.upstreamModel}（${route.upstreamModel}）`);
+  });
+  const answer = await ask("輸入要刪除的編號（逗號、範圍或 all；Enter／cancel 返回）");
+  if (!answer || answer.toLowerCase() === "cancel") {
+    console.log("未進行任何修改。");
+    return;
+  }
+  const selectedSlugs = parseSelection(answer, available.length)
+    .map(index => available[index].pickerSlug);
+  let plan = planRemoveModels(manifest, settings, catalog, selectedSlugs);
+  let userConfig = await readUserConfig();
+  const defaultModel = removedDefaultModel(userConfig.config, selectedSlugs);
+  console.log("\n即將刪除：");
+  for (const route of plan.removed) console.log(`  - ${route.displayName || route.upstreamModel}`);
+  if (defaultModel) console.log("這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
+  console.log("使用上述模型的既有任務需切換到其他模型後才能繼續。");
+  if (!(await confirm("確認刪除所選自訂模型？", false))) {
+    console.log("未進行任何修改。");
+    return;
+  }
+  // 確認期間官方清單或路由可能剛好更新；只按仍然存在的精確 slug 刪除。
+  userConfig = await readUserConfig();
+  if (removedDefaultModel(userConfig.config, selectedSlugs) !== defaultModel) {
+    fail("全域預設模型在確認期間變更，請重新執行刪除。" );
+  }
+  const currentManifest = readManifest();
+  const currentSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  const currentCatalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+  plan = planRemoveModels(currentManifest, currentSettings, currentCatalog, selectedSlugs);
+  const port = Number(currentSettings.port ?? currentManifest.port);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) fail("現有安裝沒有可用的連接埠設定。");
+
+  const backupDir = join(backupsRoot, `remove-model-${timestamp()}`);
+  ensureDirectory(backupDir);
+  for (const [source, name] of [
+    [routerPath, "router.mjs"], [bridgePath, "claude-bridge.mjs"],
+    [settingsPath, "settings.json"], [catalogPath, "models.json"],
+    [manifestPath, "install.json"],
+  ]) {
+    if (!copyIfExists(source, join(backupDir, name))) fail(`無法備份 ${name}，已取消刪除。`);
+  }
+  if (defaultModel && !copyIfExists(userConfig.filePath, join(backupDir, "config.toml"))) {
+    fail("無法備份全域預設模型設定，已取消刪除。");
+  }
+
+  let configChangeAttempted = false;
+  try {
+    writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
+    chmodSync(routerPath, 0o600);
+    writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
+    chmodSync(bridgePath, 0o600);
+    writeJsonAtomic(catalogPath, plan.catalog);
+    writeJsonAtomic(settingsPath, plan.settings);
+    writeJsonAtomic(manifestPath, { ...plan.manifest, updatedAt: new Date().toISOString() });
+    restartServiceInPlace();
+    await waitForHealth(port);
+    if (defaultModel) {
+      configChangeAttempted = true;
+      await writeConfigEdits([{ keyPath: "model", value: null }]);
+      if (deepGet((await readUserConfig()).config, "model").present) {
+        fail("全域預設模型設定未成功清除。");
+      }
+    }
+    await waitForPickerModels(plan.settings.routes, selectedSlugs);
+  } catch (error) {
+    console.error("\n刪除失敗，正在還原之前的配置...");
+    const restoreFailures = [];
+    for (const [name, target] of [
+      ["router.mjs", routerPath], ["claude-bridge.mjs", bridgePath],
+      ["settings.json", settingsPath], ["models.json", catalogPath],
+      ["install.json", manifestPath],
+    ]) {
+      try {
+        if (!copyIfExists(join(backupDir, name), target)) fail(`找不到 ${name} 備份。`);
+      } catch (restoreError) { restoreFailures.push(`${name}：${restoreError.message}`); }
+    }
+    if (configChangeAttempted) {
+      try { await writeConfigEdits([{ keyPath: "model", value: defaultModel }]); }
+      catch (restoreError) { restoreFailures.push(`全域預設模型：${restoreError.message}`); }
+    }
+    try {
+      restartServiceInPlace();
+      await waitForHealth(port);
+      if (restoreFailures.length === 0) console.error("已還原到刪除前的配置，路由器運作正常。");
+    } catch (restartError) {
+      restoreFailures.push(`路由器無法啟動：${restartError.message}；請手動啟動：${manualStartHint()}`);
+    }
+    if (restoreFailures.length) console.error(`\n還原未完成：${restoreFailures.join("；")}。備份：${backupDir}`);
+    throw error;
+  }
+
+  printHeading("刪除完成");
+  console.log(`已刪除 ${plan.removed.length} 個自訂模型，剩餘 ${plan.settings.routes.length} 個。`);
+  if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
+  console.log(`備份：${backupDir}`);
+  console.log(`請完全退出並重新打開 ${desktopAppName}。`);
+}
+
 // 更新程式碼並遷移預設顯示名稱，其餘一律沿用。把「能不能更新、更新後的
 // 設定長什麼樣」抽成純函式，才驗得到既有路由與使用者旋鈕不會在更新中被洗掉——
 // 這正是以前只能走 install 重裝、每次都要重問 Base URL、API Key 與模型的原因。
@@ -2480,8 +2656,8 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
   if (!manifest) return { ok: false, reason: "not-installed" };
   if (!settings || typeof settings !== "object") return { ok: false, reason: "missing-settings" };
 
-  const routes = Array.isArray(settings.routes) ? settings.routes.map(withDefaultModelPrefix) : [];
-  if (routes.length === 0) return { ok: false, reason: "no-routes" };
+  if (!Array.isArray(settings.routes)) return { ok: false, reason: "no-routes" };
+  const routes = settings.routes.map(withDefaultModelPrefix);
 
   const port = Number(settings.port ?? manifest.port);
   if (!Number.isFinite(port) || port <= 0) return { ok: false, reason: "bad-port" };
@@ -2515,7 +2691,7 @@ const UPDATE_FAILURES = {
   "missing-settings":
     "找不到 settings.json，安裝可能已損壞，請改用「安裝或重新配置」。",
   "no-routes":
-    "現有安裝沒有任何自訂模型，沒有可保留的設定，請改用「安裝或重新配置」。",
+    "現有安裝缺少模型路由清單，請改用「安裝或重新配置」。",
   "bad-port":
     "現有安裝沒有可用的連接埠設定，請改用「安裝或重新配置」。",
 };
@@ -3073,7 +3249,7 @@ async function offerInstalledRelayImagegen() {
       consent: () => input.isTTY ? confirm("是否使用中轉 API 生圖？將新增獨立技能並沿用現有憑證，圖片按供應商計費", false) : false,
       configure: configureRelayImagegen });
   } catch (error) {
-    console.error(`路由器已安裝，中轉生圖設定未完成：${error.message}。可稍後從選單第 8 項設定。`);
+    console.error(`路由器已安裝，中轉生圖設定未完成：${error.message}。可稍後從選單第 7 項設定。`);
   }
 }
 
@@ -3155,12 +3331,13 @@ async function status() {
     console.log(`健康狀態：不可用（${error.message}）`);
   }
   console.log("模型：");
+  if (manifest.routes.length === 0) console.log("  （目前沒有自訂模型，官方模型仍可使用）");
   for (const route of manifest.routes) {
     console.log(`  - ${route.displayName} -> ${route.upstreamModel}`);
   }
   try {
     const imagegen = relayConfig();
-    console.log(`中轉 API 生圖：${imagegen ? imagegen.models.join(", ") : "未啟用（可從選單第 8 項添加）"}`);
+    console.log(`中轉 API 生圖：${imagegen ? imagegen.models.join(", ") : "未啟用（可從選單第 7 項添加）"}`);
   } catch (error) { console.log(`中轉 API 生圖：${error.message}`); }
 }
 
@@ -3203,6 +3380,19 @@ async function rollback() {
   console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
 }
 
+export const MENU_ITEMS = [
+  ["install", "安裝或重新配置"],
+  ["update", "更新到最新版本（保留現有配置）"],
+  ["add", "添加自訂模型"],
+  ["remove", "刪除自訂模型"],
+  ["hidden-models", "管理隱藏的官方模型"],
+  ["context-1m", "設定全域上下文 100 萬"],
+  ["imagegen", "中轉 API 生圖（添加／設定）"],
+  ["status", "查看狀態"],
+  ["rollback", "回退配置"],
+  ["exit", "退出"],
+];
+
 function help() {
   console.log(`Codex 模型路由器 ${INSTALLER_VERSION}
 
@@ -3210,6 +3400,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} install
   ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
+  ${basename(scriptPath || "codex-model-router.command")} remove
   ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} context-1m
   ${basename(scriptPath || "codex-model-router.command")} imagegen
@@ -3221,7 +3412,7 @@ function help() {
   1. 兼容 OpenAI 的 Base URL
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
-路由器安裝成功後可選擇啟用中轉 API 生圖；預設不啟用，之後可從選單第 8 項添加。
+路由器安裝成功後可選擇啟用中轉 API 生圖；預設不啟用，之後可從選單第 7 項添加。
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
 沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
@@ -3231,6 +3422,9 @@ models.json 仍保留自訂模型與離線回退資料；無前綴的預設名�
 
 add 用於在已有安裝上追加模型：沿用已儲存的 Base URL、API Key 與連接埠，
 只探測新選的模型，不會重問設定，也不改動 config.toml。
+
+remove 用於勾選並刪除已配置的自訂模型；刪除前會備份，失敗時還原。
+可以刪到零個自訂模型，官方模型、API Key 與中轉生圖設定保留。
 
 hidden-models 用於單獨管理 Codex 內建目錄裡被標成隱藏的官方模型：
 只更新 forceListedModels 與模型目錄，保留自訂模型，不需要 Base URL 或 API Key。
@@ -3249,46 +3443,35 @@ openai 供應商 ID，以保持 Desktop 與手機 Remote 的既有聊天可見�
 
 async function chooseAction() {
   printHeading("Codex 模型路由器");
-  console.log("  1. 安裝或重新配置");
-  console.log("  2. 更新到最新版本（保留現有配置）");
-  console.log("  3. 添加模型（保留現有配置）");
-  console.log("  4. 管理隱藏的官方模型");
-  console.log("  5. 查看狀態");
-  console.log("  6. 回退配置");
-  console.log("  7. 設定全域上下文 100 萬");
-  console.log("  8. 中轉 API 生圖（添加／設定）");
-  console.log("  9. 退出");
+  MENU_ITEMS.forEach(([, label], index) => console.log(`  ${index + 1}. ${label}`));
   const answer = await ask("請選擇操作", "1");
   const choices = {
-    "1": "install",
     install: "install",
     setup: "install",
-    "2": "update",
     update: "update",
     upgrade: "update",
-    "3": "add",
     add: "add",
     "add-model": "add",
     addmodel: "add",
-    "4": "hidden-models",
+    remove: "remove",
+    "remove-model": "remove",
+    "remove-models": "remove",
+    "delete-model": "remove",
+    "delete-models": "remove",
     hidden: "hidden-models",
     "hidden-models": "hidden-models",
     "unhide-models": "hidden-models",
-    "5": "status",
     status: "status",
-    "6": "rollback",
     rollback: "rollback",
     uninstall: "rollback",
-    "7": "context-1m",
-    "8": "imagegen",
     imagegen: "imagegen",
     "relay-imagegen": "imagegen",
-    "9": "exit",
     "context-1m": "context-1m",
     exit: "exit",
     quit: "exit",
   };
-  const action = choices[answer.trim().toLowerCase()];
+  const value = answer.trim().toLowerCase();
+  const action = /^\d+$/.test(value) ? MENU_ITEMS[Number(value) - 1]?.[0] : choices[value];
   if (!action) fail(`無法識別的選單選項：${answer}`);
   return action;
 }
@@ -3304,6 +3487,11 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       "add",
       "add-model",
       "addmodel",
+      "remove",
+      "remove-model",
+      "remove-models",
+      "delete-model",
+      "delete-models",
       "hidden-models",
       "hidden",
       "unhide-models",
@@ -3324,6 +3512,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     else if (action === "install" || action === "setup") await install();
     else if (action === "update" || action === "upgrade") await update();
     else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
+    else if (["remove", "remove-model", "remove-models", "delete-model", "delete-models"].includes(action)) await removeModels();
     else if (action === "hidden-models" || action === "hidden" || action === "unhide-models") {
       await manageHiddenModels();
     }

@@ -82,7 +82,11 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
                 const ids = message.result.data.map(m => m.id);
                 // Codex 可先回答磁碟快取並在背景同步。模擬同一程序再次開啟選單，
                 // 不是多重啟一次或以 router 磁碟結果冒充 app-server 的模型列表。
-                if (ids.includes(expected)) { clearTimeout(timer); resolve(ids); }
+                const found = Array.isArray(expected)
+                  ? expected.every((slug, index) => ids.includes(slug) &&
+                    (index === 0 || ids.indexOf(expected[index - 1]) < ids.indexOf(slug)))
+                  : ids.includes(expected);
+                if (found) { clearTimeout(timer); resolve(ids); }
                 else setTimeout(() => send({ id: 2, method: "model/list", params: { includeHidden: true } }), 50);
               }
             }
@@ -123,4 +127,22 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
   const verified = await installer.codexRpc("model/list", { includeHidden: true },
     result => installer.hasExpectedModels(result, [custom.slug, claude.slug]), bin, root);
   assert.ok(verified.data.some(m => m.id === claude.slug));
+
+  const customModels = installer.orderCustomModelsByDiscovery(
+    models, [custom, claude],
+    [
+      { pickerSlug: custom.slug, upstreamModel: "test-model" },
+      { pickerSlug: claude.slug, upstreamModel: "ark/claude-opus-5-5" },
+    ],
+    ["ark/claude-opus-5-5", "test-model"],
+  );
+  writeFileSync(catalogPath, JSON.stringify({ models: [...models, ...customModels] }));
+  result = await picker([claude.slug, custom.slug]);
+  assert.ok(result.indexOf(claude.slug) < result.indexOf(custom.slug));
+
+  writeFileSync(catalogPath, JSON.stringify({ models: [...models, customModels[1]] }));
+  const afterRemoval = await installer.codexRpc("model/list", { includeHidden: true },
+    response => installer.hasExpectedModels(response, [custom.slug], [claude.slug]), bin, root);
+  assert.ok(afterRemoval.data.some(model => model.id === custom.slug));
+  assert.ok(afterRemoval.data.every(model => model.id !== claude.slug));
 });
