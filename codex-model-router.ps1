@@ -155,7 +155,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.22.4";
+const INSTALLER_VERSION = "1.22.5";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -4097,7 +4097,10 @@ function isBridgeReasoning(item) {
   if (typeof enc !== "string" || !enc) return false;
   try {
     const parsed = JSON.parse(Buffer.from(enc, "base64").toString("utf8"));
-    return Boolean(parsed && typeof parsed.thinking === "string" && parsed.signature);
+    return Boolean(parsed && (
+      (typeof parsed.thinking === "string" && parsed.signature) ||
+      (parsed.router_reasoning_ref === 1 && /^[a-f0-9]{64}$/.test(parsed.sha256))
+    ));
   } catch {
     return false;
   }
@@ -6254,6 +6257,10 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
 }
 __CODEX_MODEL_ROUTER_BRIDGE_JS__
 import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { gzipSync, gunzipSync } from "node:zlib";
 // Codex Responses API <-> Anthropic Messages API 雙向轉譯。
 //
 // 存在的理由：部分閘道的 /v1/responses 與 /v1/chat/completions 相容層對
@@ -6316,10 +6323,12 @@ function toImageBlock(url) {
 // iPhone 截圖是 942 x 2048，只超出 48 個像素就整輪被打回來。
 //
 // 路由器是純 Node 行程，沒有影像解碼器可以縮圖（macOS 有 sips，Windows 沒有
-// 對應的東西，兩邊行為會不一致），因此改為控制張數：只保留最新的 20 張，更舊
-// 的換成佔位文字。張數壓到上限以內之後尺寸限制自動回到 8000 像素，最近那幾張
-// 截圖就能以原始解析度送出去。
+// 對應的東西，兩邊行為會不一致），因此改為控制張數。提示快取啟用時，
+// 超過 20 張就整批省略最舊的 8 張；接下來 7 張不會再改動歷史前綴，
+// 避免每張新截圖都讓整段訊息快取失效。未啟用快取仍只省略超額張數。
+// 張數壓到上限以內之後尺寸限制自動回到 8000 像素。
 const MAX_IMAGES_PER_REQUEST = 20;
+const IMAGE_PRUNE_BATCH = 8;
 // 就算只有一張，超過 8000 像素一樣會被拒；整頁長截圖很容易超過。
 const MAX_IMAGE_DIMENSION = 8000;
 const IMAGE_OMITTED_COUNT = "(圖片已省略：超出單次請求的圖片數量上限)";
@@ -6434,7 +6443,7 @@ function lateToolOutputNotice(item) {
   return `(工具呼叫 ${item.call_id}${name}的結果已先回傳；以下是之後才送達的後續輸出)`;
 }
 
-function applyImageBudget(messages) {
+function applyImageBudget(messages, { batchCachePruning = false } = {}) {
   const slots = collectImageSlots(messages);
   if (slots.length === 0) return 0;
   let omitted = 0;
@@ -6453,9 +6462,15 @@ function applyImageBudget(messages) {
       kept.push(slot);
     }
   }
-  // 再把張數壓到上限以內，丟最舊的。
+  // 到門檻時整批省略舊圖，讓後續幾輪的歷史前綴不再變動。頂層
+  // cache_control 的滾動斷點便能命中上一輪，不需要新增上游相容性參數。
   const excess = kept.length - MAX_IMAGES_PER_REQUEST;
-  for (let i = 0; i < excess; i += 1) omit(kept[i], IMAGE_OMITTED_COUNT);
+  if (excess > 0) {
+    const count = batchCachePruning
+      ? Math.min(kept.length, Math.ceil(excess / IMAGE_PRUNE_BATCH) * IMAGE_PRUNE_BATCH)
+      : excess;
+    for (let i = 0; i < count; i += 1) omit(kept[i], IMAGE_OMITTED_COUNT);
+  }
   return omitted;
 }
 
@@ -6720,19 +6735,83 @@ function toAnthropicTools(codexTools) {
   return { tools, freeform, toolContext };
 }
 
+// Codex 會把舊 reasoning.encrypted_content 的字串長度當成額外的歷史推理 token。
+// Claude 的 input_tokens 已包含這些推理；把整段 thinking/signature 放在欄位裡
+// 會讓 Codex 重複計數，在實際用量約一半時提早精簡。只交給 Codex 短索引，
+// 原文以內容雜湊持久保存，下一輪仍可完整送回 Anthropic。
+// 檔案留在安裝目錄，update 原地換程式碼不會移走；不能按 TTL 淘汰，
+// 否則舊任務恢復後會找不到簽章。
+const reasoningStoreDir = join(dirname(fileURLToPath(import.meta.url)), "reasoning-store");
+const REASONING_REF_VERSION = 1;
+const reasoningRefPattern = /^[a-f0-9]{64}$/;
+let warnedReasoningStore = false;
+
+function parseReasoningPayload(raw) {
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed.thinking !== "string" || !parsed.signature) return null;
+  return { type: "thinking", thinking: parsed.thinking, signature: parsed.signature };
+}
+
 function decodeReasoning(encrypted) {
   if (typeof encrypted !== "string" || !encrypted) return null;
-  try {
-    const parsed = JSON.parse(Buffer.from(encrypted, "base64").toString("utf8"));
-    if (parsed && typeof parsed.thinking === "string" && parsed.signature) {
-      return { type: "thinking", thinking: parsed.thinking, signature: parsed.signature };
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(encrypted, "base64").toString("utf8")); }
+  catch { return null; }
+  if (parsed?.router_reasoning_ref != null) {
+    if (parsed.router_reasoning_ref !== REASONING_REF_VERSION ||
+        !reasoningRefPattern.test(parsed.sha256)) {
+      throw bridgeInputError("Claude 歷史推理索引格式無效；請還原原任務歷史或提供工作摘要。");
     }
-  } catch {}
-  return null;
+    try {
+      const compressed = readFileSync(join(reasoningStoreDir, parsed.sha256 + ".json.gz"));
+      const raw = gunzipSync(compressed);
+      const digest = createHash("sha256").update(raw).digest("hex");
+      if (digest !== parsed.sha256) throw new Error("digest mismatch");
+      const block = parseReasoningPayload(raw.toString("utf8"));
+      if (!block) throw new Error("invalid reasoning payload");
+      return block;
+    } catch {
+      // 不能靜默丟棄 thinking：工具呼叫的簽章與歷史就不再一致。
+      throw bridgeInputError(
+        "Claude 歷史推理檔案遺失或損壞；請還原 model-router/reasoning-store，或在新任務中提供工作摘要。",
+      );
+    }
+  }
+  try { return parseReasoningPayload(JSON.stringify(parsed)); }
+  catch { return null; }
 }
 
 export function encodeReasoning(thinking, signature) {
-  return Buffer.from(JSON.stringify({ thinking, signature }), "utf8").toString("base64");
+  const raw = Buffer.from(JSON.stringify({ thinking, signature }), "utf8");
+  if (typeof thinking !== "string" || !signature) return raw.toString("base64");
+  const digest = createHash("sha256").update(raw).digest("hex");
+  try {
+    mkdirSync(reasoningStoreDir, { recursive: true, mode: 0o700 });
+    try {
+      writeFileSync(join(reasoningStoreDir, digest + ".json.gz"), gzipSync(raw),
+        { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      // 同一段推理重試時可以複用；已有檔案若損壞，這一輪回退原格式。
+      const saved = gunzipSync(readFileSync(join(reasoningStoreDir, digest + ".json.gz")));
+      if (createHash("sha256").update(saved).digest("hex") !== digest) {
+        throw new Error("digest mismatch");
+      }
+    }
+    return Buffer.from(JSON.stringify({
+      // 舊版路由至少能識別並剝除這個 reasoning，避免回退後切到官方模型時
+      // 把不受信任的索引送給官方；新版會先識別 ref，從檔案還原真正簽章。
+      thinking: "", signature: "r",
+      router_reasoning_ref: REASONING_REF_VERSION, sha256: digest,
+    }), "utf8").toString("base64");
+  } catch (error) {
+    if (!warnedReasoningStore) {
+      warnedReasoningStore = true;
+      process.stderr.write(`model-router-reasoning-store-fallback:${error.code || "invalid"}\n`);
+    }
+    // 磁碟不可寫時至少保住這一輪的簽章與回應；只是早期精簡問題仍可能出現。
+    return raw.toString("base64");
+  }
 }
 
 // --- remote compaction v2 -----------------------------------------------
@@ -6949,7 +7028,7 @@ export function toAnthropicRequest(body, route) {
     messages.unshift({ role: "user", content: [{ type: "text", text: "." }] });
   }
 
-  const imagesOmitted = applyImageBudget(messages);
+  const imagesOmitted = applyImageBudget(messages, { batchCachePruning: route?.promptCache === true });
 
   const { tools, freeform, toolContext } = toAnthropicTools(codexTools);
 

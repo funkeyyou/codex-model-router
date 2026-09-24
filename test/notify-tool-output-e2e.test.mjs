@@ -15,6 +15,7 @@ import { assertAnthropicToolPairing } from "./helpers/anthropic-rules.mjs";
 const bin = process.env.CODEX_MODEL_ROUTER_TEST_CODEX_BIN;
 const CALL_ID = "toolu_notify_e2e";
 const MARKERS = ["NOTIFY_ONE", "NOTIFY_TWO", "NOTIFY_THREE", "FINAL_OUTPUT"];
+const THINKING = "Long Claude thinking must survive the Codex tool turn. ".repeat(300);
 
 test("Code Mode notify() 的多筆輸出經 Claude 轉譯後只剩一個 tool_result", { skip: !bin, timeout: 30000 }, async () => {
   const { bridge } = await loadPayloads();
@@ -49,13 +50,20 @@ test("Code Mode notify() 的多筆輸出經 Claude 轉譯後只剩一個 tool_re
       const block = step === 1
         ? { type: "tool_use", id: CALL_ID, name: "exec", input: {} }
         : { type: "text", text: "" };
+      const index = step === 1 ? 1 : 0;
       const events = [
         { type: "message_start", message: { id: `msg_${step}`, type: "message", role: "assistant", content: [], model: "claude-fixture", usage: { input_tokens: 10, output_tokens: 1 } } },
-        { type: "content_block_start", index: 0, content_block: block },
-        { type: "content_block_delta", index: 0, delta: step === 1
+        ...(step === 1 ? [
+          { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+          { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: THINKING } },
+          { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-notify-e2e" } },
+          { type: "content_block_stop", index: 0 },
+        ] : []),
+        { type: "content_block_start", index, content_block: block },
+        { type: "content_block_delta", index, delta: step === 1
           ? { type: "input_json_delta", partial_json: JSON.stringify({ input: code }) }
           : { type: "text_delta", text: "fixture done" } },
-        { type: "content_block_stop", index: 0 },
+        { type: "content_block_stop", index },
         { type: "message_delta", delta: { stop_reason: step === 1 ? "tool_use" : "end_turn" }, usage: { output_tokens: 1 } },
         { type: "message_stop" },
       ];
@@ -108,6 +116,12 @@ test("Code Mode notify() 的多筆輸出經 Claude 轉譯後只剩一個 tool_re
     const outputs = captures[1].body.input.filter((item) => item?.call_id === CALL_ID && /_output$/.test(item.type));
     assert.ok(outputs.length > 1, `預期 Codex 送出多筆輸出，實際 ${outputs.length} 筆`);
     const { request, toolOutputsMerged, lateToolOutputs } = captures[1].ctx;
+    const reasoning = captures[1].body.input.find((item) => item?.type === "reasoning");
+    assert.ok(reasoning, "Codex 應該把 Claude 推理索引帶回下一輪");
+    assert.ok(reasoning.encrypted_content.length < 200);
+    const restored = request.messages.flatMap((message) => message.content)
+      .find((block) => block.type === "thinking");
+    assert.deepEqual(restored, { type: "thinking", thinking: THINKING, signature: "sig-notify-e2e" });
     assertAnthropicToolPairing(request.messages);
     const results = request.messages.flatMap((message) => message.content)
       .filter((block) => block.type === "tool_result" && block.tool_use_id === CALL_ID);

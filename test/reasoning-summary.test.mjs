@@ -104,13 +104,20 @@ test("摘要放進 reasoning 項目的 summary 欄位（Codex 顯示的是這個
   assert.deepEqual(item.summary, [{ type: "summary_text", text: "想了一下" }]);
 });
 
-test("encrypted_content 的往返完全不受影響", async () => {
+test("短索引的 encrypted_content 仍能還原完整 thinking 與簽章", async () => {
   const out = await runStream(["想了一下"]);
   const item = out.filter((e) => e.type === "response.output_item.done")
     .map((e) => e.item).find((i) => i.type === "reasoning");
   const decoded = JSON.parse(Buffer.from(item.encrypted_content, "base64").toString("utf8"));
-  assert.equal(decoded.thinking, "想了一下");
-  assert.equal(decoded.signature, "sig-1");
+  assert.equal(decoded.router_reasoning_ref, 1);
+  assert.ok(item.encrypted_content.length < 200);
+  const request = toAnthropicRequest({ input: [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "問" }] },
+    item,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "答案" }] },
+  ] }, summaryRoute).request;
+  assert.deepEqual(request.messages.at(-1).content[0],
+    { type: "thinking", thinking: "想了一下", signature: "sig-1" });
 });
 
 test("display=omitted（thinking 文字為空）時完全不送摘要事件", async () => {
@@ -121,8 +128,12 @@ test("display=omitted（thinking 文字為空）時完全不送摘要事件", as
     .map((e) => e.item).find((i) => i.type === "reasoning");
   assert.deepEqual(item.summary, []);
   // 簽章仍然要留著，否則後續回合的 reasoning 會被上游拒收
-  const decoded = JSON.parse(Buffer.from(item.encrypted_content, "base64").toString("utf8"));
-  assert.equal(decoded.signature, "sig-1");
+  const request = toAnthropicRequest({ input: [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "問" }] },
+    item,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "答案" }] },
+  ] }, summaryRoute).request;
+  assert.equal(request.messages.at(-1).content[0].signature, "sig-1");
 });
 
 test("摘要事件都掛在同一個 reasoning item 上", async () => {

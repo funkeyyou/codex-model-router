@@ -7,8 +7,9 @@
 // 實測（同一張合成 PNG，只改高度與張數）：20 張 2048px 通過、21 張同尺寸被拒、
 // 21 張 1800px 通過。iPhone 截圖是 942 x 2048，只超出 48 個像素。
 //
-// 路由器沒有影像解碼器可以縮圖，所以改為控制張數：保留最新的 20 張，更舊的換
-// 成佔位文字。張數回到上限以內之後，尺寸限制自動放寬回 8000 像素。
+// 路由器沒有影像解碼器可以縮圖，所以改為控制張數：未啟用快取時保留最新 20 張；
+// 啟用快取時整批省略最舊 8 張，減少反覆修改已快取歷史。張數回到上限以內之後，
+// 尺寸限制自動放寬回 8000 像素。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -35,6 +36,8 @@ const imageMessage = (url) => ({
 
 const build = (input) =>
   toAnthropicRequest({ input }, { upstreamModel: "claude-x" });
+const buildCached = (input) =>
+  toAnthropicRequest({ input }, { upstreamModel: "claude-x", promptCache: true });
 
 const countImages = (request) => {
   let n = 0;
@@ -78,6 +81,39 @@ test("被留下的是最新的那些，不是最舊的", () => {
   };
   for (const message of request.messages) walk(message.content);
   assert.deepEqual(widths, Array.from({ length: 20 }, (_, i) => 1005 + i));
+});
+
+test("啟用快取時整批省略 8 張，接下來的新圖不再改寫歷史前綴", () => {
+  const make = (count) => Array.from({ length: count }, (_, i) => imageMessage(png(1000 + i, 200)));
+  const at20 = buildCached(make(20)).request.messages[0].content;
+  const at22 = buildCached(make(22)).request.messages[0].content;
+  const at24 = buildCached(make(24)).request.messages[0].content;
+  const at28 = buildCached(make(28)).request.messages[0].content;
+  const at29 = buildCached(make(29)).request.messages[0].content;
+  assert.equal(at20.filter((block) => block.type === "text").length, 0);
+  assert.equal(at22.filter((block) => block.type === "text").length, 8);
+  assert.equal(at22.filter((block) => block.type === "image").length, 14);
+  assert.deepEqual(at22, at24.slice(0, 22));
+  assert.deepEqual(at24, at28.slice(0, 24));
+  assert.equal(at29.filter((block) => block.type === "text").length, 16);
+  assert.equal(at29.filter((block) => block.type === "image").length, 13);
+  assert.deepEqual(buildCached(make(22)).request.cache_control, { type: "ephemeral" });
+});
+
+test("工具結果內的舊圖片整批省略後，tool_result 仍保留內容", () => {
+  const input = [];
+  for (let i = 0; i < 22; i += 1) {
+    input.push({ type: "custom_tool_call", call_id: "cache-" + i, name: "exec", input: "x" });
+    input.push({ type: "custom_tool_call_output", call_id: "cache-" + i,
+      output: [{ type: "input_image", image_url: png(1000 + i, 200) }] });
+  }
+  const { request } = buildCached(input);
+  const results = request.messages.flatMap((message) => message.content)
+    .filter((block) => block.type === "tool_result");
+  assert.equal(results.length, 22);
+  for (let i = 0; i < 8; i += 1) assert.equal(results[i].content[0].type, "text");
+  assert.equal(results[8].content[0].type, "image");
+  assert.equal(results[21].content[0].type, "image");
 });
 
 test("單張超過 8000 像素一律換掉，就算總數只有一張", () => {
