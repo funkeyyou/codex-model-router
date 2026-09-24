@@ -83,7 +83,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.22.2";
+const INSTALLER_VERSION = "1.22.3";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -4265,6 +4265,9 @@ const stats = {
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
   translatedRequests: 0,
+  claudeToolDefinitionsDeferred: 0,
+  claudeToolDescriptionCharsSaved: 0,
+  lastClaudeToolContext: null,
   imagesOmitted: 0,
   officialPassthroughs: 0,
   trailingThinkingTrimmed: 0,
@@ -4776,9 +4779,12 @@ export async function fetchModelUpstream(
     if (route.translate === "anthropic") {
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
       const { request: anthropicRequest, freeform, toolTargets, compaction, imagesOmitted,
-        thinkingTrimmed } = toAnthropicRequest(effectiveBody, route);
+        thinkingTrimmed, toolContext } = toAnthropicRequest(effectiveBody, route);
       if (imagesOmitted > 0) stats.imagesOmitted += imagesOmitted;
       if (thinkingTrimmed > 0) stats.trailingThinkingTrimmed += thinkingTrimmed;
+      stats.claudeToolDefinitionsDeferred += toolContext.toolsDeferred;
+      stats.claudeToolDescriptionCharsSaved += toolContext.charsSaved;
+      stats.lastClaudeToolContext = toolContext;
       meta.translate = "anthropic";
       meta.freeform = freeform;
       meta.toolTargets = toolTargets;
@@ -6493,15 +6499,97 @@ function flattenTopLevelSchema(schema) {
   return out;
 }
 
+const CODE_MODE_DISCOVERY_MARKER = "## On-demand nested tool definitions";
+const CODE_MODE_DISCOVERY = `${CODE_MODE_DISCOVERY_MARKER}
+Some nested tool definitions below are summaries only. All tools remain registered and callable.
+Before first using a summarized tool, read its FULL description from ALL_TOOLS by exact name;
+that description includes its parameter schema, usage rules, restrictions and approval requirements.
+Follow those rules in full. A summary is NOT sufficient to call the tool.
+For discovery, search names first, then descriptions if needed. Show at most 5 candidate names
+and short summaries (at most 120 characters each), then retrieve only the selected full definition.
+Do not print ALL_TOOLS or all matching full descriptions. Use additional targeted searches if needed.
+Example: text(ALL_TOOLS.filter(t => /keyword/i.test(t.name)).slice(0, 5)
+  .map(t => ({ name: t.name, summary: t.description.slice(0, 120) })));
+Then: text(ALL_TOOLS.find(t => t.name === "exact_tool_name")?.description);
+Only after reading it, call the unchanged tools.exact_tool_name with its documented arguments.
+`;
+
+// Only change the model-facing copy of Codex's documented Code Mode registry.
+// The actual executor and ALL_TOOLS retain full descriptions, schemas and permissions.
+// Unknown formats are left intact; headings inside code examples are never boundaries.
+export function compactCodeModeDescription(description) {
+  const unchanged = { description, toolsDeferred: 0, charsSaved: 0 };
+  if (typeof description !== "string" ||
+      !description.startsWith("Run JavaScript code to orchestrate/compose tool calls") ||
+      !description.includes("All nested tools are available on the global `tools` object") ||
+      !description.includes("`ALL_TOOLS`: metadata for the enabled nested tools") ||
+      description.includes(CODE_MODE_DISCOVERY_MARKER)) return unchanged;
+
+  const headings = [];
+  let fence = null;
+  for (const match of description.matchAll(/^.*(?:\n|$)/gm)) {
+    const line = match[0].replace(/\r?\n$/, "");
+    if (fence) {
+      const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (open) { fence = open[1]; continue; }
+    const heading = /^### `([a-zA-Z0-9_]+)`$/.exec(line);
+    if (heading) headings.push({ name: heading[1], start: match.index, content: match.index + match[0].length });
+  }
+  if (fence || !headings.length) return unchanged;
+
+  const edits = [];
+  for (let i = 0; i < headings.length; i += 1) {
+    const { name, start, content } = headings[i];
+    // Keep core tools and the complete web/image instructions eagerly visible.
+    if (!name.includes("__") || name.startsWith("web__") || name.startsWith("image_gen__")) continue;
+    const end = headings[i + 1]?.start ?? description.length;
+    const block = description.slice(content, end);
+    const declarations = [...block.matchAll(/\nexec tool declaration:\n```ts\n([\s\S]*?)\n```(?=\n|$)/g)];
+    if (declarations.length !== 1) continue;
+    const declaration = declarations[0];
+    if (!declaration[1].startsWith(`declare const tools: { ${name}(`) ||
+        !declaration[1].trimEnd().endsWith("};")) continue;
+    // Do not consume following namespace headings or instructions after the declaration.
+    const stop = content + declaration.index + declaration[0].length;
+    const summary = block.slice(0, declaration.index).trim().split(/\r?\n/, 1)[0].trim();
+    if (!summary || summary.startsWith("#") || summary.startsWith("```")) continue;
+    const short = summary.length > 180 ? summary.slice(0, 177) + "..." : summary;
+    const replacement = `### \`${name}\`\nSummary only: ${short}\nRead the full ALL_TOOLS definition before use.`;
+    if (stop - start <= replacement.length + 96) continue;
+    edits.push({ start, stop, replacement });
+  }
+  if (!edits.length) return unchanged;
+  let result = description;
+  for (const edit of edits.reverse()) result = result.slice(0, edit.start) + edit.replacement + result.slice(edit.stop);
+  const insertion = headings[0].start;
+  result = result.slice(0, insertion) + CODE_MODE_DISCOVERY + "\n" + result.slice(insertion);
+  if (result.length >= description.length) return unchanged;
+  return { description: result, toolsDeferred: edits.length, charsSaved: description.length - result.length };
+}
+
 function toAnthropicTools(codexTools) {
   const tools = [];
   const freeform = new Set();
+  const toolContext = { toolsDeferred: 0, originalChars: 0, forwardedChars: 0, charsSaved: 0 };
   for (const tool of codexTools) {
     if (tool.type === "custom") {
       freeform.add(tool.name);
+      let description = tool.description || "";
+      if (tool.name === "exec") {
+        const compacted = compactCodeModeDescription(description);
+        toolContext.toolsDeferred += compacted.toolsDeferred;
+        toolContext.originalChars += description.length;
+        toolContext.forwardedChars += compacted.description.length;
+        toolContext.charsSaved += compacted.charsSaved;
+        description = compacted.description;
+      }
       tools.push({
         name: tool.name,
-        description: tool.description || "",
+        description,
         input_schema: {
           type: "object",
           properties: {
@@ -6522,7 +6610,7 @@ function toAnthropicTools(codexTools) {
       });
     }
   }
-  return { tools, freeform };
+  return { tools, freeform, toolContext };
 }
 
 function decodeReasoning(encrypted) {
@@ -6720,7 +6808,7 @@ export function toAnthropicRequest(body, route) {
 
   const imagesOmitted = applyImageBudget(messages);
 
-  const { tools, freeform } = toAnthropicTools(codexTools);
+  const { tools, freeform, toolContext } = toAnthropicTools(codexTools);
 
   const effort = body?.reasoning?.effort;
   // 推理強度有兩種控制方式，安裝時探測出哪一種可用：
@@ -6796,7 +6884,7 @@ export function toAnthropicRequest(body, route) {
     request.thinking = { type: "enabled", budget_tokens: budget };
   }
 
-  return { request, freeform, toolTargets, compaction, imagesOmitted, thinkingTrimmed };
+  return { request, freeform, toolTargets, compaction, imagesOmitted, thinkingTrimmed, toolContext };
 }
 
 // ---------------------------------------------------------------- 回應方向
