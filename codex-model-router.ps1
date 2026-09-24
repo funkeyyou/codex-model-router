@@ -155,7 +155,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.22.3";
+const INSTALLER_VERSION = "1.22.4";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -4343,6 +4343,9 @@ const stats = {
   imagesOmitted: 0,
   officialPassthroughs: 0,
   trailingThinkingTrimmed: 0,
+  claudeToolOutputsMerged: 0,
+  claudeLateToolOutputs: 0,
+  claudeToolResultsReordered: 0,
   lastAuthProbeStatus: null,
   models: 0,
   official: 0,
@@ -4851,9 +4854,15 @@ export async function fetchModelUpstream(
     if (route.translate === "anthropic") {
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
       const { request: anthropicRequest, freeform, toolTargets, compaction, imagesOmitted,
-        thinkingTrimmed, toolContext } = toAnthropicRequest(effectiveBody, route);
+        thinkingTrimmed, toolContext, toolOutputsMerged, lateToolOutputs,
+        toolResultsReordered } = toAnthropicRequest(effectiveBody, route);
       if (imagesOmitted > 0) stats.imagesOmitted += imagesOmitted;
       if (thinkingTrimmed > 0) stats.trailingThinkingTrimmed += thinkingTrimmed;
+      // 同一個 call_id 的多筆輸出（例如 Code Mode 的 notify()）如何被收斂成
+      // Anthropic 可接受的單一 tool_result；每次轉譯都會重算，同一段歷史重送會再累加。
+      stats.claudeToolOutputsMerged += toolOutputsMerged;
+      stats.claudeLateToolOutputs += lateToolOutputs;
+      stats.claudeToolResultsReordered += toolResultsReordered;
       stats.claudeToolDefinitionsDeferred += toolContext.toolsDeferred;
       stats.claudeToolDescriptionCharsSaved += toolContext.charsSaved;
       stats.lastClaudeToolContext = toolContext;
@@ -6399,6 +6408,32 @@ export function normalizeAssistantMessages(messages) {
   return trimmed;
 }
 
+// Anthropic 要求同一則 user 訊息裡的 tool_result 全部排在最前面，文字與圖片只能
+// 接在後面，否則整輪 400（tool_use ids were found without tool_result blocks
+// immediately after）。遲到的工具輸出改成文字後，後面可能還接著其他呼叫的結果；
+// 工具呼叫與結果之間若夾了 user 內容也會如此。這裡把 tool_result 穩定地往前移，
+// 其餘區塊維持原本的相對順序。回傳調整過的訊息數。
+export function orderToolResultsFirst(messages) {
+  let reordered = 0;
+  for (const message of messages) {
+    if (message.role !== "user" || !Array.isArray(message.content)) continue;
+    const firstOther = message.content.findIndex((block) => block?.type !== "tool_result");
+    if (firstOther < 0) continue;
+    if (!message.content.slice(firstOther).some((block) => block?.type === "tool_result")) continue;
+    const results = message.content.filter((block) => block?.type === "tool_result");
+    const others = message.content.filter((block) => block?.type !== "tool_result");
+    message.content.splice(0, message.content.length, ...results, ...others);
+    reordered += 1;
+  }
+  return reordered;
+}
+
+// 模型往下走之後才送達的工具輸出，標明它屬於哪一次呼叫，免得被當成使用者的話。
+function lateToolOutputNotice(item) {
+  const name = typeof item.name === "string" && item.name ? `（${item.name.slice(0, 64)}）` : " ";
+  return `(工具呼叫 ${item.call_id}${name}的結果已先回傳；以下是之後才送達的後續輸出)`;
+}
+
 function applyImageBudget(messages) {
   const slots = collectImageSlots(messages);
   if (slots.length === 0) return 0;
@@ -6753,6 +6788,13 @@ export function toAnthropicRequest(body, route) {
     else messages.push({ role, content: [block] });
   };
 
+  // Anthropic 規定每個 tool_use 只能有一個 tool_result。記住已產生的區塊，
+  // 同一個 call_id 的後續輸出才能併回去，而不是再生出一個重複的結果。
+  const toolResults = new Map();
+  const placeholderResults = new WeakSet();
+  let toolOutputsMerged = 0;
+  let lateToolOutputs = 0;
+
   // body.input 允許是純字串（簡易呼叫），統一成項目陣列。
   const inputItems = typeof body.input === "string"
     ? [{ type: "message", role: "user", content: [{ type: "input_text", text: body.input }] }]
@@ -6840,11 +6882,39 @@ export function toAnthropicRequest(body, route) {
           for (const block of blocks) push("user", block);
           break;
         }
-        push("user", {
+        // Code Mode 的 exec 每呼叫一次 notify()，Codex 就替同一個 call_id 追加一筆
+        // 輸出（實際案例：最終結果後面接 6 則「CI 仍在建置」）。Responses 接受這種
+        // 歷史，Anthropic 卻會整輪 400：each tool_use must have a single result。
+        // 之後每一輪都重送同一段歷史，連壓縮請求也一樣，對話等於卡死。
+        const earlier = toolResults.get(item.call_id);
+        if (earlier) {
+          if (!blocks.length) break;
+          const last = messages[messages.length - 1];
+          if (last?.role === "user" && last.content.includes(earlier)) {
+            // 還在同一則 user 訊息裡：依序併入原本的結果。
+            if (placeholderResults.has(earlier)) {
+              earlier.content = [];
+              placeholderResults.delete(earlier);
+            }
+            earlier.content.push(...blocks);
+            toolOutputsMerged += 1;
+          } else {
+            // 模型已經往下走了（例如背景執行中的 exec 之後才送來通知）。改寫舊的
+            // tool_result 會讓那之後的提示快取全部失效，因此照時間順序改成 user 文字。
+            push("user", { type: "text", text: lateToolOutputNotice(item) });
+            for (const block of blocks) push("user", block);
+            lateToolOutputs += 1;
+          }
+          break;
+        }
+        const result = {
           type: "tool_result",
           tool_use_id: item.call_id,
           content: blocks.length ? blocks : [{ type: "text", text: "(no output)" }],
-        });
+        };
+        if (!blocks.length) placeholderResults.add(result);
+        toolResults.set(item.call_id, result);
+        push("user", result);
         break;
       }
 
@@ -6872,6 +6942,7 @@ export function toAnthropicRequest(body, route) {
   if (compaction) push("user", { type: "text", text: COMPACTION_PROMPT });
 
   const thinkingTrimmed = normalizeAssistantMessages(messages);
+  const toolResultsReordered = orderToolResultsFirst(messages);
 
   // Anthropic 要求首個訊息必須是 user。
   if (!messages.length || messages[0].role !== "user") {
@@ -6956,7 +7027,10 @@ export function toAnthropicRequest(body, route) {
     request.thinking = { type: "enabled", budget_tokens: budget };
   }
 
-  return { request, freeform, toolTargets, compaction, imagesOmitted, thinkingTrimmed, toolContext };
+  return {
+    request, freeform, toolTargets, compaction, imagesOmitted, thinkingTrimmed, toolContext,
+    toolOutputsMerged, lateToolOutputs, toolResultsReordered,
+  };
 }
 
 // ---------------------------------------------------------------- 回應方向

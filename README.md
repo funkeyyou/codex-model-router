@@ -219,6 +219,12 @@ Ark 不支援指定尺寸／品質或透明背景，`--size`、`--quality` 須�
 `claudeToolDefinitionsDeferred` 與 `claudeToolDescriptionCharsSaved` 為啟動後累計值。
 這些是字元統計，不是 token 數，也不是帳單節省。
 
+**1.22.4 起，同一個工具呼叫的多筆輸出會合併成一個結果。** Code Mode 的 `exec` 每呼叫一次
+`notify()`，Codex 就替同一個 `call_id` 追加一筆輸出；Responses 接受這種歷史，Anthropic 則規定
+每個 `tool_use` 只能有一個 `tool_result`。Claude 轉譯會把同一則訊息內的後續輸出依序併回原本的結果；
+模型已往下執行後才送達的輸出，改成標明來源的文字放在當下的位置，不改寫先前的結果，提示快取不受影響。
+user 訊息中的 `tool_result` 也一律排在文字之前。GPT 路由維持原樣轉發。
+
 因此「模型看不到工具」應先查任務工具清單；「工具可見但執行失敗」才往權限、工具服務、
 路由及上游檢查。安裝路由器不會自動安裝所有 MCP／插件或更改其權限。
 
@@ -357,6 +363,10 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 功能不受影響。連續握手失敗達門檻後 `upstreamWebSocketCooldowns` 會加一，路由器接著
 一段時間內直接走 HTTP，不再每條新連線都重試；上游一旦恢復就立刻解除。
 
+`claudeToolOutputsMerged` 是 Claude 轉譯時併回原結果的後續工具輸出數，`claudeLateToolOutputs`
+是改成文字的遲到輸出數，`claudeToolResultsReordered` 是為了讓工具結果排在最前面而調整的訊息數。
+這些值每次轉譯都會重新計算，同一段歷史每送一次就再累加；增加本身不代表出錯。
+
 實際埠號以 `status` 印出的為準：48953 被佔用時安裝器會自動往後找。
 
 ## 疑難排解
@@ -410,6 +420,17 @@ Get-Content "$env:USERPROFILE\.codex\model-router\router.err.log" -Tail 50 -Enco
 
 若使用者附件、近期截圖或文字本身就超限，仍會回 413 並說明原因，需要縮小圖片、減少附件，
 或把工作摘要帶到新對話。壓縮能否成功取決於縮減後的請求大小；不是所有 413 都只能開新對話。
+
+### Claude 對話出現 each tool_use must have a single result
+
+錯誤全文類似
+``messages.60.content.1: each tool_use must have a single result. Found multiple `tool_result` blocks with id: toolu_...``。
+通常是模型在 Code Mode 的 `exec` 裡呼叫了 `notify()` 回報進度：
+Codex 會把每則通知記成同一個工具呼叫的額外輸出，1.22.3 以前的 Claude 轉譯把每一筆都轉成獨立的
+`tool_result`，上游因此拒收。之後每一輪都會重送同一段歷史，連用 Claude 壓縮也會失敗，整條對話看起來就像卡死。
+
+升級到 1.22.4 以上即可。路由器每次都會重新轉譯完整歷史，原本卡住的對話不必壓縮或新開就能繼續；
+`/healthz` 的 `claudeToolOutputsMerged` 大於 0 代表這類歷史已被合併處理。
 
 ### 選擇器裡看不到某個官方模型
 

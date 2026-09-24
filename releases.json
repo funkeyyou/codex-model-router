@@ -1,6 +1,15 @@
 {
-  "latest": "1.22.3",
+  "latest": "1.22.4",
   "releases": [
+    {
+      "version": "1.22.4",
+      "date": "2026-09-24",
+      "changes": [
+        "修復 Claude 轉譯在 Code Mode 使用 notify() 後整輪 400（each tool_use must have a single result）：Codex 會替同一個 call_id 追加多筆輸出，現在依序併入同一個 tool_result；已卡住的對話更新後不必壓縮即可繼續。",
+        "模型往下執行後才送達的工具輸出改成標明來源的文字，不改寫先前的 tool_result，保留提示快取；user 訊息中的 tool_result 一律排在文字之前。",
+        "健康檢查新增 claudeToolOutputsMerged、claudeLateToolOutputs、claudeToolResultsReordered 計數；GPT 路由維持原樣轉發。"
+      ]
+    },
     {
       "version": "1.22.3",
       "date": "2026-09-24",
