@@ -76,7 +76,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { Writable } from "node:stream";
 import { basename, dirname, join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -140,7 +140,10 @@ const plistPath = join(launchAgentsDir, `${launchLabel}.plist`);
 // 由它跑一個「執行 → 等結束 → 重跑」的迴圈，等同 launchd 的 KeepAlive。
 const taskName = `CodexModelRouter-${installHash}`;
 const taskXmlPath = join(installRoot, "service-task.xml");
-const launcherVbsPath = join(installRoot, "router-launcher.vbs");
+// 守護迴圈用 JScript 寫。1.22.5 以前是 VBScript，但微軟預計約 2027 年起預設停用
+// VBScript（改為選用功能），屆時新裝的服務會起不來；JScript 引擎不在這次淘汰範圍內。
+const launcherPath = join(installRoot, "router-launcher.js");
+const legacyLauncherVbsPath = join(installRoot, "router-launcher.vbs");
 // 憑證放在 installRoot 之外：安裝失敗時 installRoot 會整個被封存搬走，
 // 但已存好的金鑰應該像鑰匙圈項目一樣留著。
 const credentialsRoot = resolve(
@@ -1613,9 +1616,6 @@ function startLaunchAgent() {
 }
 
 // --- Windows：工作排程器 + 隱藏視窗守護迴圈 --------------------------------
-function vbsQuote(value) {
-  return `"${String(value).replaceAll('"', '""')}"`;
-}
 
 // 走 cmd.exe 只為了把 stdout/stderr 附加到記錄檔，對應 launchd 的 StandardErrorPath。
 // 不落地成 .cmd：批次檔是以主控台 OEM 代碼頁讀取的，使用者名稱含非 ASCII 時路徑會壞；
@@ -1625,19 +1625,50 @@ function routerCommandLine() {
   return `cmd.exe /d /s /c "${inner}"`;
 }
 
-// wscript 屬 GUI 子系統，不會配置主控台；Run(..., 0, True) 隱藏執行並等待結束，
+// wscript 屬 GUI 子系統，不會配置主控台；Run(..., 0, true) 隱藏執行並等待結束，
 // 迴圈本身就是 launchd KeepAlive 的等價物（含 3 秒節流）。
-function launcherVbsScript() {
+//
+// JSON 字串就是合法的 JScript（ES3）字串常值；U+2028/U+2029 在 ES3 字串裡是換行，
+// 另外跳脫。檔案以 UTF-16LE 加 BOM 寫出，路徑含非 ASCII 字元也不受代碼頁影響。
+export function jscriptLauncher(commandLine) {
+  const literal = JSON.stringify(String(commandLine))
+    .replaceAll("\u2028", "\\u2028")
+    .replaceAll("\u2029", "\\u2029");
   return [
-    "Option Explicit",
-    "Dim shell",
-    'Set shell = CreateObject("WScript.Shell")',
-    "Do",
-    `  shell.Run ${vbsQuote(routerCommandLine())}, 0, True`,
-    "  WScript.Sleep 3000",
-    "Loop",
+    'var shell = new ActiveXObject("WScript.Shell");',
+    `var command = ${literal};`,
+    "for (;;) {",
+    "  shell.Run(command, 0, true);",
+    "  WScript.Sleep(3000);",
+    "}",
     "",
   ].join("\r\n");
+}
+
+function launcherScript() {
+  return jscriptLauncher(routerCommandLine());
+}
+
+// 系統管理員可以用原則停用 Windows Script Host；先確認它能執行 JScript，
+// 否則排程工作會靜默地起不來，只剩健康檢查逾時這個看不出原因的錯誤。
+export function assertScriptHostAvailable() {
+  const directory = mkdtempSync(join(tmpdir(), "codex-model-router-wsh-"));
+  try {
+    const probe = join(directory, "probe.js");
+    writeFileSync(probe, utf16leWithBom("WScript.Quit(7);\r\n"));
+    const cscript = join(env.SystemRoot || "C:\\Windows", "System32", "cscript.exe");
+    const result = shell(cscript, ["//nologo", "//B", "//E:jscript", probe], { allowFailure: true });
+    if (result.status !== 7) {
+      fail("Windows Script Host 無法執行 JScript（可能被系統原則停用）；背景服務需要它以隱藏視窗啟動路由器。");
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+// 舊版的 VBScript 啟動器；新的排程定義註冊成功後就用不到了。
+function removeLegacyLauncher() {
+  if (isWindows) rmSync(legacyLauncherVbsPath, { force: true });
 }
 
 function currentAccount() {
@@ -1700,7 +1731,7 @@ function taskXmlDocument() {
   <Actions Context="Author">
     <Exec>
       <Command>${xmlEscape(join(env.SystemRoot || "C:\\Windows", "System32", "wscript.exe"))}</Command>
-      <Arguments>//nologo //B ${xmlEscape(`"${launcherVbsPath}"`)}</Arguments>
+      <Arguments>//nologo //B //E:jscript ${xmlEscape(`"${launcherPath}"`)}</Arguments>
       <WorkingDirectory>${xmlEscape(installRoot)}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -1763,13 +1794,13 @@ function utf16leWithBom(text) {
 
 function writeServiceDefinition() {
   if (isWindows) {
-    writeFileSync(launcherVbsPath, utf16leWithBom(launcherVbsScript()), {
+    writeFileSync(launcherPath, utf16leWithBom(launcherScript()), {
       mode: 0o600,
     });
     writeFileSync(taskXmlPath, utf16leWithBom(taskXmlDocument()), {
       mode: 0o600,
     });
-    for (const path of [launcherVbsPath, taskXmlPath]) {
+    for (const path of [launcherPath, taskXmlPath]) {
       restrictAcl(path);
     }
     return;
@@ -1821,9 +1852,9 @@ function serviceDefinitionUnchanged() {
       return existsSync(plistPath) &&
         readFileSync(plistPath, "utf8") === launchAgentPlist();
     }
-    if (!existsSync(taskXmlPath) || !existsSync(launcherVbsPath)) return false;
+    if (!existsSync(taskXmlPath) || !existsSync(launcherPath)) return false;
     return (
-      Buffer.compare(readFileSync(launcherVbsPath), utf16leWithBom(launcherVbsScript())) === 0 &&
+      Buffer.compare(readFileSync(launcherPath), utf16leWithBom(launcherScript())) === 0 &&
       Buffer.compare(readFileSync(taskXmlPath), utf16leWithBom(taskXmlDocument())) === 0
     );
   } catch {
@@ -1846,9 +1877,10 @@ function removeServiceRegistration() {
   });
 }
 
-// 重新設定 / 回退時要一併備份或還原的服務檔案。
+// 重新設定 / 回退時要一併備份或還原的服務檔案。舊版的 .vbs 也列入：
+// 重新註冊失敗而還原舊定義時，排程工作仍指向它。
 function serviceArchivePaths() {
-  return isWindows ? [taskXmlPath, launcherVbsPath] : [plistPath];
+  return isWindows ? [taskXmlPath, launcherPath, legacyLauncherVbsPath] : [plistPath];
 }
 
 async function freePort(preferredPort = 48953) {
@@ -2261,11 +2293,13 @@ async function install() {
     // 使用者自己調過的旋鈕不能被重裝洗掉。
     ...preservedSettings(),
   });
+  if (isWindows && !testMode) assertScriptHostAvailable();
   writeServiceDefinition();
 
   let configChanged = false;
   try {
     startService();
+    removeLegacyLauncher();
     await waitForHealth(port);
     const writeResult = await writeConfigEdits([
       { keyPath: "model_provider", value: "openai" },
@@ -2799,9 +2833,11 @@ async function update() {
       // 守護迴圈或啟動方式真的變了才重新註冊。這一步在 Windows 上可能因權限失敗，
       // 失敗就把舊定義放回去並原地重啟——升級不該因為註冊不了而讓服務停擺。
       try {
+        if (isWindows && !testMode) assertScriptHostAvailable();
         writeServiceDefinition();
         stopService();
         startService();
+        removeLegacyLauncher();
       } catch (registrationError) {
         for (const path of serviceArchivePaths()) {
           copyIfExists(join(backupDir, basename(path)), path);
