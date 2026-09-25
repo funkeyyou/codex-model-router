@@ -551,13 +551,17 @@ node tools/build.mjs --check   # 只比對，有落差就以非零狀態結束
 
 ```bash
 npm test        # node --test，無需安裝任何相依套件
-npm ci          # 安裝 ESLint（只有靜態檢查需要）
+npm ci          # 安裝 ESLint 與 e2e 測試用的 Codex CLI
 npm run lint    # ESLint
 npm run check   # 等同 CI：安裝器與 src/ 一致、ESLint、測試
 ```
 
 安裝器與路由器的頂層本來就有副作用（跑安裝流程、佔用連接埠），測試靠
 `CODEX_MODEL_ROUTER_IMPORT_ONLY=1` 擋掉，其餘模組載入行為完全一致。
+
+幾個 e2e 測試會啟動真的 Codex（`app-server`），搭配假的登入資訊與本機上游，不連網、
+不需要真實憑證。執行檔來自 `npm ci` 安裝的 `@openai/codex`（版本固定在
+`package-lock.json`），也可以用 `CODEX_MODEL_ROUTER_TEST_CODEX_BIN` 指定；兩者都沒有時略過。
 
 ### CI
 
@@ -567,6 +571,11 @@ npm run check   # 等同 CI：安裝器與 src/ 一致、ESLint、測試
   以及 `.ps1` 的 UTF-8 BOM 檢查。
 - **windows**——同一份建置檢查與測試在 Windows 簽出上再跑一次，語法檢查改用
   Windows 內建的 PowerShell 5.1，並確認 5.1 讀這支 `.ps1` 的編碼是對的。
+
+兩個 job 都會裝好固定版本的 Codex CLI，e2e 測試一定會跑。另有
+`.github/workflows/codex-latest.yml` 每天改用 npm 上最新的 Codex 跑一次完整測試：Codex 更新頻繁，
+協定一改路由器就可能在使用者那邊壞掉，這個排程能先發現。確認相容後更新 `package.json`
+裡固定的版本即可；Dependabot 每週也會提出更新。
 
 之所以要有第二個 job：使用者實際跑的是 5.1，但 CI 上的 `pwsh` 是 7，`??`、`?.`、
 三元運算子與 `&&` 在 7 上都合法、到了 5.1 才是語法錯誤。負載這邊也一樣——POSIX
