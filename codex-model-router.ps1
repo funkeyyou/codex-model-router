@@ -4165,6 +4165,7 @@ function isBridgeReasoning(item) {
     const parsed = JSON.parse(Buffer.from(enc, "base64").toString("utf8"));
     return Boolean(parsed && (
       (typeof parsed.thinking === "string" && parsed.signature) ||
+      typeof parsed.redacted_thinking === "string" ||
       (parsed.router_reasoning_ref === 1 && /^[a-f0-9]{64}$/.test(parsed.sha256))
     ));
   } catch {
@@ -7111,6 +7112,9 @@ let warnedReasoningStore = false;
 
 function parseReasoningPayload(raw) {
   const parsed = JSON.parse(raw);
+  if (typeof parsed?.redacted_thinking === "string" && parsed.redacted_thinking) {
+    return { type: "redacted_thinking", data: parsed.redacted_thinking };
+  }
   if (!parsed || typeof parsed.thinking !== "string" || !parsed.signature) return null;
   return { type: "thinking", thinking: parsed.thinking, signature: parsed.signature };
 }
@@ -7147,6 +7151,18 @@ function decodeReasoning(encrypted) {
 export function encodeReasoning(thinking, signature) {
   const raw = Buffer.from(JSON.stringify({ thinking, signature }), "utf8");
   if (typeof thinking !== "string" || !signature) return raw.toString("base64");
+  return storeReasoning(raw);
+}
+
+// 安全系統遮蔽的推理（redacted_thinking）只有一段不透明的密文，同樣必須原樣送回：
+// 工具回合裡少了它，Anthropic 會以「最後一則 assistant 訊息必須以 thinking 開頭」拒收。
+export function encodeRedactedReasoning(data) {
+  const raw = Buffer.from(JSON.stringify({ redacted_thinking: String(data ?? "") }), "utf8");
+  if (typeof data !== "string" || !data) return raw.toString("base64");
+  return storeReasoning(raw);
+}
+
+function storeReasoning(raw) {
   const digest = createHash("sha256").update(raw).digest("hex");
   try {
     mkdirSync(reasoningStoreDir, { recursive: true, mode: 0o700 });
@@ -7681,6 +7697,13 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
             output_index: outputIndex,
             item: { id: cur.itemId, type: "reasoning", content: [], encrypted_content: "", summary: [] },
           });
+        } else if (block.type === "redacted_thinking") {
+          cur = { kind: "redacted", itemId: randomId("rs_", 53), data: typeof block.data === "string" ? block.data : "", index: outputIndex };
+          send({
+            type: "response.output_item.added",
+            output_index: outputIndex,
+            item: { id: cur.itemId, type: "reasoning", content: [], encrypted_content: "", summary: [] },
+          });
         } else if (block.type === "text") {
           cur = { kind: "text", itemId: randomId("msg_", 54), text: block.text || "", index: outputIndex };
           send({
@@ -7769,7 +7792,17 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
 
       case "content_block_stop": {
         if (!cur) break;
-        if (cur.kind === "thinking") {
+        if (cur.kind === "redacted") {
+          const item = {
+            id: cur.itemId,
+            type: "reasoning",
+            content: [],
+            encrypted_content: encodeRedactedReasoning(cur.data),
+            summary: [],
+          };
+          output.push(item);
+          send({ type: "response.output_item.done", output_index: cur.index, item });
+        } else if (cur.kind === "thinking") {
           if (cur.summaryStarted) {
             send({
               type: "response.reasoning_summary_text.done",
