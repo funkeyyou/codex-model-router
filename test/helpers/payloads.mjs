@@ -1,7 +1,8 @@
 // 把 codex-model-router.sh 內嵌的 JavaScript 取出成真的模組，供測試 import。
 //
-// 測試一律針對 .sh —— 它是負載的唯一真實來源。直接讀 repo 裡的獨立 .mjs 檔會
-// 測到不存在的東西（那些檔案只在安裝後才存在於 CODEX_HOME）。
+// 測試一律針對建置後的 .sh —— 它就是使用者實際下載的那份。原始碼在 src/，
+// CI 另以 tools/build.mjs --check 確認兩者一致；這裡照安裝器的切法取出負載，
+// 連切段邏輯本身也一起驗到。
 
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
