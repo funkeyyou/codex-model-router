@@ -1,6 +1,6 @@
 // 獨立圖片命令：API 走本機路由器，結果圖片另行下載；命令不讀取或儲存 API Key。
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, extname, resolve, join } from "node:path";
+import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";

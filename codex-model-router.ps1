@@ -1068,7 +1068,7 @@ async function probeAnthropicParam(apiRoot, apiKey, model, extra) {
       await response.text();
       return true;
     }
-    const text = await response.text();
+    await response.text();
     // 5xx／限流只代表這次問不到，不能據此判定參數不支援。
     if (isTransientProbeStatus(response.status)) return null;
     return false;
@@ -1614,7 +1614,7 @@ function xmlEscape(value) {
     .replaceAll('"', "&quot;");
 }
 
-function launchAgentPlist(port) {
+function launchAgentPlist() {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1827,7 +1827,7 @@ function utf16leWithBom(text) {
   ]);
 }
 
-function writeServiceDefinition(port) {
+function writeServiceDefinition() {
   if (isWindows) {
     writeFileSync(launcherVbsPath, utf16leWithBom(launcherVbsScript()), {
       mode: 0o600,
@@ -1841,7 +1841,7 @@ function writeServiceDefinition(port) {
     return;
   }
   ensureDirectory(launchAgentsDir);
-  writeFileSync(plistPath, launchAgentPlist(port), { mode: 0o600 });
+  writeFileSync(plistPath, launchAgentPlist(), { mode: 0o600 });
   chmodSync(plistPath, 0o600);
   shell("/usr/bin/plutil", ["-lint", plistPath]);
 }
@@ -1881,11 +1881,11 @@ function manualStartHint() {
 }
 
 // 服務定義逐位元組比對：一樣就完全不要碰註冊。
-function serviceDefinitionUnchanged(port) {
+function serviceDefinitionUnchanged() {
   try {
     if (!isWindows) {
       return existsSync(plistPath) &&
-        readFileSync(plistPath, "utf8") === launchAgentPlist(port);
+        readFileSync(plistPath, "utf8") === launchAgentPlist();
     }
     if (!existsSync(taskXmlPath) || !existsSync(launcherVbsPath)) return false;
     return (
@@ -2327,7 +2327,7 @@ async function install() {
     // 使用者自己調過的旋鈕不能被重裝洗掉。
     ...preservedSettings(),
   });
-  writeServiceDefinition(port);
+  writeServiceDefinition();
 
   let configChanged = false;
   try {
@@ -2844,7 +2844,7 @@ async function update() {
     copyIfExists(path, join(backupDir, basename(path)));
   }
 
-  let health = null;
+  let health;
   let serviceWarning = null;
   let catalogConfigAttempted = false;
   try {
@@ -2858,14 +2858,14 @@ async function update() {
       ...plan.manifest,
       updatedAt: new Date().toISOString(),
     });
-    if (serviceDefinitionUnchanged(plan.port)) {
+    if (serviceDefinitionUnchanged()) {
       // 常見情況：埠與路徑都沒變，重新註冊沒有意義，原地重啟即可（不需提權）。
       restartServiceInPlace();
     } else {
       // 守護迴圈或啟動方式真的變了才重新註冊。這一步在 Windows 上可能因權限失敗，
       // 失敗就把舊定義放回去並原地重啟——升級不該因為註冊不了而讓服務停擺。
       try {
-        writeServiceDefinition(plan.port);
+        writeServiceDefinition();
         stopService();
         startService();
       } catch (registrationError) {
@@ -2986,7 +2986,7 @@ async function manageHiddenModels() {
   copyIfExists(settingsPath, join(backupDir, "settings.json"));
   copyIfExists(catalogPath, join(backupDir, "models.json"));
 
-  let health = null;
+  let health;
   try {
     writeJsonAtomic(catalogPath, combinedCatalog);
     writeJsonAtomic(settingsPath, { ...settings, forceListedModels: chosen });
@@ -6875,8 +6875,6 @@ export function toAnthropicRequest(body, route) {
       : null;
   const systemParts = typeof body.instructions === "string" && body.instructions ? [body.instructions] : [];
   const messages = [];
-  let codexTools = [];
-  let toolTargets = new Map();
   let compaction = false;
 
   // 同 role 的連續區塊必須合併，否則 Anthropic 會拒絕。
@@ -6901,7 +6899,7 @@ export function toAnthropicRequest(body, route) {
   // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
   const toolDefinitions = [...(Array.isArray(body.tools) ? body.tools : [])];
   for (const item of inputItems) if (item?.type === "additional_tools") toolDefinitions.push(...(item.tools || []));
-  ({ tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions));
+  const { tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions);
   const unavailable = [];
   const inspectTools = (tools) => {
     for (const tool of tools) {
@@ -7502,7 +7500,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
 __CODEX_MODEL_ROUTER_IMAGEGEN_JS__
 // 獨立圖片命令：API 走本機路由器，結果圖片另行下載；命令不讀取或儲存 API Key。
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, extname, resolve, join } from "node:path";
+import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";

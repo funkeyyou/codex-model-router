@@ -7,8 +7,14 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "sync": "node tools/build.mjs",
+    "lint": "eslint .",
     "test": "node --test \"test/*.test.mjs\"",
-    "check": "node tools/build.mjs --check && npm test"
+    "check": "node tools/build.mjs --check && eslint . && npm test"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0"
+  }
 }

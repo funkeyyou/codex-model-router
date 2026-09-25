@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { bridge } = await loadPayloads();
-const { toAnthropicRequest, bridgeAnthropicStream, decodeCompaction } = bridge;
+const { toAnthropicRequest, bridgeAnthropicStream } = bridge;
 
 const summaryRoute = {
   upstreamModel: "claude-x",

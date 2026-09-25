@@ -36,6 +36,16 @@ jobs:
       - name: 安裝器與 src/ 一致
         run: node tools/build.mjs --check
 
+      # 反斜線被吃掉的字串、沒用到的變數這類錯誤執行時不會報錯，只有靜態檢查抓得到。
+      # 結果與平台及 Node 版本無關，跑一次就夠。
+      - name: 安裝開發工具
+        if: matrix.node-version == '24'
+        run: npm ci
+
+      - name: ESLint
+        if: matrix.node-version == '24'
+        run: npx eslint .
+
       - name: 測試
         run: npm test
 
