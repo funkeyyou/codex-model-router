@@ -203,7 +203,7 @@ Ark 不支援指定尺寸／品質或透明背景，`--size`、`--quality` 須�
 | --- | --- |
 | 終端機、檔案編輯、MCP、瀏覽器等 function/custom 工具 | GPT 保留定義；Claude 做雙向轉譯，包含 namespace 與自由格式輸入。仍需 Codex 本身掛載工具並允許執行。 |
 | Codex 的搜尋、筆記、歷史 HTTP 端點 | 繼續送往官方後端，由官方驗證帳號權限；不會因選擇自訂模型而改用中轉 Key。 |
-| 平台內建 image_generation、web_search、file_search 等工具 | 自訂 GPT 依中轉能力而定；Claude 轉譯無法執行這些內建工具，會告知模型限制。明確強制使用不可用工具時回報 422，不自動改投其他供應商。 |
+| 平台內建 image_generation、web_search、file_search 等工具 | 自訂 GPT 依中轉能力而定；Claude 轉譯無法執行這些內建工具，會告知模型限制。明確強制使用不可用工具時回報 422，不自動改投其他供應商。官方 GPT 回合已完成的這類項目，切到 Claude 時會轉成文字摘要（本機命令轉成配對的工具呼叫），同一條對話可以繼續。 |
 | 中轉 API 生圖 | 使用已啟用的 router-imagegen 技能與既有 Images／Ark 路徑，無需內建 image_gen。 |
 | 圖片與 MCP 圖片結果 | Claude 支援 URL、data URL 及 MCP 的 data/mimeType 圖片區塊。圖片數量與大小限制仍適用。 |
 | PDF、MCP 資源 | PDF data URL／文件 URL 轉為 Claude document；MCP 文字資源與連結保留為文字，不額外下載。上游仍需支援文件功能。 |

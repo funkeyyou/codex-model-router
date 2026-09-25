@@ -6439,6 +6439,57 @@ export function orderToolResultsFirst(messages) {
   return reordered;
 }
 
+// 平台內建工具項目的簡短文字描述。只摘要已知欄位並截斷長內容，
+// 仍不認得的項目由呼叫端照舊拒絕，不默默刪除。
+const HOSTED_TOOL_LABELS = {
+  web_search_call: "網頁搜尋",
+  file_search_call: "檔案搜尋",
+  code_interpreter_call: "程式碼執行",
+  image_generation_call: "生圖",
+  local_shell_call: "本機命令",
+  computer_call: "電腦操作",
+  computer_call_output: "電腦操作結果",
+  mcp_call: "MCP 工具",
+  mcp_list_tools: "MCP 工具清單",
+  mcp_approval_request: "MCP 授權請求",
+  mcp_approval_response: "MCP 授權回覆",
+  tool_search_call: "工具搜尋",
+  tool_search_output: "工具搜尋結果",
+};
+
+function clipText(value, max = 300) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+export function hostedToolSummary(item) {
+  const label = HOSTED_TOOL_LABELS[item?.type];
+  if (!label) return null;
+  const action = item.action && typeof item.action === "object" ? item.action : {};
+  let detail = "";
+  if (item.type === "web_search_call") {
+    if (action.type === "search") detail = `：${clipText(action.query ?? action.queries ?? "")}`;
+    else if (action.type === "open_page" && action.url) detail = `：開啟 ${clipText(action.url)}`;
+    else if (action.url && action.pattern) detail = `：在 ${clipText(action.url)} 中尋找 ${clipText(action.pattern)}`;
+  } else if (item.type === "image_generation_call" && typeof item.revised_prompt === "string" && item.revised_prompt) {
+    detail = `，提示詞：${clipText(item.revised_prompt)}`;
+  } else if (item.type === "local_shell_call" && action.command) {
+    detail = `：${clipText(Array.isArray(action.command) ? action.command.join(" ") : action.command)}`;
+  } else if (item.type === "mcp_call") {
+    detail = `：${clipText(`${item.server_label ?? ""}/${item.name ?? ""}`, 120)}`;
+    if (item.output) detail += `，結果：${clipText(item.output, 800)}`;
+    if (item.error) detail += `，錯誤：${clipText(item.error)}`;
+  } else if (item.type === "code_interpreter_call" && item.code) {
+    detail = `：${clipText(item.code, 800)}`;
+  } else if (item.type === "file_search_call" && Array.isArray(item.queries)) {
+    detail = `：${clipText(item.queries.join("；"))}`;
+  }
+  return {
+    role: /_(?:output|response)$/.test(item.type) ? "user" : "assistant",
+    text: `(先前的回合使用了平台內建的${label}${detail})`,
+  };
+}
+
 // 模型往下走之後才送達的工具輸出，標明它屬於哪一次呼叫，免得被當成使用者的話。
 function lateToolOutputNotice(item) {
   const name = typeof item.name === "string" && item.name ? `（${item.name.slice(0, 64)}）` : " ";
@@ -6951,13 +7002,24 @@ export function toAnthropicRequest(body, route) {
         break;
       }
 
+      // 官方 GPT 回合的本機命令：轉成 tool_use，後面那筆輸出才配得上 tool_result。
+      case "local_shell_call": {
+        const action = item.action && typeof item.action === "object" && !Array.isArray(item.action) ? item.action : {};
+        if (item.call_id) push("assistant", { type: "tool_use", id: item.call_id, name: "local_shell", input: action });
+        else push("assistant", { type: "text", text: hostedToolSummary(item).text });
+        break;
+      }
+
+      case "local_shell_call_output":
       case "custom_tool_call_output":
       case "function_call_output": {
-        const blocks = toAnthropicBlocks(item.output);
+        // local_shell_call_output 以 id 指向那次呼叫的 call_id。
+        const output = item.type === "local_shell_call_output" && !item.call_id ? { ...item, call_id: item.id } : item;
+        const blocks = toAnthropicBlocks(output.output);
         // 從另一個 Codex 任務轉送進來的訊息會以 function_call_output 表示，
         // 但沒有 call_id；它不是某次工具呼叫的結果，不能產生缺 tool_use_id 的
         // Anthropic tool_result。保留成普通 user 內容，模型才能收到轉送的指示。
-        if (!item.call_id) {
+        if (!output.call_id) {
           for (const block of blocks) push("user", block);
           break;
         }
@@ -6965,7 +7027,7 @@ export function toAnthropicRequest(body, route) {
         // 輸出（實際案例：最終結果後面接 6 則「CI 仍在建置」）。Responses 接受這種
         // 歷史，Anthropic 卻會整輪 400：each tool_use must have a single result。
         // 之後每一輪都重送同一段歷史，連壓縮請求也一樣，對話等於卡死。
-        const earlier = toolResults.get(item.call_id);
+        const earlier = toolResults.get(output.call_id);
         if (earlier) {
           if (!blocks.length) break;
           const last = messages[messages.length - 1];
@@ -6980,7 +7042,7 @@ export function toAnthropicRequest(body, route) {
           } else {
             // 模型已經往下走了（例如背景執行中的 exec 之後才送來通知）。改寫舊的
             // tool_result 會讓那之後的提示快取全部失效，因此照時間順序改成 user 文字。
-            push("user", { type: "text", text: lateToolOutputNotice(item) });
+            push("user", { type: "text", text: lateToolOutputNotice(output) });
             for (const block of blocks) push("user", block);
             lateToolOutputs += 1;
           }
@@ -6988,12 +7050,31 @@ export function toAnthropicRequest(body, route) {
         }
         const result = {
           type: "tool_result",
-          tool_use_id: item.call_id,
+          tool_use_id: output.call_id,
           content: blocks.length ? blocks : [{ type: "text", text: "(no output)" }],
         };
         if (!blocks.length) placeholderResults.add(result);
-        toolResults.set(item.call_id, result);
+        toolResults.set(output.call_id, result);
         push("user", result);
+        break;
+      }
+
+      // 官方 GPT 回合留下的平台內建工具項目（網頁搜尋、生圖等）。切到 Claude 繼續同一條
+      // 對話時它們都已完成，也沒有可轉送的執行器；轉成簡短文字，否則每一輪都會 422。
+      case "web_search_call":
+      case "file_search_call":
+      case "code_interpreter_call":
+      case "image_generation_call":
+      case "computer_call":
+      case "computer_call_output":
+      case "mcp_call":
+      case "mcp_list_tools":
+      case "mcp_approval_request":
+      case "mcp_approval_response":
+      case "tool_search_call":
+      case "tool_search_output": {
+        const summary = hostedToolSummary(item);
+        push(summary.role, { type: "text", text: summary.text });
         break;
       }
 
@@ -7011,7 +7092,10 @@ export function toAnthropicRequest(body, route) {
       }
 
       default:
-        if (item?.type) throw bridgeInputError("Claude 轉譯收到不支援的對話項目，無法安全省略；請用原模型完成該工具回合，或重送文字摘要。");
+        if (item?.type) {
+          const type = String(item.type).replace(/[^a-zA-Z0-9_.-]/g, "").slice(0, 64);
+          throw bridgeInputError(`Claude 轉譯收到不支援的對話項目（${type}），無法安全省略；請改用原模型繼續，或在新任務中提供工作摘要。`);
+        }
         break;
     }
   }
