@@ -259,13 +259,17 @@ function restrictAcl(path) {
 // Windows 的「下載」可以被搬到別的磁碟，而且相當常見；固定用
 // %USERPROFILE%\Downloads 會把生成的圖寫到使用者根本不會去看的舊位置。
 // 真正的來源是已知資料夾的登錄項，讀不到就退回預設。
+//
+// 必須用 String.raw：一般字串裡的 \S、\M 不是跳脫字元，反斜線會被 JS 靜默吃掉，
+// 查的就變成不存在的 HKCU:SOFTWAREMicrosoft...——1.22.5 以前正是如此，偵測從未成功。
+export const USER_SHELL_FOLDERS_KEY =
+  String.raw`HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders`;
+const DOWNLOADS_FOLDER_GUID = "{374DE290-123F-4565-9164-39C4925E467B}";
+
 function windowsDownloadsDir() {
-  const guid = "{374DE290-123F-4565-9164-39C4925E467B}";
-  const key =
-    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders";
   const result = powershell(
     [
-      `$value = (Get-ItemProperty -LiteralPath ${psQuote(key)} -Name ${psQuote(guid)}).${psQuote(guid)}`,
+      `$value = (Get-ItemProperty -LiteralPath ${psQuote(USER_SHELL_FOLDERS_KEY)} -Name ${psQuote(DOWNLOADS_FOLDER_GUID)}).${psQuote(DOWNLOADS_FOLDER_GUID)}`,
       "[Environment]::ExpandEnvironmentVariables($value)",
     ].join("\n"),
     { allowFailure: true },
@@ -274,22 +278,31 @@ function windowsDownloadsDir() {
   return (result.stdout || "").trim() || null;
 }
 
+// 舊版偵測必定失敗，於是把預設的 %USERPROFILE%\Downloads 寫進了 settings。
+// 仍是那個預設值、而「下載」其實已搬到別處時，視為當年偵測失敗的結果，改用實際位置；
+// 其他任何值都當成使用者自己設定的，一律保留。回傳 null 表示不需要改。
+export function migratedImageOutputDir(previous, knownFolder, defaultDir) {
+  const same = (a, b) => resolve(a).toLowerCase() === resolve(b).toLowerCase();
+  if (typeof previous !== "string" || !previous || !same(previous, defaultDir)) return null;
+  if (typeof knownFolder !== "string" || !knownFolder || same(knownFolder, defaultDir)) return null;
+  return knownFolder;
+}
+
 // 生成的圖預設落在使用者的「下載」。明確寫進 settings 讓它看得見也改得動；
 // 使用者若已經改過就沿用，重新安裝不該把它蓋掉。
 function resolveImageOutputDir() {
+  const defaultDir = join(homeDir, "Downloads");
+  const knownFolder = isWindows ? windowsDownloadsDir() : null;
   if (existsSync(settingsPath)) {
     try {
       const previous = JSON.parse(readFileSync(settingsPath, "utf8"));
       if (typeof previous.imageOutputDir === "string" && previous.imageOutputDir) {
-        return previous.imageOutputDir;
+        return migratedImageOutputDir(previous.imageOutputDir, knownFolder, defaultDir) ||
+          previous.imageOutputDir;
       }
     } catch {}
   }
-  if (isWindows) {
-    const resolved = windowsDownloadsDir();
-    if (resolved) return resolved;
-  }
-  return join(homeDir, "Downloads");
+  return knownFolder || defaultDir;
 }
 
 function listDirectories(directory) {
@@ -2724,6 +2737,11 @@ async function update() {
   const userConfig = await readUserConfig();
   const previousCatalogPath = userConfig.config.model_catalog_json;
   const migrateCatalog = isManagedCatalogPath(previousCatalogPath, catalogPath);
+  // 舊版的已知資料夾偵測從未成功；只修正仍停在預設值的設定。
+  const migratedOutputDir = isWindows
+    ? migratedImageOutputDir(plan.settings.imageOutputDir, windowsDownloadsDir(), join(homeDir, "Downloads"))
+    : null;
+  if (migratedOutputDir) plan.settings = { ...plan.settings, imageOutputDir: migratedOutputDir };
 
   printHeading("更新路由器");
   console.log(`版本：${plan.installed || "未知"} → ${plan.target}`);
@@ -2736,6 +2754,7 @@ async function update() {
   for (const route of plan.routes) {
     console.log(`  - ${route.displayName || route.upstreamModel}`);
   }
+  if (migratedOutputDir) console.log(`閘道生成圖片的存放位置改為實際的「下載」資料夾：${migratedOutputDir}`);
   console.log(
     "\n只會換掉路由器與轉譯層程式碼然後重啟；服務定義只有真的變了才會重寫。" +
       "不重問 Base URL、API Key 與模型；舊版固定模型目錄將遷移為啟動時同步官方清單。",
