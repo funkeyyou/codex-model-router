@@ -258,6 +258,12 @@ Windows 的常駐做法是：工作排程器以 `wscript.exe` 執行一支守護
 啟動 `router.mjs`，路由器結束就重跑——等同 LaunchAgent 的 `KeepAlive`，而且全程不會
 有主控台視窗跳出來。排程另外每 10 分鐘檢查一次，守護行程本身若被殺掉也能自動補回。
 
+守護迴圈是 JScript 寫的 `router-launcher.js`。1.22.5 以前用 VBScript（`.vbs`），但微軟
+預計約 2027 年起預設停用 VBScript，屆時新裝的服務會起不來；執行 `update` 就會換成新版。
+工作若是以系統管理員身分建立的，一般權限可能無法重新註冊，`update` 會沿用舊定義並提示，
+此時以系統管理員身分執行一次 `update` 即可。安裝前會先確認 Windows Script Host 沒被系統
+原則停用。
+
 API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別台機器都無法解密；
 兩個平台都不會把金鑰寫進 `config.toml` 或安裝器檔案。
 
