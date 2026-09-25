@@ -543,8 +543,10 @@ node tools/build.mjs --check   # 只比對，有落差就以非零狀態結束
 測試直接把建置後 `.sh` 裡的四段負載取出來 import，所以測到的一定是會發佈出去的那份。
 
 ```bash
-npm test     # node --test，無需安裝任何相依套件
-npm run check   # 等同 CI：先驗安裝器與 src/ 一致，再跑測試
+npm test        # node --test，無需安裝任何相依套件
+npm ci          # 安裝 ESLint（只有靜態檢查需要）
+npm run lint    # ESLint
+npm run check   # 等同 CI：安裝器與 src/ 一致、ESLint、測試
 ```
 
 安裝器與路由器的頂層本來就有副作用（跑安裝流程、佔用連接埠），測試靠
@@ -554,7 +556,7 @@ npm run check   # 等同 CI：先驗安裝器與 src/ 一致，再跑測試
 
 `.github/workflows/ci.yml` 在 push 與 PR 上跑兩個 job：
 
-- **ubuntu**——建置一致性檢查、測試（Node 22 與 24）、`.sh` 與 `.ps1` 的語法檢查，
+- **ubuntu**——建置一致性檢查、ESLint、測試（Node 22 與 24）、`.sh` 與 `.ps1` 的語法檢查，
   以及 `.ps1` 的 UTF-8 BOM 檢查。
 - **windows**——同一份建置檢查與測試在 Windows 簽出上再跑一次，語法檢查改用
   Windows 內建的 PowerShell 5.1，並確認 5.1 讀這支 `.ps1` 的編碼是對的。

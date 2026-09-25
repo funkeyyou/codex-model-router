@@ -598,8 +598,6 @@ export function toAnthropicRequest(body, route) {
       : null;
   const systemParts = typeof body.instructions === "string" && body.instructions ? [body.instructions] : [];
   const messages = [];
-  let codexTools = [];
-  let toolTargets = new Map();
   let compaction = false;
 
   // 同 role 的連續區塊必須合併，否則 Anthropic 會拒絕。
@@ -624,7 +622,7 @@ export function toAnthropicRequest(body, route) {
   // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
   const toolDefinitions = [...(Array.isArray(body.tools) ? body.tools : [])];
   for (const item of inputItems) if (item?.type === "additional_tools") toolDefinitions.push(...(item.tools || []));
-  ({ tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions));
+  const { tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions);
   const unavailable = [];
   const inspectTools = (tools) => {
     for (const tool of tools) {
