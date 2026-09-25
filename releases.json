@@ -1,6 +1,21 @@
 {
-  "latest": "1.22.5",
+  "latest": "1.23.0",
   "releases": [
+    {
+      "version": "1.23.0",
+      "date": "2026-09-26",
+      "changes": [
+        "修復 Claude 串流中途出錯（例如 overloaded_error）時 Codex 空等約 5 分鐘才重試：改送 response.failed，錯誤碼換成 Codex 認得的值，上下文爆掉不再白白重試，限流會照上游要求的秒數等待。",
+        "修復 Claude 壓縮回合與 tool_choice:none 拿掉 tools 而被 Anthropic 拒收（歷史有工具呼叫時必須定義 tools），改用 tool_choice:none 禁止呼叫。",
+        "修復從官方 GPT 中途切到 Claude 時，歷史裡的網頁搜尋、生圖、本機命令等項目讓整條對話永久 422；改轉成文字摘要或配對的工具呼叫。",
+        "修復 Windows 取 API Key 時整個路由器凍結 1 秒以上（Ark 生圖輪詢每次都觸發）；改為非同步讀取並依憑證檔變更快取。WebSocket 收大訊息不再平方成長，30 MB 由 1.3 秒降到約 50 毫秒。",
+        "安全：拒絕 Host 不是本機的請求（防 DNS rebinding），生圖與 Ark 端點拒絕瀏覽器網頁發起的請求，避免網頁借路由器花費中轉額度。",
+        "chatgpt.com 暫時連不上時，24 小時內驗證過的憑證仍可使用中轉模型（settings.json 的 authProbeGraceMs 可調）；401/403 照樣拒絕。",
+        "Windows 背景服務的守護迴圈由 VBScript 改為 JScript（VBScript 預計約 2027 年起預設停用），並修復「下載」資料夾偵測從未生效；更新時會修正仍停在預設值的圖片存放位置。",
+        "安裝器平行探測模型，也可手動輸入 /models 沒列出的模型 ID；macOS 版會檢查 Node 版本；Claude 的 redacted_thinking 區塊可往返。",
+        "重新配置不再洗掉 maxHttpBodyBytes、maxHistoryBytes、historyTtlMs、maxUpstreamRequestBytes 設定；Codex 連線未送 Close 訊框就結束時不再留下半開連線。"
+      ]
+    },
     {
       "version": "1.22.5",
       "date": "2026-09-25",
