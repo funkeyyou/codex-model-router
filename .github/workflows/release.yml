@@ -1,0 +1,50 @@
+# 推送 v* tag 時建立 GitHub Release，附上兩支安裝器、診斷腳本與 SHA256SUMS。
+#
+# 安裝說明預設直接下載 main 上的安裝器；想固定版本、或下載後先驗證完整性的使用者，
+# 可以改從 Release 下載並比對 SHA256SUMS。tag 必須是 v<INSTALLER_VERSION>，
+# 版本或更新說明對不上時直接失敗，不會發佈。
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: 安裝器與 src/ 一致
+        run: node tools/build.mjs --check
+
+      - name: 測試
+        run: |
+          npm ci
+          npm test
+
+      - name: 更新說明與版本檢查
+        run: node tools/release.mjs notes "${GITHUB_REF_NAME}" > "${RUNNER_TEMP}/notes.md"
+
+      - name: 產生 SHA256SUMS
+        run: |
+          mkdir -p "${RUNNER_TEMP}/assets"
+          node tools/release.mjs checksums "${RUNNER_TEMP}/assets"
+          cat "${RUNNER_TEMP}/assets/SHA256SUMS"
+
+      - name: 建立 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "${RUNNER_TEMP}/notes.md" \
+            "${RUNNER_TEMP}"/assets/*

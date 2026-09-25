@@ -38,6 +38,32 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 輸入 API Key 時畫面不會顯示任何字元（跟 `sudo` 一樣），貼上後直接按 Enter。
 路由器安裝成功後，另會詢問是否使用中轉 API 生圖，預設為否；同意後才偵測圖片模型並安裝獨立技能。
 
+### 固定版本並驗證下載（可選）
+
+上面的指令下載的是 `main` 上的最新安裝器。想固定某個版本，或下載後先確認檔案沒被竄改，
+可以改從 [Releases](https://github.com/funkeyyou/codex-model-router/releases) 下載：
+每個版本都附有兩支安裝器、診斷腳本與 `SHA256SUMS`。
+`releases/latest/download/` 永遠指向最新的正式版本。
+
+macOS：
+
+```bash
+curl -fsSLO https://github.com/funkeyyou/codex-model-router/releases/latest/download/codex-model-router.sh
+curl -fsSLO https://github.com/funkeyyou/codex-model-router/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing && bash codex-model-router.sh
+```
+
+Windows：
+
+```powershell
+curl.exe -fsSLO https://github.com/funkeyyou/codex-model-router/releases/latest/download/codex-model-router.ps1
+curl.exe -fsSLO https://github.com/funkeyyou/codex-model-router/releases/latest/download/SHA256SUMS
+(Get-FileHash .\codex-model-router.ps1 -Algorithm SHA256).Hash.ToLower()
+Select-String codex-model-router.ps1 .\SHA256SUMS
+```
+
+兩行輸出的雜湊相同再執行安裝器。
+
 ## 升級
 
 已經裝過的話，日常升級用 `update`，不要重跑 `install`：
@@ -542,6 +568,17 @@ node tools/build.mjs --check   # 只比對，有落差就以非零狀態結束
 ```
 
 兩支安裝器都要提交進 repo，因為安裝指令直接從 `main` 下載它們。
+
+發佈新版本：更新 `src/installer.mjs` 的 `INSTALLER_VERSION` 與 `releases.json`，執行
+`node tools/build.mjs`，合併進 `main` 後推送對應的 tag：
+
+```bash
+git tag v1.23.0
+git push origin v1.23.0
+```
+
+`.github/workflows/release.yml` 會先驗證 tag、安裝器版本與 `releases.json` 一致並跑完測試，
+再建立 GitHub Release，附上安裝器、診斷腳本與 `SHA256SUMS`。
 發布新版本時也要更新 `releases.json` 的 `latest` 與對應更新說明；建置工具會驗證
 `latest` 是否和安裝器內的 `INSTALLER_VERSION` 一致。
 
