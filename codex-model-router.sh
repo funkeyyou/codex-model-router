@@ -3548,7 +3548,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
 
 __CODEX_MODEL_ROUTER_ROUTER_JS__
 import http from "node:http";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
@@ -3556,6 +3556,7 @@ import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renam
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { zstdDecompressSync } from "node:zlib";
 import {
   toAnthropicRequest,
@@ -3576,7 +3577,10 @@ const keychainService = settings.keychainService;
 const keychainAccount = settings.keychainAccount || "codex";
 const credentialPath = settings.credentialPath || null;
 const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route]));
+const execFileAsync = promisify(execFile);
 const tokenCacheTtlMs = 5 * 60 * 1000;
+// Windows 以密文檔的修改時間判斷 Key 有沒有換，快取可以放久一點。
+const credentialCacheTtlMs = 12 * 60 * 60 * 1000;
 const authValidationTtlMs = 5 * 60 * 1000;
 const maxRememberedThreads = 2048;
 const maxValidatedAuthDigests = 64;
@@ -4299,6 +4303,7 @@ const stats = {
   claudeLateToolOutputs: 0,
   claudeToolResultsReordered: 0,
   lastAuthProbeStatus: null,
+  credentialReads: 0,
   models: 0,
   official: 0,
   custom: 0,
@@ -4315,7 +4320,6 @@ const stats = {
 };
 const validatedAuthDigests = new Map();
 const threadRoutes = new Map();
-let apiKeyCache = null;
 
 class RouterRequestError extends Error {
   constructor(status, code, message, phase = "request", upstreamStatus = null) {
@@ -4403,20 +4407,27 @@ function writeJson(response, status, payload) {
 }
 
 // 憑證來源：macOS 讀鑰匙圈；Windows 解 DPAPI 密文檔（entropy 就是 keychainService）。
-function readStoredSecret() {
+//
+// 一定要非同步：Windows 起 powershell.exe 解 DPAPI 每次要 1 秒以上，同步呼叫期間
+// 整個路由器（所有對話的串流、WebSocket 心跳）都會停住。
+async function runSecretCommand(file, args, options = {}) {
+  const pending = execFileAsync(file, args, { encoding: "utf8", maxBuffer: 1024 * 1024, ...options });
+  // 不給子行程任何輸入；PowerShell 在 stdin 是未關閉的管線時可能一直等待。
+  pending.child.stdin?.end();
+  const { stdout } = await pending;
+  return stdout.trim();
+}
+
+export async function readStoredSecret() {
   if (process.platform !== "win32") {
-    return execFileSync(
-      "/usr/bin/security",
-      [
-        "find-generic-password",
-        "-a",
-        keychainAccount,
-        "-s",
-        keychainService,
-        "-w",
-      ],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
+    return runSecretCommand("/usr/bin/security", [
+      "find-generic-password",
+      "-a",
+      keychainAccount,
+      "-s",
+      keychainService,
+      "-w",
+    ]);
   }
   if (!credentialPath) throw new Error("設定中缺少憑證檔案路徑");
   const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
@@ -4430,32 +4441,66 @@ function readStoredSecret() {
     "$plain = [Security.Cryptography.ProtectedData]::Unprotect($blob, $entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)",
     "[Console]::Out.Write([Text.Encoding]::UTF8.GetString($plain))",
   ].join("\n");
-  return execFileSync(
-    "powershell.exe",
-    [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-EncodedCommand",
-      Buffer.from(script, "utf16le").toString("base64"),
-    ],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
-  ).trim();
+  return runSecretCommand("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+    Buffer.from(script, "utf16le").toString("base64"),
+  ], { windowsHide: true });
 }
 
-function getApiKey(forceRefresh = false) {
+// 金鑰快取。fingerprint 變了（Windows 的密文檔被重新寫入）就重讀，否則在 TTL 內沿用；
+// 同時間的多個請求共用同一次讀取。reload 用在上游回 401/403 時強制重讀。
+export function createSecretCache({ read, fingerprint = () => null, ttlMs, now = Date.now }) {
+  let cached = null;
+  let pending = null;
+  return async function get({ reload = false } = {}) {
+    const current = fingerprint();
+    if (!reload && cached && cached.fingerprint === current && cached.expiresAt > now()) return cached.value;
+    if (!pending) {
+      pending = (async () => {
+        try {
+          const value = await read();
+          if (!value) throw new Error("自訂供應商的憑證為空");
+          cached = { value, fingerprint: current, expiresAt: now() + ttlMs };
+          return value;
+        } finally {
+          pending = null;
+        }
+      })();
+    }
+    return pending;
+  };
+}
+
+// Windows 的密文檔只在安裝器換 Key 時改寫；stat 幾乎不花時間，可以每次檢查。
+// macOS 的鑰匙圈沒有等價的廉價檢查，沿用較短的 TTL（讀取本身只要數十毫秒）。
+function credentialFingerprint() {
+  if (process.platform !== "win32" || !credentialPath) return null;
+  try {
+    const info = statSync(credentialPath);
+    return `${info.mtimeMs}:${info.size}`;
+  } catch {
+    return "missing";
+  }
+}
+
+const cachedApiKey = createSecretCache({
+  read: async () => {
+    stats.credentialReads += 1;
+    return readStoredSecret();
+  },
+  fingerprint: credentialFingerprint,
+  ttlMs: process.platform === "win32" && credentialPath ? credentialCacheTtlMs : tokenCacheTtlMs,
+});
+
+async function getApiKey(reload = false) {
   if (process.env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
     return process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
   }
-  const now = Date.now();
-  if (!forceRefresh && apiKeyCache && apiKeyCache.expiresAt > now) {
-    return apiKeyCache.value;
-  }
-  const value = readStoredSecret();
-  if (!value) throw new Error("自訂供應商的憑證為空");
-  apiKeyCache = { value, expiresAt: now + tokenCacheTtlMs };
-  return value;
+  return cachedApiKey({ reload });
 }
 
 function appendHeader(headers, name, value) {
@@ -4734,7 +4779,7 @@ export async function streamUpstream(upstream, response, history = null, respons
 }
 
 async function fetchCustom(target, headers, body, signal) {
-  let apiKey = getApiKey(false);
+  let apiKey = await getApiKey(false);
   let upstream = await fetch(target, {
     method: "POST",
     headers: buildCustomHeaders(headers, apiKey),
@@ -4744,7 +4789,7 @@ async function fetchCustom(target, headers, body, signal) {
   });
   if (upstream.status !== 401 && upstream.status !== 403) return upstream;
   await upstream.arrayBuffer();
-  apiKey = getApiKey(true);
+  apiKey = await getApiKey(true);
   return fetch(target, {
     method: "POST",
     headers: buildCustomHeaders(headers, apiKey),
@@ -4916,9 +4961,11 @@ async function handleArkImages(request, response, incomingUrl) {
   request.on("aborted", () => controller.abort());
   response.on("close", () => { if (!response.writableFinished) controller.abort(); });
   // 此路徑相對於已配置的供應商 origin，不接在 /v1 後，也不轉送官方後端。
-  // 任務提交只發一次；重新讀取儲存的 Key，不以 401/403 為由重送付費提交。
+  // 任務提交只發一次，不以 401/403 為由重送付費提交。Key 由快取提供：Windows 的密文檔
+  // 一改寫就會重讀，不必每次都起 PowerShell（任務輪詢每 2 秒一次，以前每次都卡住路由器）。
+  const apiKey = await getApiKey();
   const upstream = await fetch(new URL(incomingUrl.pathname, new URL(apiRoot).origin), {
-    method: request.method, headers: buildCustomHeaders(request.headers, getApiKey(true)),
+    method: request.method, headers: buildCustomHeaders(request.headers, apiKey),
     body: taskQuery ? undefined : Buffer.concat(chunks), redirect: "manual", signal: controller.signal,
   });
   stats.arkImageRequests += 1;
