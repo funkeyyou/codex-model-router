@@ -78,3 +78,12 @@ test("標頭不完整時回報至少還要多少位元組", () => {
   assert.equal(webSocketFrameLength(Buffer.from([0x81, 127, 0])), 10);
   assert.equal(webSocketFrameLength(Buffer.from([0x81, 0x80 | 5])), 2 + 4 + 5);
 });
+
+test("握手後殘留的資料就算帶著超大標頭，也不會在建構時丟出例外", () => {
+  const header = Buffer.alloc(10);
+  header[0] = 0x81;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(200 * 1024 * 1024), 2);
+  const reader = createWebSocketFrameReader(header);
+  assert.throws(() => reader.push(Buffer.from([0])), /超過路由器限制/, "由呼叫端的錯誤處理接住");
+});
