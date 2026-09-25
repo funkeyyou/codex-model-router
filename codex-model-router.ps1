@@ -5539,7 +5539,9 @@ export function webSocketFrameLength(buffer, limit = maxWebSocketMessageBytes) {
 export function createWebSocketFrameReader(initial = Buffer.alloc(0), limit = maxWebSocketMessageBytes) {
   let chunks = initial.length ? [initial] : [];
   let buffered = initial.length;
-  let needed = webSocketFrameLength(initial, limit);
+  // 不在這裡解析 initial：建構時丟出例外（例如超過上限的標頭）沒有人接得住，
+  // 留到下一次 push，由呼叫端既有的錯誤處理關閉連線。
+  let needed = 2;
   const reader = {
     // 合併時複製的累計位元組數，供測試確認不再是平方成長。
     copiedBytes: 0,
