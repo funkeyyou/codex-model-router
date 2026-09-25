@@ -915,16 +915,99 @@ function parseSelection(value, modelCount) {
   return [...selected].sort((a, b) => a - b);
 }
 
+// 選擇模型：編號、範圍、all，或直接輸入清單沒有列出的模型 ID——部分閘道的 /models
+// 不完整，模型明明能用卻選不到。手動輸入的 ID 照樣要通過探測才會加入。
+const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/;
+
+export function parseModelSelection(value, models) {
+  const trimmed = String(value || "").trim();
+  if (/^(all|\*)$/i.test(trimmed)) return [...models];
+  const selected = [];
+  const add = (model) => { if (!selected.includes(model)) selected.push(model); };
+  for (const rawPart of trimmed.split(/[,，]/)) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    if (/^\d+(?:\s*-\s*\d+)?$/.test(part)) {
+      for (const index of parseSelection(part, models.length)) add(models[index]);
+      continue;
+    }
+    if (!MODEL_ID_PATTERN.test(part)) fail(`模型 ID 格式無效：${part}`);
+    add(part);
+  }
+  if (selected.length === 0) fail("沒有選擇任何模型。");
+  return selected;
+}
+
 async function selectModels(models) {
   printHeading("可用模型");
+  if (models.length === 0) console.log("  （清單上沒有可選的模型）");
   models.forEach((model, index) => {
     console.log(`${String(index + 1).padStart(3)}. ${model}`);
   });
   const automaticSelection = env.CODEX_MODEL_ROUTER_TEST_MODELS;
   const answer =
     automaticSelection ||
-    (await ask("請輸入模型編號，可使用逗號、範圍，或輸入 all 全選"));
-  return parseSelection(answer, models.length).map((index) => models[index]);
+    (await ask("請輸入模型編號（可用逗號、範圍或 all），清單沒列出的模型也可以直接輸入 ID"));
+  return parseModelSelection(answer, models);
+}
+
+// 探測輸出。平行探測時每個模型先寫進自己的緩衝區，完成後依選擇順序整段印出。
+const consoleProbeLog = {
+  write: (text) => process.stdout.write(text),
+  line: (text = "") => console.log(text),
+};
+
+function bufferedProbeLog() {
+  const chunks = [];
+  return {
+    write: (text) => { chunks.push(String(text)); },
+    line: (text = "") => { chunks.push(`${text}\n`); },
+    text: () => chunks.join(""),
+  };
+}
+
+// 同時最多探測幾個模型。每個模型內部的探測仍依序進行，同時送往閘道的請求不會超過這個數；
+// 閘道限流較嚴時可用 CODEX_MODEL_ROUTER_PROBE_CONCURRENCY 調低（1 等於逐一探測）。
+function probeConcurrency() {
+  const value = Number(env.CODEX_MODEL_ROUTER_PROBE_CONCURRENCY);
+  return Number.isInteger(value) && value >= 1 ? Math.min(value, 8) : 3;
+}
+
+// 平行執行、依序輸出：結果與輸出都照 models 的順序，不會交錯。
+// 任何一個探測丟出例外時，等全部結束後拋出第一個，與逐一探測時一樣中止流程。
+export async function probeModelsInParallel(models, probe, {
+  concurrency = probeConcurrency(),
+  print = (text) => process.stdout.write(text),
+} = {}) {
+  const results = new Array(models.length);
+  const errors = new Array(models.length);
+  const logs = models.map(() => bufferedProbeLog());
+  const done = new Array(models.length).fill(false);
+  let printed = 0;
+  let next = 0;
+  const flush = () => {
+    while (printed < models.length && done[printed]) {
+      print(logs[printed].text());
+      printed += 1;
+    }
+  };
+  const worker = async () => {
+    while (next < models.length) {
+      const index = next;
+      next += 1;
+      try {
+        results[index] = await probe(models[index], logs[index]);
+      } catch (error) {
+        errors[index] = error;
+      }
+      done[index] = true;
+      flush();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(Math.max(1, concurrency), models.length) }, worker));
+  const failure = errors.find((error) => error !== undefined);
+  if (failure) throw failure;
+  return results;
 }
 
 async function testResponse(apiRoot, apiKey, model, effort) {
@@ -1060,26 +1143,26 @@ export function isTransientProbeStatus(status) {
   return status === 0 || status === 408 || status === 429 || status >= 500;
 }
 
-async function probeModel(apiRoot, apiKey, model) {
+async function probeModel(apiRoot, apiKey, model, log = consoleProbeLog) {
   const supportedEfforts = [];
   const transientEfforts = [];
   for (const effort of EFFORTS) {
-    process.stdout.write(`  ${effort.padEnd(7)} `);
+    log.write(`  ${effort.padEnd(7)} `);
     try {
       const result = await testResponse(apiRoot, apiKey, model, effort);
       if (result.ok) {
         supportedEfforts.push(effort);
-        console.log("支持");
+        log.line("支持");
       } else if (isTransientProbeStatus(result.status)) {
         transientEfforts.push(effort);
-        console.log(`暫時不可用（HTTP ${result.status}）`);
+        log.line(`暫時不可用（HTTP ${result.status}）`);
       } else {
-        console.log(`不支持（HTTP ${result.status}）`);
+        log.line(`不支持（HTTP ${result.status}）`);
       }
     } catch (error) {
       // 逾時或連線層例外同樣只代表這次問不到。
       transientEfforts.push(effort);
-      console.log(`暫時不可用（${error instanceof Error ? error.message : String(error)}）`);
+      log.line(`暫時不可用（${error instanceof Error ? error.message : String(error)}）`);
     }
   }
 
@@ -1092,14 +1175,14 @@ async function probeModel(apiRoot, apiKey, model) {
     };
   }
 
-  process.stdout.write("  預設    ");
+  log.write("  預設    ");
   try {
     const result = await testResponse(apiRoot, apiKey, model, null);
     if (result.ok) {
-      console.log("支援，但不提供推理強度控制");
+      log.line("支援，但不提供推理強度控制");
       return { supported: true, efforts: [], stripReasoning: true, transientEfforts };
     }
-    console.log(`不支持（HTTP ${result.status}）`);
+    log.line(`不支持（HTTP ${result.status}）`);
     return {
       supported: false,
       efforts: [],
@@ -1108,7 +1191,7 @@ async function probeModel(apiRoot, apiKey, model) {
       transient: isTransientProbeStatus(result.status),
     };
   } catch (error) {
-    console.log(`暫時不可用（${error instanceof Error ? error.message : String(error)}）`);
+    log.line(`暫時不可用（${error instanceof Error ? error.message : String(error)}）`);
     return { supported: false, efforts: [], stripReasoning: false, transientEfforts, transient: true };
   }
 }
@@ -2030,8 +2113,8 @@ export function resolveRouteWithPrevious(outcome, previous) {
 //   route            探測成功的路由，失敗為 null
 //   transient        失敗是否只是「這次問不到」（呼叫端可據此保留既有設定）
 //   transientEfforts 這次暫時問不到的推理強度
-async function buildRouteForModel(discovery, apiKey, model) {
-  printHeading(`正在測試 ${model}`);
+async function buildRouteForModel(discovery, apiKey, model, log = consoleProbeLog) {
+  log.line(`\n正在測試 ${model}`);
   const owner = modelOwners.get(model) || "unknown";
   const ownerIsAnthropic = owner === "anthropic";
   // /models 沒標供應商時按模型名推斷，否則 Claude 會靜默落到通用 Responses
@@ -2040,19 +2123,19 @@ async function buildRouteForModel(discovery, apiKey, model) {
 
   if (ownerIsAnthropic || guessedAnthropic) {
     if (guessedAnthropic) {
-      console.log("  供應商        /models 未標註，按模型名推斷為 Anthropic");
+      log.line("  供應商        /models 未標註，按模型名推斷為 Anthropic");
     }
     // Claude 走本機轉譯：直接驗證原生 /messages。
-    process.stdout.write("  原生 /messages  ");
+    log.write("  原生 /messages  ");
     const probeResult = await probeAnthropicModel(discovery.apiRoot, apiKey, model);
     if (probeResult.ok) {
-      console.log("支持");
-      process.stdout.write("  上下文上限    ");
+      log.line("支持");
+      log.write("  上下文上限    ");
       const contextWindow = await probeAnthropicContextWindow(discovery.apiRoot, apiKey, model);
-      console.log(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "無法探測（將回退）");
-      process.stdout.write("  最大輸出      ");
+      log.line(contextWindow ? `${contextWindow.toLocaleString()} tokens` : "無法探測（將回退）");
+      log.write("  最大輸出      ");
       const { maxOutput, canonicalId } = await probeAnthropicMaxOutput(discovery.apiRoot, apiKey, model);
-      console.log(
+      log.line(
         maxOutput
           ? `${maxOutput.toLocaleString()} tokens${canonicalId ? `（${canonicalId}）` : ""}`
           : "無法探測",
@@ -2061,11 +2144,11 @@ async function buildRouteForModel(discovery, apiKey, model) {
       // budget_tokens 在較新的模型上已被移除：官方直接 400，部分閘道靜默丟棄，
       // 結果是 Codex 裡選 low 或 max 毫無差別，而且一律跑在高強度。
       // 支援 output_config 的話就直接透傳五檔，低強度才真的會變快。
-      process.stdout.write("  推理強度控制  ");
+      log.write("  推理強度控制  ");
       const supportsOutputConfig = await probeAnthropicParam(
         discovery.apiRoot, apiKey, model, { output_config: { effort: "low" } },
       );
-      console.log(
+      log.line(
         supportsOutputConfig === true
           ? "output_config.effort（五檔直接透傳）"
           : supportsOutputConfig === false
@@ -2077,12 +2160,12 @@ async function buildRouteForModel(discovery, apiKey, model) {
       // 要 summarized 才能在 Codex 裡看到推理摘要。
       let supportsSummary = null;
       if (supportsOutputConfig === true) {
-        process.stdout.write("  推理摘要      ");
+        log.write("  推理摘要      ");
         supportsSummary = await probeAnthropicParam(
           discovery.apiRoot, apiKey, model,
           { thinking: { type: "adaptive", display: "summarized" } },
         );
-        console.log(
+        log.line(
           supportsSummary === true
             ? "顯示摘要"
             : supportsSummary === false
@@ -2092,11 +2175,11 @@ async function buildRouteForModel(discovery, apiKey, model) {
       }
 
       // 對話歷史每輪都會重送；沒有滾動斷點的話上游每輪都要重算整段歷史。
-      process.stdout.write("  提示詞快取    ");
+      log.write("  提示詞快取    ");
       const supportsCache = await probeAnthropicParam(
         discovery.apiRoot, apiKey, model, { cache_control: { type: "ephemeral" } },
       );
-      console.log(
+      log.line(
         supportsCache === true
           ? "支援滾動斷點"
           : supportsCache === false
@@ -2123,30 +2206,30 @@ async function buildRouteForModel(discovery, apiKey, model) {
       return { route, transient: false, transientEfforts: [] };
     }
 
-    console.log(`失敗（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
+    log.line(`失敗（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
     if (guessedAnthropic) {
       // 只是按名字猜的，探測不通不足以判定模型不可用，回退到通用路由。
-      console.log("  該閘道沒有可用的 Anthropic 原生端點，改用通用 Responses 路由重試。");
-      console.log("  注意：Codex 的 Code Mode 用 namespace 包裝工具，部分閘道會因此報錯或丟工具。");
+      log.line("  該閘道沒有可用的 Anthropic 原生端點，改用通用 Responses 路由重試。");
+      log.line("  注意：Codex 的 Code Mode 用 namespace 包裝工具，部分閘道會因此報錯或丟工具。");
     } else if (isTransientProbeStatus(probeResult.status)) {
       // 額度、上游容量或網路問題，而非模型真的不受支持。
-      console.log(`跳過 ${model}：上游暫時不可用，並非模型不受支援。`);
+      log.line(`跳過 ${model}：上游暫時不可用，並非模型不受支援。`);
       return { route: null, transient: true, transientEfforts: [] };
     } else if (probeResult.status === 401 || probeResult.status === 403) {
-      console.log(`跳過 ${model}：當前 API Key 無權存取該模型。`);
+      log.line(`跳過 ${model}：當前 API Key 無權存取該模型。`);
       return { route: null, transient: false, transientEfforts: [] };
     } else if (probeResult.status === 404) {
-      console.log(`跳過 ${model}：該閘道未提供 Anthropic 原生 /messages 端點，無法本機轉譯。`);
+      log.line(`跳過 ${model}：該閘道未提供 Anthropic 原生 /messages 端點，無法本機轉譯。`);
       return { route: null, transient: false, transientEfforts: [] };
     } else {
-      console.log(`跳過 ${model}：Anthropic 原生端點探測未通過。`);
+      log.line(`跳過 ${model}：Anthropic 原生端點探測未通過。`);
       return { route: null, transient: false, transientEfforts: [] };
     }
   }
 
-  const probe = await probeModel(discovery.apiRoot, apiKey, model);
+  const probe = await probeModel(discovery.apiRoot, apiKey, model, log);
   if (!probe.supported) {
-    console.log(
+    log.line(
       probe.transient
         ? `跳過 ${model}：上游暫時不可用，並非模型不受支援。`
         : `跳過 ${model}：Responses API 探測未通過。`,
@@ -2198,7 +2281,7 @@ async function install() {
   const discovery = await discoverApiRoot(baseUrl, apiKey);
   console.log(`API 根地址：${discovery.apiRoot}`);
   const selectedModels = await selectModels(discovery.models);
-  console.log("\n每個選中的模型最多會執行五次小型 Responses API 探測。" );
+  console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
   if (!(await confirm("是否繼續進行能力探測？", true))) {
     fail("已在修改配置前取消安裝。" );
   }
@@ -2215,8 +2298,10 @@ async function install() {
   const routes = [];
   const keptModels = [];
   const keptEfforts = [];
-  for (const model of selectedModels) {
-    const outcome = await buildRouteForModel(discovery, apiKey, model);
+  const outcomes = await probeModelsInParallel(selectedModels,
+    (model, log) => buildRouteForModel(discovery, apiKey, model, log));
+  for (const [index, model] of selectedModels.entries()) {
+    const outcome = outcomes[index];
     const { route, kept, restored } = resolveRouteWithPrevious(
       outcome,
       previousRoutes.get(model),
@@ -2467,22 +2552,24 @@ async function addModels() {
   const configured = new Set(existingRoutes.map((route) => route.upstreamModel));
   const available = discovery.models.filter((model) => !configured.has(model));
   if (available.length === 0) {
-    fail("該 Base URL 上的模型都已配置，沒有可添加的項。");
+    console.log("清單上的模型都已配置；仍可直接輸入清單沒有列出的模型 ID。");
   }
 
-  const selectedModels = await selectModels(available);
+  const selectedModels = (await selectModels(available)).filter((model) => {
+    if (!configured.has(model)) return true;
+    console.log(`已配置，略過：${model}`);
+    return false;
+  });
   if (selectedModels.length === 0) fail("未選擇任何模型。");
-  console.log("\n每個選中的模型最多會執行五次小型 Responses API 探測。");
+  console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
   if (!(await confirm("是否繼續進行能力探測？", true))) {
     fail("已在修改配置前取消。");
   }
 
-  const newRoutes = [];
-  for (const model of selectedModels) {
-    // 這裡的模型都是新選的，沒有既有設定可以沿用；暫時性失敗只能略過。
-    const { route } = await buildRouteForModel(discovery, apiKey, model);
-    if (route) newRoutes.push(route);
-  }
+  // 這裡的模型都是新選的，沒有既有設定可以沿用；暫時性失敗只能略過。
+  const outcomes = await probeModelsInParallel(selectedModels,
+    (model, log) => buildRouteForModel(discovery, apiKey, model, log));
+  const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean);
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
 
   const routes = [...existingRoutes, ...newRoutes];
