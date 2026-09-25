@@ -502,6 +502,7 @@ function isBridgeReasoning(item) {
     const parsed = JSON.parse(Buffer.from(enc, "base64").toString("utf8"));
     return Boolean(parsed && (
       (typeof parsed.thinking === "string" && parsed.signature) ||
+      typeof parsed.redacted_thinking === "string" ||
       (parsed.router_reasoning_ref === 1 && /^[a-f0-9]{64}$/.test(parsed.sha256))
     ));
   } catch {
