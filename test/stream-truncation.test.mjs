@@ -42,6 +42,7 @@ function fakeResponse() {
     writeHead() {},
     write(chunk) {
       chunks.push(String(chunk));
+      return true; // 沒有背壓，streamUpstream 不必等 drain
     },
     end() {
       this.ended = true;
@@ -150,13 +151,74 @@ test("WebSocket：上游自己送了終止事件就不補", async () => {
   }
 });
 
-test("WebSocket：上游送的 error 也算收過尾", async () => {
+// Codex 會忽略頂層 error（只認 completed／incomplete／failed），只送 error 就收工的話，
+// WebSocket 上要空等 300 秒閒置逾時才重試。錯誤內容要轉成 response.failed 補上。
+test("WebSocket：上游只送 error 就結束時，改用它的內容補 response.failed", async () => {
   const socket = fakeSocket();
   await bridgeSseToWebSocket(
-    upstreamOf([sse({ type: "error", error: { message: "上游炸了" } })]),
+    upstreamOf([sse({ type: "error", code: "server_is_overloaded", message: "上游過載" })]),
     socket,
   );
 
   const types = socket.events.map((event) => event.type);
-  assert.deepEqual(types, ["error"], "不該在 error 後面再疊一個 response.failed");
+  assert.deepEqual(types, ["error", "response.failed"]);
+  assert.deepEqual(socket.events.at(-1).response.error, { code: "server_is_overloaded", message: "上游過載" });
+});
+
+test("WebSocket：包一層的 error 事件也會換成 Codex 認得的錯誤碼", async () => {
+  const socket = fakeSocket();
+  await bridgeSseToWebSocket(
+    upstreamOf([sse({ type: "error", status: 429, error: { type: "rate_limit_error", message: "slow down" } })]),
+    socket,
+  );
+  assert.equal(socket.events.at(-1).response.error.code, "rate_limit_exceeded");
+});
+
+test("WebSocket：error 之後上游自己送了 response.failed 就不再補", async () => {
+  const socket = fakeSocket();
+  await bridgeSseToWebSocket(
+    upstreamOf([
+      sse({ type: "error", code: "server_is_overloaded", message: "上游過載" }),
+      sse({ type: "response.failed", response: { id: "resp_1", error: { code: "server_is_overloaded" } } }),
+    ]),
+    socket,
+  );
+  const types = socket.events.map((event) => event.type);
+  assert.deepEqual(types, ["error", "response.failed"]);
+});
+
+test("HTTP：上游只送 error 就結束時同樣補 response.failed，而不是當成截斷", async () => {
+  const response = fakeResponse();
+  const upstream = { ...upstreamOf([sse({ type: "error", code: "server_is_overloaded", message: "上游過載" })]),
+    ok: true, headers: new Headers({ "content-type": "text/event-stream" }) };
+  await router.streamUpstream(upstream, response, null, true);
+  assert.match(response.text, /"type":"response\.failed"/);
+  assert.match(response.text, /"code":"server_is_overloaded"/);
+  assert.doesNotMatch(response.text, /upstream_stream_truncated/);
+});
+
+// Anthropic 串流中途出錯（最常見是 overloaded_error）會送 event: error 後結束。
+const anthropicMidStreamError = [
+  ...anthropicOpening,
+  sse({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }),
+];
+
+test("Claude 轉譯（HTTP）：串流中途的 overloaded_error 變成可重試的 response.failed", async () => {
+  const response = fakeResponse();
+  await bridgeAnthropicToHttp(upstreamOf(anthropicMidStreamError), response, meta());
+  const events = response.text.split("\n").filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)));
+  assert.deepEqual(events.map((event) => event.type).slice(-1), ["response.failed"]);
+  assert.equal(events.at(-1).response.error.code, "server_is_overloaded");
+  assert.equal(events.filter((event) => event.type === "error").length, 0, "頂層 error 會被 Codex 忽略，不必送");
+  assert.doesNotMatch(response.text, /upstream_stream_truncated/);
+});
+
+test("Claude 轉譯（WebSocket）：串流中途出錯也立刻送出 response.failed", async () => {
+  const socket = fakeSocket();
+  await router.bridgeAnthropicToWebSocket(upstreamOf(anthropicMidStreamError), socket, meta());
+  const events = socket.events;
+  assert.equal(events.at(-1).type, "response.failed");
+  assert.equal(events.at(-1).response.error.code, "server_is_overloaded");
+  assert.equal(events.filter((event) => event.type === "response.failed").length, 1);
 });
