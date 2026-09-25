@@ -204,11 +204,28 @@ test("namespace 巢狀工具會攤平", () => {
   assert.deepEqual(request.tools.map((t) => t.name), ["a", "b"]);
 });
 
-test("tool_choice 對應：required -> any、none -> 不送 tools", () => {
+test("tool_choice 對應：required -> any、none -> 保留 tools 但禁止呼叫", () => {
   const tools = [{ type: "additional_tools", tools: [{ type: "function", name: "a", parameters: {} }] }];
   assert.deepEqual(build([...tools, userMessage("x")], { tool_choice: "required" }).tool_choice, { type: "any" });
   assert.deepEqual(build([...tools, userMessage("x")], { tool_choice: "auto" }).tool_choice, { type: "auto" });
-  assert.equal(build([...tools, userMessage("x")], { tool_choice: "none" }).tools, undefined);
+  // 拿掉 tools 的話，歷史裡的 tool_use／tool_result 會讓 Anthropic 整輪 400。
+  const none = build([...tools, userMessage("x")], { tool_choice: "none", parallel_tool_calls: false });
+  assert.deepEqual(none.tools.map((tool) => tool.name), ["a"]);
+  assert.deepEqual(none.tool_choice, { type: "none" }, "none 不接受 disable_parallel_tool_use");
+});
+
+// Anthropic：Requests which include tool_use or tool_result blocks must define tools.
+const toolHistory = [
+  userMessage("看一下檔案"),
+  { type: "function_call", call_id: "toolu_1", name: "shell", arguments: "{\"cmd\":\"ls\"}" },
+  { type: "function_call_output", call_id: "toolu_1", output: "a.txt" },
+];
+
+test("這一輪沒有工具、歷史卻有工具呼叫時，補上佔位定義並禁止呼叫", () => {
+  const request = build(toolHistory);
+  assert.deepEqual(request.tools.map((tool) => tool.name), ["shell"]);
+  assert.deepEqual(request.tool_choice, { type: "none" });
+  assert.equal(build([userMessage("只有文字")]).tools, undefined, "沒有工具歷史就不加");
 });
 
 // --- input_schema 的頂層組合關鍵字 -------------------------------------------
@@ -303,16 +320,16 @@ test("既有 compaction 項目還原成帶前綴的 user 文字", () => {
     `${COMPACTION_REPLAY_PREFIX}之前做到一半`);
 });
 
-test("壓縮回合會補提示詞，且不帶工具（帶了模型會改去呼叫工具）", () => {
+test("壓縮回合會補提示詞，工具定義照送但禁止呼叫", () => {
+  const tools = [{ type: "function", name: "shell", parameters: { type: "object", properties: { cmd: { type: "string" } } } }];
+  const normal = toAnthropicRequest({ tools, input: toolHistory }, { upstreamModel: "claude-x" });
   const result = toAnthropicRequest({
-    input: [
-      { type: "additional_tools", tools: [{ type: "function", name: "a", parameters: {} }] },
-      userMessage("一堆歷史"),
-      { type: "compaction_trigger" },
-    ],
+    tools, parallel_tool_calls: false, input: [...toolHistory, { type: "compaction_trigger" }],
   }, { upstreamModel: "claude-x" });
   assert.equal(result.compaction, true);
-  assert.equal(result.request.tools, undefined);
+  // 與一般回合相同的 tools：歷史有 tool_use 時必須定義，快取前綴也才一致。
+  assert.deepEqual(result.request.tools, normal.request.tools);
+  assert.deepEqual(result.request.tool_choice, { type: "none" }, "模型只能寫摘要，不能改去呼叫工具");
   assert.match(result.request.messages.at(-1).content.at(-1).text, /COMPACTION/);
 });
 
