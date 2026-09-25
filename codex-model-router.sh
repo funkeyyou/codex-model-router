@@ -2257,6 +2257,8 @@ async function install() {
   if (existingManifest?.version) assertInstallerNotOlder(existingManifest.version);
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
+  // 在問任何問題、寫任何檔案之前先確認背景服務起得來。
+  if (isWindows && !testMode) assertScriptHostAvailable();
 
   printHeading(existingManifest ? "重新配置 Codex 模型路由器" : "安裝 Codex 模型路由器");
   const defaultBaseUrl = existingManifest?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
@@ -2396,7 +2398,6 @@ async function install() {
     // 使用者自己調過的旋鈕不能被重裝洗掉。
     ...preservedSettings(),
   });
-  if (isWindows && !testMode) assertScriptHostAvailable();
   writeServiceDefinition();
 
   let configChanged = false;
