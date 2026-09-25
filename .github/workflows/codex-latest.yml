@@ -1,0 +1,40 @@
+# Codex 更新頻繁，協定一改（新的事件型別、新的對話項目、app-server 的 RPC）路由器就可能
+# 在使用者那邊壞掉。PR 的 CI 用 package-lock.json 固定的版本，結果才穩定可重現；
+# 這裡每天改用 npm 上最新的 Codex 跑一次完整測試，協定變動能在使用者碰到之前先發現。
+# 失敗時 GitHub 會通知 repo 擁有者；確認相容後，更新 package.json 裡固定的版本即可。
+
+name: 最新版 Codex 相容性
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest-codex:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: 安裝開發工具
+        run: npm ci
+
+      - name: 換成最新版 Codex CLI
+        run: npm install --no-save --no-audit --no-fund @openai/codex@latest
+
+      - name: Codex CLI
+        run: node test/helpers/codex-bin.mjs
+
+      - name: 測試
+        run: npm test

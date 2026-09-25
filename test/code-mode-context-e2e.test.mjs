@@ -9,8 +9,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { zstdDecompressSync } from "node:zlib";
 import { loadPayloads } from "./helpers/payloads.mjs";
+import { codexBin } from "./helpers/codex-bin.mjs";
 
-const bin = process.env.CODEX_MODEL_ROUTER_TEST_CODEX_BIN;
+const bin = codexBin;
 test("Code Mode compact summaries retain full registry schemas and executable nested tools", {skip: !bin, timeout: 30000}, async () => {
   const { bridge } = await loadPayloads();
   const home = mkdtempSync(join(tmpdir(), "router-context-e2e-"));

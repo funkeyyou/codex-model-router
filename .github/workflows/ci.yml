@@ -36,15 +36,19 @@ jobs:
       - name: 安裝器與 src/ 一致
         run: node tools/build.mjs --check
 
-      # 反斜線被吃掉的字串、沒用到的變數這類錯誤執行時不會報錯，只有靜態檢查抓得到。
-      # 結果與平台及 Node 版本無關，跑一次就夠。
+      # ESLint 與 e2e 測試用的 Codex CLI（版本固定在 package-lock.json）。
       - name: 安裝開發工具
-        if: matrix.node-version == '24'
         run: npm ci
 
+      # 反斜線被吃掉的字串、沒用到的變數這類錯誤執行時不會報錯，只有靜態檢查抓得到。
+      # 結果與平台及 Node 版本無關，跑一次就夠。
       - name: ESLint
         if: matrix.node-version == '24'
         run: npx eslint .
+
+      # 確認 e2e 測試真的有 Codex 可用，而不是全部被略過。
+      - name: Codex CLI
+        run: node test/helpers/codex-bin.mjs
 
       - name: 測試
         run: npm test
@@ -93,6 +97,12 @@ jobs:
       # .gitattributes 把換行統一成 LF；在 Windows 簽出上跑一次，確認沒被 CRLF 破壞。
       - name: 安裝器與 src/ 一致（Windows 簽出）
         run: node tools/build.mjs --check
+
+      - name: 安裝開發工具
+        run: npm ci
+
+      - name: Codex CLI
+        run: node test/helpers/codex-bin.mjs
 
       - name: 測試
         run: npm test

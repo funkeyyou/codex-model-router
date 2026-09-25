@@ -9,8 +9,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync } fro
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadPayloads } from "./helpers/payloads.mjs";
+import { codexBin } from "./helpers/codex-bin.mjs";
 
-const bin = process.env.CODEX_MODEL_ROUTER_TEST_CODEX_BIN;
+const bin = codexBin;
 test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型", { skip: !bin, timeout: 30000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), "router-catalog-e2e-"));
   const runtime = join(root, "model-router");

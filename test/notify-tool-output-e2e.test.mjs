@@ -1,5 +1,5 @@
 // 真實 Codex 執行 Code Mode 的 notify()，再經 Claude 轉譯。上游與登入都是假的，不連網。
-// 需要 CODEX_MODEL_ROUTER_TEST_CODEX_BIN 指向 codex 執行檔，否則略過。
+// 需要真實的 Codex 執行檔（npm ci 安裝的 @openai/codex，或 CODEX_MODEL_ROUTER_TEST_CODEX_BIN），否則略過。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -11,8 +11,9 @@ import { tmpdir } from "node:os";
 import { zstdDecompressSync } from "node:zlib";
 import { loadPayloads } from "./helpers/payloads.mjs";
 import { assertAnthropicToolPairing } from "./helpers/anthropic-rules.mjs";
+import { codexBin } from "./helpers/codex-bin.mjs";
 
-const bin = process.env.CODEX_MODEL_ROUTER_TEST_CODEX_BIN;
+const bin = codexBin;
 const CALL_ID = "toolu_notify_e2e";
 const MARKERS = ["NOTIFY_ONE", "NOTIFY_TWO", "NOTIFY_THREE", "FINAL_OUTPUT"];
 const THINKING = "Long Claude thinking must survive the Codex tool turn. ".repeat(300);

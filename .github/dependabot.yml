@@ -1,0 +1,11 @@
+# 固定的 Codex CLI 版本（e2e 測試用）、ESLint 與 CI 用到的 actions 每週檢查一次更新。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
