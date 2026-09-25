@@ -150,7 +150,7 @@ import {
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { Writable } from "node:stream";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, win32 } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
@@ -357,7 +357,9 @@ function windowsDownloadsDir() {
 // 仍是那個預設值、而「下載」其實已搬到別處時，視為當年偵測失敗的結果，改用實際位置；
 // 其他任何值都當成使用者自己設定的，一律保留。回傳 null 表示不需要改。
 export function migratedImageOutputDir(previous, knownFolder, defaultDir) {
-  const same = (a, b) => resolve(a).toLowerCase() === resolve(b).toLowerCase();
+  // 只有 Windows 會用到：以 Windows 規則比較（不分大小寫、忽略結尾的分隔符號），
+  // 在其他平台跑測試時結果也一樣。
+  const same = (a, b) => win32.resolve(a).toLowerCase() === win32.resolve(b).toLowerCase();
   if (typeof previous !== "string" || !previous || !same(previous, defaultDir)) return null;
   if (typeof knownFolder !== "string" || !knownFolder || same(knownFolder, defaultDir)) return null;
   return knownFolder;
