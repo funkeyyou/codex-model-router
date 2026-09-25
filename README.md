@@ -524,26 +524,27 @@ Anthropic 路由前，把它們改寫或剝除掉**——健康檢查的 `bridge
 
 ## 開發
 
-`codex-model-router.sh` 是四段內嵌 JavaScript（installer / router / claude-bridge / imagegen）的
-唯一真實來源，`codex-model-router.ps1` 只是把同一段文字包進 PowerShell 註解區塊。
-改完 `.sh` 之後要同步過去：
+程式碼放在 `src/`：四段 JavaScript（`installer.mjs`、`router.mjs`、`claude-bridge.mjs`、
+`imagegen.mjs`）都是一般模組，另有 `wrapper.sh` 與 `wrapper.ps1` 兩個啟動外殼。
+repo 根目錄的 `codex-model-router.sh`／`.ps1` 是建置產物：同一份負載分別包進 bash heredoc
+與 PowerShell 註解區塊，讓使用者只需下載單一檔案。改完 `src/` 之後要重新建置：
 
 ```bash
-node tools/sync-payloads.mjs           # 寫入 .ps1
-node tools/sync-payloads.mjs --check   # 只比對，有落差就以非零狀態結束
+node tools/build.mjs           # 寫入 .sh 與 .ps1
+node tools/build.mjs --check   # 只比對，有落差就以非零狀態結束
 ```
 
-發布新版本時也要更新 `releases.json` 的 `latest` 與對應更新說明；同步工具會驗證
+兩支安裝器都要提交進 repo，因為安裝指令直接從 `main` 下載它們。
+發布新版本時也要更新 `releases.json` 的 `latest` 與對應更新說明；建置工具會驗證
 `latest` 是否和安裝器內的 `INSTALLER_VERSION` 一致。
 
 ### 測試
 
-測試直接把 `.sh` 裡的四段負載取出來 import，所以測到的一定是會發佈出去的那份
-（repo 裡沒有獨立的 `router.mjs`，那些檔案只在安裝後存在於 `CODEX_HOME`）。
+測試直接把建置後 `.sh` 裡的四段負載取出來 import，所以測到的一定是會發佈出去的那份。
 
 ```bash
 npm test     # node --test，無需安裝任何相依套件
-npm run check   # 等同 CI：先驗負載同步，再跑測試
+npm run check   # 等同 CI：先驗安裝器與 src/ 一致，再跑測試
 ```
 
 安裝器與路由器的頂層本來就有副作用（跑安裝流程、佔用連接埠），測試靠
@@ -553,9 +554,9 @@ npm run check   # 等同 CI：先驗負載同步，再跑測試
 
 `.github/workflows/ci.yml` 在 push 與 PR 上跑兩個 job：
 
-- **ubuntu**——負載同步檢查、測試（Node 22 與 24）、`.sh` 與 `.ps1` 的語法檢查，
+- **ubuntu**——建置一致性檢查、測試（Node 22 與 24）、`.sh` 與 `.ps1` 的語法檢查，
   以及 `.ps1` 的 UTF-8 BOM 檢查。
-- **windows**——同一份同步檢查與測試在 Windows 簽出上再跑一次，語法檢查改用
+- **windows**——同一份建置檢查與測試在 Windows 簽出上再跑一次，語法檢查改用
   Windows 內建的 PowerShell 5.1，並確認 5.1 讀這支 `.ps1` 的編碼是對的。
 
 之所以要有第二個 job：使用者實際跑的是 5.1，但 CI 上的 `pwsh` 是 7，`??`、`?.`、
@@ -565,13 +566,13 @@ Windows 上會變成普通相對路徑，測試照樣綠燈，其實什麼都沒
 
 下面那兩件事之所以要自動擋，是因為它們壞掉都不會立刻報錯。
 
-**請不要手改 `.ps1`，也不要自己寫同步腳本。** 那個工具除了搬運文字，還負責兩件
-容易被忽略、壞掉又不會立刻報錯的事：
+**請不要手改根目錄的 `.sh`／`.ps1`，也不要自己寫同步腳本。** 建置工具除了搬運文字，
+還負責幾件容易被忽略、壞掉又不會立刻報錯的事：
 
 - `.ps1` 開頭必須保留 UTF-8 BOM。PowerShell 5.1 少了 BOM 會改用 ANSI 代碼頁讀檔，
   安裝器的所有中文訊息都會變成亂碼。
-- 四段負載要整批同步。只同步其中一段（例如只改了 installer 就只搬 installer）
-  會讓 Windows 版靜默停留在舊的 router 或 claude-bridge。
+- 四段負載要整批寫入。只更新其中一段會讓某個平台靜默停留在舊的 router 或 claude-bridge。
+- 負載裡不能出現標記行或 `#>`，否則 bash heredoc 或 PowerShell 註解會提早結束。
 
 換行由 `.gitattributes` 統一成 LF；混進 CRLF 會讓 `--check` 在不同平台的簽出上誤報。
 

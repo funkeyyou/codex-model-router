@@ -1,8 +1,8 @@
 # 這個 repo 的兩種失敗都是「靜默」的，所以必須靠 CI 擋：
 #
-#   1. 漏跑 tools/sync-payloads.mjs -> Windows 使用者拿到舊的 router 或
-#      claude-bridge，或是 .ps1 少了 UTF-8 BOM 導致 PowerShell 5.1 中文亂碼。
-#      兩者都要等 Windows 使用者實際跑起來才會發現。
+#   1. 改了 src/ 卻漏跑 tools/build.mjs -> 使用者下載到的 .sh／.ps1 仍是舊程式，
+#      或是 .ps1 少了 UTF-8 BOM 導致 PowerShell 5.1 中文亂碼。
+#      兩者都要等使用者實際跑起來才會發現。
 #   2. 內嵌負載的語法或行為退步 -> 安裝當下不會報錯，要等實際對話才炸。
 
 name: CI
@@ -32,9 +32,9 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      # .sh 是負載的唯一真實來源；.ps1 必須是它同步出來的結果。
-      - name: 內嵌負載已同步到 .ps1
-        run: node tools/sync-payloads.mjs --check
+      # src/ 是唯一真實來源；兩支安裝器必須是它建置出來的結果。
+      - name: 安裝器與 src/ 一致
+        run: node tools/build.mjs --check
 
       - name: 測試
         run: npm test
@@ -57,7 +57,7 @@ jobs:
           Write-Host 'codex-model-router.ps1 語法正確'
 
       # PowerShell 5.1 沒有 BOM 會用 ANSI 代碼頁讀檔，中文訊息整片亂碼。
-      # sync-payloads.mjs --check 已涵蓋，這裡再單獨擋一次，因為壞掉的樣子最難認。
+      # build.mjs --check 已涵蓋，這裡再單獨擋一次，因為壞掉的樣子最難認。
       - name: .ps1 保有 UTF-8 BOM
         run: |
           head -c 3 codex-model-router.ps1 | od -An -tx1 | tr -d ' \n' | grep -qx efbbbf \
@@ -81,8 +81,8 @@ jobs:
           node-version: "24"
 
       # .gitattributes 把換行統一成 LF；在 Windows 簽出上跑一次，確認沒被 CRLF 破壞。
-      - name: 內嵌負載已同步到 .ps1（Windows 簽出）
-        run: node tools/sync-payloads.mjs --check
+      - name: 安裝器與 src/ 一致（Windows 簽出）
+        run: node tools/build.mjs --check
 
       - name: 測試
         run: npm test
