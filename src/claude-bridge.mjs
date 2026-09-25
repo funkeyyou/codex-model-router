@@ -854,6 +854,54 @@ export function toAnthropicRequest(body, route) {
 
 // ---------------------------------------------------------------- 回應方向
 
+// Codex 只看 response.failed 的 error.code 決定怎麼處理：
+//   context_length_exceeded       上下文已滿，不重試
+//   insufficient_quota 等         額度用盡，不重試
+//   server_is_overloaded          伺服器過載，重試
+//   rate_limit_exceeded           限流，依訊息裡的「try again in Ns」等待後重試
+// 其餘 code 一律當一般串流錯誤。上游若只給 HTTP 狀態碼或 Anthropic 的錯誤型別
+// （overloaded_error、rate_limit_error），不換成上面這些 code 的話，上下文爆掉
+// 也會被白白重試，限流也不會照上游要求的時間等待。
+const CODEX_ERROR_CODES = new Set([
+  "context_length_exceeded", "insufficient_quota", "credit_balance_exhausted",
+  "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "usage_not_included",
+  "invalid_prompt", "server_is_overloaded", "rate_limit_exceeded", "slow_down",
+]);
+const CONTEXT_OVERFLOW_PATTERN =
+  /prompt is too long|maximum context length|context (?:window|length)|input is too long|exceeds? the context/i;
+
+// 輸入可以是 Anthropic 的 {type, message}、OpenAI 的 {type, code, message}，
+// 或只有 HTTP 狀態碼；回傳 Codex 認得的 { code, message }。
+export function codexErrorFromUpstream(error = {}, { status = null, retryAfterSeconds = null } = {}) {
+  const source = error && typeof error === "object" ? error : { message: error };
+  const message = typeof source.message === "string" && source.message
+    ? source.message
+    : (status ? `上游返回 HTTP ${status}` : "上游錯誤");
+  const kinds = [source.code, source.type]
+    .filter((value) => typeof value === "string" && value)
+    .map((value) => value.toLowerCase());
+  let code = kinds.find((kind) => CODEX_ERROR_CODES.has(kind)) || null;
+  if (!code) {
+    if (kinds.some((kind) => /context_length|context_window/.test(kind)) || CONTEXT_OVERFLOW_PATTERN.test(message)) {
+      code = "context_length_exceeded";
+    } else if (kinds.some((kind) => /insufficient_(?:user_)?quota|billing|credit_balance/.test(kind)) || status === 402) {
+      code = "insufficient_quota";
+    } else if (kinds.includes("overloaded_error") || status === 529) {
+      code = "server_is_overloaded";
+    } else if (kinds.includes("rate_limit_error") || status === 429) {
+      code = "rate_limit_exceeded";
+    }
+  }
+  let text = message;
+  if (code === "rate_limit_exceeded" && retryAfterSeconds > 0 && !/try again in/i.test(text)) {
+    text += ` Please try again in ${retryAfterSeconds}s.`;
+  }
+  return {
+    code: code || kinds[0] || (status ? String(status) : "upstream_error"),
+    message: text,
+  };
+}
+
 function randomId(prefix, length) {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   let out = prefix;
@@ -1195,8 +1243,15 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
         break;
       }
 
+      // Anthropic 在串流中途出錯（最常見的是 overloaded_error）時送這個事件，然後結束串流。
+      // 只轉成頂層 error 的話 Codex 會忽略它：WebSocket 上要空等閒置逾時才重試。
       case "error": {
-        send({ type: "error", error: event.error || { message: "上游錯誤" } });
+        failed = true;
+        suppress = false;
+        const response = base();
+        response.status = "failed";
+        response.error = codexErrorFromUpstream(event.error || {});
+        send({ type: "response.failed", response });
         break;
       }
 

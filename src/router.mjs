@@ -12,6 +12,7 @@ import {
   toAnthropicRequest,
   bridgeAnthropicStream,
   decodeCompaction,
+  codexErrorFromUpstream,
   COMPACTION_REPLAY_PREFIX,
 } from "./claude-bridge.mjs";
 
@@ -708,6 +709,7 @@ const stats = {
   statefulFallbacks: 0,
   responseFailedSent: 0,
   truncatedUpstreamStreams: 0,
+  upstreamErrorsWithoutTerminal: 0,
   oversizeRejects: 0,
   toolImagesOmitted: 0,
   toolImageBytesSaved: 0,
@@ -1140,9 +1142,11 @@ export async function streamUpstream(upstream, response, history = null, respons
     return;
   }
   let sawTerminal = false;
+  let upstreamError = null;
   const observe = (responsesStream || history) && upstream.ok && upstream.headers.get("content-type")?.includes("text/event-stream")
     ? observeResponsesSse((event) => {
       if (isTerminalEvent(event)) { sawTerminal = true; response.routerTerminalSent = true; }
+      else if (event?.type === "error") upstreamError = event;
       rememberHistoryEvent(history, event);
     })
     : null;
@@ -1160,9 +1164,14 @@ export async function streamUpstream(upstream, response, history = null, respons
   }
   observe?.finish();
   if (observe && !sawTerminal) {
-    noteTruncatedStream();
-    const event = responseFailedEvent("upstream_stream_truncated", truncatedStreamMessage);
+    let event;
+    if (upstreamError) event = responseFailedFromErrorEvent(upstreamError);
+    else {
+      noteTruncatedStream();
+      event = responseFailedEvent("upstream_stream_truncated", truncatedStreamMessage);
+    }
     response.write("\n\nevent: response.failed\ndata: " + JSON.stringify(event) + "\n\n");
+    response.routerTerminalSent = true;
   }
   if (jsonChunks) {
     try {
@@ -1455,6 +1464,20 @@ async function handleResponses(request, response, incomingUrl) {
     await bridgeAnthropicToHttp(upstream, response, meta);
     return;
   }
+  // Anthropic 的錯誤內文是 {type:"error", error:{type, message}}，Codex 看的是 OpenAI
+  // 形狀的 error.code。改寫成它認得的值，例如 prompt is too long → context_length_exceeded。
+  if (meta.translate === "anthropic") {
+    const text = await upstream.text();
+    captureWrite(captureId, "upstream-error.txt", text);
+    const retryAfter = upstream.headers.get("retry-after");
+    const details = upstreamErrorDetails(upstream.status, text, retryAfter);
+    response.writeHead(upstream.status, {
+      "content-type": "application/json",
+      ...(retryAfter ? { "retry-after": retryAfter } : {}),
+    });
+    response.end(JSON.stringify({ error: { ...details.error, code: details.code, message: details.message } }));
+    return;
+  }
   // 只有開了擷取才走這條：把上游的錯誤內文留下來再原樣回覆。上游錯誤的正文
   // 常比客戶端顯示的那一行詳細，而它一旦串出去就沒了。
   if (captureId && (upstream.status < 200 || upstream.status >= 300)) {
@@ -1546,15 +1569,51 @@ function sendResponseFailed(socket, code, message) {
 // 因為標頭當初是 200。此時若就這樣收工關閉連線，Codex 只會看到
 // 「websocket closed by server before response.completed」，等同無聲卡死。
 // 凡是逐塊讀上游串流的地方，讀完都要確認終止事件真的送出去了。
+//
+// 頂層的 error 不算終止事件：Codex 只認下面三種，單獨的 error 會被直接忽略，
+// WebSocket 上要空等閒置逾時（預設 300 秒）才重試。上游送了 error 就結束串流時，
+// 用 responseFailedFromErrorEvent 把它的內容轉成 response.failed 補上。
 const terminalEventTypes = new Set([
   "response.completed",
   "response.failed",
   "response.incomplete",
-  "error",
 ]);
 
 export function isTerminalEvent(event) {
   return terminalEventTypes.has(event?.type);
+}
+
+// 上游 error 事件有兩種形狀：Responses 串流的 {type, code, message}，以及包一層的
+// {type, error: {type, code, message}, status}。錯誤碼換成 Codex 認得的值。
+export function responseFailedFromErrorEvent(event) {
+  const source = event?.error && typeof event.error === "object" ? event.error : event;
+  const { code, message } = codexErrorFromUpstream({
+    code: source?.code,
+    type: source?.type === "error" ? null : source?.type,
+    message: source?.message,
+  }, { status: Number.isInteger(event?.status) ? event.status : null });
+  stats.upstreamErrorsWithoutTerminal += 1;
+  return responseFailedEvent(code, message);
+}
+
+// 非 2xx 回應的內文：OpenAI 形狀 {error: {...}}、Anthropic 形狀 {type, error: {...}}、
+// 少數閘道的 {error: "文字"}，或根本不是 JSON。error 保留上游原樣，code／message
+// 換成 Codex 認得的形式。
+export function upstreamErrorDetails(status, rawText, retryAfter = null) {
+  let payload = null;
+  try { payload = JSON.parse(rawText); } catch {}
+  const error = typeof payload?.error === "string"
+    ? { message: payload.error }
+    : (payload?.error && typeof payload.error === "object" ? payload.error : null);
+  const seconds = Number(retryAfter);
+  const mapped = codexErrorFromUpstream(error || { message: rawText || "" }, {
+    status,
+    retryAfterSeconds: Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : null,
+  });
+  return {
+    error: error || { type: "router_upstream_error", code: String(status), message: mapped.message },
+    ...mapped,
+  };
 }
 
 const truncatedStreamMessage = "上游串流在送出終止事件前就結束";
@@ -1740,21 +1799,10 @@ export async function bridgeSseToWebSocket(upstream, socket, captureId = null, h
   stats.lastWebSocketStatus = upstream.status;
   if (upstream.status < 200 || upstream.status >= 300) {
     const rawText = await upstream.text();
-    let payload = null;
-    try {
-      payload = JSON.parse(rawText);
-    } catch {}
-    const errorObject = payload?.error || {
-      type: "router_upstream_error",
-      code: String(upstream.status),
-      message: rawText || `上游返回 HTTP ${upstream.status}`,
-    };
-    sendWebSocketJson(socket, { type: "error", error: errorObject });
-    sendResponseFailed(
-      socket,
-      errorObject.code || upstream.status,
-      errorObject.message || `上游返回 HTTP ${upstream.status}`,
-    );
+    // 狀態碼字串（"400"、"429"）Codex 不認得：上下文爆掉會被白白重試，限流也不會等。
+    const details = upstreamErrorDetails(upstream.status, rawText, upstream.headers?.get?.("retry-after"));
+    sendWebSocketJson(socket, { type: "error", error: details.error });
+    sendResponseFailed(socket, details.code, details.message);
     // 關閉連線的策略需要區分兩種錯誤：
     //
     // 1) 預熱請求（websocket.warmup=true）在部分閘道上必定失敗，但 Codex 會忽略
@@ -1777,8 +1825,10 @@ export async function bridgeSseToWebSocket(upstream, socket, captureId = null, h
   if (!upstream.body) throw new Error("WebSocket 上游響應沒有內文");
 
   let sawTerminal = false;
+  let upstreamError = null;
   const onEvent = (event) => {
     if (isTerminalEvent(event)) sawTerminal = true;
+    else if (event?.type === "error") upstreamError = event;
     rememberHistoryEvent(history, event);
   };
   const imageState = { pending: [], maxIndex: -1 };
@@ -1802,8 +1852,13 @@ export async function bridgeSseToWebSocket(upstream, socket, captureId = null, h
     sendSseBlockToWebSocket(socket, pending, onEvent, imageState);
   }
   if (!sawTerminal) {
-    noteTruncatedStream();
-    sendResponseFailed(socket, "upstream_stream_truncated", truncatedStreamMessage);
+    if (upstreamError) {
+      sendWebSocketJson(socket, responseFailedFromErrorEvent(upstreamError));
+      stats.responseFailedSent += 1;
+    } else {
+      noteTruncatedStream();
+      sendResponseFailed(socket, "upstream_stream_truncated", truncatedStreamMessage);
+    }
   }
 }
 

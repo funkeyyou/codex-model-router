@@ -43,7 +43,8 @@ test("GPT HTTP SSE 即使沒有 session/history 也偵測提早結束；其他�
     await router.streamUpstream(stream([{ type: "response.output_text.delta", delta: "half" }]), response, null, responsesStream);
     assert.equal(response.text.includes("upstream_stream_truncated"), responsesStream);
   }
-  for (const type of ["response.completed", "response.incomplete", "response.failed", "error"]) {
+  // 頂層 error 不在其中：Codex 會忽略它，只送 error 的情況見 stream-truncation.test.mjs。
+  for (const type of ["response.completed", "response.incomplete", "response.failed"]) {
     const response = responseSink();
     await router.streamUpstream(stream([{ type, response: { id: "ok" } }]), response, null, true);
     assert.doesNotMatch(response.text, /upstream_stream_truncated/);
