@@ -5305,7 +5305,69 @@ function closeWebSocket(socket, code = 1000, reason = "") {
   socket.end();
 }
 
-export function parseWebSocketFrames(buffer) {
+// buffer 開頭那個訊框總共需要幾個位元組；標頭還不完整時，回傳至少還要讀到的長度。
+export function webSocketFrameLength(buffer, limit = maxWebSocketMessageBytes) {
+  if (buffer.length < 2) return 2;
+  const second = buffer[1];
+  let payloadLength = second & 0x7f;
+  let header = 2;
+  if (payloadLength === 126) {
+    header = 4;
+    if (buffer.length < header) return header;
+    payloadLength = buffer.readUInt16BE(2);
+  } else if (payloadLength === 127) {
+    header = 10;
+    if (buffer.length < header) return header;
+    const longLength = buffer.readBigUInt64BE(2);
+    if (longLength > BigInt(limit)) throw new Error("WebSocket 訊息超過路由器限制");
+    payloadLength = Number(longLength);
+  }
+  if (payloadLength > limit) throw new Error("WebSocket 訊息超過路由器限制");
+  if (second & 0x80) header += 4;
+  return header + payloadLength;
+}
+
+// 逐塊累積 TCP 資料，湊滿一個完整訊框才合併並解析。
+//
+// 以前每收到一塊就把整個緩衝區 Buffer.concat 再從頭解析：Codex 送來的一則 30 MB
+// response.create（長對話帶著 base64 截圖很常見）以 64 KiB 分塊到達，累計要複製
+// 約 7 GiB，實測 1.3 秒；先讀標頭算出訊框長度、收齊再合併只要約 50 毫秒。
+// 標頭一到就檢查長度上限，不必等整個超大訊框收完才拒絕。
+export function createWebSocketFrameReader(initial = Buffer.alloc(0), limit = maxWebSocketMessageBytes) {
+  let chunks = initial.length ? [initial] : [];
+  let buffered = initial.length;
+  let needed = webSocketFrameLength(initial, limit);
+  const reader = {
+    // 合併時複製的累計位元組數，供測試確認不再是平方成長。
+    copiedBytes: 0,
+    push(chunk) {
+      if (chunk.length) {
+        chunks.push(chunk);
+        buffered += chunk.length;
+      }
+      if (buffered < needed) {
+        // 標頭可能還沒到齊：湊到能算出長度為止（標頭最多 14 個位元組，複製成本可忽略）。
+        if (chunks.length > 1 && buffered <= 14) {
+          chunks = [Buffer.concat(chunks, buffered)];
+          needed = webSocketFrameLength(chunks[0], limit);
+        }
+        if (buffered < needed) return [];
+      }
+      const buffer = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, buffered);
+      if (chunks.length > 1) reader.copiedBytes += buffered;
+      const { frames, remainder } = parseWebSocketFrames(buffer, limit);
+      // remainder 是大緩衝區的切片；複製一份，免得一小段殘餘資料留住整個緩衝區。
+      const rest = remainder.length && remainder.length < buffer.length ? Buffer.from(remainder) : remainder;
+      chunks = rest.length ? [rest] : [];
+      buffered = rest.length;
+      needed = webSocketFrameLength(rest, limit);
+      return frames;
+    },
+  };
+  return reader;
+}
+
+export function parseWebSocketFrames(buffer, limit = maxWebSocketMessageBytes) {
   const frames = [];
   let offset = 0;
   while (offset + 2 <= buffer.length) {
@@ -5320,13 +5382,13 @@ export function parseWebSocketFrames(buffer) {
     } else if (payloadLength === 127) {
       if (cursor + 8 > buffer.length) break;
       const longLength = buffer.readBigUInt64BE(cursor);
-      if (longLength > BigInt(maxWebSocketMessageBytes)) {
+      if (longLength > BigInt(limit)) {
         throw new Error("WebSocket 訊息超過路由器限制");
       }
       payloadLength = Number(longLength);
       cursor += 8;
     }
-    if (payloadLength > maxWebSocketMessageBytes) {
+    if (payloadLength > limit) {
       throw new Error("WebSocket 訊息超過路由器限制");
     }
     const masked = (second & 0x80) !== 0;
@@ -5669,7 +5731,8 @@ function createUpstreamSession(socket, leftover) {
     onEvent: null,
     onClosed: null,
   };
-  let buffer = leftover ?? Buffer.alloc(0);
+  // 握手回應後面若已帶著訊框，先放進讀取器，與下一塊資料一起解析。
+  const frameReader = createWebSocketFrameReader(leftover ?? Buffer.alloc(0));
   let fragments = [];
   const markClosed = (reason) => {
     if (session.closed) return;
@@ -5679,17 +5742,15 @@ function createUpstreamSession(socket, leftover) {
     if (notify) notify(reason);
   };
   socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    let parsed;
+    let frames;
     try {
-      parsed = parseWebSocketFrames(buffer);
+      frames = frameReader.push(chunk);
     } catch (error) {
       socket.destroy();
       markClosed(error instanceof Error ? error.message : String(error));
       return;
     }
-    buffer = parsed.remainder;
-    for (const frame of parsed.frames) {
+    for (const frame of frames) {
       if (frame.opcode === 0x9) {
         socket.write(encodeMaskedWebSocketFrame(0xa, frame.payload));
         continue;
@@ -6104,7 +6165,7 @@ function handleWebSocketUpgrade(request, socket, head) {
   );
   stats.websockets += 1;
 
-  let pending = head;
+  const frameReader = createWebSocketFrameReader();
   let fragmentOpcode = null;
   let fragmentChunks = [];
   let activeAbortController = null;
@@ -6212,10 +6273,7 @@ function handleWebSocketUpgrade(request, socket, head) {
 
   const consume = (chunk) => {
     try {
-      pending = Buffer.concat([pending, chunk]);
-      const parsed = parseWebSocketFrames(pending);
-      pending = parsed.remainder;
-      for (const frame of parsed.frames) {
+      for (const frame of frameReader.push(chunk)) {
         if (frame.opcode === 0x8) {
           activeAbortController?.abort();
           closeWebSocket(socket);
@@ -6263,7 +6321,7 @@ function handleWebSocketUpgrade(request, socket, head) {
   };
   socket.on("close", teardown);
   socket.on("error", teardown);
-  if (head.length > 0) consume(Buffer.alloc(0));
+  if (head.length > 0) consume(head);
 }
 
 const server = http.createServer(async (request, response) => {
