@@ -413,6 +413,22 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 最常見）。這種情況讀取端只看到乾淨的 EOF、不是例外，所以路由器會補一個 `response.failed`
 讓客戶端明確收尾，而不是無聲斷線。
 
+`upstreamErrorsWithoutTerminal` 是上游只送了頂層 `error` 就結束串流的次數。Codex 會忽略
+單獨的 `error`，路由器因此用它的內容補上 `response.failed`。錯誤碼會換成 Codex 認得的值：
+上下文爆掉是 `context_length_exceeded`（不重試）、過載是 `server_is_overloaded`、
+限流是 `rate_limit_exceeded`（上游給了 `retry-after` 就照著等）、額度用盡是 `insufficient_quota`。
+
+`credentialReads` 是實際讀取（Windows 為解密）API Key 的次數。Windows 以憑證檔的修改時間
+判斷 Key 是否更換，檔案沒變就沿用快取，這個數字應該很少增加。
+
+`foreignHostRejects` 是 Host 不是本機名稱而被拒絕的請求數（DNS rebinding 會是這種樣子）；
+`browserRequestsRejected` 是瀏覽器網頁對生圖或 Ark 端點發起、被拒絕的請求數。
+兩者在正常使用下都應為 0。
+
+`authProbeGraceUsed` 是 ChatGPT 驗證探測失敗（網路錯誤或 401/403 以外的狀態），但同一組憑證
+在寬限期內驗證成功過而放行的次數。寬限期預設 24 小時，可用 `settings.json` 的
+`authProbeGraceMs` 調整（毫秒，0 代表關閉），重啟路由器後生效；401/403 一律拒絕。
+
 `upstreamWebSocketFallbacks` 增加代表官方的上游 WebSocket 當下不通，已自動回退 HTTP，
 功能不受影響。連續握手失敗達門檻後 `upstreamWebSocketCooldowns` 會加一，路由器接著
 一段時間內直接走 HTTP，不再每條新連線都重試；上游一旦恢復就立刻解除。
