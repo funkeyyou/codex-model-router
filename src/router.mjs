@@ -2700,6 +2700,9 @@ function handleWebSocketUpgrade(request, socket, head) {
   };
   socket.on("close", teardown);
   socket.on("error", teardown);
+  // http.Server 的連線允許半關閉：用戶端沒送 Close 訊框就結束（例如行程被終止）時，
+  // 這一端只會收到 end，連線與上游 WebSocket 會一直留著。WebSocket 不使用半關閉，直接收掉。
+  socket.on("end", () => socket.destroy());
   if (head.length > 0) consume(head);
 }
 
