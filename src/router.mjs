@@ -709,6 +709,7 @@ const stats = {
   websocketEvents: 0,
   heartbeats: 0,
   authProbeFailures: 0,
+  authProbeGraceUsed: 0,
   upstreamErrorCloses: 0,
   statefulFallbacks: 0,
   responseFailedSent: 0,
@@ -772,6 +773,13 @@ const stats = {
   lastError: null,
 };
 const validatedAuthDigests = new Map();
+// 驗證探測只是用來證明呼叫端是已登入的 Codex。chatgpt.com 暫時連不上（網路、代理、
+// 官方故障）時，不該連帶讓中轉模型也不能用——那正是最需要中轉當備援的時候。
+// 同一組憑證在寬限期內真的驗證成功過，探測遇到網路錯誤或 401/403 以外的失敗就放行；
+// 401/403 代表憑證本身被拒，照樣拒絕並清掉寬限紀錄。
+const authProbeGraceMs = Number.isSafeInteger(settings.authProbeGraceMs) && settings.authProbeGraceMs >= 0
+  ? settings.authProbeGraceMs : 24 * 60 * 60 * 1000;
+const lastAuthSuccess = new Map();
 const threadRoutes = new Map();
 
 class RouterRequestError extends Error {
@@ -1017,9 +1025,15 @@ function authDigest(headers) {
     .digest("hex");
 }
 
-export function markAuthValidated(headers) {
+// verified=false 只延長短期快取（寬限期放行時用），不會把寬限期本身往後延。
+export function markAuthValidated(headers, { verified = true } = {}) {
   const digest = authDigest(headers);
   if (!digest) return;
+  if (verified) {
+    lastAuthSuccess.delete(digest);
+    lastAuthSuccess.set(digest, Date.now());
+    while (lastAuthSuccess.size > maxValidatedAuthDigests) lastAuthSuccess.delete(lastAuthSuccess.keys().next().value);
+  }
   // 過期項目只在「同一個摘要再被查一次」時才會被刪。憑證輪替後舊摘要再也不會
   // 被查到，就會一直留著。這裡在成長到上限時掃一次，掃完仍超出就汰換最舊的。
   if (validatedAuthDigests.size >= maxValidatedAuthDigests) {
@@ -1048,6 +1062,17 @@ export function hasValidatedAuth(headers) {
   return true;
 }
 
+function allowDuringAuthOutage(headers, reason) {
+  const digest = authDigest(headers);
+  const lastSuccess = digest ? lastAuthSuccess.get(digest) : undefined;
+  if (lastSuccess === undefined || Date.now() - lastSuccess > authProbeGraceMs) return false;
+  stats.authProbeGraceUsed += 1;
+  process.stderr.write(`model-router-auth-probe-grace:${reason}\n`);
+  // 探測持續失敗期間，不必每個請求都再等一次逾時。
+  markAuthValidated(headers, { verified: false });
+  return true;
+}
+
 async function validateOfficialAuth(requestHeaders, signal) {
   if (hasValidatedAuth(requestHeaders)) return true;
   if (!authDigest(requestHeaders)) {
@@ -1067,11 +1092,13 @@ async function validateOfficialAuth(requestHeaders, signal) {
   } catch (error) {
     if (signal?.aborted) throw signal.reason;
     stats.authProbeFailures += 1;
+    if (allowDuringAuthOutage(requestHeaders, "network")) return true;
     throw Object.assign(new Error("ChatGPT 驗證探測失敗", { cause: error }), { phase: "auth_probe" });
   }
   stats.lastAuthProbeStatus = upstream.status;
   if (upstream.status === 401 || upstream.status === 403) {
     stats.authProbeFailures += 1;
+    lastAuthSuccess.delete(authDigest(requestHeaders));
     throw new RouterRequestError(
       upstream.status, "chatgpt_auth_rejected",
       `ChatGPT 身份驗證遭拒（HTTP ${upstream.status}），請檢查登入狀態或帳號權限。`,
@@ -1081,6 +1108,7 @@ async function validateOfficialAuth(requestHeaders, signal) {
   // 缺少 client_version 會回 400，沿用相容處理；服務故障或重新導向不能快取成驗證成功。
   if (!upstream.ok && upstream.status !== 400) {
     stats.authProbeFailures += 1;
+    if (allowDuringAuthOutage(requestHeaders, `http-${upstream.status}`)) return true;
     throw new RouterRequestError(
       upstream.status === 429 ? 429 : 503, "auth_probe_unavailable",
       `ChatGPT 驗證服務暫時不可用（HTTP ${upstream.status}），請稍後重試。`,

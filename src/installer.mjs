@@ -1175,12 +1175,18 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // imageOutputDir 與 forceListedModels 不列在這：前者由 resolveImageOutputDir
 // 處理（沒設過時還要算預設值），後者由 install() 直接沿用既有值——安裝流程
 // 不再詢問隱藏模型，改由 hidden-models 命令單獨管理。
-const preservedSettingKeys = [
+// 路由器讀取的每一個可調設定都要列在這裡；test/settings-keys.test.mjs 會核對。
+export const preservedSettingKeys = [
+  "authProbeGraceMs",
   "captureDir",
   "catalogRefresh",
   "closeOnUpstreamError",
   "heartbeatIntervalMs",
+  "historyTtlMs",
+  "maxHistoryBytes",
+  "maxHttpBodyBytes",
   "maxLogBytes",
+  "maxUpstreamRequestBytes",
   "upstreamWebSocket",
   "upstreamWebSocketCooldownMs",
   "upstreamWebSocketFailureThreshold",
