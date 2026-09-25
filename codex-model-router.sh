@@ -7077,18 +7077,38 @@ export function toAnthropicRequest(body, route) {
     blocks[blocks.length - 1].cache_control = { type: "ephemeral" };
     request.system = blocks;
   }
-  // 壓縮回合只能回一個 compaction 項目，帶著工具反而會讓模型改去呼叫工具。
-  if (tools.length && !compaction) {
+  // 壓縮回合只能回一個 compaction 項目，模型不能改去呼叫工具；tool_choice:"none" 亦然。
+  // 但 tools 不能拿掉：歷史裡有 tool_use／tool_result 時，Anthropic 要求請求必須定義
+  // tools，否則整輪 400（Requests which include tool_use or tool_result blocks must
+  // define tools）；拿掉 tools 也會讓 tools → system 這段快取前綴失效。
+  // 改用 tool_choice:{type:"none"} 禁止呼叫，tools 與一般回合完全相同。
+  if (tools.length) {
     request.tools = tools;
-    if (body.tool_choice === "auto" || !body.tool_choice) request.tool_choice = { type: "auto" };
+    if (compaction || body.tool_choice === "none") request.tool_choice = { type: "none" };
+    else if (body.tool_choice === "auto" || !body.tool_choice) request.tool_choice = { type: "auto" };
     else if (body.tool_choice === "required") request.tool_choice = { type: "any" };
-    else if (body.tool_choice === "none") delete request.tools;
     else if (typeof body.tool_choice === "object" && ["function", "custom"].includes(body.tool_choice?.type)) {
       const name = toolAlias(body.tool_choice.namespace, body.tool_choice.name);
       if (!tools.some((tool) => tool.name === name)) throw bridgeInputError("指定的工具不在這次可用工具清單內。");
       request.tool_choice = { type: "tool", name };
     } else throw bridgeInputError("Claude 轉譯不支援這個 tool_choice，請選用本次提供的函式工具。");
-    if (body.parallel_tool_calls === false && request.tool_choice) request.tool_choice.disable_parallel_tool_use = true;
+    if (body.parallel_tool_calls === false && request.tool_choice.type !== "none") {
+      request.tool_choice.disable_parallel_tool_use = true;
+    }
+  } else {
+    // 這一輪沒有提供任何工具，歷史裡卻有工具呼叫：補上只供對應歷史的佔位定義，
+    // 並禁止呼叫，否則同樣會被 Anthropic 以「必須定義 tools」拒收。
+    const historical = [...new Set(messages.flatMap((message) => message.content)
+      .filter((block) => block?.type === "tool_use" && typeof block.name === "string")
+      .map((block) => block.name))];
+    if (historical.length) {
+      request.tools = historical.map((name) => ({
+        name,
+        description: "此工具在本輪不可用，只用來對應歷史中的工具呼叫。",
+        input_schema: { type: "object", properties: {} },
+      }));
+      request.tool_choice = { type: "none" };
+    }
   }
   if (!tools.length && body.tool_choice && !["auto", "none"].includes(body.tool_choice)) {
     throw bridgeInputError("指定的工具在 Claude 轉譯路由中不可用。");
