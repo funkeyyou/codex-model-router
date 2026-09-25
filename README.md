@@ -36,6 +36,9 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 
 安裝時會詢問三件事：Base URL、API Key、以及要加入哪些模型。
 輸入 API Key 時畫面不會顯示任何字元（跟 `sudo` 一樣），貼上後直接按 Enter。
+選模型時可以輸入編號、範圍或 `all`；閘道的 `/models` 沒列出的模型，也可以直接輸入模型 ID
+（例如 `1,3,qwen3-max`），一樣要通過探測才會加入。選中的模型會平行探測，同時最多 3 個；
+閘道限流較嚴時可設環境變數 `CODEX_MODEL_ROUTER_PROBE_CONCURRENCY=1` 改回逐一探測。
 路由器安裝成功後，另會詢問是否使用中轉 API 生圖，預設為否；同意後才偵測圖片模型並安裝獨立技能。
 
 ### 固定版本並驗證下載（可選）
