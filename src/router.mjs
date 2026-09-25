@@ -755,6 +755,8 @@ const stats = {
   claudeToolResultsReordered: 0,
   lastAuthProbeStatus: null,
   credentialReads: 0,
+  foreignHostRejects: 0,
+  browserRequestsRejected: 0,
   models: 0,
   official: 0,
   custom: 0,
@@ -1393,12 +1395,53 @@ export async function fetchModelUpstream(
 export const IMAGE_PATH_PATTERN = /^\/(?:v1\/)?images\/(?:generations|edits|variations)$/;
 export const ARK_IMAGE_PATH_PATTERN = /^\/v2\/extend\/image\/ark_gpt_image\/(?:generations|edits|tasks\/[A-Za-z0-9_-]{1,160})$/;
 
+// 路由器只聽 127.0.0.1，但瀏覽器裡的任何網頁都能對它發請求：跨站的「簡單請求」
+// （text/plain、multipart/form-data 的 POST）不會觸發 CORS 預檢，照樣送達；
+// DNS rebinding 更能讓惡意網頁以同源身分送出請求並讀到回應。兩層防護：
+//
+//   1. Host 只接受本機名稱。DNS rebinding 的請求帶的是攻擊者的網域。
+//   2. 花費中轉額度、又不要求 ChatGPT 憑證的端點（生圖、Ark）拒絕瀏覽器請求。
+//      瀏覽器的 POST 一定帶 Origin，現行瀏覽器的每個請求也都帶 Sec-Fetch-Site；
+//      Codex 本身與 imagegen 命令（Node fetch）兩者都不帶。
+//
+// /responses 不必另外擋：自訂路由本來就要求 ChatGPT 憑證，瀏覽器頁面拿不到。
+const loopbackHostnames = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+export function isLoopbackHost(value) {
+  // HTTP/1.0 等不帶 Host 的用戶端不會是瀏覽器。
+  if (typeof value !== "string" || !value) return true;
+  const host = value.trim().toLowerCase();
+  const name = host.startsWith("[") ? host.slice(0, host.indexOf("]") + 1) : host.replace(/:\d+$/, "");
+  return loopbackHostnames.has(name.replace(/\.$/, ""));
+}
+
+export function isBrowserRequest(headers) {
+  if (headers?.origin != null) return true;
+  const site = headers?.["sec-fetch-site"];
+  // none 代表使用者自己在網址列開啟，不是網頁發起的請求。
+  return typeof site === "string" && site !== "none";
+}
+
+function rejectBrowserRequest(request, response) {
+  if (!isBrowserRequest(request.headers)) return false;
+  stats.browserRequestsRejected += 1;
+  writeJson(response, 403, {
+    error: {
+      message: "拒絕來自瀏覽器網頁的生圖請求：這個端點會使用中轉 API Key，只接受 Codex 與本機命令。",
+      type: "router_error",
+      code: "browser_request_rejected",
+    },
+  });
+  return true;
+}
+
 async function handleArkImages(request, response, incomingUrl) {
   const taskQuery = incomingUrl.pathname.includes("/tasks/");
   if (!ARK_IMAGE_PATH_PATTERN.test(incomingUrl.pathname) || request.method !== (taskQuery ? "GET" : "POST")) {
     writeJson(response, 404, { error: { message: "未知的 Ark 圖片任務端點。" } });
     return;
   }
+  if (rejectBrowserRequest(request, response)) return;
   request.routerContext.route = "custom";
   if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
   const chunks = [];
@@ -1428,7 +1471,8 @@ async function handleImages(request, response, incomingUrl) {
   // 與自訂模型同一套驗證，但只在請求真的帶了 ChatGPT 憑證時才驗。
   // image_gen 是用戶端工具，未必會帶上 /responses 那組標頭；若因為缺標頭就擋下，
   // 使用者只會從一個 404 換成一個 401，問題沒解決。路由器只聽 127.0.0.1，
-  // 且這條路徑花的是使用者自己的閘道金鑰，因此放行沒有標頭的請求。
+  // 因此放行沒有標頭的請求；但瀏覽器網頁發起的請求一律拒絕（見 isBrowserRequest）。
+  if (rejectBrowserRequest(request, response)) return;
   request.routerContext.route = "custom";
   if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
   const rawBody = await readRequestBody(request);
@@ -2510,7 +2554,18 @@ export async function handleWebSocketResponseInner(
   }
 }
 
+// 升級前就拒絕的連線：回應要先送完再關。write 之後立刻 destroy 可能把還沒送出的
+// 狀態列一起丟掉，用戶端只看到連線被切斷。
+function rejectUpgrade(socket, statusLine) {
+  socket.end(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`, () => socket.destroy());
+}
+
 function handleWebSocketUpgrade(request, socket, head) {
+  if (!isLoopbackHost(request.headers.host)) {
+    stats.foreignHostRejects += 1;
+    rejectUpgrade(socket, "403 Forbidden");
+    return;
+  }
   let incomingUrl;
   try {
     incomingUrl = new URL(request.url || "/", `http://${listenHost}:${listenPort}`);
@@ -2522,15 +2577,13 @@ function handleWebSocketUpgrade(request, socket, head) {
     incomingUrl.pathname !== "/responses" &&
     incomingUrl.pathname !== "/v1/responses"
   ) {
-    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-    socket.destroy();
+    rejectUpgrade(socket, "404 Not Found");
     return;
   }
 
   const websocketKey = request.headers["sec-websocket-key"];
   if (typeof websocketKey !== "string") {
-    socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
-    socket.destroy();
+    rejectUpgrade(socket, "400 Bad Request");
     return;
   }
   const accept = createHash("sha1")
@@ -2709,6 +2762,13 @@ function handleWebSocketUpgrade(request, socket, head) {
 const server = http.createServer(async (request, response) => {
   stats.requests += 1;
   request.routerContext = { transport: "http", route: "official" };
+  if (!isLoopbackHost(request.headers.host)) {
+    stats.foreignHostRejects += 1;
+    writeJson(response, 403, {
+      error: { message: "只接受以 127.0.0.1 或 localhost 連線的請求。", type: "router_error", code: "forbidden_host" },
+    });
+    return;
+  }
   try {
     const incomingUrl = new URL(request.url || "/", `http://${listenHost}:${listenPort}`);
     if (request.method === "GET" && incomingUrl.pathname === "/healthz") {
