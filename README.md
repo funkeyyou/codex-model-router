@@ -399,15 +399,16 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 若安裝時 Claude 模型被跳過，用診斷腳本確認是哪一類問題：
 
 ```bash
-bash claude-probe-diag.sh <API_ROOT> <API_KEY> <模型名>
+bash claude-probe-diag.sh <API_ROOT> <模型名>
 ```
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\claude-probe-diag.ps1 <API_ROOT> <模型名>
 ```
 
-它會分別檢查模型是否在清單中、原生 `/v1/messages` 的實際狀態碼與訊息、
-以及 `/v1/responses` 對照組。上游暫時不可用（5xx）時重跑安裝器即可加入。
+兩個腳本都會以隱藏輸入的方式詢問 API Key，不會留在命令歷史；macOS 版也可改用環境變數
+`CODEX_ROUTER_API_KEY` 提供。它會分別檢查模型是否在清單中、原生 `/v1/messages` 的實際
+狀態碼與訊息、以及 `/v1/responses` 對照組。上游暫時不可用（5xx）時重跑安裝器即可加入。
 
 `status` 會印出實際使用的 Node 與 Codex 執行檔路徑。Windows 上如果 Codex 桌面版升級後
 換掉了自帶執行檔的版本目錄，這兩行會標示「檔案已不存在」——重跑一次安裝器即可修正。
