@@ -1,6 +1,15 @@
 {
-  "latest": "1.23.0",
+  "latest": "1.23.1",
   "releases": [
+    {
+      "version": "1.23.1",
+      "date": "2026-09-26",
+      "changes": [
+        "修復官方模型走 WebSocket 直連時，上游只送不帶狀態碼的 error 會讓 Codex 空等約 5 分鐘才重試；現在一律補上 response.failed。官方帶狀態碼的錯誤（例如用量上限）照樣原樣轉給 Codex，重置時間等提示不受影響。",
+        "官方上游回 previous_response_not_found 時，改由路由器直接用完整歷史重送；Codex 不必斷線重連，也不會跳出重試提示。",
+        "限流的 Retry-After 支援 HTTP 日期格式（RFC 9110），Codex 會照上游指定的時間等待，不再退回預設的重試間隔。"
+      ]
+    },
     {
       "version": "1.23.0",
       "date": "2026-09-26",
