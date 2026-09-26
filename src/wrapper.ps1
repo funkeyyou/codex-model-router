@@ -128,4 +128,3 @@ if ($commandArguments.Count -eq 0 -and -not [Console]::IsInputRedirected) {
 }
 
 exit $exitCode
-

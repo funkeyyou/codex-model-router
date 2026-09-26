@@ -74,4 +74,3 @@ if [[ ${ARG_COUNT} -eq 0 && -t 0 ]]; then
   read -r -p "按 Enter 鍵結束（視窗是否關閉取決於終端設定）..." _
 fi
 exit ${EXIT_STATUS}
-

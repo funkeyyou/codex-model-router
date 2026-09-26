@@ -74,7 +74,6 @@ if [[ ${ARG_COUNT} -eq 0 && -t 0 ]]; then
   read -r -p "按 Enter 鍵結束（視窗是否關閉取決於終端設定）..." _
 fi
 exit ${EXIT_STATUS}
-
 : <<'__CODEX_MODEL_ROUTER_EMBEDDED__'
 __CODEX_MODEL_ROUTER_INSTALLER_JS__
 import { createHash } from "node:crypto";
@@ -3695,7 +3694,6 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     process.exitCode = 1;
   }
 }
-
 __CODEX_MODEL_ROUTER_ROUTER_JS__
 import http from "node:http";
 import { execFile } from "node:child_process";

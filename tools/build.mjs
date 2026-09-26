@@ -45,6 +45,7 @@ function readSource(name) {
   const { text, hasBom } = readText(join(srcDir, name));
   if (hasBom) throw new Error(`src/${name} 不可帶 BOM；.ps1 的 BOM 由建置工具加上`);
   if (!text.endsWith("\n")) throw new Error(`src/${name} 必須以換行結尾`);
+  if (text.endsWith("\n\n")) throw new Error(`src/${name} 結尾多了空行；git diff --check 會報錯`);
   return text;
 }
 
