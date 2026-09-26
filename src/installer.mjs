@@ -1149,6 +1149,102 @@ async function probeModel(apiRoot, apiKey, model, log = consoleProbeLog) {
   }
 }
 
+// Chat Completions 的小型探測：串流一小段回覆。extra 用來測上游收不收某個參數。
+async function testChatCompletion(apiRoot, apiKey, model, extra = {}) {
+  const response = await fetchWithTimeout(
+    `${apiRoot.replace(/\/$/, "")}/chat/completions`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with exactly OK." }],
+        max_tokens: 32,
+        stream: true,
+        ...extra,
+      }),
+    },
+    90000,
+  );
+  const text = await response.text();
+  return {
+    // 串流回應裡一定有 choices；少數伺服器不理會 stream 直接回整個 JSON，一樣有 choices。
+    ok: response.ok && text.includes("\"choices\""),
+    status: response.ok && !text.includes("\"choices\"") ? 502 : response.status,
+    detail: response.ok ? "" : text.slice(0, 240),
+  };
+}
+
+const CHAT_PROBE_TOOL = {
+  type: "function",
+  function: {
+    name: "report_status",
+    description: "Report the current status.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+};
+
+// 回傳 { supported, transient, tools, streamOptions, efforts }。
+export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeLog) {
+  const describe = (error) => (error instanceof Error ? error.message : String(error));
+  let streamOptions = true;
+  log.write("  Chat Completions ");
+  let result;
+  try {
+    result = await testChatCompletion(apiRoot, apiKey, model, { stream_options: { include_usage: true } });
+    // 少數閘道不認得 stream_options：拿掉再試一次，之後就不要求用量。
+    if (!result.ok && result.status === 400) {
+      const retry = await testChatCompletion(apiRoot, apiKey, model);
+      if (retry.ok) {
+        result = retry;
+        streamOptions = false;
+      }
+    }
+  } catch (error) {
+    log.line(`暫時不可用（${describe(error)}）`);
+    return { supported: false, transient: true };
+  }
+  if (!result.ok) {
+    const transient = isTransientProbeStatus(result.status);
+    log.line(`${transient ? "暫時不可用" : "不支持"}（HTTP ${result.status}）${result.detail ? "：" + result.detail : ""}`);
+    return { supported: false, transient };
+  }
+  log.line(streamOptions ? "支持" : "支持（閘道不接受 stream_options，不回報用量）");
+  const base = streamOptions ? { stream_options: { include_usage: true } } : {};
+
+  // Codex 幾乎每一輪都帶工具。上游拒收 tools 參數的模型只能用文字回答。
+  log.write("  工具呼叫         ");
+  let tools = true;
+  try {
+    const probe = await testChatCompletion(apiRoot, apiKey, model, { ...base, tools: [CHAT_PROBE_TOOL] });
+    if (probe.ok) log.line("支持");
+    else if (isTransientProbeStatus(probe.status)) log.line(`暫時無法確認（HTTP ${probe.status}），先當作支援`);
+    else {
+      tools = false;
+      log.line(`不支持（HTTP ${probe.status}），這個模型在 Codex 裡只能用文字回答`);
+    }
+  } catch (error) {
+    log.line(`暫時無法確認（${describe(error)}），先當作支援`);
+  }
+
+  log.write("  推理強度控制     ");
+  let efforts = [];
+  try {
+    const probe = await testChatCompletion(apiRoot, apiKey, model, { ...base, reasoning_effort: "low" });
+    if (probe.ok) {
+      efforts = ["low", "medium", "high"];
+      log.line("reasoning_effort（low／medium／high）");
+    } else {
+      log.line(isTransientProbeStatus(probe.status)
+        ? `暫時無法確認（HTTP ${probe.status}），使用模型預設`
+        : "不支持，使用模型預設");
+    }
+  } catch (error) {
+    log.line(`暫時無法確認（${describe(error)}），使用模型預設`);
+  }
+  return { supported: true, transient: false, tools, streamOptions, efforts };
+}
+
 // --- 中轉供應商 ---------------------------------------------------------------
 //
 // 1.24.0 起可以同時設定多家。settings.json 以 providers 陣列記錄；舊版只有一家，
@@ -1620,6 +1716,9 @@ export function customCatalogEntry(officialModels, route, index) {
   entry.upgrade = null;
   entry.supports_search_tool = false;
   delete entry.web_search_tool_type;
+  // 只有 Chat Completions 的模型改用一般函式工具，不用 Code Mode：Code Mode 要模型把整段
+  // JavaScript 塞進單一工具參數，這些模型熟悉的是一般的函式呼叫。
+  if (route.translate === "chat") delete entry.tool_mode;
   // 上下文視窗解析順序：探測值 > 官方同名模板 > 通用模板值（並警告）。
   if (Number.isFinite(route.contextWindow) && route.contextWindow > 0) {
     entry.context_window = route.contextWindow;
@@ -2231,7 +2330,7 @@ export function resolveRouteWithPrevious(outcome, previous) {
 //   route            探測成功的路由，失敗為 null
 //   transient        失敗是否只是「這次問不到」（呼叫端可據此保留既有設定）
 //   transientEfforts 這次暫時問不到的推理強度
-async function buildRouteForModel(discovery, apiKey, model, log = consoleProbeLog, providerId = DEFAULT_PROVIDER_ID) {
+export async function buildRouteForModel(discovery, apiKey, model, log = consoleProbeLog, providerId = DEFAULT_PROVIDER_ID) {
   log.line(`\n正在測試 ${model}`);
   const owner = modelOwners.get(model) || "unknown";
   const ownerIsAnthropic = owner === "anthropic";
@@ -2348,15 +2447,39 @@ async function buildRouteForModel(discovery, apiKey, model, log = consoleProbeLo
   }
 
   const probe = await probeModel(discovery.apiRoot, apiKey, model, log);
-  if (!probe.supported) {
+  if (!probe.supported && !probe.transient) {
+    // 只有 /chat/completions 的模型（DeepSeek、通義千問、GLM、Kimi、Ollama、vLLM 等）
+    // 改走本機轉譯。
+    log.line("  改探 Chat Completions（本機轉譯成 Codex 的 Responses 格式）");
+    const chat = await probeChatModel(discovery.apiRoot, apiKey, model, log);
+    if (chat.supported) {
+      const route = {
+        pickerSlug: pickerSlug(model, providerId),
+        upstreamModel: model,
+        displayName: withDefaultModelPrefix({ upstreamModel: model, providerId }).displayName || model,
+        providerHost: new URL(discovery.apiRoot).host,
+        ...(providerId !== DEFAULT_PROVIDER_ID ? { providerId } : {}),
+        efforts: chat.efforts,
+        stripReasoning: chat.efforts.length === 0,
+        contextWindow: null,
+        translate: "chat",
+        chatTools: chat.tools,
+        chatStreamOptions: chat.streamOptions,
+      };
+      return { route, transient: false, transientEfforts: [] };
+    }
     log.line(
-      probe.transient
+      chat.transient
         ? `跳過 ${model}：上游暫時不可用，並非模型不受支援。`
-        : `跳過 ${model}：Responses API 探測未通過。`,
+        : `跳過 ${model}：Responses 與 Chat Completions 探測都未通過。`,
     );
+    return { route: null, transient: chat.transient, transientEfforts: [] };
+  }
+  if (!probe.supported) {
+    log.line(`跳過 ${model}：上游暫時不可用，並非模型不受支援。`);
     return {
       route: null,
-      transient: Boolean(probe.transient),
+      transient: true,
       transientEfforts: probe.transientEfforts || [],
     };
   }
@@ -4115,6 +4238,8 @@ function help() {
   1. 兼容 OpenAI 的 Base URL
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
+探測時 /responses 不通的模型會改探 /chat/completions（DeepSeek、通義千問、Ollama 等），
+通過的由路由器在本機轉譯。
 路由器安裝成功後可選擇啟用中轉 API 生圖；預設不啟用，之後可從選單第 ${menuNumber("imagegen")} 項添加。
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
