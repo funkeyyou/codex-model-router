@@ -3,7 +3,8 @@
 讓 Codex Desktop 在保留官方模型的同時，額外使用相容 OpenAI 介面的自訂供應商。
 
 官方 ChatGPT 模型仍直接送往 OpenAI，只有你選取的自訂模型會送往你設定的 Base URL。
-可以同時設定多家供應商，各自保存 API Key（見「[同時使用多家供應商](#同時使用多家供應商)」）。
+可以同時設定多家供應商，各自保存 API Key（見「[同時使用多家供應商](#同時使用多家供應商)」）；
+只提供 `/chat/completions` 的模型也能用（見「[只有 Chat Completions 的模型](#只有-chat-completions-的模型)」）。
 Codex 仍使用內建的 `openai` 供應商 ID，所以桌面版與手機 Remote 既有的對話都不受影響。
 
 支援 macOS 與 Windows：兩邊跑的是同一份路由器與轉譯程式碼，只有「憑證存放」與
@@ -130,6 +131,38 @@ Windows 同樣是 `powershell -ExecutionPolicy Bypass -File .\codex-model-router
   上游拒絕舊 Key 時立即改用。
 - 從舊版更新時，原本唯一的供應商成為主要供應商（名稱 `default`），模型、選擇器 ID 與
   名稱都不變，既有對話照常使用。
+
+## 只有 Chat Completions 的模型
+
+Codex 只會說 Responses API。以前只有 `/chat/completions` 的模型在探測時會被跳過，例如
+DeepSeek、通義千問、GLM、Kimi、Gemini 的 OpenAI 相容介面、Ollama、vLLM。從 1.25.0 起，
+`/responses` 探測不通時安裝器會改探 `/chat/completions`；通過的模型由路由器在本機轉譯，
+和 Claude 走 `/messages` 的做法一樣，在 Codex 選單上照常出現。
+
+探測時會另外確認三件事，結果記在路由設定裡：
+
+- **工具呼叫**：上游收不收 `tools` 參數。不收的模型在 Codex 裡只能用文字回答，歷史裡的
+  工具呼叫與結果會改成文字給它看。
+- **推理強度**：上游收不收 `reasoning_effort`。收的話 Codex 裡可選 low／medium／high。
+- **用量**：上游收不收 `stream_options`。不收的閘道不會回報用量，Codex 顯示的上下文用量會比較不準。
+
+轉譯時的幾個規則：
+
+- 這些模型用一般的函式工具（`exec_command`、`apply_patch` 等），不用 Code Mode：Code Mode 要模型
+  把整段 JavaScript 塞進單一工具參數，一般的函式呼叫是這些模型熟悉得多的形式。
+- 模型的推理（`reasoning_content`、`reasoning`，或內文開頭的 `<think>…</think>`）顯示成 Codex 的
+  推理摘要。同一輪的工具往返裡會送回給模型（DeepSeek、Kimi 等需要），更早的輪次不送；切到官方或
+  其他路由時會先剝掉。
+- Chat Completions 要求每個工具呼叫後面緊接著它的結果。中斷後沒有結果的呼叫會補上
+  `(no output)`；太晚送達的結果改成標明來源的文字；工具回傳的圖片改在結果後面以使用者訊息附上。
+
+限制：
+
+- 這些模型的工具呼叫能力參差不齊，在 Codex 裡的效果可能不如 GPT 或 Claude，建議先用簡單任務試。
+- 平台內建工具（網頁搜尋、內建生圖等）與 PDF 等檔案附件不支援，會明確告知模型或回報錯誤，
+  不會默默丟掉。生圖可以用中轉 API 生圖技能。
+- 上游多半不回報上下文上限。沒有同名的官方模型可以參考時，會沿用通用模板的上限並在安裝時提示；
+  與實際不符時請手動修改 `models.json`。
 
 ## 版本資訊與更新內容
 
@@ -263,14 +296,14 @@ Ark 不支援指定尺寸／品質或透明背景，`--size`、`--quality` 須�
 
 | 功能 | 路由處理與限制 |
 | --- | --- |
-| 終端機、檔案編輯、MCP、瀏覽器等 function/custom 工具 | GPT 保留定義；Claude 做雙向轉譯，包含 namespace 與自由格式輸入。仍需 Codex 本身掛載工具並允許執行。 |
+| 終端機、檔案編輯、MCP、瀏覽器等 function/custom 工具 | GPT 保留定義；Claude 與 Chat Completions 做雙向轉譯，包含 namespace 與自由格式輸入。仍需 Codex 本身掛載工具並允許執行。 |
 | Codex 的搜尋、筆記、歷史 HTTP 端點 | 繼續送往官方後端，由官方驗證帳號權限；不會因選擇自訂模型而改用中轉 Key。 |
-| 平台內建 image_generation、web_search、file_search 等工具 | 自訂 GPT 依中轉能力而定；Claude 轉譯無法執行這些內建工具，會告知模型限制。明確強制使用不可用工具時回報 422，不自動改投其他供應商。官方 GPT 回合已完成的這類項目，切到 Claude 時會轉成文字摘要（本機命令轉成配對的工具呼叫），同一條對話可以繼續。 |
+| 平台內建 image_generation、web_search、file_search 等工具 | 自訂 GPT 依中轉能力而定；Claude 與 Chat Completions 轉譯無法執行這些內建工具，會告知模型限制。明確強制使用不可用工具時回報 422，不自動改投其他供應商。官方 GPT 回合已完成的這類項目，切到 Claude 時會轉成文字摘要（本機命令轉成配對的工具呼叫），同一條對話可以繼續。 |
 | 中轉 API 生圖 | 使用已啟用的 router-imagegen 技能與既有 Images／Ark 路徑，無需內建 image_gen。 |
 | 圖片與 MCP 圖片結果 | Claude 支援 URL、data URL 及 MCP 的 data/mimeType 圖片區塊。圖片數量與大小限制仍適用。 |
-| PDF、MCP 資源 | PDF data URL／文件 URL 轉為 Claude document；MCP 文字資源與連結保留為文字，不額外下載。上游仍需支援文件功能。 |
+| PDF、MCP 資源 | PDF data URL／文件 URL 轉為 Claude document；Chat Completions 轉譯不支援 PDF，明確回報。MCP 文字資源與連結保留為文字，不額外下載。上游仍需支援文件功能。 |
 | 私有 file_id、音訊或未知內容類型 | Claude 轉譯明確回報不支援，不默默刪除。可先用本機讀檔／轉錄工具轉成文字或圖片。 |
-| 嚴格結構化輸出 | Claude 轉譯尚未適配，明確回報 422；請改用文字或函式工具。GPT 路徑維持原樣轉發。 |
+| 嚴格結構化輸出 | Claude 轉譯尚未適配，明確回報 422；請改用文字或函式工具。Chat Completions 轉譯對到 `response_format`，上游需支援。GPT 路徑維持原樣轉發。 |
 
 **1.22.3 起，Claude Code Mode 預設按需讀取外部工具說明。** 可辨識的巢狀工具
 先提供名稱與摘要，模型呼叫前從 Codex 的 `ALL_TOOLS` 取得完整說明、參數 schema
@@ -456,6 +489,10 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 
 `providers` 列出每家供應商的名稱、上游主機與模型數；`stats.lastProvider` 是最近一次自訂模型
 請求送到哪一家，`stats.lastImageProvider` 是最近一次生圖送到哪一家。
+
+`chatTranslatedRequests` 是經 Chat Completions 轉譯送出的請求數。`chatPlaceholderToolResults` 是替
+沒有結果的工具呼叫補上 `(no output)` 的次數，`chatToolOutputsMerged` 與 `chatLateToolOutputs` 分別是
+併回原結果、改成文字的後續工具輸出數；同一段歷史每送一次就再累加，增加本身不代表出錯。
 
 `foreignHostRejects` 是 Host 不是本機名稱而被拒絕的請求數（DNS rebinding 會是這種樣子）；
 `browserRequestsRejected` 是瀏覽器網頁對生圖或 Ark 端點發起、被拒絕的請求數。
