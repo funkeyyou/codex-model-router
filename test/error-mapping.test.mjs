@@ -100,6 +100,17 @@ test("WebSocket：429 帶 retry-after 時，Codex 會照上游要求的秒數等
   assert.match(failure.message, /try again in 12s/);
 });
 
+test("WebSocket：retry-after 是 HTTP 日期時同樣換算成秒數", async () => {
+  const socket = fakeSocket();
+  const upstream = new Response(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: "Too many requests." } }),
+    { status: 429, headers: { "retry-after": new Date(Date.now() + 45_000).toUTCString() } });
+  await router.bridgeSseToWebSocket(upstream, socket);
+  const failure = socket.events.at(-1).response.error;
+  assert.equal(failure.code, "rate_limit_exceeded");
+  const seconds = Number(/try again in (\d+)s/.exec(failure.message)?.[1]);
+  assert.ok(seconds >= 44 && seconds <= 46, failure.message);
+});
+
 // --- HTTP：Claude 路由的非 2xx -----------------------------------------------
 
 const headers = { authorization: "Bearer fixture", "chatgpt-account-id": "fixture-account", "session-id": "error-mapping" };
