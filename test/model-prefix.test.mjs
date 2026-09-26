@@ -39,7 +39,8 @@ test("更新既有名稱只遷移預設顯示欄位，官方、手動名稱、�
     { slug: routes[1].pickerSlug, display_name: "ark/claude-test" },
     { slug: routes[2].pickerSlug, display_name: "手動名稱" },
   ] };
-  const plan = planUpdate({ version: "1.19.0", routes }, { port: 48953, routes, keep: "unchanged" }, "1.19.1");
+  const plan = planUpdate({ version: "1.19.0", routes },
+    { port: 48953, routes, keep: "unchanged", baseUrl: "https://example.test", apiRoot: "https://example.test/v1" }, "1.19.1");
   assert.equal(plan.settings.routes[0].displayName, "api/gpt-test");
   assert.deepEqual(plan.manifest.routes, plan.settings.routes);
   assert.equal(plan.settings.keep, "unchanged");

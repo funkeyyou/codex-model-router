@@ -68,6 +68,23 @@ test("同意後建立獨立技能、命令及模型限制，不寫入 Key 或官
   assert.ok(!Object.keys(config).some((key) => /secret|apiKey|credential/i.test(key)));
 });
 
+test("技能記錄生圖用的供應商；舊版技能沒記錄時視為 default，更新時沿用", (t) => {
+  const { options } = fixture(t);
+  const readConfig = () => JSON.parse(readFileSync(join(options.root, "config.json"), "utf8"));
+  installer.installRelayImageSkill(options);
+  assert.equal(readConfig().providerId, "default");
+  installer.installRelayImageSkill({ ...options, providerId: "openrouter" });
+  assert.equal(readConfig().providerId, "openrouter");
+  installer.installRelayImageSkill({ ...options, models: [all[2]] });
+  assert.equal(readConfig().providerId, "openrouter", "沒指定時沿用上次的供應商");
+  const legacy = readConfig();
+  delete legacy.providerId;
+  writeFileSync(join(options.root, "config.json"), JSON.stringify(legacy));
+  installer.installRelayImageSkill(options);
+  assert.equal(readConfig().providerId, "default");
+  assert.throws(() => installer.installRelayImageSkill({ ...options, providerId: "Bad Name" }), /供應商/);
+});
+
 test("既有技能更新保留手動修改與其他檔案，停用封存後可恢復", (t) => {
   const { options } = fixture(t);
   installer.installRelayImageSkill(options);
