@@ -5415,6 +5415,18 @@ export function responseFailedFromErrorEvent(event) {
   return responseFailedEvent(code, message);
 }
 
+// Retry-After 可以是秒數或 HTTP 日期（RFC 9110 §10.2.3），換算成還要等幾秒；
+// 無法解析或時間已過就回 null。HTTP 日期一律是 GMT，但 asctime 格式不寫時區，
+// Date.parse 會當成本機時間，所以沒寫時區時補上 GMT。
+export function parseRetryAfter(value, now = Date.now()) {
+  const text = value == null ? "" : String(value).trim();
+  if (!text) return null;
+  const seconds = /^\d+(?:\.\d+)?$/.test(text)
+    ? Number(text)
+    : (Date.parse(/\b(?:GMT|UTC)\b|[+-]\d{4}$/i.test(text) ? text : `${text} GMT`) - now) / 1000;
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : null;
+}
+
 // 非 2xx 回應的內文：OpenAI 形狀 {error: {...}}、Anthropic 形狀 {type, error: {...}}、
 // 少數閘道的 {error: "文字"}，或根本不是 JSON。error 保留上游原樣，code／message
 // 換成 Codex 認得的形式。
@@ -5424,10 +5436,9 @@ export function upstreamErrorDetails(status, rawText, retryAfter = null) {
   const error = typeof payload?.error === "string"
     ? { message: payload.error }
     : (payload?.error && typeof payload.error === "object" ? payload.error : null);
-  const seconds = Number(retryAfter);
   const mapped = codexErrorFromUpstream(error || { message: rawText || "" }, {
     status,
-    retryAfterSeconds: Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : null,
+    retryAfterSeconds: parseRetryAfter(retryAfter),
   });
   return {
     error: error || { type: "router_upstream_error", code: String(status), message: mapped.message },
