@@ -36,6 +36,10 @@ jobs:
       - name: 安裝器與 src/ 一致
         run: node tools/build.mjs --check
 
+      # 行尾空白、檔尾空行：跟空樹比對，整個 repo 都檢查，不只這次改到的檔案。
+      - name: 空白檢查
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
       # ESLint 與 e2e 測試用的 Codex CLI（版本固定在 package-lock.json）。
       - name: 安裝開發工具
         run: npm ci

@@ -128,7 +128,6 @@ if ($commandArguments.Count -eq 0 -and -not [Console]::IsInputRedirected) {
 }
 
 exit $exitCode
-
 <#
 __CODEX_MODEL_ROUTER_INSTALLER_JS__
 import { createHash } from "node:crypto";
@@ -3749,7 +3748,6 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     process.exitCode = 1;
   }
 }
-
 __CODEX_MODEL_ROUTER_ROUTER_JS__
 import http from "node:http";
 import { execFile } from "node:child_process";
