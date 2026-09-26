@@ -3,6 +3,7 @@
 讓 Codex Desktop 在保留官方模型的同時，額外使用相容 OpenAI 介面的自訂供應商。
 
 官方 ChatGPT 模型仍直接送往 OpenAI，只有你選取的自訂模型會送往你設定的 Base URL。
+可以同時設定多家供應商，各自保存 API Key（見「[同時使用多家供應商](#同時使用多家供應商)」）。
 Codex 仍使用內建的 `openai` 供應商 ID，所以桌面版與手機 Remote 既有的對話都不受影響。
 
 支援 macOS 與 Windows：兩邊跑的是同一份路由器與轉譯程式碼，只有「憑證存放」與
@@ -92,6 +93,7 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 不影響已完成的路由器更新。尚未啟用的技能不會被 `update` 自動安裝。
 
 `install` 保留給第一次安裝、換 Base URL 或 API Key、以及重新挑選模型的情況。
+設定了多家供應商時，`install` 只重新配置主要供應商，其他家與它們的模型保持不變。
 
 `add` 只探測新選的模型；完成後，自訂模型會按本次探測清單的順序排列。
 已配置但未出現在本次清單的模型會留在後方，原有名稱與能力設定不變。
@@ -101,6 +103,33 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 官方模型、API Key 與中轉生圖技能不受影響；若刪除全域預設模型，會清除指向該模型的 `model` 設定。
 可以刪到零個自訂模型，日後仍可更新或重新添加。
 既有任務若仍使用已刪除的模型，需先切換模型才能繼續。
+
+## 同時使用多家供應商
+
+從 1.24.0 起可以同時設定多家中轉供應商，各自保存 API Key，模型都會出現在 Codex 的選單上，
+可以混用，也可以把另一家當備援。用 `providers`（選單第 5 項）管理：
+
+```bash
+bash codex-model-router.sh providers add      # 新增一家：Base URL、API Key，探測並添加它的模型
+bash codex-model-router.sh providers remove   # 移除一家與它的全部模型
+bash codex-model-router.sh providers key      # 更換某一家的 API Key
+```
+
+Windows 同樣是 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 providers add` 等。
+
+- 第一家是主要供應商：`install` 重新配置的是它，Codex 內建的 `image_gen` 也送到它。
+- 其他家的模型名稱前面帶供應商名稱，例如 `openrouter/claude-sonnet-4.5`；選擇器 ID 也帶，
+  同一個模型在兩家都有時不會撞在一起。名稱在新增時決定，預設從網址猜
+  （`api.openrouter.ai` → `openrouter`），只能用小寫英文、數字與連字號。
+- 有多家時，`add` 會先問要替哪一家添加模型；`remove` 可以一次刪不同家的模型。
+- 移除供應商會一併移除它的模型；全域預設模型是其中之一時會清除該設定，中轉 API 生圖用的是
+  這家時會停用技能（之後可重新設定）。最後一家不能移除，要整個移除請用 `rollback`。
+  移除前會備份，任何一步失敗都會還原。
+- `imagegen` 在有多家時會問要用哪一家生圖。
+- 更換 API Key 後，Windows 下一個請求就改用新 Key；macOS 最晚 5 分鐘內生效，
+  上游拒絕舊 Key 時立即改用。
+- 從舊版更新時，原本唯一的供應商成為主要供應商（名稱 `default`），模型、選擇器 ID 與
+  名稱都不變，既有對話照常使用。
 
 ## 版本資訊與更新內容
 
@@ -113,11 +142,11 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 
 ## 其他指令
 
-選單第 6 項「設定全域上下文 100 萬」也可用
+選單第 7 項「設定全域上下文 100 萬」也可用
 `bash codex-model-router.sh context-1m` 執行；Windows 使用
 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 context-1m`。
 功能會備份使用者配置，只將全域 `model_context_window` 設為 1000000，並讀回驗證。
-最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 7 項為中轉 API 生圖，第 10 項為退出。
+最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 8 項為中轉 API 生圖，第 11 項為退出。
 完成後重新開啟桌面版並建立新任務。配置不會增加上游模型本身的能力或帳號權限。
 
 不帶參數執行會出現選單，也可以直接指定動作。
@@ -128,6 +157,7 @@ macOS：
 bash codex-model-router.sh update     # 升級程式碼，保留現有設定
 bash codex-model-router.sh add        # 添加自訂模型
 bash codex-model-router.sh remove     # 刪除自訂模型
+bash codex-model-router.sh providers  # 新增／移除供應商、更換 API Key
 bash codex-model-router.sh hidden-models # 單獨管理被隱藏的官方模型
 bash codex-model-router.sh imagegen   # 單獨添加／設定中轉 API 生圖
 bash codex-model-router.sh status     # 檢視安裝狀態與健康度
@@ -140,6 +170,7 @@ Windows：
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 add
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 remove
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 providers
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 hidden-models
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 imagegen
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
@@ -150,9 +181,11 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 
 ## 中轉 API 生圖（可選）
 
-安裝時同意啟用，或事後選擇選單第 7 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
+安裝時同意啟用，或事後選擇選單第 8 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
 不修改官方 `.system/imagegen`，也不需要內建 `image_gen` 工具。請求經本機路由器使用已保存的
 API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案內含生圖額度。
+設定了多家供應商時會先問要用哪一家；技能會記住這個選擇，之後的生圖都送到那一家，
+那一家被移除時技能會一併停用，不會改用別家的帳號計費。
 
 設定時先選擇要偵測的模型（可複選），工具會自動測試並添加成功的項目。
 先使用目前 API Key 呼叫通用 `/v1/images/generations`；已選模型全部未通過時，才自動改測 Ark 任務介面。
@@ -419,7 +452,10 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 限流是 `rate_limit_exceeded`（上游給了 `retry-after` 就照著等）、額度用盡是 `insufficient_quota`。
 
 `credentialReads` 是實際讀取（Windows 為解密）API Key 的次數。Windows 以憑證檔的修改時間
-判斷 Key 是否更換，檔案沒變就沿用快取，這個數字應該很少增加。
+判斷 Key 是否更換，檔案沒變就沿用快取，這個數字應該很少增加。每家供應商各自快取。
+
+`providers` 列出每家供應商的名稱、上游主機與模型數；`stats.lastProvider` 是最近一次自訂模型
+請求送到哪一家，`stats.lastImageProvider` 是最近一次生圖送到哪一家。
 
 `foreignHostRejects` 是 Host 不是本機名稱而被拒絕的請求數（DNS rebinding 會是這種樣子）；
 `browserRequestsRejected` 是瀏覽器網頁對生圖或 Ark 端點發起、被拒絕的請求數。
