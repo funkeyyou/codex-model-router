@@ -71,6 +71,55 @@ test("只使用 loopback 路由、不送認證標頭，依上游原名送出圖�
   assert.deepEqual(readFileSync(result.path), png);
 });
 
+// 多家供應商時由路由器依標頭決定用哪一家；舊版技能沒記錄供應商，不帶標頭（用主要供應商）。
+test("技能記錄了供應商時，生圖與 Ark 任務的每個請求都帶上供應商標頭", async (t) => {
+  const healthy = (url) => String(url).endsWith("/healthz")
+    ? Response.json({ status: "ok", stats: { imageRequests: 0, arkImageRequests: 0 } }) : null;
+  const providerOf = (options) => new Headers(options?.headers).get(imagegen.PROVIDER_HEADER);
+
+  const legacy = fixture(t);
+  const legacyHeaders = [];
+  await imagegen.runRelayImagegen(legacy.generate, { configPath: legacy.configPath, fetchImpl: async (url, options) => {
+    legacyHeaders.push(providerOf(options));
+    return healthy(url) || Response.json({ data: [{ b64_json: png.toString("base64") }] });
+  } });
+  assert.deepEqual(legacyHeaders, [null, null]);
+
+  const images = fixture(t);
+  const config = JSON.parse(readFileSync(images.configPath, "utf8"));
+  writeFileSync(images.configPath, JSON.stringify({ ...config, providerId: "openrouter" }));
+  const imageHeaders = [];
+  await imagegen.runRelayImagegen(images.generate, { configPath: images.configPath, fetchImpl: async (url, options) => {
+    if (!String(url).endsWith("/healthz")) imageHeaders.push(providerOf(options));
+    return healthy(url) || Response.json({ data: [{ b64_json: png.toString("base64") }] });
+  } });
+  assert.deepEqual(imageHeaders, ["openrouter"]);
+
+  const ark = fixture(t);
+  writeFileSync(ark.configPath, JSON.stringify({ ...config, providerId: "openrouter", apiMode: "ark-task" }));
+  const arkHeaders = [];
+  await imagegen.runRelayImagegen(ark.generate, { configPath: ark.configPath, pollIntervalMs: 1,
+    downloadImpl: async () => png,
+    fetchImpl: async (url, options) => {
+      const health = healthy(url);
+      if (health) return health;
+      arkHeaders.push(providerOf(options));
+      return String(url).includes("/tasks/")
+        ? Response.json({ task_id: "task_1", status: "succeeded", result: { images: [{ url: "https://cdn.example/a.png" }] } })
+        : Response.json({ task_id: "task_1" });
+    } });
+  assert.deepEqual(arkHeaders, ["openrouter", "openrouter"]);
+});
+
+test("技能裡的供應商名稱格式不對時，在送出任何請求前拒絕", async (t) => {
+  const f = fixture(t);
+  const config = JSON.parse(readFileSync(f.configPath, "utf8"));
+  writeFileSync(f.configPath, JSON.stringify({ ...config, providerId: "Bad Name" }));
+  await assert.rejects(imagegen.runRelayImagegen(f.generate, {
+    configPath: f.configPath, fetchImpl: () => assert.fail("不應發送請求"),
+  }), /供應商設定無效/);
+});
+
 test("改圖用 multipart 保留圖片原位元組；2.5 模型支援 max 與透明背景", async (t) => {
   const f = fixture(t);
   const reference = join(f.dir, "原圖.png");
