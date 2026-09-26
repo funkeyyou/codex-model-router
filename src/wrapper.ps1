@@ -5,8 +5,8 @@
 #   powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 status
 #   powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 #
-# 檔案末尾的註解區塊內嵌 installer / router / claude-bridge / imagegen 四段 JavaScript，
-# 與 codex-model-router.sh 逐字一致，由 tools/sync-payloads.mjs 同步。
+# 檔案末尾的註解區塊內嵌 installer / router / claude-bridge / chat-bridge / imagegen 五段
+# JavaScript，與 codex-model-router.sh 逐字一致，由 tools/build.mjs 產生。
 
 $ErrorActionPreference = 'Stop'
 

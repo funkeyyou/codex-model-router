@@ -16,6 +16,7 @@ import {
   codexErrorFromUpstream,
   COMPACTION_REPLAY_PREFIX,
 } from "./claude-bridge.mjs";
+import { toChatRequest, bridgeChatStream, isChatReasoning } from "./chat-bridge.mjs";
 
 const routerDirectory = dirname(fileURLToPath(import.meta.url));
 const settingsPath = join(routerDirectory, "settings.json");
@@ -558,6 +559,7 @@ export function historyCacheInfo(now = Date.now()) {
 // 編碼進 reasoning 的 encrypted_content。官方後端驗不過這種內容
 // （The encrypted content for item ... could not be verified），
 // 因此送往非 Anthropic 路由時必須先剝除，否則碰過 Claude 的對話就切不回官方。
+// Chat Completions 轉譯層的推理只帶一個標記，同樣只有它自己用得上。
 function isBridgeReasoning(item) {
   if (item?.type !== "reasoning") return false;
   const enc = item.encrypted_content;
@@ -567,16 +569,17 @@ function isBridgeReasoning(item) {
     return Boolean(parsed && (
       (typeof parsed.thinking === "string" && parsed.signature) ||
       typeof parsed.redacted_thinking === "string" ||
-      (parsed.router_reasoning_ref === 1 && /^[a-f0-9]{64}$/.test(parsed.sha256))
+      (parsed.router_reasoning_ref === 1 && /^[a-f0-9]{64}$/.test(parsed.sha256)) ||
+      parsed.router_chat_reasoning === 1
     ));
   } catch {
     return false;
   }
 }
 
-export function stripBridgeReasoning(input) {
+export function stripBridgeReasoning(input, { keepChatReasoning = false } = {}) {
   if (!Array.isArray(input)) return { input, removed: 0 };
-  const kept = input.filter((item) => !isBridgeReasoning(item));
+  const kept = input.filter((item) => !isBridgeReasoning(item) || (keepChatReasoning && isChatReasoning(item)));
   return { input: kept, removed: input.length - kept.length };
 }
 
@@ -710,9 +713,9 @@ function rebuildStatefulInput(key, incomingInput, previousId) {
 
 // 從 Claude 轉譯路由切出去時，必須清掉轉譯層合成的內容，否則官方與其他供應商
 // 會整輪拒收。官方路由不論走 HTTP 或 WebSocket 都要做這一步。
-function stripBridgeArtifacts(body) {
+function stripBridgeArtifacts(body, { keepChatReasoning = false } = {}) {
   let result = body;
-  const stripped = stripBridgeReasoning(result.input);
+  const stripped = stripBridgeReasoning(result.input, { keepChatReasoning });
   if (stripped.removed > 0) {
     result = { ...result, input: stripped.input };
     stats.bridgeReasoningStripped += stripped.removed;
@@ -811,6 +814,10 @@ const stats = {
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
   translatedRequests: 0,
+  chatTranslatedRequests: 0,
+  chatToolOutputsMerged: 0,
+  chatLateToolOutputs: 0,
+  chatPlaceholderToolResults: 0,
   claudeToolDefinitionsDeferred: 0,
   claudeToolDescriptionCharsSaved: 0,
   lastClaudeToolContext: null,
@@ -1409,7 +1416,8 @@ export async function fetchModelUpstream(
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
   if (route?.translate !== "anthropic") {
-    effectiveBody = stripBridgeArtifacts(effectiveBody);
+    // Chat Completions 路由在同一輪的工具往返裡要送回自己產生的推理。
+    effectiveBody = stripBridgeArtifacts(effectiveBody, { keepChatReasoning: route?.translate === "chat" });
   }
 
   // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
@@ -1472,6 +1480,37 @@ export async function fetchModelUpstream(
     }
     const budget = budgetToolImages(outboundBodyObject);
     recordImageBudget(budget);
+    if (route.translate === "chat") {
+      // 只有 /chat/completions 的模型：本機轉譯成 Chat Completions，回應再轉回 Responses 事件。
+      // 圖片預算先在 Responses 形狀上做，舊的工具截圖與其他路由用同一套規則縮減。
+      const { request: chatRequest, freeform, toolTargets, compaction,
+        toolOutputsMerged, lateToolOutputs, placeholderToolResults } = toChatRequest(budget.request, route);
+      stats.chatToolOutputsMerged += toolOutputsMerged;
+      stats.chatLateToolOutputs += lateToolOutputs;
+      stats.chatPlaceholderToolResults += placeholderToolResults;
+      meta.translate = "chat";
+      meta.freeform = freeform;
+      meta.toolTargets = toolTargets;
+      meta.compaction = compaction;
+      meta.model = body.model;
+      meta.requestBody = effectiveBody;
+      meta.chatRequest = chatRequest;
+      stats.chatTranslatedRequests += 1;
+      const chatBody = Buffer.from(JSON.stringify(chatRequest));
+      if (upstreamRequestTooLarge(chatBody.length)) {
+        return oversizeResponse(chatBody.length);
+      }
+      const translated = await fetchCustom(
+        provider,
+        new URL(`${provider.apiRoot}/chat/completions`),
+        requestHeaders,
+        chatBody,
+        signal,
+      );
+      stats.lastCustomStatus = translated.status;
+      recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
+      return translated;
+    }
     outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {
       return oversizeResponse(outboundBody.length);
@@ -1683,14 +1722,16 @@ async function handleResponses(request, response, incomingUrl) {
       JSON.stringify(meta.anthropicRequest, null, 2),
     );
   }
+  if (meta.chatRequest) captureWrite(captureId, "chat-request.json", JSON.stringify(meta.chatRequest, null, 2));
   captureWrite(captureId, "upstream-status.txt", `${upstream.status}\n`);
-  if (meta.translate === "anthropic" && upstream.status >= 200 && upstream.status < 300) {
-    await bridgeAnthropicToHttp(upstream, response, meta);
+  if (meta.translate && upstream.status >= 200 && upstream.status < 300) {
+    await bridgeTranslatedToHttp(upstream, response, meta);
     return;
   }
   // Anthropic 的錯誤內文是 {type:"error", error:{type, message}}，Codex 看的是 OpenAI
   // 形狀的 error.code。改寫成它認得的值，例如 prompt is too long → context_length_exceeded。
-  if (meta.translate === "anthropic") {
+  // Chat Completions 的錯誤雖然已是 OpenAI 形狀，錯誤碼各家寫法不一，一樣要改寫。
+  if (meta.translate) {
     const text = await upstream.text();
     captureWrite(captureId, "upstream-error.txt", text);
     const retryAfter = upstream.headers.get("retry-after");
@@ -2463,10 +2504,14 @@ export function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) 
   });
 }
 
+function streamBridgeFor(meta) {
+  return meta.translate === "chat" ? bridgeChatStream : bridgeAnthropicStream;
+}
+
 // HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回
-// HTTPS；此時若把 Anthropic 的原生事件原樣送回，客戶端解不開，該對話就會
+// HTTPS；此時若把上游的原生事件原樣送回，客戶端解不開，該對話就會
 // 永遠停在「正在重新連線」，而且再也回不來——因為每次重試都是同一個結果。
-export async function bridgeAnthropicToHttp(upstream, response, meta) {
+export async function bridgeTranslatedToHttp(upstream, response, meta) {
   stats.lastCustomStatus = upstream.status;
   if (!upstream.body) throw new Error("上游響應沒有內文");
   response.routerResponsesStream = true;
@@ -2476,7 +2521,7 @@ export async function bridgeAnthropicToHttp(upstream, response, meta) {
     connection: "keep-alive",
   });
   let sawTerminal = false;
-  await bridgeAnthropicStream(
+  await streamBridgeFor(meta)(
     upstream.body,
     (event) => {
       if (isTerminalEvent(event)) { sawTerminal = true; response.routerTerminalSent = true; }
@@ -2493,19 +2538,20 @@ export async function bridgeAnthropicToHttp(upstream, response, meta) {
   response.end();
 }
 
-export async function bridgeAnthropicToWebSocket(upstream, socket, meta, captureId = null) {
+export async function bridgeTranslatedToWebSocket(upstream, socket, meta, captureId = null) {
   stats.lastWebSocketStatus = upstream.status;
   if (!upstream.body) throw new Error("WebSocket 上游響應沒有內文");
+  const rawCaptureName = meta.translate === "chat" ? "chat-response.sse" : "anthropic-response.sse";
   const tee = captureId
     ? async function* (src) {
         for await (const chunk of src) {
-          captureAppend(captureId, "anthropic-response.sse", Buffer.from(chunk));
+          captureAppend(captureId, rawCaptureName, Buffer.from(chunk));
           yield chunk;
         }
       }
     : null;
   let sawTerminal = false;
-  await bridgeAnthropicStream(
+  await streamBridgeFor(meta)(
     tee ? tee(upstream.body) : upstream.body,
     (event) => {
       captureAppend(captureId, "response.sse", `data: ${JSON.stringify(event)}\n\n`);
@@ -2700,8 +2746,9 @@ export async function handleWebSocketResponseInner(
     if (meta.anthropicRequest) {
       captureWrite(captureId, "anthropic-request.json", JSON.stringify(meta.anthropicRequest, null, 2));
     }
-    if (meta.translate === "anthropic" && upstream.status >= 200 && upstream.status < 300) {
-      await bridgeAnthropicToWebSocket(upstream, socket, meta, captureId);
+    if (meta.chatRequest) captureWrite(captureId, "chat-request.json", JSON.stringify(meta.chatRequest, null, 2));
+    if (meta.translate && upstream.status >= 200 && upstream.status < 300) {
+      await bridgeTranslatedToWebSocket(upstream, socket, meta, captureId);
     } else {
       await bridgeSseToWebSocket(upstream, socket, captureId, meta.history);
     }

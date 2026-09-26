@@ -15,7 +15,8 @@ const shellPath = join(repoRoot, "codex-model-router.sh");
 const MARKERS = {
   installer: ["__CODEX_MODEL_ROUTER_INSTALLER_JS__", "__CODEX_MODEL_ROUTER_ROUTER_JS__"],
   router: ["__CODEX_MODEL_ROUTER_ROUTER_JS__", "__CODEX_MODEL_ROUTER_BRIDGE_JS__"],
-  bridge: ["__CODEX_MODEL_ROUTER_BRIDGE_JS__", "__CODEX_MODEL_ROUTER_IMAGEGEN_JS__"],
+  bridge: ["__CODEX_MODEL_ROUTER_BRIDGE_JS__", "__CODEX_MODEL_ROUTER_CHAT_JS__"],
+  "chat-bridge": ["__CODEX_MODEL_ROUTER_CHAT_JS__", "__CODEX_MODEL_ROUTER_IMAGEGEN_JS__"],
   imagegen: ["__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", "__CODEX_MODEL_ROUTER_EMBEDDED__"],
 };
 
@@ -64,7 +65,7 @@ function extractTo(settings) {
   }
   writeFileSync(join(dir, "settings.json"), JSON.stringify(settings), "utf8");
 
-  // router.mjs 只認同目錄下的 ./claude-bridge.mjs。
+  // router.mjs 與 chat-bridge.mjs 只認同目錄下的 ./claude-bridge.mjs。
   writeFileSync(join(dir, "claude-bridge.mjs"), `export * from "./bridge.mjs";\n`, "utf8");
 
   // 安裝器與路由器的頂層都有副作用（安裝流程 / 監聽連接埠），import 前先擋掉。
@@ -83,6 +84,7 @@ export async function loadPayloads() {
     installer: await load("installer"),
     router: await load("router"),
     bridge: await load("bridge"),
+    chat: await load("chat-bridge"),
     imagegen: await load("imagegen"),
   };
   return cached;

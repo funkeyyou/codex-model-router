@@ -38,7 +38,7 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
   const port = reservation.address().port;
   await new Promise(resolve => reservation.close(resolve));
   const { dir, installer } = await loadPayloads();
-  for (const name of ["router.mjs", "bridge.mjs", "claude-bridge.mjs"]) copyFileSync(join(dir, name), join(runtime, name));
+  for (const name of ["router.mjs", "bridge.mjs", "claude-bridge.mjs", "chat-bridge.mjs"]) copyFileSync(join(dir, name), join(runtime, name));
   const catalogPath = join(runtime, "models.json");
   writeFileSync(catalogPath, JSON.stringify({ models: [entry("old-model"), custom] }));
   writeFileSync(join(runtime, "settings.json"), JSON.stringify({ apiRoot: "https://unused.example/v1",

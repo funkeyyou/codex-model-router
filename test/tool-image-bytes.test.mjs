@@ -182,7 +182,7 @@ test("實際轉送路徑與增量重建都使用縮減後的請求，原本超�
     if (route.translate) assert.deepEqual(meta.anthropicRequest, received.at(-1).body);
     const chunks = [];
     const socket = { destroyed: false, writable: true, write(chunk) { chunks.push(Buffer.from(chunk)); } };
-    if (route.translate) await instance.bridgeAnthropicToWebSocket(first, socket, meta);
+    if (route.translate) await instance.bridgeTranslatedToWebSocket(first, socket, meta);
     else await instance.bridgeSseToWebSocket(first, socket, null, meta.history);
     const events = instance.parseWebSocketFrames(Buffer.concat(chunks)).frames.map((frame) => JSON.parse(frame.payload));
     const previousId = events.find((event) => event.type === "response.completed").response.id;

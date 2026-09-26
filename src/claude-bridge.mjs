@@ -32,7 +32,7 @@ const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 // ---------------------------------------------------------------- 請求方向
 
-function textOf(content) {
+export function textOf(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
@@ -231,7 +231,7 @@ export function hostedToolSummary(item) {
 }
 
 // 模型往下走之後才送達的工具輸出，標明它屬於哪一次呼叫，免得被當成使用者的話。
-function lateToolOutputNotice(item) {
+export function lateToolOutputNotice(item) {
   const name = typeof item.name === "string" && item.name ? `（${item.name.slice(0, 64)}）` : " ";
   return `(工具呼叫 ${item.call_id}${name}的結果已先回傳；以下是之後才送達的後續輸出)`;
 }
@@ -267,11 +267,11 @@ function applyImageBudget(messages, { batchCachePruning = false } = {}) {
   return omitted;
 }
 
-function bridgeInputError(message) {
+export function bridgeInputError(message) {
   return Object.assign(new Error(message), { name: "BridgeRequestError" });
 }
 
-function parseToolArguments(value) {
+export function parseToolArguments(value) {
   let parsed;
   try { parsed = typeof value === "string" ? JSON.parse(value || "{}") : value; }
   catch { throw bridgeInputError("工具參數不是完整 JSON；未產生替代參數，請重新產生該工具呼叫。"); }
@@ -339,7 +339,7 @@ export function toolAlias(namespace, name) {
   return "cmr_" + createHash("sha256").update(JSON.stringify([ns, name])).digest("hex").slice(0, 60);
 }
 
-function flattenTools(items, out = [], namespace = null, targets = new Map()) {
+export function flattenTools(items, out = [], namespace = null, targets = new Map()) {
   for (const tool of items || []) {
     if (tool?.type === "namespace") {
       const nested = !tool.name || (tool.name === "functions" && !namespace)
@@ -370,7 +370,7 @@ const FREEFORM_KEY = "input";
 //
 // allOf → 合併所有分支（properties 聯集、required 聯集）
 // oneOf / anyOf → properties 取聯集，required 取交集（只保留每個分支都必填的）
-function flattenTopLevelSchema(schema) {
+export function flattenTopLevelSchema(schema) {
   if (!schema || typeof schema !== "object") {
     return { type: "object", properties: {} };
   }
@@ -630,7 +630,7 @@ function storeReasoning(raw) {
 //
 // encrypted_content 對客戶端是不透明字串，只會被原樣塞回後續請求的 input，
 // 所以比照 reasoning 的做法把摘要編碼進去，下一輪再解出來還原成訊息。
-const COMPACTION_PROMPT =
+export const COMPACTION_PROMPT =
   "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\n" +
   "Include:\n" +
   "- Current progress and key decisions made\n" +
@@ -1021,7 +1021,7 @@ export function codexErrorFromUpstream(error = {}, { status = null, retryAfterSe
   };
 }
 
-function randomId(prefix, length) {
+export function randomId(prefix, length) {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   let out = prefix;
   while (out.length < length) out += chars[Math.floor(Math.random() * chars.length)];
