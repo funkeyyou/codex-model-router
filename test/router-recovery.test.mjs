@@ -172,6 +172,41 @@ for (const fallback of [false, true]) {
   });
 }
 
+// 官方上游的訊息不一定提到 previous_response_id，要看錯誤碼。沒認出來的話錯誤會轉給
+// Codex，它得斷線重連、整段重送一次，畫面上還會跳出重試提示。
+test("官方 WebSocket 回 previous_response_not_found 時由路由器重播，Codex 看不到錯誤", async (t) => {
+  const router = await loadRouterWith({});
+  const sent = [];
+  const session = {
+    closed: false, responseIds: new Set(),
+    send(payload) {
+      sent.push(payload);
+      queueMicrotask(() => {
+        if (sent.length === 1) this.onEvent?.(completed("resp_ws"));
+        else if (sent.length === 2) this.onEvent?.({ type: "error", status: 400, error: {
+          type: "invalid_request_error", code: "previous_response_not_found",
+          message: "Previous response with id 'resp_ws' not found.", param: "previous_response_id",
+        } });
+        else this.onEvent?.(completed("resp_replay", []));
+      });
+    },
+    destroy() { this.closed = true; },
+  };
+  t.mock.method(globalThis, "fetch", () => assert.fail("重播應留在同一條 WebSocket，不必回退 HTTP"));
+  const state = { session, connectionNamespace: "ws-not-found", upstreamDisabled: false };
+  const socket = socketFor(router);
+  const run = (body) => router.handleWebSocketResponseInner(
+    { headers }, socket, inputUrl, { type: "response.create", ...body }, new AbortController(), state,
+  );
+  await run(initial());
+  await run(continuation("resp_ws"));
+  assert.equal(sent[1].previous_response_id, "resp_ws");
+  assert.equal(sent[2].previous_response_id, undefined);
+  assert.equal(sent[2].input.filter((item) => item.type === "function_call_output").length, 1);
+  assert.deepEqual(socket.events.map((event) => event.type), ["response.completed", "response.completed"]);
+  assert.equal(socket.events.at(-1).response.id, "resp_replay");
+});
+
 test("WebSocket 已轉發內容後斷線，不再透明回退而重複產生輸出", async (t) => {
   const router = await loadRouterWith({});
   const fetch = t.mock.method(globalThis, "fetch", () => assert.fail("不能重播已開始的回合"));
