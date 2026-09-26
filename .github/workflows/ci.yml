@@ -26,7 +26,7 @@ jobs:
         # 24 是 ChatGPT Desktop 內建的那一版，也是多數使用者實際跑的。
         node-version: ["22", "24"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v5
         with:
@@ -87,7 +87,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v5
         with:
