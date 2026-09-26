@@ -1,6 +1,16 @@
 {
-  "latest": "1.24.0",
+  "latest": "1.25.0",
   "releases": [
+    {
+      "version": "1.25.0",
+      "date": "2026-09-26",
+      "changes": [
+        "支援只有 /chat/completions 的模型，例如 DeepSeek、通義千問、GLM、Kimi、Gemini 相容介面、Ollama、vLLM：/responses 探測不通時改探 Chat Completions，通過的由路由器在本機轉譯，在 Codex 選單上照常使用。",
+        "探測時一併確認上游收不收工具呼叫、推理強度（reasoning_effort）與用量回報；不收工具的模型只能以文字回答，Codex 會照實告知。",
+        "這些模型改用一般函式工具，不用 Code Mode。推理（reasoning_content、<think> 區塊）顯示成 Codex 的推理摘要，同一輪工具往返會送回給模型，切到官方或其他路由前會剝掉。",
+        "工具呼叫的能力依模型而異，效果可能不如 GPT 或 Claude；平台內建工具與 PDF 附件不支援，會明確告知。"
+      ]
+    },
     {
       "version": "1.24.0",
       "date": "2026-09-26",
