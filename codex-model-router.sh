@@ -5984,11 +5984,13 @@ export function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) 
       flushed = true;
       for (const event of buffered.splice(0)) onEvent(event);
     };
+    // 官方上游找不到接續對象時回 {code: "previous_response_not_found", param: "previous_response_id"}，
+    // 訊息本身不一定提到 previous_response_id。
     const isInvalidChain = (event) => {
-      const message = String(
-        event?.error?.message || event?.response?.error?.message || "",
-      );
-      return message.includes("previous_response_id");
+      const error = event?.error || event?.response?.error || {};
+      return error.code === "previous_response_not_found"
+        || error.param === "previous_response_id"
+        || String(error.message || "").includes("previous_response_id");
     };
 
     session.onClosed = (reason) => failHard(reason instanceof Error ? reason : Object.assign(
