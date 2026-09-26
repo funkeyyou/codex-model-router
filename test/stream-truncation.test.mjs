@@ -187,6 +187,46 @@ test("WebSocket：error 之後上游自己送了 response.failed 就不再補", 
   assert.deepEqual(types, ["error", "response.failed"]);
 });
 
+// --- 官方 WebSocket 直連 ------------------------------------------------------
+//
+// 這條路徑沒有 EOF 可等：上游連線要留給下一輪用，error 本身就是這一輪的終點。
+// 官方上游的 error 帶 HTTP status，Codex 會自己處理（例如顯示用量上限與重置時間），
+// 所以要原樣先送；沒帶 status 的會被 Codex 忽略，後面一定要有 response.failed。
+
+async function officialTurn(events) {
+  const received = [];
+  const session = {
+    responseIds: new Set(),
+    send() { queueMicrotask(() => { for (const event of events) this.onEvent?.(event); }); },
+  };
+  const outcome = await router.runUpstreamWebSocketTurn(session, { model: "gpt-test" }, {
+    onEvent: (event) => received.push(event),
+  });
+  return { outcome, received };
+}
+
+test("官方 WebSocket：上游只送不帶 status 的 error，也要補 response.failed", async () => {
+  const { outcome, received } = await officialTurn([
+    { type: "response.created", response: { id: "resp_1" } },
+    { type: "response.in_progress", response: { id: "resp_1" } },
+    { type: "error", error: { type: "server_error", code: "server_is_overloaded", message: "上游過載" } },
+  ]);
+  assert.equal(outcome.ok, true);
+  assert.deepEqual(received.map((event) => event.type), ["response.created", "response.in_progress", "error", "response.failed"]);
+  assert.deepEqual(received.at(-1).response.error, { code: "server_is_overloaded", message: "上游過載" });
+});
+
+test("官方 WebSocket：帶 status 的 error 原樣先送，Codex 才看得到用量上限的細節", async () => {
+  const usageLimit = {
+    type: "error", status: 429,
+    error: { type: "usage_limit_reached", message: "The usage limit has been reached", resets_at: 1738888888 },
+    headers: { "x-codex-primary-used-percent": "100.0" },
+  };
+  const { received } = await officialTurn([usageLimit]);
+  assert.deepEqual(received[0], usageLimit);
+  assert.deepEqual(received.map((event) => event.type), ["error", "response.failed"]);
+});
+
 test("HTTP：上游只送 error 就結束時同樣補 response.failed，而不是當成截斷", async () => {
   const response = fakeResponse();
   const upstream = { ...upstreamOf([sse({ type: "error", code: "server_is_overloaded", message: "上游過載" })]),

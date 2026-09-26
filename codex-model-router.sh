@@ -6021,6 +6021,13 @@ export function runUpstreamWebSocketTurn(session, payload, { onEvent, signal }) 
       }
       if (type === "response.failed" || type === "error") {
         flush();
+        // 官方上游的 error 帶 HTTP status（例如用量上限的 429），Codex 會自己處理並丟掉
+        // 這條連線，後面補的 response.failed 不會被讀到；沒帶 status 的 error 則會被 Codex
+        // 忽略，不補終止事件就要空等閒置逾時。所以兩種情況都補，原本的 error 照樣先送。
+        if (type === "error") {
+          onEvent(responseFailedFromErrorEvent(event));
+          stats.responseFailedSent += 1;
+        }
         finish({ ok: true, retryWithReplay: false });
       }
     };
