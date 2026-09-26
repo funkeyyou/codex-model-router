@@ -10,6 +10,9 @@ import { setTimeout as delay } from "node:timers/promises";
 
 export const IMAGE_MODELS = ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"];
 export const ARK_IMAGE_PATH = "/v2/extend/image/ark_gpt_image";
+// 路由器依這個標頭決定用哪一家供應商生圖；與 router.mjs 的 PROVIDER_HEADER 相同。
+export const PROVIDER_HEADER = "x-codex-router-provider";
+const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
 const MODEL_ALIASES = {
   image2: IMAGE_MODELS[0], "image-2": IMAGE_MODELS[0],
   sunburst: IMAGE_MODELS[1], "image2.5-sunburst": IMAGE_MODELS[1],
@@ -189,10 +192,11 @@ export async function downloadArkImage(source, { signal, lookupImpl = lookup, dn
 }
 
 export async function runArkImageTask({ origin, payload, action = "generate", apiKey = "", timeoutMs = 300000,
-  fetchImpl = globalThis.fetch, downloadImpl = downloadArkImage, pollIntervalMs = 2000 } = {}) {
+  fetchImpl = globalThis.fetch, downloadImpl = downloadArkImage, pollIntervalMs = 2000, extraHeaders = {} } = {}) {
   const signal = AbortSignal.timeout(timeoutMs);
   const base = `${new URL(origin).origin}${ARK_IMAGE_PATH}`;
-  const headers = { "content-type": "application/json", ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) };
+  const headers = { "content-type": "application/json", ...extraHeaders,
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) };
   let taskId;
   const read = async (response) => {
     const result = await responseJson(response);
@@ -299,13 +303,19 @@ export async function runRelayImagegen(args, {
     throw new Error("此命令尚未由路由器安裝器配置。");
   }
   const model = chooseImageModel(config, options.model, options.action);
+  // 舊版技能沒有記錄供應商：那時只有一家，路由器會用主要供應商。
+  const providerId = config.providerId ?? null;
+  if (providerId !== null && !(typeof providerId === "string" && PROVIDER_ID_PATTERN.test(providerId))) {
+    throw new Error("生圖供應商設定無效，請從路由器選單重新設定中轉 API 生圖。");
+  }
+  const providerHeaders = providerId ? { [PROVIDER_HEADER]: providerId } : {};
   const apiMode = config.apiMode || "images";
   if (!["images", "ark-task"].includes(apiMode)) throw new Error("生圖介面設定無效，請重新設定中轉生圖。");
   const upstreamModel = config.upstreamModels?.[model] || model;
   if (upstreamModel !== model && !(typeof upstreamModel === "string" && upstreamModel.endsWith(`/${model}`) && !/[\s?#]/.test(upstreamModel))) {
     throw new Error("圖片模型對應無效，請重新設定中轉生圖。");
   }
-  if (options.action === "list") return { models: config.models, upstreamModels: config.upstreamModels, apiMode,
+  if (options.action === "list") return { models: config.models, upstreamModels: config.upstreamModels, apiMode, provider: providerId,
     defaultGenerate: chooseImageModel(config, null, "generate"), defaultEdit: chooseImageModel(config, null, "edit") };
 
   const settings = JSON.parse(readFileSync(config.routerSettingsPath, "utf8"));
@@ -365,12 +375,12 @@ export async function runRelayImagegen(args, {
     const arkPayload = { model: upstreamModel, prompt, output_format: format, background: options.background };
     if (options.action === "edit") arkPayload.image_base64s = inputs.map((image) => `data:image/${image.type};base64,${image.bytes.toString("base64")}`);
     const result = await runArkImageTask({ origin, action: options.action, payload: arkPayload, fetchImpl, downloadImpl,
-      timeoutMs: timeout * 1000, pollIntervalMs });
+      timeoutMs: timeout * 1000, pollIntervalMs, extraHeaders: providerHeaders });
     writeFileSync(out, result.bytes, { mode: 0o600, flag: "wx" });
     return { model, upstreamModel, apiMode, taskId: result.taskId, path: out, bytes: result.bytes.length };
   }
   let body = JSON.stringify(payload);
-  const headers = { "content-type": "application/json" };
+  const headers = { "content-type": "application/json", ...providerHeaders };
   if (options.action === "edit") {
     body = new FormData();
     for (const [name, value] of Object.entries(payload)) body.set(name, String(value));

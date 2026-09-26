@@ -22,12 +22,76 @@ const settingsPath = join(routerDirectory, "settings.json");
 const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
 const listenHost = "127.0.0.1";
 const listenPort = Number(settings.port);
-const apiRoot = String(settings.apiRoot).replace(/\/$/, "");
 const officialBase = String(settings.officialBaseUrl).replace(/\/$/, "");
-const keychainService = settings.keychainService;
-const keychainAccount = settings.keychainAccount || "codex";
-const credentialPath = settings.credentialPath || null;
+
+// 中轉供應商。1.24.0 以前只能設一家，欄位直接放在設定頂層；之後放在 providers 陣列。
+// 路由沒寫 providerId 就屬於 id 為 default 的那一家，也就是舊版的唯一一家。
+export const DEFAULT_PROVIDER_ID = "default";
+
+export function normalizeProviders(source) {
+  const list = Array.isArray(source?.providers) && source.providers.length > 0
+    ? source.providers
+    : source?.apiRoot ? [{ ...source, id: DEFAULT_PROVIDER_ID }] : [];
+  return list.map((provider) => ({
+    id: String(provider.id || DEFAULT_PROVIDER_ID),
+    apiRoot: String(provider.apiRoot || "").replace(/\/$/, ""),
+    keychainService: provider.keychainService,
+    keychainAccount: provider.keychainAccount || "codex",
+    credentialPath: provider.credentialPath || null,
+  }));
+}
+
+const providers = normalizeProviders(settings);
+const providerById = new Map(providers.map((provider) => [provider.id, provider]));
+// 第一家是主要供應商：Codex 內建 image_gen 與沒有指定供應商的生圖請求都送到這裡。
+const primaryProvider = providers[0] || null;
 const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route]));
+
+export function providerForRoute(route, registry = providerById) {
+  const id = route?.providerId || DEFAULT_PROVIDER_ID;
+  const provider = registry.get(id);
+  // 不能退回其他家：那會拿別家的 Key 去打別家的上游，錯誤訊息還會誤導。
+  if (!provider) {
+    throw new RouterRequestError(
+      500, "provider_not_configured",
+      `找不到供應商「${id}」的設定，請執行安裝器的 update，或刪除後重新添加這個模型。`,
+      "routing",
+    );
+  }
+  return provider;
+}
+
+// 中轉生圖命令用這個標頭指定供應商；Codex 內建的 image_gen 不帶，一律送主要供應商。
+export const PROVIDER_HEADER = "x-codex-router-provider";
+
+export function imageProviderFor(headers, registry = providerById, primary = primaryProvider) {
+  const requested = headers?.[PROVIDER_HEADER];
+  if (requested == null || requested === "") {
+    if (!primary) throw new RouterRequestError(503, "provider_not_configured", "尚未設定中轉供應商。", "routing");
+    return primary;
+  }
+  const provider = typeof requested === "string" ? registry.get(requested) : null;
+  // 指定的供應商不存在時拒絕，不改送主要供應商——那會用另一個帳號計費。
+  if (!provider) {
+    throw new RouterRequestError(
+      400, "unknown_provider",
+      "中轉生圖指定的供應商已不存在，請從安裝器重新設定中轉 API 生圖。",
+      "routing",
+    );
+  }
+  return provider;
+}
+
+function hostOf(url) {
+  try { return new URL(url).host; } catch { return null; }
+}
+
+const providerSummary = providers.map((provider) => ({
+  id: provider.id,
+  host: hostOf(provider.apiRoot),
+  routes: settings.routes.filter((route) => (route.providerId || DEFAULT_PROVIDER_ID) === provider.id).length,
+}));
+
 const execFileAsync = promisify(execFile);
 const tokenCacheTtlMs = 5 * 60 * 1000;
 // Windows 以密文檔的修改時間判斷 Key 有沒有換，快取可以放久一點。
@@ -743,6 +807,7 @@ const stats = {
   catalogRefreshFailures: 0,
   catalogModels: 0,
   lastImageStatus: null,
+  lastImageProvider: null,
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
   translatedRequests: 0,
@@ -768,6 +833,7 @@ const stats = {
   lastCustomStatus: null,
   lastWebSocketStatus: null,
   lastRoute: null,
+  lastProvider: null,
   lastModel: null,
   lastReasoningEffort: null,
   lastForwardedReasoningEffort: null,
@@ -835,15 +901,28 @@ export function describeRouterError(error) {
   };
 }
 
+// 錯誤記錄要寫出實際連的是哪一家；請求本身沒記下時，由模型對應的路由推回去。
+// 生圖請求在選定供應商之前把 provider 設成 null：指定的供應商不存在時，
+// 記錄不能寫成主要供應商。
+function contextProvider(context) {
+  if (context.route !== "custom") return null;
+  if ("provider" in context) return context.provider;
+  const route = typeof context.model === "string" ? routeMap.get(context.model) : null;
+  return (route && providerById.get(route.providerId || DEFAULT_PROVIDER_ID)) || primaryProvider;
+}
+
 function recordRouterError(error, context = {}, countFailure = true) {
   const details = describeRouterError(error);
   const requestId = randomBytes(8).toString("hex");
-  const endpoint = details.phase === "auth_probe" || context.route !== "custom" ? officialBase : apiRoot;
+  const official = details.phase === "auth_probe" || context.route !== "custom";
+  const provider = official ? null : contextProvider(context);
+  const upstreamRoot = official ? officialBase : provider?.apiRoot;
   const record = {
     at: new Date().toISOString(), requestId,
     transport: context.transport || null, route: context.route || null,
     model: typeof context.model === "string" ? context.model.slice(0, 160) : null,
-    upstreamHost: new URL(endpoint).host,
+    upstreamHost: upstreamRoot ? hostOf(upstreamRoot) : null,
+    ...(provider ? { provider: provider.id } : {}),
     ...details,
   };
   // 不記錄原始例外訊息、標頭、Key 或請求內文；cause.code 已足夠定位網路故障。
@@ -880,7 +959,9 @@ async function runSecretCommand(file, args, options = {}) {
   return stdout.trim();
 }
 
-export async function readStoredSecret() {
+export async function readStoredSecret(provider = primaryProvider) {
+  if (!provider) throw new Error("尚未設定中轉供應商");
+  const { keychainService, keychainAccount, credentialPath } = provider;
   if (process.platform !== "win32") {
     return runSecretCommand("/usr/bin/security", [
       "find-generic-password",
@@ -939,30 +1020,40 @@ export function createSecretCache({ read, fingerprint = () => null, ttlMs, now =
 
 // Windows 的密文檔只在安裝器換 Key 時改寫；stat 幾乎不花時間，可以每次檢查。
 // macOS 的鑰匙圈沒有等價的廉價檢查，沿用較短的 TTL（讀取本身只要數十毫秒）。
-function credentialFingerprint() {
-  if (process.platform !== "win32" || !credentialPath) return null;
+function credentialFingerprint(provider) {
+  if (process.platform !== "win32" || !provider.credentialPath) return null;
   try {
-    const info = statSync(credentialPath);
+    const info = statSync(provider.credentialPath);
     return `${info.mtimeMs}:${info.size}`;
   } catch {
     return "missing";
   }
 }
 
-const cachedApiKey = createSecretCache({
-  read: async () => {
-    stats.credentialReads += 1;
-    return readStoredSecret();
-  },
-  fingerprint: credentialFingerprint,
-  ttlMs: process.platform === "win32" && credentialPath ? credentialCacheTtlMs : tokenCacheTtlMs,
-});
+// 每家供應商各自一份快取：換掉其中一家的 Key 不影響其他家。
+const secretCaches = new Map();
 
-async function getApiKey(reload = false) {
+function secretCacheFor(provider) {
+  let cache = secretCaches.get(provider.id);
+  if (!cache) {
+    cache = createSecretCache({
+      read: async () => {
+        stats.credentialReads += 1;
+        return readStoredSecret(provider);
+      },
+      fingerprint: () => credentialFingerprint(provider),
+      ttlMs: process.platform === "win32" && provider.credentialPath ? credentialCacheTtlMs : tokenCacheTtlMs,
+    });
+    secretCaches.set(provider.id, cache);
+  }
+  return cache;
+}
+
+async function getApiKey(provider, reload = false) {
   if (process.env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
     return process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
   }
-  return cachedApiKey({ reload });
+  return secretCacheFor(provider)({ reload });
 }
 
 function appendHeader(headers, name, value) {
@@ -1203,11 +1294,11 @@ async function proxyToOfficial(request, response, incomingUrl) {
   await streamUpstream(upstream, response);
 }
 
-export function targetUrl(custom, incomingUrl) {
+export function targetUrl(custom, incomingUrl, provider = primaryProvider) {
   const path = incomingUrl.pathname.startsWith("/v1/")
     ? incomingUrl.pathname.slice(3)
     : incomingUrl.pathname;
-  const base = custom ? apiRoot : officialBase;
+  const base = custom ? provider.apiRoot : officialBase;
   return new URL(`${base}${path}${incomingUrl.search}`);
 }
 
@@ -1260,8 +1351,8 @@ export async function streamUpstream(upstream, response, history = null, respons
   response.end();
 }
 
-async function fetchCustom(target, headers, body, signal) {
-  let apiKey = await getApiKey(false);
+async function fetchCustom(provider, target, headers, body, signal) {
+  let apiKey = await getApiKey(provider, false);
   let upstream = await fetch(target, {
     method: "POST",
     headers: buildCustomHeaders(headers, apiKey),
@@ -1271,7 +1362,7 @@ async function fetchCustom(target, headers, body, signal) {
   });
   if (upstream.status !== 401 && upstream.status !== 403) return upstream;
   await upstream.arrayBuffer();
-  apiKey = await getApiKey(true);
+  apiKey = await getApiKey(provider, true);
   return fetch(target, {
     method: "POST",
     headers: buildCustomHeaders(headers, apiKey),
@@ -1290,8 +1381,9 @@ export async function fetchModelUpstream(
   meta = {},
 ) {
   const route = chooseRoute(requestHeaders, body);
-  rememberRoute(requestHeaders, route);
   const isCustom = route != null;
+  const provider = isCustom ? providerForRoute(route) : null;
+  rememberRoute(requestHeaders, route);
 
   // HTTP 回退與第三方上游不保證支援 previous_response_id，從對應的成功回合重播。
   const historyKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
@@ -1329,6 +1421,7 @@ export async function fetchModelUpstream(
   let outboundBody = Buffer.from(JSON.stringify(outboundBodyObject));
 
   stats.lastRoute = isCustom ? "custom" : "official";
+  stats.lastProvider = provider?.id ?? null;
   stats.lastModel = body?.model ?? null;
   stats.lastReasoningEffort = body?.reasoning?.effort ?? null;
   stats.lastForwardedReasoningEffort =
@@ -1367,13 +1460,14 @@ export async function fetchModelUpstream(
         return oversizeResponse(anthropicBody.length);
       }
       const translated = await fetchCustom(
-        new URL(`${apiRoot}/messages`),
+        provider,
+        new URL(`${provider.apiRoot}/messages`),
         requestHeaders,
         anthropicBody,
         signal,
       );
       stats.lastCustomStatus = translated.status;
-      recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model });
+      recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
       return translated;
     }
     const budget = budgetToolImages(outboundBodyObject);
@@ -1383,13 +1477,14 @@ export async function fetchModelUpstream(
       return oversizeResponse(outboundBody.length);
     }
     const upstream = await fetchCustom(
-      targetUrl(true, incomingUrl),
+      provider,
+      targetUrl(true, incomingUrl, provider),
       requestHeaders,
       outboundBody,
       signal,
     );
     stats.lastCustomStatus = upstream.status;
-    recordUpstreamFailure(upstream, { transport: meta.transport, route: "custom", model: body?.model });
+    recordUpstreamFailure(upstream, { transport: meta.transport, route: "custom", model: body?.model, provider });
     return upstream;
   }
 
@@ -1472,6 +1567,9 @@ async function handleArkImages(request, response, incomingUrl) {
   }
   if (rejectBrowserRequest(request, response)) return;
   request.routerContext.route = "custom";
+  request.routerContext.provider = null;
+  const provider = imageProviderFor(request.headers);
+  request.routerContext.provider = provider;
   if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
   const chunks = [];
   let size = 0;
@@ -1486,12 +1584,13 @@ async function handleArkImages(request, response, incomingUrl) {
   // 此路徑相對於已配置的供應商 origin，不接在 /v1 後，也不轉送官方後端。
   // 任務提交只發一次，不以 401/403 為由重送付費提交。Key 由快取提供：Windows 的密文檔
   // 一改寫就會重讀，不必每次都起 PowerShell（任務輪詢每 2 秒一次，以前每次都卡住路由器）。
-  const apiKey = await getApiKey();
-  const upstream = await fetch(new URL(incomingUrl.pathname, new URL(apiRoot).origin), {
+  const apiKey = await getApiKey(provider);
+  const upstream = await fetch(new URL(incomingUrl.pathname, new URL(provider.apiRoot).origin), {
     method: request.method, headers: buildCustomHeaders(request.headers, apiKey),
     body: taskQuery ? undefined : Buffer.concat(chunks), redirect: "manual", signal: controller.signal,
   });
   stats.arkImageRequests += 1;
+  stats.lastImageProvider = provider.id;
   stats.lastImageStatus = upstream.status;
   await streamUpstream(upstream, response);
 }
@@ -1503,6 +1602,9 @@ async function handleImages(request, response, incomingUrl) {
   // 因此放行沒有標頭的請求；但瀏覽器網頁發起的請求一律拒絕（見 isBrowserRequest）。
   if (rejectBrowserRequest(request, response)) return;
   request.routerContext.route = "custom";
+  request.routerContext.provider = null;
+  const provider = imageProviderFor(request.headers);
+  request.routerContext.provider = provider;
   if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
   const rawBody = await readRequestBody(request);
 
@@ -1515,12 +1617,14 @@ async function handleImages(request, response, incomingUrl) {
     ? incomingUrl.pathname.slice(3)
     : incomingUrl.pathname;
   const upstream = await fetchCustom(
-    new URL(`${apiRoot}${path}${incomingUrl.search}`),
+    provider,
+    new URL(`${provider.apiRoot}${path}${incomingUrl.search}`),
     request.headers,
     rawBody,
     abortController.signal,
   );
   stats.imageRequests += 1;
+  stats.lastImageProvider = provider.id;
   stats.lastImageStatus = upstream.status;
   await streamUpstream(upstream, response);
 }
@@ -2528,6 +2632,7 @@ async function tryUpstreamWebSocketTurn(
       stats.lastWebSocketStatus = 200;
       stats.official += 1;
       stats.lastRoute = "official-ws";
+      stats.lastProvider = null;
       stats.lastModel = message?.model ?? null;
       stats.lastReasoningEffort = message?.reasoning?.effort ?? null;
       stats.lastForwardedReasoningEffort = message?.reasoning?.effort ?? null;
@@ -2828,6 +2933,7 @@ const server = http.createServer(async (request, response) => {
         version: settings.version,
         uptimeSeconds: Math.floor(process.uptime()),
         historyCache: historyCacheInfo(),
+        providers: providerSummary,
         stats,
       });
       return;
