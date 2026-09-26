@@ -2,7 +2,8 @@
 //
 // 這個命令存在的理由就是「升級不必重新設定模型」，所以這裡盯的不是它有沒有跑完，
 // 而是已完成預設名稱遷移後，設定除了版本號以外一模一樣：路由、憑證位置、連接埠與
-// 使用者旋鈕不能在升級中被洗掉。首次 api/ 名稱遷移另由 model-prefix.test.mjs 驗證。
+// 使用者旋鈕不能在升級中被洗掉。首次 api/ 名稱遷移另由 model-prefix.test.mjs 驗證；
+// 舊版放在頂層的單一供應商欄位，第一次更新時會搬進 providers（內容不變）。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -37,16 +38,52 @@ const manifest = () => ({
   routes: structuredClone(routes),
 });
 
-test("預設名稱已遷移時，更新只改版本號，其餘設定逐欄位保持不變", () => {
+const LEGACY_PROVIDER_FIELDS = ["apiRoot", "baseUrl", "keychainService", "keychainAccount", "credentialPath"];
+
+test("舊版單一供應商的欄位搬進 providers，其餘設定逐欄位保持不變", () => {
   const before = settings();
   const plan = planUpdate(manifest(), before, "1.17.0");
   assert.equal(plan.ok, true);
   assert.equal(plan.settings.version, "1.17.0");
+  assert.deepEqual(plan.settings.providers, [{
+    id: "default",
+    baseUrl: before.baseUrl,
+    apiRoot: before.apiRoot,
+    keychainService: before.keychainService,
+    keychainAccount: "codex",
+    credentialPath: before.credentialPath,
+  }]);
   for (const key of Object.keys(before)) {
-    if (key === "version") continue;
+    if (key === "version" || LEGACY_PROVIDER_FIELDS.includes(key)) continue;
     assert.deepEqual(plan.settings[key], before[key], `${key} 不該被更新改動`);
   }
-  assert.deepEqual(Object.keys(plan.settings).sort(), Object.keys(before).sort());
+  const expectedKeys = [...Object.keys(before).filter((key) => !LEGACY_PROVIDER_FIELDS.includes(key)), "providers"];
+  assert.deepEqual(Object.keys(plan.settings).sort(), expectedKeys.sort());
+  assert.deepEqual(plan.manifest.providers, plan.settings.providers);
+  // 舊版安裝器的 rollback 不檢查版本，靠 manifest 的 keychainService 刪 Key。
+  for (const field of LEGACY_PROVIDER_FIELDS) {
+    assert.equal(plan.manifest[field], plan.settings.providers[0][field], `manifest 保留主要供應商的 ${field}`);
+  }
+});
+
+test("已是新格式時，更新只改版本號，其餘設定逐欄位保持不變", () => {
+  const migrated = planUpdate(manifest(), settings(), "1.17.0");
+  const plan = planUpdate(migrated.manifest, migrated.settings, "1.18.0");
+  assert.equal(plan.ok, true);
+  assert.deepEqual({ ...plan.settings, version: migrated.settings.version }, migrated.settings);
+  assert.deepEqual({ ...plan.manifest, version: migrated.manifest.version }, migrated.manifest);
+});
+
+test("找不到供應商設定，或有模型指向不存在的供應商時拒絕更新", () => {
+  const bare = settings();
+  for (const field of LEGACY_PROVIDER_FIELDS) delete bare[field];
+  const bareManifest = manifest();
+  delete bareManifest.keychainService;
+  assert.equal(planUpdate(bareManifest, bare, "1.17.0").reason, "no-providers");
+
+  const orphan = settings();
+  orphan.routes = [...orphan.routes, { pickerSlug: "custom/gone-x", upstreamModel: "x", providerId: "gone" }];
+  assert.equal(planUpdate(manifest(), orphan, "1.17.0").reason, "unknown-provider");
 });
 
 test("自訂模型原封不動地留下來，不需要重新探測", () => {

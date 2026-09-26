@@ -68,7 +68,7 @@ test("只有刪除命中全域預設模型時才清除預設", () => {
 
 test("選單按安裝、模型管理、其他設定、狀態與退出分組", () => {
   assert.deepEqual(installer.MENU_ITEMS.map(([action]) => action), [
-    "install", "update", "add", "remove", "hidden-models", "context-1m", "imagegen", "status", "rollback", "exit",
+    "install", "update", "add", "remove", "providers", "hidden-models", "context-1m", "imagegen", "status", "rollback", "exit",
   ]);
 });
 
@@ -102,9 +102,9 @@ test("remove 輸入 cancel 不修改檔案也不建立備份", { skip: process.p
   const child = spawnSync("bash", [script, "remove"], { env: childEnv, input: "cancel\n", encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr || child.stdout);
   assert.match(child.stdout, /未進行任何修改/);
-  const menu = spawnSync("bash", [script], { env: childEnv, input: "10\n", encoding: "utf8" });
+  const menu = spawnSync("bash", [script], { env: childEnv, input: "11\n", encoding: "utf8" });
   assert.equal(menu.status, 0, menu.stderr || menu.stdout);
-  assert.match(menu.stdout, /10\. 退出/);
+  assert.match(menu.stdout, /11\. 退出/);
   assert.match(menu.stdout, /未進行任何修改/);
   for (const [name, content] of files) assert.equal(readFileSync(join(installRoot, name), "utf8"), content);
   assert.equal(readFileSync(join(root, "config.toml"), "utf8"), config);
