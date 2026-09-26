@@ -4,14 +4,14 @@
 //   node tools/build.mjs           # 寫入 .sh 與 .ps1
 //   node tools/build.mjs --check   # 只比對，有落差就以非零狀態結束
 //
-// src/ 是唯一真實來源：四段 JavaScript 各自是一般的 .mjs 檔，可以直接用編輯器、
+// src/ 是唯一真實來源：五段 JavaScript 各自是一般的 .mjs 檔，可以直接用編輯器、
 // ESLint 與 node --check 處理。兩支安裝器只是把同一份文字包進不同的外殼——
 // .sh 放在 bash heredoc 裡，.ps1 放在 PowerShell 的 <# #> 註解區塊裡——
 // 讓使用者一樣只要下載單一檔案。
 //
 // 這支工具除了搬運文字，還負責幾件壞掉也不會立刻報錯的事：
 //   - .ps1 開頭必須有 UTF-8 BOM，否則 PowerShell 5.1 會用 ANSI 代碼頁讀檔，中文全變亂碼；
-//   - 四段負載要整批寫入，只更新其中一段會讓某個平台靜默停在舊版；
+//   - 五段負載要整批寫入，只更新其中一段會讓某個平台靜默停在舊版；
 //   - 負載裡不能出現標記行或 "#>"，否則 heredoc 或 PowerShell 註解會提早結束。
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -31,6 +31,7 @@ export const SECTIONS = [
   { marker: "__CODEX_MODEL_ROUTER_INSTALLER_JS__", file: "installer.mjs" },
   { marker: "__CODEX_MODEL_ROUTER_ROUTER_JS__", file: "router.mjs" },
   { marker: "__CODEX_MODEL_ROUTER_BRIDGE_JS__", file: "claude-bridge.mjs" },
+  { marker: "__CODEX_MODEL_ROUTER_CHAT_JS__", file: "chat-bridge.mjs" },
   { marker: "__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", file: "imagegen.mjs" },
 ];
 const ALL_MARKERS = [...SECTIONS.map((section) => section.marker), END_MARKER];

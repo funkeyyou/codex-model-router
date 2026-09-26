@@ -612,8 +612,8 @@ Anthropic 路由前，把它們改寫或剝除掉**——健康檢查的 `bridge
 
 ## 開發
 
-程式碼放在 `src/`：四段 JavaScript（`installer.mjs`、`router.mjs`、`claude-bridge.mjs`、
-`imagegen.mjs`）都是一般模組，另有 `wrapper.sh` 與 `wrapper.ps1` 兩個啟動外殼。
+程式碼放在 `src/`：五段 JavaScript（`installer.mjs`、`router.mjs`、`claude-bridge.mjs`、
+`chat-bridge.mjs`、`imagegen.mjs`）都是一般模組，另有 `wrapper.sh` 與 `wrapper.ps1` 兩個啟動外殼。
 repo 根目錄的 `codex-model-router.sh`／`.ps1` 是建置產物：同一份負載分別包進 bash heredoc
 與 PowerShell 註解區塊，讓使用者只需下載單一檔案。改完 `src/` 之後要重新建置：
 
@@ -639,7 +639,7 @@ git push origin v1.23.0
 
 ### 測試
 
-測試直接把建置後 `.sh` 裡的四段負載取出來 import，所以測到的一定是會發佈出去的那份。
+測試直接把建置後 `.sh` 裡的五段負載取出來 import，所以測到的一定是會發佈出去的那份。
 
 ```bash
 npm test        # node --test，無需安裝任何相依套件
@@ -681,7 +681,7 @@ Windows 上會變成普通相對路徑，測試照樣綠燈，其實什麼都沒
 
 - `.ps1` 開頭必須保留 UTF-8 BOM。PowerShell 5.1 少了 BOM 會改用 ANSI 代碼頁讀檔，
   安裝器的所有中文訊息都會變成亂碼。
-- 四段負載要整批寫入。只更新其中一段會讓某個平台靜默停留在舊的 router 或 claude-bridge。
+- 五段負載要整批寫入。只更新其中一段會讓某個平台靜默停留在舊的 router 或轉譯層。
 - 負載裡不能出現標記行或 `#>`，否則 bash heredoc 或 PowerShell 註解會提早結束。
 
 換行由 `.gitattributes` 統一成 LF；混進 CRLF 會讓 `--check` 在不同平台的簽出上誤報。

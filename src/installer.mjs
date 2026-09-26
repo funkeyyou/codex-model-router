@@ -59,6 +59,7 @@ const launchAgentsDir = resolve(
 const manifestPath = join(installRoot, "install.json");
 const routerPath = join(installRoot, "router.mjs");
 const bridgePath = join(installRoot, "claude-bridge.mjs");
+const chatBridgePath = join(installRoot, "chat-bridge.mjs");
 const settingsPath = join(installRoot, "settings.json");
 const catalogPath = join(installRoot, "models.json");
 const logPath = join(installRoot, "router.err.log");
@@ -336,9 +337,38 @@ function loadBridgeSource() {
   const markerIndex = source.indexOf(marker);
   if (markerIndex < 0) fail("安裝器中缺少內嵌 Claude 轉譯程式碼。" );
   const bridgeSource = source.slice(markerIndex + marker.length);
-  const endMarker = "\n__CODEX_MODEL_ROUTER_IMAGEGEN_JS__";
+  const endMarker = "\n__CODEX_MODEL_ROUTER_CHAT_JS__";
   const endIndex = bridgeSource.lastIndexOf(endMarker);
   return endIndex < 0 ? bridgeSource : bridgeSource.slice(0, endIndex);
+}
+
+function loadChatBridgeSource() {
+  if (!scriptPath || !existsSync(scriptPath)) {
+    fail("無法讀取安裝器原始檔。" );
+  }
+  const source = readFileSync(scriptPath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_CHAT_JS__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_IMAGEGEN_JS__");
+  if (start < 0 || end <= start) fail("安裝器中缺少內嵌 Chat Completions 轉譯程式碼。");
+  return source.slice(start + marker.length, end) + "\n";
+}
+
+// 轉譯層有兩支：claude-bridge.mjs，以及 1.25.0 起的 chat-bridge.mjs。後者在舊安裝裡
+// 不存在，備份時沒有就跳過；還原時備份裡沒有它，就刪掉這次新寫的那份（舊版路由器用不到）。
+function writeBridgeSources() {
+  writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
+  chmodSync(bridgePath, 0o600);
+  writeFileSync(chatBridgePath, loadChatBridgeSource(), { mode: 0o600 });
+  chmodSync(chatBridgePath, 0o600);
+}
+
+function backupChatBridge(directory) {
+  copyIfExists(chatBridgePath, join(directory, "chat-bridge.mjs"));
+}
+
+function restoreChatBridge(directory) {
+  if (!copyIfExists(join(directory, "chat-bridge.mjs"), chatBridgePath)) rmSync(chatBridgePath, { force: true });
 }
 
 export function loadImagegenSource(sourcePath = scriptPath) {
@@ -2483,6 +2513,7 @@ async function install() {
     ensureDirectory(reconfigureBackupDir);
     copyIfExists(routerPath, join(reconfigureBackupDir, "router.mjs"));
     copyIfExists(bridgePath, join(reconfigureBackupDir, "claude-bridge.mjs"));
+    backupChatBridge(reconfigureBackupDir);
     copyIfExists(settingsPath, join(reconfigureBackupDir, "settings.json"));
     copyIfExists(catalogPath, join(reconfigureBackupDir, "models.json"));
     copyIfExists(manifestPath, join(reconfigureBackupDir, "install.json"));
@@ -2494,8 +2525,7 @@ async function install() {
   ensureDirectory(installRoot);
   writeFileSync(routerPath, routerSource, { mode: 0o600 });
   chmodSync(routerPath, 0o600);
-  writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
-  chmodSync(bridgePath, 0o600);
+  writeBridgeSources();
   writeJsonAtomic(catalogPath, combinedCatalog);
   writeJsonAtomic(settingsPath, withProviders({
     version: INSTALLER_VERSION,
@@ -2547,6 +2577,7 @@ async function install() {
       serviceDefinitionPath: isWindows ? taskXmlPath : plistPath,
       routerPath,
       bridgePath,
+      chatBridgePath,
       settingsPath,
       catalogPath,
       logPath,
@@ -2570,6 +2601,7 @@ async function install() {
     if (existingManifest && reconfigureBackupDir) {
       copyIfExists(join(reconfigureBackupDir, "router.mjs"), routerPath);
       copyIfExists(join(reconfigureBackupDir, "claude-bridge.mjs"), bridgePath);
+      restoreChatBridge(reconfigureBackupDir);
       copyIfExists(join(reconfigureBackupDir, "settings.json"), settingsPath);
       copyIfExists(join(reconfigureBackupDir, "models.json"), catalogPath);
       copyIfExists(join(reconfigureBackupDir, "install.json"), manifestPath);
@@ -2696,6 +2728,7 @@ async function addModels() {
   ensureDirectory(backupDir);
   copyIfExists(routerPath, join(backupDir, "router.mjs"));
   copyIfExists(bridgePath, join(backupDir, "claude-bridge.mjs"));
+  backupChatBridge(backupDir);
   copyIfExists(settingsPath, join(backupDir, "settings.json"));
   copyIfExists(catalogPath, join(backupDir, "models.json"));
   copyIfExists(manifestPath, join(backupDir, "install.json"));
@@ -2722,8 +2755,7 @@ async function addModels() {
     // 路由器與轉譯層一併刷新，否則 settings.version 會與實際執行的程式碼對不上。
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
-    writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
-    chmodSync(bridgePath, 0o600);
+    writeBridgeSources();
     writeJsonAtomic(catalogPath, combinedCatalog);
     writeJsonAtomic(settingsPath, withProviders({ ...settings, version: INSTALLER_VERSION, routes }, providers));
     writeJsonAtomic(manifestPath, manifestWithProviders({
@@ -2741,6 +2773,7 @@ async function addModels() {
     console.error("\n添加失敗，正在還原之前的配置...");
     copyIfExists(join(backupDir, "router.mjs"), routerPath);
     copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
+    restoreChatBridge(backupDir);
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
     copyIfExists(join(backupDir, "models.json"), catalogPath);
     copyIfExists(join(backupDir, "install.json"), manifestPath);
@@ -2872,6 +2905,7 @@ async function removeModels() {
   ]) {
     if (!copyIfExists(source, join(backupDir, name))) fail(`無法備份 ${name}，已取消刪除。`);
   }
+  backupChatBridge(backupDir);
   if (defaultModel && !copyIfExists(userConfig.filePath, join(backupDir, "config.toml"))) {
     fail("無法備份全域預設模型設定，已取消刪除。");
   }
@@ -2880,8 +2914,7 @@ async function removeModels() {
   try {
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
-    writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
-    chmodSync(bridgePath, 0o600);
+    writeBridgeSources();
     writeJsonAtomic(catalogPath, plan.catalog);
     writeJsonAtomic(settingsPath, plan.settings);
     writeJsonAtomic(manifestPath, { ...plan.manifest, updatedAt: new Date().toISOString() });
@@ -2907,6 +2940,8 @@ async function removeModels() {
         if (!copyIfExists(join(backupDir, name), target)) fail(`找不到 ${name} 備份。`);
       } catch (restoreError) { restoreFailures.push(`${name}：${restoreError.message}`); }
     }
+    try { restoreChatBridge(backupDir); }
+    catch (restoreError) { restoreFailures.push(`chat-bridge.mjs：${restoreError.message}`); }
     if (configChangeAttempted) {
       try { await writeConfigEdits([{ keyPath: "model", value: defaultModel }]); }
       catch (restoreError) { restoreFailures.push(`全域預設模型：${restoreError.message}`); }
@@ -3023,6 +3058,7 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
   for (const [source, name] of files) {
     if (!copyIfExists(source, join(backupDir, name))) fail(`無法備份 ${name}，已取消。`);
   }
+  backupChatBridge(backupDir);
   if (configFile && !copyIfExists(configFile, join(backupDir, "config.toml"))) {
     fail("無法備份 config.toml，已取消。");
   }
@@ -3030,8 +3066,7 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
   try {
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
-    writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
-    chmodSync(bridgePath, 0o600);
+    writeBridgeSources();
     writeJsonAtomic(catalogPath, catalog);
     writeJsonAtomic(settingsPath, settings);
     writeJsonAtomic(manifestPath, { ...manifest, updatedAt: new Date().toISOString() });
@@ -3051,6 +3086,8 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
         if (!copyIfExists(join(backupDir, name), target)) failures.push(`找不到 ${name} 備份`);
       } catch (restoreError) { failures.push(`${name}：${restoreError.message}`); }
     }
+    try { restoreChatBridge(backupDir); }
+    catch (restoreError) { failures.push(`chat-bridge.mjs：${restoreError.message}`); }
     if (applied && restore) {
       try { await restore(); } catch (restoreError) { failures.push(restoreError.message); }
     }
@@ -3371,6 +3408,7 @@ async function update() {
   ensureDirectory(backupDir);
   copyIfExists(routerPath, join(backupDir, "router.mjs"));
   copyIfExists(bridgePath, join(backupDir, "claude-bridge.mjs"));
+  backupChatBridge(backupDir);
   copyIfExists(settingsPath, join(backupDir, "settings.json"));
   copyIfExists(manifestPath, join(backupDir, "install.json"));
   if (migrateCatalog) copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
@@ -3385,8 +3423,7 @@ async function update() {
   try {
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
-    writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
-    chmodSync(bridgePath, 0o600);
+    writeBridgeSources();
     writeJsonAtomic(settingsPath, plan.settings);
     if (namesChanged) writeJsonAtomic(catalogPath, updatedCatalog);
     writeJsonAtomic(manifestPath, {
@@ -3431,6 +3468,7 @@ async function update() {
     }
     copyIfExists(join(backupDir, "router.mjs"), routerPath);
     copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
+    restoreChatBridge(backupDir);
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
     copyIfExists(join(backupDir, "install.json"), manifestPath);
     if (namesChanged) copyIfExists(join(backupDir, "models.json"), catalogPath);

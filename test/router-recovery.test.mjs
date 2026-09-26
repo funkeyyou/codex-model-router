@@ -35,7 +35,7 @@ async function turn(router, body) {
   const meta = {};
   const upstream = await router.fetchModelUpstream(headers, inputUrl, body, Buffer.from(JSON.stringify(body)), undefined, meta);
   const socket = socketFor(router);
-  if (meta.translate === "anthropic" && upstream.ok) await router.bridgeAnthropicToWebSocket(upstream, socket, meta);
+  if (meta.translate === "anthropic" && upstream.ok) await router.bridgeTranslatedToWebSocket(upstream, socket, meta);
   else await router.bridgeSseToWebSocket(upstream, socket, null, meta.history);
   return socket.events;
 }

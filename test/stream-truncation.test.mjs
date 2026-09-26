@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { router } = await loadPayloads();
-const { bridgeSseToWebSocket, bridgeAnthropicToHttp, parseWebSocketFrames } = router;
+const { bridgeSseToWebSocket, bridgeTranslatedToHttp, parseWebSocketFrames } = router;
 
 const meta = () => ({
   model: "claude-test",
@@ -89,7 +89,7 @@ const anthropicOpening = [
 
 test("HTTP：串流沒送 message_stop 就結束，要補 response.failed", async () => {
   const response = fakeResponse();
-  await bridgeAnthropicToHttp(upstreamOf(anthropicOpening), response, meta());
+  await bridgeTranslatedToHttp(upstreamOf(anthropicOpening), response, meta());
 
   assert.match(response.text, /"type":"response\.failed"/);
   assert.match(response.text, /upstream_stream_truncated/);
@@ -99,7 +99,7 @@ test("HTTP：串流沒送 message_stop 就結束，要補 response.failed", asyn
 
 test("HTTP：串流正常收尾時不會多送 response.failed", async () => {
   const response = fakeResponse();
-  await bridgeAnthropicToHttp(
+  await bridgeTranslatedToHttp(
     upstreamOf([
       ...anthropicOpening,
       sse({ type: "content_block_stop", index: 0 }),
@@ -245,7 +245,7 @@ const anthropicMidStreamError = [
 
 test("Claude 轉譯（HTTP）：串流中途的 overloaded_error 變成可重試的 response.failed", async () => {
   const response = fakeResponse();
-  await bridgeAnthropicToHttp(upstreamOf(anthropicMidStreamError), response, meta());
+  await bridgeTranslatedToHttp(upstreamOf(anthropicMidStreamError), response, meta());
   const events = response.text.split("\n").filter((line) => line.startsWith("data: "))
     .map((line) => JSON.parse(line.slice(6)));
   assert.deepEqual(events.map((event) => event.type).slice(-1), ["response.failed"]);
@@ -256,7 +256,7 @@ test("Claude 轉譯（HTTP）：串流中途的 overloaded_error 變成可重試
 
 test("Claude 轉譯（WebSocket）：串流中途出錯也立刻送出 response.failed", async () => {
   const socket = fakeSocket();
-  await router.bridgeAnthropicToWebSocket(upstreamOf(anthropicMidStreamError), socket, meta());
+  await router.bridgeTranslatedToWebSocket(upstreamOf(anthropicMidStreamError), socket, meta());
   const events = socket.events;
   assert.equal(events.at(-1).type, "response.failed");
   assert.equal(events.at(-1).response.error.code, "server_is_overloaded");
