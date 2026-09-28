@@ -157,6 +157,8 @@ test("實際轉送路徑與增量重建都使用縮減後的請求，原本超�
     received.push({ url: String(url), bytes: options.body.length, body: JSON.parse(options.body) });
     const events = String(url).endsWith("/messages") ? [
       { type: "message_start", message: { usage: { input_tokens: 1 } } },
+      { type: "content_block_start", content_block: { type: "text", text: "ok" } },
+      { type: "content_block_stop" },
       { type: "message_delta", delta: { stop_reason: "end_turn" } },
       { type: "message_stop" },
     ] : [{ type: "response.completed", response: { id: "response-previous", status: "completed", output: [] } }];

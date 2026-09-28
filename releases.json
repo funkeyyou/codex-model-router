@@ -1,6 +1,14 @@
 {
-  "latest": "1.25.1",
+  "latest": "1.25.2",
   "releases": [
+    {
+      "version": "1.25.2",
+      "date": "2026-09-28",
+      "changes": [
+        "Claude 串流以 stop_reason: refusal 結束時，把上游提供的類別與原因顯示為 Codex 錯誤，不再以空白的成功回應結束；未標拒答但沒有答案或工具呼叫的回合也會明確失敗。",
+        "Claude 壓縮回合遭拒、摘要為空或輸出被截斷時，送出 response.failed 並保留原始對話歷史，不再寫入假的空摘要。健康檢查新增 claudeRefusals、claudeEmptyResponses、claudeCompactionFailures 計數。"
+      ]
+    },
     {
       "version": "1.25.1",
       "date": "2026-09-28",

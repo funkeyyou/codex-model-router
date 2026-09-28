@@ -814,6 +814,9 @@ const stats = {
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
   translatedRequests: 0,
+  claudeRefusals: 0,
+  claudeEmptyResponses: 0,
+  claudeCompactionFailures: 0,
   chatTranslatedRequests: 0,
   chatToolOutputsMerged: 0,
   chatLateToolOutputs: 0,
@@ -2508,6 +2511,13 @@ function streamBridgeFor(meta) {
   return meta.translate === "chat" ? bridgeChatStream : bridgeAnthropicStream;
 }
 
+function recordClaudeBridgeFailure(event, meta) {
+  if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
+  if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
+  if (meta.claudeFailureKind === "empty_response") stats.claudeEmptyResponses += 1;
+  if (meta.claudeCompactionFailed) stats.claudeCompactionFailures += 1;
+}
+
 // HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回
 // HTTPS；此時若把上游的原生事件原樣送回，客戶端解不開，該對話就會
 // 永遠停在「正在重新連線」，而且再也回不來——因為每次重試都是同一個結果。
@@ -2525,6 +2535,7 @@ export async function bridgeTranslatedToHttp(upstream, response, meta) {
     upstream.body,
     (event) => {
       if (isTerminalEvent(event)) { sawTerminal = true; response.routerTerminalSent = true; }
+      recordClaudeBridgeFailure(event, meta);
       rememberHistoryEvent(meta.history, event);
       response.write("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n");
     },
@@ -2556,6 +2567,7 @@ export async function bridgeTranslatedToWebSocket(upstream, socket, meta, captur
     (event) => {
       captureAppend(captureId, "response.sse", `data: ${JSON.stringify(event)}\n\n`);
       if (isTerminalEvent(event)) sawTerminal = true;
+      recordClaudeBridgeFailure(event, meta);
       rememberHistoryEvent(meta.history, event);
       sendWebSocketJson(socket, event);
       stats.websocketEvents += 1;

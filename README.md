@@ -484,6 +484,11 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 上下文爆掉是 `context_length_exceeded`（不重試）、過載是 `server_is_overloaded`、
 限流是 `rate_limit_exceeded`（上游給了 `retry-after` 就照著等）、額度用盡是 `insufficient_quota`。
 
+`claudeRefusals` 記錄 Claude 串流明確以 `stop_reason: refusal` 拒答的次數；Codex 會顯示上游
+提供的類別與原因。`claudeEmptyResponses` 記錄上游宣告完成、卻沒有答案或工具呼叫的次數，
+這只能確認回覆為空，不能單靠它判定為拒答。`claudeCompactionFailures` 記錄壓縮時遭拒、
+摘要為空或未完整生成的次數；這些回合以失敗收尾，不會寫入佔位摘要取代原始歷史。
+
 `credentialReads` 是實際讀取（Windows 為解密）API Key 的次數。Windows 以憑證檔的修改時間
 判斷 Key 是否更換，檔案沒變就沿用快取，這個數字應該很少增加。每家供應商各自快取。
 
@@ -513,6 +518,13 @@ Invoke-RestMethod http://127.0.0.1:48953/healthz | ConvertTo-Json -Depth 5
 實際埠號以 `status` 印出的為準：48953 被佔用時安裝器會自動往後找。
 
 ## 疑難排解
+
+### Claude 回合突然沒有回覆
+
+更新到 1.25.2 以上後，明確的上游拒答會顯示原因；沒有標示拒答的空回覆也會顯示錯誤。
+拒答時，移除或改寫觸發的內容後再試；若同一對話仍帶著該內容，請改開新對話。單純按「繼續」
+會再次送出相同歷史。舊版若已把 `(compaction produced no summary)` 寫進壓縮歷史，更新無法
+自動還原那次已被取代的內容。
 
 若安裝時 Claude 模型被跳過，用診斷腳本確認是哪一類問題：
 

@@ -1114,6 +1114,30 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   const decoder = new TextDecoder();
   let pending = "";
 
+  const failResponse = (error, kind = null) => {
+    failed = true;
+    suppress = false;
+    if (kind) ctx.claudeFailureKind = kind;
+    if (compactionMode) ctx.claudeCompactionFailed = true;
+    const response = base();
+    response.status = "failed";
+    response.error = error;
+    response.usage = mapUsage(usage);
+    send({ type: "response.failed", response });
+  };
+
+  const refusalMessage = (details) => {
+    const category = typeof details?.category === "string"
+      ? details.category.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40)
+      : "";
+    const explanation = typeof details?.explanation === "string"
+      ? details.explanation.replace(/\s+/g, " ").trim().slice(0, 300)
+      : "";
+    return `Claude 拒絕處理這一輪${category ? `（${category}）` : ""}。` +
+      `${explanation ? `原因：${explanation} ` : ""}` +
+      "請移除或改寫觸發拒答的內容；若歷史仍包含該內容，請改開新對話。";
+  };
+
   const handle = (event) => {
     if (failed) return;
     switch (event.type) {
@@ -1293,12 +1317,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
             parsed = parseToolArguments(cur.json || cur.initialInput);
             if (cur.kind === "custom_tool" && typeof parsed[FREEFORM_KEY] !== "string") throw bridgeInputError("自由格式工具缺少字串 input。");
           } catch {
-            failed = true;
-            suppress = false;
-            const response = base();
-            response.status = "failed";
-            response.error = { code: "invalid_tool_arguments", message: "上游工具參數不完整或格式錯誤；未產生替代參數，請重新產生該工具呼叫。" };
-            send({ type: "response.failed", response });
+            failResponse({ code: "invalid_tool_arguments", message: "上游工具參數不完整或格式錯誤；未產生替代參數，請重新產生該工具呼叫。" });
             break;
           }
           if (cur.kind === "custom_tool") {
@@ -1345,13 +1364,24 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       case "message_delta":
         stopReason = event.delta?.stop_reason ?? stopReason;
         if (event.usage) usage = { ...(usage || {}), ...event.usage };
+        if (stopReason === "refusal" || event.stop_details?.type === "refusal") {
+          failResponse({ code: "invalid_prompt", message: refusalMessage(event.stop_details) }, "refusal");
+        }
         break;
 
       case "message_stop": {
         if (compactionMode) {
+          if (!compactionText.trim() || (stopReason && stopReason !== "end_turn")) {
+            failResponse({
+              code: "invalid_prompt",
+              message: stopReason === "max_tokens"
+                ? "Claude 的壓縮摘要超過輸出上限，原始對話歷史未替換。"
+                : "Claude 沒有產生完整的壓縮摘要，原始對話歷史未替換。",
+            }, "empty_compaction");
+            break;
+          }
           suppress = false;
-          // 摘要為空也必須送出項目，否則客戶端直接 Fatal。
-          const summary = compactionText.trim() || "(compaction produced no summary)";
+          const summary = compactionText.trim();
           const item = {
             id: randomId("cmp_", 54),
             type: "compaction",
@@ -1365,6 +1395,15 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           send({ type: "response.output_item.done", output_index: 0, item });
           output.length = 0;
           output.push(item);
+        } else if (!output.some((item) =>
+          item.type === "function_call" || item.type === "custom_tool_call" ||
+          (item.type === "message" && item.content?.some((part) =>
+            part.type === "output_text" && part.text?.trim())))) {
+          failResponse({
+            code: "invalid_prompt",
+            message: "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
+          }, "empty_response");
+          break;
         }
         const response = base();
         response.status = "completed";
@@ -1382,12 +1421,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       // Anthropic 在串流中途出錯（最常見的是 overloaded_error）時送這個事件，然後結束串流。
       // 只轉成頂層 error 的話 Codex 會忽略它：WebSocket 上要空等閒置逾時才重試。
       case "error": {
-        failed = true;
-        suppress = false;
-        const response = base();
-        response.status = "failed";
-        response.error = codexErrorFromUpstream(event.error || {});
-        send({ type: "response.failed", response });
+        failResponse(codexErrorFromUpstream(event.error || {}));
         break;
       }
 

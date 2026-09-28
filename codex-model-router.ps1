@@ -154,7 +154,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.25.1";
+const INSTALLER_VERSION = "1.25.2";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -5318,6 +5318,9 @@ const stats = {
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
   translatedRequests: 0,
+  claudeRefusals: 0,
+  claudeEmptyResponses: 0,
+  claudeCompactionFailures: 0,
   chatTranslatedRequests: 0,
   chatToolOutputsMerged: 0,
   chatLateToolOutputs: 0,
@@ -7012,6 +7015,13 @@ function streamBridgeFor(meta) {
   return meta.translate === "chat" ? bridgeChatStream : bridgeAnthropicStream;
 }
 
+function recordClaudeBridgeFailure(event, meta) {
+  if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
+  if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
+  if (meta.claudeFailureKind === "empty_response") stats.claudeEmptyResponses += 1;
+  if (meta.claudeCompactionFailed) stats.claudeCompactionFailures += 1;
+}
+
 // HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回
 // HTTPS；此時若把上游的原生事件原樣送回，客戶端解不開，該對話就會
 // 永遠停在「正在重新連線」，而且再也回不來——因為每次重試都是同一個結果。
@@ -7029,6 +7039,7 @@ export async function bridgeTranslatedToHttp(upstream, response, meta) {
     upstream.body,
     (event) => {
       if (isTerminalEvent(event)) { sawTerminal = true; response.routerTerminalSent = true; }
+      recordClaudeBridgeFailure(event, meta);
       rememberHistoryEvent(meta.history, event);
       response.write("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n");
     },
@@ -7060,6 +7071,7 @@ export async function bridgeTranslatedToWebSocket(upstream, socket, meta, captur
     (event) => {
       captureAppend(captureId, "response.sse", `data: ${JSON.stringify(event)}\n\n`);
       if (isTerminalEvent(event)) sawTerminal = true;
+      recordClaudeBridgeFailure(event, meta);
       rememberHistoryEvent(meta.history, event);
       sendWebSocketJson(socket, event);
       stats.websocketEvents += 1;
@@ -8701,6 +8713,30 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   const decoder = new TextDecoder();
   let pending = "";
 
+  const failResponse = (error, kind = null) => {
+    failed = true;
+    suppress = false;
+    if (kind) ctx.claudeFailureKind = kind;
+    if (compactionMode) ctx.claudeCompactionFailed = true;
+    const response = base();
+    response.status = "failed";
+    response.error = error;
+    response.usage = mapUsage(usage);
+    send({ type: "response.failed", response });
+  };
+
+  const refusalMessage = (details) => {
+    const category = typeof details?.category === "string"
+      ? details.category.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40)
+      : "";
+    const explanation = typeof details?.explanation === "string"
+      ? details.explanation.replace(/\s+/g, " ").trim().slice(0, 300)
+      : "";
+    return `Claude 拒絕處理這一輪${category ? `（${category}）` : ""}。` +
+      `${explanation ? `原因：${explanation} ` : ""}` +
+      "請移除或改寫觸發拒答的內容；若歷史仍包含該內容，請改開新對話。";
+  };
+
   const handle = (event) => {
     if (failed) return;
     switch (event.type) {
@@ -8880,12 +8916,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
             parsed = parseToolArguments(cur.json || cur.initialInput);
             if (cur.kind === "custom_tool" && typeof parsed[FREEFORM_KEY] !== "string") throw bridgeInputError("自由格式工具缺少字串 input。");
           } catch {
-            failed = true;
-            suppress = false;
-            const response = base();
-            response.status = "failed";
-            response.error = { code: "invalid_tool_arguments", message: "上游工具參數不完整或格式錯誤；未產生替代參數，請重新產生該工具呼叫。" };
-            send({ type: "response.failed", response });
+            failResponse({ code: "invalid_tool_arguments", message: "上游工具參數不完整或格式錯誤；未產生替代參數，請重新產生該工具呼叫。" });
             break;
           }
           if (cur.kind === "custom_tool") {
@@ -8932,13 +8963,24 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       case "message_delta":
         stopReason = event.delta?.stop_reason ?? stopReason;
         if (event.usage) usage = { ...(usage || {}), ...event.usage };
+        if (stopReason === "refusal" || event.stop_details?.type === "refusal") {
+          failResponse({ code: "invalid_prompt", message: refusalMessage(event.stop_details) }, "refusal");
+        }
         break;
 
       case "message_stop": {
         if (compactionMode) {
+          if (!compactionText.trim() || (stopReason && stopReason !== "end_turn")) {
+            failResponse({
+              code: "invalid_prompt",
+              message: stopReason === "max_tokens"
+                ? "Claude 的壓縮摘要超過輸出上限，原始對話歷史未替換。"
+                : "Claude 沒有產生完整的壓縮摘要，原始對話歷史未替換。",
+            }, "empty_compaction");
+            break;
+          }
           suppress = false;
-          // 摘要為空也必須送出項目，否則客戶端直接 Fatal。
-          const summary = compactionText.trim() || "(compaction produced no summary)";
+          const summary = compactionText.trim();
           const item = {
             id: randomId("cmp_", 54),
             type: "compaction",
@@ -8952,6 +8994,15 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           send({ type: "response.output_item.done", output_index: 0, item });
           output.length = 0;
           output.push(item);
+        } else if (!output.some((item) =>
+          item.type === "function_call" || item.type === "custom_tool_call" ||
+          (item.type === "message" && item.content?.some((part) =>
+            part.type === "output_text" && part.text?.trim())))) {
+          failResponse({
+            code: "invalid_prompt",
+            message: "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
+          }, "empty_response");
+          break;
         }
         const response = base();
         response.status = "completed";
@@ -8969,12 +9020,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       // Anthropic 在串流中途出錯（最常見的是 overloaded_error）時送這個事件，然後結束串流。
       // 只轉成頂層 error 的話 Codex 會忽略它：WebSocket 上要空等閒置逾時才重試。
       case "error": {
-        failed = true;
-        suppress = false;
-        const response = base();
-        response.status = "failed";
-        response.error = codexErrorFromUpstream(event.error || {});
-        send({ type: "response.failed", response });
+        failResponse(codexErrorFromUpstream(event.error || {}));
         break;
       }
 
