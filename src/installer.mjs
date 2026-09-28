@@ -22,7 +22,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.25.0";
+const INSTALLER_VERSION = "1.25.1";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -283,6 +283,7 @@ function codexCandidates() {
   if (!isWindows) {
     return [
       env.CODEX_MODEL_ROUTER_CODEX_BIN,
+      "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
       "/Applications/ChatGPT.app/Contents/Resources/codex",
       commandPath("codex"),
     ];
@@ -2880,12 +2881,13 @@ async function addModels() {
     chmodSync(routerPath, 0o600);
     writeBridgeSources();
     writeJsonAtomic(catalogPath, combinedCatalog);
-    writeJsonAtomic(settingsPath, withProviders({ ...settings, version: INSTALLER_VERSION, routes }, providers));
+    writeJsonAtomic(settingsPath, withProviders({ ...settings, version: INSTALLER_VERSION, routes, codexBin }, providers));
     writeJsonAtomic(manifestPath, manifestWithProviders({
       ...manifest,
       version: INSTALLER_VERSION,
       updatedAt: new Date().toISOString(),
       routes,
+      codexBin,
     }, providers));
     // 路由變了但服務定義沒變，原地重啟就好——重新註冊需要提權，沒必要冒那個險。
     restartServiceInPlace();
@@ -3547,10 +3549,11 @@ async function update() {
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
     writeBridgeSources();
-    writeJsonAtomic(settingsPath, plan.settings);
+    writeJsonAtomic(settingsPath, { ...plan.settings, codexBin });
     if (namesChanged) writeJsonAtomic(catalogPath, updatedCatalog);
     writeJsonAtomic(manifestPath, {
       ...plan.manifest,
+      codexBin,
       updatedAt: new Date().toISOString(),
     });
     if (serviceDefinitionUnchanged()) {

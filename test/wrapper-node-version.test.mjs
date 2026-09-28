@@ -29,7 +29,11 @@ function findNode({ override = null, onPath = null } = {}) {
   mkdirSync(pathDirectory);
   const overridePath = override ? fakeNode(join(root, "override"), override) : "";
   if (onPath) fakeNode(pathDirectory, onPath);
-  const result = spawnSync("bash", ["-c", `set -euo pipefail\n${functions}\nfind_node`], {
+  const isolatedFunctions = functions.replace(
+    "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node",
+    join(root, "unavailable-bundled-node"),
+  );
+  const result = spawnSync("bash", ["-c", `set -euo pipefail\n${isolatedFunctions}\nfind_node`], {
     encoding: "utf8",
     env: { PATH: `${pathDirectory}:/usr/bin:/bin`, CODEX_MODEL_ROUTER_NODE_BIN: overridePath },
   });

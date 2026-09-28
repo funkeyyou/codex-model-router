@@ -1,6 +1,13 @@
 {
-  "latest": "1.25.0",
+  "latest": "1.25.1",
   "releases": [
+    {
+      "version": "1.25.1",
+      "date": "2026-09-28",
+      "changes": [
+        "修復新版 ChatGPT Desktop 移動 Codex CLI 後，終端機未提供 codex 路徑時，添加自訂模型誤報未安裝；成功添加模型或更新路由器後，也會刷新設定中保存的 CLI 路徑。"
+      ]
+    },
     {
       "version": "1.25.0",
       "date": "2026-09-26",
