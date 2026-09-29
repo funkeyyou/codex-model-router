@@ -21,14 +21,14 @@ const sourcePath = fileURLToPath(new URL("../codex-model-router.sh", import.meta
 const releases = JSON.parse(readFileSync(new URL("../releases.json", import.meta.url), "utf8"));
 
 // 假上游：/p1、/p2、/p3 各當一家供應商的 Base URL，記下每個請求。
-async function fakeUpstream(t) {
+async function fakeUpstream(t, modelNames = {}) {
   const requests = [];
   const server = http.createServer((request, response) => {
     requests.push({ path: request.url, auth: request.headers.authorization });
     response.setHeader("content-type", "application/json");
     const match = /^\/(p[123])\/v1\/models$/.exec(request.url);
     if (match) {
-      response.end(JSON.stringify({ data: [{ id: `${match[1]}-model` }] }));
+      response.end(JSON.stringify({ data: (modelNames[match[1]] || [`${match[1]}-model`]).map((id) => ({ id })) }));
     } else if (request.url === "/healthz") {
       response.end(JSON.stringify({ status: "ok", stats: {} }));
     } else {
@@ -156,17 +156,35 @@ test("新增供應商：重複的 Base URL 直接擋下；新網址查到模型�
 
   const added = await runInstaller(t, ["providers", "add"], state, [
     { marker: "兼容 OpenAI 的 Base URL", answer: `${upstream.origin}/p3` },
+    { marker: "請輸入模型編號", answer: "1" },
     { marker: "供應商名稱", answer: "Bad_Name" },
     { marker: "不能以連字號開頭或結尾", answer: "" },
-    { marker: "請輸入模型編號", answer: "1" },
     { marker: "是否繼續進行能力探測", answer: "n" },
   ]);
   assert.equal(added.code, 1, added.output);
-  assert.match(added.output, /供應商名稱（會顯示在它的模型名稱前面） \[local\]/);
+  assert.match(added.output, /供應商名稱（用於管理，僅為無前綴的模型補上名稱；Enter 使用預設） \[local\]/);
   assert.match(added.output, /p3-model/);
   assert.match(added.output, /已在修改配置前取消/);
   assert.equal(added.unchanged, true);
   assert.deepEqual(added.backups, []);
+});
+
+test("所選模型已有前綴時跳過供應商名稱，管理名稱撞名則自動避開", async (t) => {
+  const upstream = await fakeUpstream(t, { p3: ["ark/gpt-test", "plain-model"] });
+  const state = installation(upstream, { providers: [
+    providerAt(upstream.origin, "default", "p1"), providerAt(upstream.origin, "local", "p2"),
+  ] });
+  const result = await runInstaller(t, ["providers", "add"], state, [
+    { marker: "兼容 OpenAI 的 Base URL", answer: `${upstream.origin}/p3` },
+    { marker: "請輸入模型編號", answer: "ark/gpt-test" },
+    { marker: "是否繼續進行能力探測", answer: "n" },
+  ]);
+  assert.equal(result.code, 1, result.output);
+  assert.match(result.output, /管理名稱自動設為「local-2」/);
+  assert.doesNotMatch(result.output, /供應商名稱（/);
+  assert.match(result.output, /已在修改配置前取消/);
+  assert.equal(result.unchanged, true);
+  assert.deepEqual(result.backups, []);
 });
 
 test("status 列出每家供應商與各自的模型數", async (t) => {

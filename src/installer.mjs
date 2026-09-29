@@ -1386,13 +1386,13 @@ export function withDefaultModelPrefix(route) {
   if (typeof route?.upstreamModel !== "string" || !route.upstreamModel) return route;
   const model = route.upstreamModel;
   const providerId = routeProviderId(route);
-  // 其他供應商一律以供應商名稱開頭，同一個模型在兩家都有時選單上才分得出來。
+  // 已有上游前綴時保留原名；不同供應商仍由 pickerSlug 與 providerId 區分。
+  if (model.includes("/")) return route.displayName ? route : { ...route, displayName: model };
   if (providerId !== DEFAULT_PROVIDER_ID) {
     if (route.displayName && route.displayName !== model) return route;
     return { ...route, displayName: `${providerId}/${model}` };
   }
   // 只補自動產生的顯示名稱；上游 ID、選擇器 ID 與使用者手動取的名稱都保留。
-  if (model.includes("/")) return route.displayName ? route : { ...route, displayName: model };
   if (route.displayName && route.displayName !== model) return route;
   return { ...route, displayName: `api/${model}` };
 }
@@ -3256,7 +3256,7 @@ async function manageProviders(subcommand = null) {
 async function askProviderId(baseUrl, takenIds) {
   const suggested = suggestProviderId(baseUrl, takenIds);
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const answer = (await ask("供應商名稱（會顯示在它的模型名稱前面）", suggested)).trim().toLowerCase();
+    const answer = (await ask("供應商名稱（用於管理，僅為無前綴的模型補上名稱；Enter 使用預設）", suggested)).trim().toLowerCase();
     const problem = providerIdError(answer, takenIds);
     if (!problem) return answer;
     console.log(problem);
@@ -3269,11 +3269,10 @@ async function addProvider() {
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
   printHeading("新增供應商");
-  console.log("每家供應商各自保存 API Key；它的模型會出現在選單上，名稱前面帶供應商名稱。");
+  console.log("每家供應商各自保存 API Key；已有前綴的模型保留原名，無前綴的模型才加供應商名稱。");
   const baseUrl = normalizeUrl(await ask("兼容 OpenAI 的 Base URL"));
   const clash = providers.find((provider) => provider.baseUrl === baseUrl);
   if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」；要添加它的模型請用「添加自訂模型」。`);
-  const id = await askProviderId(baseUrl, providers.map((provider) => provider.id));
   const keychainService = keychainServiceFor(baseUrl);
   const keyExisted = keychainHas(keychainService);
   if (!keyExisted) await storeApiKey(keychainService, baseUrl);
@@ -3287,6 +3286,10 @@ async function addProvider() {
     const discovery = await discoverApiRoot(baseUrl, apiKey);
     console.log(`API 根地址：${discovery.apiRoot}`);
     const selectedModels = await selectModels(discovery.models);
+    const takenIds = providers.map((provider) => provider.id);
+    const prefixed = selectedModels.length > 0 && selectedModels.every((model) => model.includes("/"));
+    const id = prefixed ? suggestProviderId(baseUrl, takenIds) : await askProviderId(baseUrl, takenIds);
+    if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商管理名稱自動設為「${id}」。`);
     console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
     if (!(await confirm("是否繼續進行能力探測？", true))) fail("已在修改配置前取消。");
     const outcomes = await probeModelsInParallel(selectedModels,
@@ -4258,7 +4261,7 @@ remove 用於勾選並刪除已配置的自訂模型；刪除前會備份，失�
 可以刪到零個自訂模型，官方模型、API Key 與中轉生圖設定保留。
 
 providers 用於同時使用多家中轉供應商：add 新增一家（各自保存 API Key，探測並添加
-它的模型，模型名稱前面帶供應商名稱）；remove 移除一家與它的模型；key 更換某一家的
+它的模型，已有前綴的模型保留原名）；remove 移除一家與它的模型；key 更換某一家的
 API Key。第一家是主要供應商，install 重新配置的是它，Codex 內建的 image_gen 也送它。
 add 有多家時會先問要替哪一家添加模型。
 

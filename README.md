@@ -119,9 +119,10 @@ bash codex-model-router.sh providers key      # 更換某一家的 API Key
 Windows 同樣是 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 providers add` 等。
 
 - 第一家是主要供應商：`install` 重新配置的是它，Codex 內建的 `image_gen` 也送到它。
-- 其他家的模型名稱前面帶供應商名稱，例如 `openrouter/claude-sonnet-4.5`；選擇器 ID 也帶，
-  同一個模型在兩家都有時不會撞在一起。名稱在新增時決定，預設從網址猜
-  （`api.openrouter.ai` → `openrouter`），只能用小寫英文、數字與連字號。
+- 已有前綴的模型保留上游原名，例如 `ark/gpt-6-sol`；無前綴的模型才補上供應商名稱。
+  新增時若所選模型都有前綴，會跳過名稱輸入，自動從網址產生唯一的供應商管理名稱；
+  其他情況可按 Enter 接受預設名稱。內部選擇器 ID 仍按供應商隔離，兩家提供同名模型也不會混用 Key，
+  但選單可能顯示相同名稱；既有手動名稱與已保存的顯示名稱保留。
 - 有多家時，`add` 會先問要替哪一家添加模型；`remove` 可以一次刪不同家的模型。
 - 移除供應商會一併移除它的模型；全域預設模型是其中之一時會清除該設定，中轉 API 生圖用的是
   這家時會停用技能（之後可重新設定）。最後一家不能移除，要整個移除請用 `rollback`。

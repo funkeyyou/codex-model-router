@@ -96,7 +96,7 @@ test("供應商名稱只接受小寫英數與連字號；保留名稱與重複�
   assert.match(installer.providerIdError("b", ["b"]), /已經有/);
 });
 
-test("主要供應商（default）的選擇器 ID 與顯示名稱規則不變；其他家都帶供應商名稱", () => {
+test("供應商 ID 隔離路由；模型已有前綴時不再疊加供應商名稱", () => {
   const legacySlug = `custom/claude-x-${createHash("sha256").update("claude-x").digest("hex").slice(0, 8)}`;
   assert.equal(installer.pickerSlug("claude-x"), legacySlug);
   assert.equal(installer.pickerSlug("claude-x", "default"), legacySlug);
@@ -110,7 +110,7 @@ test("主要供應商（default）的選擇器 ID 與顯示名稱規則不變；
   assert.equal(installer.withDefaultModelPrefix(route("anthropic/claude-x")).displayName, "anthropic/claude-x");
   assert.equal(installer.withDefaultModelPrefix(route("claude-x", "openrouter")).displayName, "openrouter/claude-x");
   assert.equal(installer.withDefaultModelPrefix(route("anthropic/claude-x", "openrouter")).displayName,
-    "openrouter/anthropic/claude-x");
+    "anthropic/claude-x");
   const named = { ...route("claude-x", "openrouter"), displayName: "工作用" };
   assert.equal(installer.withDefaultModelPrefix(named), named);
   const prefixed = installer.withDefaultModelPrefix(route("claude-x", "openrouter"));
