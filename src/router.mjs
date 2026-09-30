@@ -817,6 +817,8 @@ const stats = {
   claudeRefusals: 0,
   claudeEmptyResponses: 0,
   claudeCompactionFailures: 0,
+  // Claude CLI 拒收路由器加的歷史快取斷點、改以無斷點重送的次數；應為 0。
+  claudeCliCacheFallbacks: 0,
   chatTranslatedRequests: 0,
   chatToolOutputsMerged: 0,
   chatLateToolOutputs: 0,
@@ -1475,7 +1477,9 @@ export async function fetchModelUpstream(
         const { fetchClaudeCli } = await import("./claude-cli.mjs");
         const translated = await fetchClaudeCli(budget.request, {
           ...settings.claudeCli, effort: outboundBodyObject?.reasoning?.effort,
-        }, signal);
+        }, signal, {
+          onDiagnostic: (event) => { if (event?.type === "cache_marker_fallback") stats.claudeCliCacheFallbacks += 1; },
+        });
         stats.lastCustomStatus = translated.status;
         stats.lastProvider = "claude-cli";
         return translated;

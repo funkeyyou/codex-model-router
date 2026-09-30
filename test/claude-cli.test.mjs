@@ -131,7 +131,8 @@ test("native replay preserves paired results, image bytes and roles without chan
   assert.notEqual(cli.prepareCliConversation(source, dir).transcript, prepared.transcript, "threads never share mutable session IDs");
   const forbidden = cli.prepareCliConversation({ ...source, tool_choice: { type: "none" } }, dir);
   assert.equal(forbidden.tools.length, 1, "previous tool definitions remain available during replay");
-  assert.match(forbidden.system, /do not call any tools/);
+  assert.equal(forbidden.system, prepared.system, "a per-turn tool constraint must not change the cached system prompt");
+  assert.match(JSON.parse(forbidden.input).message.content.at(-1).text, /do not call any tools/);
 });
 
 test("MCP relay requires per-request authorization and never executes a requested tool", async () => {

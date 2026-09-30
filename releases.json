@@ -1,6 +1,16 @@
 {
-  "latest": "1.26.4",
+  "latest": "1.26.5",
   "releases": [
+    {
+      "version": "1.26.5",
+      "date": "2026-09-30",
+      "changes": [
+        "改善 Claude CLI 訂閱路由的提示快取：重播歷史結尾加上 1 小時快取斷點，並固定 CLI 自身快取為 1 小時，下一輪可讀取上一輪的歷史；本機模擬 4 輪 10 次請求，命中率由約 37% 提高到約 85%。",
+        "Claude API 與 CLI 路由中，對話中途補送的 developer 訊息改為留在原位並以 system-reminder 標示，本輪工具限制也改放在本輪輸入，不再改寫 system 而使整段快取失效。",
+        "Claude CLI 不再把 Codex 工具說明截斷在 2,048 字元，並停用工具延遲載入，確保完整的 Code Mode 工具文件可見。",
+        "CLI 若拒收快取斷點，會在產生內容前改以不帶斷點重送一次並暫停 30 分鐘；新增 claudeCliCacheFallbacks 診斷、快取前綴與真實 CLI 回歸測試。"
+      ]
+    },
     {
       "version": "1.26.4",
       "date": "2026-09-30",

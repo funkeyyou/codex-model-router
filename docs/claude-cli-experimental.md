@@ -35,11 +35,23 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 claude-cli
 
 CLI 只看得到以 MCP 提供的 Codex 工具定義；原生 Bash／Edit／Read、Chrome、skills、使用者／專案設定與 hooks 關閉。MCP 端點永遠不執行工具，收到第一輪完整模型回應後就結束 CLI，工具由 Codex 執行，再把真實結果帶進下一輪。管理員強制設定仍由 Claude CLI 控制。
 
+Claude CLI 預設把每個 MCP 工具說明截斷在 2,048 字元，Codex Code Mode 的巢狀工具文件因此看不到。1.26.5 起路由器以 `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` 保留完整說明，並以 `ENABLE_TOOL_SEARCH=false` 讓所有 Codex 工具直接可用，不改成延遲載入。
+
+### 提示快取
+
+CLI 會把最後一個快取斷點放在它附加於歷史之後、每個行程重建的環境內容上，下一輪無法重用，每輪幾乎都要重寫整段對話。1.26.5 起：
+
+- 在重播歷史的最後一個可快取區塊加上 1 小時斷點（不放在 thinking 區塊，也不放在本輪新輸入），下一輪重播相同前綴時直接讀取快取；
+- 以 `CLAUDE_CODE_PROMPT_CACHE_TTL=1h` 固定 CLI 自己的快取時間，讓兩者 TTL 一致，並忽略繼承的其他快取環境變數；額外用量（overage）期間同樣使用 1 小時；
+- 本輪的工具限制指示放在本輪輸入，不改寫 system；對話中途的 developer 訊息留在原位，同樣不改寫 system。
+
+若 CLI 版本不接受這個斷點（例如忽略 TTL 設定，或自己已用滿 4 個斷點），上游會在產生內容前拒收；路由器改以不帶斷點重送一次，並在 30 分鐘內暫停加斷點。`/healthz` 的 `claudeCliCacheFallbacks` 記錄次數，正常應為 0。
+
 有工具結果的回合，會在原始工具往返之後追加一則固定的「繼續處理」訊息，避免 CLI 恢復時把尚未配對的工具呼叫清除。這個適配依賴 Claude 的 transcript 格式，因此標記為實驗性；CLI 改版後需重跑相容性測試。
 
 開始推理前重新確認訂閱登入；忽略繼承的 Anthropic API Key、Base URL、第三方後端與模型環境變數，防止悄悄改用 API 計费。不會在授權失效或用量不足時自動切 API 供應商。仍保留 HTTP(S) 代理環境變數。路由器既有的 ChatGPT 登入檢查不變。
 
-上下文超限、CLI 授權失效、用量不足、中斷、未知工具與拒答會回報失敗，不當作空白成功。CLI 沒有原生 `tool_choice` 選项，因此以本輪指示加輸出驗證實作；禁止／指定工具時仍保留歷史工具定義，避免恢復對話時丟失工具的含義。若模型提出禁止的工具，會在交給 Codex 前拒絕；指定工具／必須呼叫工具及禁止平行呼叫的限制若未被遵守，回合會失敗。SDK 原生工具執行、跨 CLI 行程的原生 resume 快取不在第一版範圍。
+上下文超限、CLI 授權失效、用量不足、中斷、未知工具與拒答會回報失敗，不當作空白成功。CLI 沒有原生 `tool_choice` 選项，因此以本輪指示加輸出驗證實作；禁止／指定工具時仍保留歷史工具定義，避免恢復對話時丟失工具的含義。若模型提出禁止的工具，會在交給 Codex 前拒絕；指定工具／必須呼叫工具及禁止平行呼叫的限制若未被遵守，回合會失敗。SDK 原生工具執行不在第一版範圍。
 
 訂閱用量政策以 [Anthropic 官方說明](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) 為準；不承諾永久使用相同額度或計費方式。CLI 恢復介面參考 [官方 session 文件](https://code.claude.com/docs/en/sessions)。
 

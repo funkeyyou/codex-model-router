@@ -154,7 +154,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.26.4";
+const INSTALLER_VERSION = "1.26.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5600,6 +5600,8 @@ const stats = {
   claudeRefusals: 0,
   claudeEmptyResponses: 0,
   claudeCompactionFailures: 0,
+  // Claude CLI 拒收路由器加的歷史快取斷點、改以無斷點重送的次數；應為 0。
+  claudeCliCacheFallbacks: 0,
   chatTranslatedRequests: 0,
   chatToolOutputsMerged: 0,
   chatLateToolOutputs: 0,
@@ -6258,7 +6260,9 @@ export async function fetchModelUpstream(
         const { fetchClaudeCli } = await import("./claude-cli.mjs");
         const translated = await fetchClaudeCli(budget.request, {
           ...settings.claudeCli, effort: outboundBodyObject?.reasoning?.effort,
-        }, signal);
+        }, signal, {
+          onDiagnostic: (event) => { if (event?.type === "cache_marker_fallback") stats.claudeCliCacheFallbacks += 1; },
+        });
         stats.lastCustomStatus = translated.status;
         stats.lastProvider = "claude-cli";
         return translated;
@@ -8159,6 +8163,13 @@ export function bridgeInputError(message) {
   return Object.assign(new Error(message), { name: "BridgeRequestError" });
 }
 
+// Codex 在對話中途補送的 developer 訊息（技能清單、協作模式、切換模型、時間等）
+// 若併進 system，system 一變，tools → system → messages 之後的快取就全部失效。
+// 開頭那組 developer 訊息仍進 system；之後出現的留在原位，以 system-reminder 標示來源。
+export function midConversationInstruction(text) {
+  return `<system-reminder>\nCodex developer message:\n${text}\n</system-reminder>`;
+}
+
 // Codex protocol AgentMessage: inter-agent input, not this assistant's reply
 // or a tool result. Keep provenance and every plaintext block in order.
 export function agentMessageText(item) {
@@ -8635,8 +8646,13 @@ export function toAnthropicRequest(body, route) {
   if (body.text?.format && body.text.format.type !== "text") {
     throw bridgeInputError("Claude 轉譯尚未支援此結構化輸出格式，請改用文字或函式工具輸出。");
   }
+  // 只看項目本身與它之前的內容，重播同一段歷史時分類結果不會改變。
+  let leadingInstructions = true;
   for (const item of inputItems) {
-    switch (item?.type || (item?.role ? "message" : null)) {
+    const kind = item?.type || (item?.role ? "message" : null);
+    const instruction = kind === "message" && (item.role === "developer" || item.role === "system");
+    if (!instruction && kind !== "additional_tools") leadingInstructions = false;
+    switch (kind) {
       case "additional_tools": {
         break;
       }
@@ -8649,7 +8665,9 @@ export function toAnthropicRequest(body, route) {
         if (item.role === "developer" || item.role === "system") {
           // system 只接受純文字。
           const text = textOf(item.content);
-          if (text) systemParts.push(text);
+          if (!text) break;
+          if (leadingInstructions) systemParts.push(text);
+          else push("user", { type: "text", text: midConversationInstruction(text) });
           break;
         }
         const blocks = toAnthropicBlocks(item.content);
@@ -10778,15 +10796,46 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 
+// One TTL for the CLI's own breakpoints and the history breakpoint added below.
+// Anthropic rejects a longer TTL after a shorter one, so the two must match.
+export const CLI_CACHE_TTL = "1h";
+const CACHE_MARKER_COOLDOWN_MS = 30 * 60 * 1000;
+let cacheMarkerDisabledUntil = 0;
+
+export function cliCacheMarkerEnabled(now = Date.now()) {
+  return now >= cacheMarkerDisabledUntil;
+}
+
+export function disableCliCacheMarker(now = Date.now()) {
+  cacheMarkerDisabledUntil = now + CACHE_MARKER_COOLDOWN_MS;
+}
+
+export function resetCliCacheMarker() {
+  cacheMarkerDisabledUntil = 0;
+}
+
+// A request rejected for its cache breakpoints is safe to resend without the
+// router's marker: the API validates the request before any generation.
+export function cacheControlRejected(text) {
+  return /cache[_ ]control|prompt[_ ]cach|\bttl\b/i.test(String(text || ""));
+}
+
 export function claudeCliEnvironment(source = process.env) {
   const env = { ...source };
   // A subscription route must not silently use an inherited API key, proxy
   // provider, or a different model. HTTP(S)_PROXY is deliberately retained.
   for (const key of Object.keys(env)) {
-    if (/^(ANTHROPIC_|CLAUDE_CODE_|CLAUDE_AGENT_|CLAUDE_CONFIG_DIR$|CLAUDECODE$)/.test(key)) delete env[key];
+    if (/^(ANTHROPIC_|CLAUDE_CODE_|CLAUDE_AGENT_|CLAUDE_CONFIG_DIR$|CLAUDECODE$|ENABLE_TOOL_SEARCH$|FORCE_PROMPT_CACHING_|ENABLE_PROMPT_CACHING_|DISABLE_PROMPT_CACHING)/.test(key)) delete env[key];
   }
   return { ...env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1",
-    DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" };
+    DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+    CLAUDE_CODE_PROMPT_CACHE_TTL: CLI_CACHE_TTL,
+    // Codex Code Mode documents its nested tools in the exec description; the
+    // CLI otherwise truncates every MCP tool description at 2,048 characters.
+    CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: "1048576",
+    // Keep every Codex tool directly callable. Deferred MCP tools would need the
+    // CLI's own search tool, which this isolated route does not provide.
+    ENABLE_TOOL_SEARCH: "false" };
 }
 
 const isolationArgs = ["--setting-sources", "", "--settings", '{"disableAllHooks":true}'];
@@ -10876,7 +10925,28 @@ export async function claudeCliAuth(binary, { login = false, signal } = {}) {
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
-export function prepareCliConversation(request, cwd) {
+// Blocks that accept cache_control. Thinking blocks cannot carry a breakpoint.
+const CACHEABLE_BLOCKS = new Set(["text", "image", "document", "tool_use", "tool_result"]);
+
+function cacheMarkerBlock(messages) {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (typeof message.content === "string") {
+      if (!message.content.trim()) continue;
+      message.content = [{ type: "text", text: message.content }];
+    }
+    const content = Array.isArray(message.content) ? message.content : [];
+    for (let position = content.length - 1; position >= 0; position--) {
+      const block = content[position];
+      if (!CACHEABLE_BLOCKS.has(block?.type)) continue;
+      if (block.type === "text" && !(typeof block.text === "string" && block.text.trim())) continue;
+      return block;
+    }
+  }
+  return null;
+}
+
+export function prepareCliConversation(request, cwd, { cacheTtl = CLI_CACHE_TTL } = {}) {
   const sessionId = randomUUID();
   let parentUuid = null;
   const names = new Map();
@@ -10901,7 +10971,7 @@ export function prepareCliConversation(request, cwd) {
   const endsInToolResult = messages.at(-1).content?.some?.((block) => block.type === "tool_result");
   const last = endsInToolResult ? { role: "user", content: [{ type: "text",
     text: "Continue from the tool results above and answer the pending user request." }] } : messages.pop();
-  const transcript = messages.map((message) => {
+  const rows = messages.map((message) => {
     const uuid = randomUUID();
     const row = { type: message.role, uuid, parentUuid, sessionId, cwd, isSidechain: false,
       timestamp: new Date().toISOString(), version: "2.1.231", userType: "external",
@@ -10911,18 +10981,32 @@ export function prepareCliConversation(request, cwd) {
         stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 },
       } : {}) } };
     parentUuid = uuid;
-    return JSON.stringify(row);
-  }).join("\n");
+    return row;
+  });
+  // The CLI puts its last breakpoint on an environment block that it appends
+  // after this history and rebuilds for every process, so the next turn cannot
+  // reuse it. Mark the end of the replayed history instead; the next turn
+  // replays the same prefix and reads it from cache.
+  const markerBlock = cacheTtl ? cacheMarkerBlock(rows.map((row) => row.message)) : null;
+  const plainTranscript = rows.map((row) => JSON.stringify(row)).join("\n");
+  if (markerBlock) markerBlock.cache_control = { type: "ephemeral", ttl: cacheTtl };
+  const transcript = markerBlock ? rows.map((row) => JSON.stringify(row)).join("\n") : plainTranscript;
   const system = typeof request.system === "string" ? request.system
     : (request.system || []).map((block) => block.text || "").join("\n\n");
   // The CLI has no native tool_choice option. Keep the same definitions during
   // replay, including when tools are forbidden, so previous calls remain known.
   // Enforce the choice on output before forwarding any disallowed tool to Codex.
+  // The instruction belongs to this turn only; placing it in the system prompt
+  // would invalidate the cached tools/system/history prefix.
   const choice = request.tool_choice?.type;
   const constraint = choice === "none" ? "For this response, do not call any tools. Respond using the conversation and tool results already provided."
     : choice === "tool" ? `For this response, call only the tool ${names.get(request.tool_choice.name)}.`
     : choice === "any" ? "For this response, call at least one of the provided tools." : "";
-  return { tools, reverseNames, transcript, system: [system, constraint].filter(Boolean).join("\n\n"),
+  if (constraint) {
+    const content = typeof last.content === "string" ? [{ type: "text", text: last.content }] : (last.content || []);
+    last.content = [...content, { type: "text", text: constraint }];
+  }
+  return { tools, reverseNames, transcript, plainTranscript, cacheMarker: Boolean(markerBlock), system,
     input: JSON.stringify({ type: "user", session_id: sessionId, parent_tool_use_id: null, message: last }) + "\n" };
 }
 
@@ -11001,18 +11085,20 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     signal?.throwIfAborted();
   }
   const directory = await mkdtemp(join(tmpdir(), "codex-claude-turn-"));
-  let mcp, child, timer, killTimer, closed = false, terminal = false, streamController;
+  let mcp, child = null, timer, terminal = false, streamController;
   let cleanupPromise;
+  const processes = new Set();
+  // Resolves after the process exits; escalates if it ignores the first signal.
+  const terminate = (proc) => proc.routerClosed ? Promise.resolve() : new Promise((resolve) => {
+    const killTimer = setTimeout(() => proc.kill("SIGKILL"), 1500);
+    proc.once("close", () => { clearTimeout(killTimer); resolve(); });
+    proc.kill();
+  });
   const cleanup = () => cleanupPromise ||= (async () => {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
     mcp?.close();
-    if (child && !closed) {
-      child.kill();
-      killTimer = setTimeout(() => child.kill("SIGKILL"), 1500);
-      await new Promise((resolve) => child.once("close", resolve));
-      clearTimeout(killTimer);
-    }
+    await Promise.all([...processes].map(terminate));
     await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   })();
   const send = (event) => streamController.enqueue(Buffer.from(`data: ${JSON.stringify(event)}\n\n`));
@@ -11025,87 +11111,115 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
   };
   const abort = () => finish("protocol");
   try {
-    const conversation = prepareCliConversation(request, directory);
+    const conversation = prepareCliConversation(request, directory,
+      { cacheTtl: cliCacheMarkerEnabled() ? CLI_CACHE_TTL : null });
     await writeFile(join(directory, "system.txt"), conversation.system, { mode: 0o600 });
-    if (conversation.transcript) await writeFile(join(directory, "history.jsonl"), conversation.transcript + "\n", { mode: 0o600 });
+    const historyPath = join(directory, "history.jsonl");
+    if (conversation.transcript) await writeFile(historyPath, conversation.transcript + "\n", { mode: 0o600 });
     mcp = await startCliToolServer(conversation.tools);
     await writeFile(join(directory, "mcp.json"), JSON.stringify(mcp.config), { mode: 0o600 });
-    const args = ["-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json",
+    const baseArgs = ["-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json",
       "--include-partial-messages", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
       "--mcp-config", join(directory, "mcp.json"), "--disable-slash-commands", "--no-chrome",
       "--permission-mode", "dontAsk", "--max-turns", "1", ...isolationArgs,
       "--system-prompt-file", join(directory, "system.txt"), "--model", request.model];
-    if (conversation.transcript) args.push("--resume", join(directory, "history.jsonl"), "--fork-session");
-    if (configuration.effort) args.push("--effort", configuration.effort);
     const stream = new ReadableStream({ start(controller) { streamController = controller; },
       cancel() { terminal = true; return cleanup(); } });
-    child = spawn(configuration.binary, args, { cwd: directory, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
-      env: testEnv || { ...claudeCliEnvironment(), CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(request.max_tokens || 32000) } });
-    let pending = "", started = false, stopReason = null, toolCount = 0;
-    child.stderr.resume(); // Never log CLI stderr: it can contain prompts or credentials.
-    child.stdin.on("error", () => { if (!terminal) finish("protocol"); });
-    child.on("error", () => finish("unavailable"));
-    child.on("close", () => { closed = true; if (!terminal) finish("protocol"); });
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      if (terminal) return;
-      pending += chunk.toString("utf8");
-      if (pending.length > 16 * 1024 * 1024) { finish("protocol"); return; }
-      let newline;
-      while (!terminal && (newline = pending.indexOf("\n")) >= 0) {
-        const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
-        let record;
-        try { record = JSON.parse(line); } catch { finish("protocol"); return; }
-        if (!record || typeof record.type !== "string") { finish("protocol"); return; }
-        onDiagnostic?.({ type: record.type, event: record.event?.type, stop: record.event?.delta?.stop_reason,
-          block: record.event?.content_block?.type, error: record.error, subtype: record.subtype,
-          model: record.event?.message?.model, assistantStop: record.message?.stop_reason,
-          ...(record.message?.stop_reason === "refusal" ? { refusal: record.message.content?.filter((block) => block.type === "text")
-            .map((block) => block.text).join("\n").slice(0, 1000) } : {}) });
-        if (record.type === "assistant" && record.error) {
-          const requiredVersion = requiredCliVersion(record);
-          if (requiredVersion) { finish("upgrade_required", requiredVersion); return; }
-          if (record.message?.stop_reason === "refusal") {
-            if (!started) send({ type: "message_start", message: { usage: {} } });
-            send({ type: "message_delta", delta: { stop_reason: "refusal" }, stop_details: record.message.stop_details });
-            send({ type: "message_stop" });
-            finish(); return;
+    const env = testEnv || { ...claudeCliEnvironment(), CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(request.max_tokens || 32000) };
+    let started = false, stopReason = null, toolCount = 0, cacheRetried = false;
+    const launch = (history) => {
+      const args = [...baseArgs];
+      if (history) args.push("--resume", history, "--fork-session");
+      if (configuration.effort) args.push("--effort", configuration.effort);
+      const proc = spawn(configuration.binary, args, { cwd: directory, windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env });
+      processes.add(proc);
+      child = proc;
+      let pending = "";
+      proc.stderr.resume(); // Never log CLI stderr: it can contain prompts or credentials.
+      proc.stdin.on("error", () => { if (proc === child && !terminal) finish("protocol"); });
+      proc.on("error", () => { if (proc === child) finish("unavailable"); });
+      proc.on("close", () => { proc.routerClosed = true; if (proc === child && !terminal) finish("protocol"); });
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (chunk) => {
+        if (terminal || proc !== child) return;
+        pending += chunk.toString("utf8");
+        if (pending.length > 16 * 1024 * 1024) { finish("protocol"); return; }
+        let newline;
+        while (!terminal && proc === child && (newline = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+          let record;
+          try { record = JSON.parse(line); } catch { finish("protocol"); return; }
+          if (!record || typeof record.type !== "string") { finish("protocol"); return; }
+          onDiagnostic?.({ type: record.type, event: record.event?.type, stop: record.event?.delta?.stop_reason,
+            block: record.event?.content_block?.type, error: record.error, subtype: record.subtype,
+            model: record.event?.message?.model, assistantStop: record.message?.stop_reason,
+            ...(record.message?.stop_reason === "refusal" ? { refusal: record.message.content?.filter((block) => block.type === "text")
+              .map((block) => block.text).join("\n").slice(0, 1000) } : {}) });
+          if (record.type === "assistant" && record.error) {
+            const requiredVersion = requiredCliVersion(record);
+            if (requiredVersion) { finish("upgrade_required", requiredVersion); return; }
+            if (record.message?.stop_reason === "refusal") {
+              if (!started) send({ type: "message_start", message: { usage: {} } });
+              send({ type: "message_delta", delta: { stop_reason: "refusal" }, stop_details: record.message.stop_details });
+              send({ type: "message_stop" });
+              finish(); return;
+            }
+            const detail = JSON.stringify(record.message?.content || "");
+            if (conversation.cacheMarker && !cacheRetried && !started && cacheControlRejected(detail)) {
+              // An older CLI may ignore the TTL setting, or a newer one may already
+              // use every breakpoint. Nothing reached Codex yet: resend once without
+              // the router's breakpoint and pause it for later turns.
+              cacheRetried = true;
+              disableCliCacheMarker();
+              onDiagnostic?.({ type: "cache_marker_fallback" });
+              child = null;
+              void terminate(proc);
+              void relaunchWithoutMarker();
+              return;
+            }
+            finish(record.error === "authentication_failed" ? "authentication_failed"
+              : record.error === "rate_limit" ? "rate_limit"
+              : /context.*(?:length|window)|prompt is too long/i.test(detail) ? "context_length_exceeded" : "protocol"); return;
           }
-          const detail = JSON.stringify(record.message?.content || "");
-          finish(record.error === "authentication_failed" ? "authentication_failed"
-            : record.error === "rate_limit" ? "rate_limit"
-            : /context.*(?:length|window)|prompt is too long/i.test(detail) ? "context_length_exceeded" : "protocol"); return;
+          if (record.type === "result") { finish("protocol"); return; }
+          if (record.type !== "stream_event" || record.parent_tool_use_id) continue;
+          const event = record.event;
+          if (!event || typeof event.type !== "string") { finish("protocol"); return; }
+          if (event.type === "message_start") {
+            if (started) { finish("protocol"); return; }
+            started = true;
+          }
+          if (!started) { finish("protocol"); return; }
+          if (event.type === "message_delta" && event.delta?.stop_reason) stopReason = event.delta.stop_reason;
+          if (event.type === "message_stop" && !stopReason) { finish("protocol"); return; }
+          if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
+            const name = conversation.reverseNames.get(event.content_block.name);
+            if (!name) { finish("invalid_tool"); return; }
+            toolCount++;
+            if (request.tool_choice?.type === "none" || (request.tool_choice?.type === "tool" && name !== request.tool_choice.name)
+              || (request.tool_choice?.disable_parallel_tool_use && toolCount > 1)) { finish("tool_choice"); return; }
+            event.content_block.name = name;
+          }
+          if (event.type === "message_stop" && ["any", "tool"].includes(request.tool_choice?.type) && !toolCount) {
+            finish("tool_choice"); return;
+          }
+          send(event);
+          if (event.type === "message_stop") finish();
         }
-        if (record.type === "result") { finish("protocol"); return; }
-        if (record.type !== "stream_event" || record.parent_tool_use_id) continue;
-        const event = record.event;
-        if (!event || typeof event.type !== "string") { finish("protocol"); return; }
-        if (event.type === "message_start") {
-          if (started) { finish("protocol"); return; }
-          started = true;
-        }
-        if (!started) { finish("protocol"); return; }
-        if (event.type === "message_delta" && event.delta?.stop_reason) stopReason = event.delta.stop_reason;
-        if (event.type === "message_stop" && !stopReason) { finish("protocol"); return; }
-        if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
-          const name = conversation.reverseNames.get(event.content_block.name);
-          if (!name) { finish("invalid_tool"); return; }
-          toolCount++;
-          if (request.tool_choice?.type === "none" || (request.tool_choice?.type === "tool" && name !== request.tool_choice.name)
-            || (request.tool_choice?.disable_parallel_tool_use && toolCount > 1)) { finish("tool_choice"); return; }
-          event.content_block.name = name;
-        }
-        if (event.type === "message_stop" && ["any", "tool"].includes(request.tool_choice?.type) && !toolCount) {
-          finish("tool_choice"); return;
-        }
-        send(event);
-        if (event.type === "message_stop") finish();
-      }
-    });
+      });
+      if (!terminal) proc.stdin.end(conversation.input);
+    };
+    const relaunchWithoutMarker = async () => {
+      try {
+        const plainPath = join(directory, "history-plain.jsonl");
+        await writeFile(plainPath, conversation.plainTranscript + "\n", { mode: 0o600 });
+        if (!terminal) launch(plainPath);
+      } catch { finish("protocol"); }
+    };
     timer = setTimeout(() => finish("timeout"), configuration.timeoutMs || 180000);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    if (!terminal) child.stdin.end(conversation.input);
+    if (!terminal) launch(conversation.transcript ? historyPath : null);
     return new Response(stream, { headers: { "content-type": "text/event-stream" } });
   } catch (error) { await cleanup(); throw error; }
 }

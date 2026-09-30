@@ -271,6 +271,13 @@ export function bridgeInputError(message) {
   return Object.assign(new Error(message), { name: "BridgeRequestError" });
 }
 
+// Codex 在對話中途補送的 developer 訊息（技能清單、協作模式、切換模型、時間等）
+// 若併進 system，system 一變，tools → system → messages 之後的快取就全部失效。
+// 開頭那組 developer 訊息仍進 system；之後出現的留在原位，以 system-reminder 標示來源。
+export function midConversationInstruction(text) {
+  return `<system-reminder>\nCodex developer message:\n${text}\n</system-reminder>`;
+}
+
 // Codex protocol AgentMessage: inter-agent input, not this assistant's reply
 // or a tool result. Keep provenance and every plaintext block in order.
 export function agentMessageText(item) {
@@ -747,8 +754,13 @@ export function toAnthropicRequest(body, route) {
   if (body.text?.format && body.text.format.type !== "text") {
     throw bridgeInputError("Claude 轉譯尚未支援此結構化輸出格式，請改用文字或函式工具輸出。");
   }
+  // 只看項目本身與它之前的內容，重播同一段歷史時分類結果不會改變。
+  let leadingInstructions = true;
   for (const item of inputItems) {
-    switch (item?.type || (item?.role ? "message" : null)) {
+    const kind = item?.type || (item?.role ? "message" : null);
+    const instruction = kind === "message" && (item.role === "developer" || item.role === "system");
+    if (!instruction && kind !== "additional_tools") leadingInstructions = false;
+    switch (kind) {
       case "additional_tools": {
         break;
       }
@@ -761,7 +773,9 @@ export function toAnthropicRequest(body, route) {
         if (item.role === "developer" || item.role === "system") {
           // system 只接受純文字。
           const text = textOf(item.content);
-          if (text) systemParts.push(text);
+          if (!text) break;
+          if (leadingInstructions) systemParts.push(text);
+          else push("user", { type: "text", text: midConversationInstruction(text) });
           break;
         }
         const blocks = toAnthropicBlocks(item.content);
