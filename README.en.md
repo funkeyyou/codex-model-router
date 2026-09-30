@@ -1,4 +1,12 @@
-# codex-model-router
+# codex-model-router — Multi-model routing for Codex Desktop
+
+[简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md) · [Releases](https://github.com/funkeyyou/codex-model-router/releases) · [Report an issue](https://github.com/funkeyyou/codex-model-router/issues)
+
+**Use Claude and OpenAI-compatible models in Codex Desktop alongside official GPT models.**
+
+A local LLM proxy and multi-provider model router for Codex Desktop / ChatGPT Desktop on macOS and Windows. Connect custom Base URLs and third-party APIs using OpenAI Responses API, Anthropic Messages API or OpenAI-compatible Chat Completions. Experimental Claude Code CLI subscription routing is also available.
+
+## Claude Code subscription routing (experimental)
 
 Experimental [Claude CLI subscription routing](docs/claude-cli-experimental.md) is available through menu item 6 or the `claude-cli` command. It asks before installing or updating Claude Code and guides subscription sign-in when needed.
 
@@ -7,10 +15,6 @@ Since v1.26.1, the installer reads the CLI's current model list first and shows 
 Listing models sends no inference request. Only selected models are tested, using subscription quota. If discovery fails, the installer clearly labels its built-in fallback candidates. The CLI list may differ from Claude Desktop and does not guarantee available quota for every model; unlisted versions can still be tested by explicit ID.
 
 Short text and tool roundtrips passed with a live subscription on macOS; Chrome, image generation, long conversations and Windows subscription execution still need validation. Context limits are manual settings, not verified capacities: a 1M setting with the retained 95% usable ratio appears as about 950K in Codex.
-
-[English](README.en.md) · [繁體中文 / Full reference](README.md) · [Releases](https://github.com/funkeyyou/codex-model-router/releases) · [Report an issue](https://github.com/funkeyyou/codex-model-router/issues)
-
-**Use Claude and OpenAI-compatible models in Codex Desktop alongside official GPT models.**
 
 A local model router for macOS and Windows. Add your own API providers to the Codex model picker, keep their API keys separate, and switch models without repeatedly changing the global provider configuration.
 
@@ -32,7 +36,7 @@ Chat Completions support can be useful for compatible DeepSeek, Qwen, GLM, Kimi,
 
 You need Codex Desktop / ChatGPT Desktop, a Codex login using a ChatGPT account, and your provider's Base URL and API key. The installer requires Node.js 22.15 or newer and can use the desktop app's bundled Node.js when available.
 
-Provider API usage is billed by the provider. This tool does not supply credits, a Claude subscription login, or access to account-restricted native tools. It is an unofficial community project, not affiliated with OpenAI or Anthropic.
+Provider API usage is billed by the provider. This tool does not supply credits, a Claude subscription, or access to account-restricted native tools. It is an unofficial community project, not affiliated with OpenAI or Anthropic.
 
 Tool and attachment support varies. Claude and Chat Completions translation cannot execute OpenAI-hosted tools such as native web search or native image generation. The optional relay image skill is a separate capability. See the [full compatibility reference in Chinese](README.md).
 
@@ -92,7 +96,7 @@ To remove the router configuration:
 bash codex-model-router.sh rollback
 ```
 
-**Before rollback:** conversations containing translated Claude history may no longer work with the official backend once the router is removed. Start a new conversation after rollback, or keep the router for those existing conversations. Read the [rollback details](README.md#回退之後用過-claude-模型的舊對話會壞掉) first.
+**Before rollback:** conversations containing translated Claude history may no longer work with the official backend once the router is removed. Start a new conversation after rollback, or keep the router for those existing conversations. Read the [rollback details](README.zh-TW.md#回退之後用過-claude-模型的舊對話會壞掉) first.
 
 ## Development and help
 
