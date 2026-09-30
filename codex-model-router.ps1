@@ -154,7 +154,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.26.5";
+const INSTALLER_VERSION = "1.26.6";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8170,6 +8170,20 @@ export function midConversationInstruction(text) {
   return `<system-reminder>\nCodex developer message:\n${text}\n</system-reminder>`;
 }
 
+// Codex 送給自訂模型的是 GPT 版系統提示：要求把進度送到 commentary 頻道、答案送到 final
+// 頻道。Claude 的輸出沒有頻道，這段要求對它不起作用，於是多半一路呼叫工具不說話。
+// 這裡把兩個頻道對應到 Claude 實際的輸出方式，並比照 Claude Code 的進度更新規則。
+// 內容固定，放在 system 最後，不影響提示快取。
+export const CLAUDE_CODEX_GUIDANCE = [
+  "# Notes for Claude models in Codex",
+  "",
+  "The instructions above were written for GPT models. You are a Claude model running in Codex, and your output has no channels. Map them this way:",
+  "- `commentary` channel: any text you write before a tool call. Codex shows it to the user immediately as a progress update.",
+  "- `final` channel: your last message, with no tool call after it. It ends the turn, so it must contain everything the user needs from this turn.",
+  "",
+  "Your text is the main way the user follows your work. Before your first tool call, say in one sentence what you're about to do. While working, give a short update when you find something important, change direction, or hit a blocker, and don't run through a long series of tool calls in silence. Keep each update to one or two complete sentences that make sense to someone catching up, and don't narrate your internal deliberation.",
+].join("\n");
+
 // Codex protocol AgentMessage: inter-agent input, not this assistant's reply
 // or a tool result. Keep provenance and every plaintext block in order.
 export function agentMessageText(item) {
@@ -8861,6 +8875,7 @@ export function toAnthropicRequest(body, route) {
   // 頂層 cache_control 的閘道會讓每一條 Claude 請求都 400。
   if (route?.promptCache === true) request.cache_control = { type: "ephemeral" };
 
+  systemParts.push(CLAUDE_CODEX_GUIDANCE);
   if (systemParts.length) {
     // 最後一段掛 cache_control，讓穩定的前綴可被快取。
     const blocks = systemParts.map((text) => ({ type: "text", text }));
@@ -9066,11 +9081,25 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   let cur = null;
   let failed = false;
   let completed = false;
+  // 文字項目的 output_item.done 延到確定後面接什麼才送出：後面還有其他內容或工具呼叫的是
+  // 進度更新（commentary）；整則回應最後一段、且這一輪沒有工具呼叫的才是最終答案
+  // （final_answer）。Codex 桌面版靠這個標記辨識最終答案。逐字串流照常，只延後 done。
+  let pendingText = null;
+  const flushText = (phase) => {
+    if (!pendingText) return;
+    const { index, item } = pendingText;
+    pendingText = null;
+    item.phase = phase;
+    output.push(item);
+    send({ type: "response.output_item.done", output_index: index, item });
+  };
 
   const decoder = new TextDecoder();
   let pending = "";
 
   const failResponse = (error, kind = null) => {
+    // 先在原本的抑制狀態下補完已串流的文字，壓縮回合的文字仍不外送。
+    flushText("commentary");
     failed = true;
     suppress = false;
     if (kind) ctx.claudeFailureKind = kind;
@@ -9098,6 +9127,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
     if (failed || completed) return;
     switch (event.type) {
       case "content_block_start": {
+        flushText("commentary");
         const block = event.content_block || {};
         if (block.type === "thinking") {
           cur = { kind: "thinking", itemId: randomId("rs_", 53), thinking: "", signature: "", index: outputIndex };
@@ -9265,8 +9295,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
             phase: "commentary",
             role: "assistant",
           };
-          output.push(item);
-          send({ type: "response.output_item.done", output_index: cur.index, item });
+          pendingText = { index: cur.index, item };
         } else if (cur.kind === "custom_tool" || cur.kind === "function_tool") {
           let parsed;
           try {
@@ -9326,6 +9355,9 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
         break;
 
       case "message_stop": {
+        const toolCalled = output.some((item) => item.type === "function_call" || item.type === "custom_tool_call");
+        flushText(!toolCalled && (stopReason === "end_turn" || stopReason === "stop_sequence")
+          ? "final_answer" : "commentary");
         if (compactionMode) {
           if (!compactionText.trim() || (stopReason && stopReason !== "end_turn")) {
             failResponse({
@@ -9468,6 +9500,8 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   } else if (pending.trim()) {
     consume(pending);
   }
+  // 串流在 message_stop 前中斷：已完成的文字以進度更新收尾，終止事件仍由 router 補。
+  if (!failed && !completed) flushText("commentary");
   // 真正缺少 message_stop 的串流仍交由 router 補失敗，不因收到部分文字而
   // 自行合成成功；只有最後一筆事件少了結尾空行時才在上面正常讀取它。
 }
@@ -10107,6 +10141,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
 
   const fail = (error) => {
     if (failed || done) return;
+    flushMessage("commentary");
     failed = true;
     suppress = false;
     const response = base();
@@ -10132,6 +10167,18 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     send({ type: "response.output_item.done", output_index: current.index, item });
   };
 
+  // 與 Claude 轉譯相同：文字項目的 output_item.done 延到確定後面接什麼才送出，
+  // 最後一段且這一輪沒有工具呼叫的才標成最終答案（final_answer）。
+  let pendingMessage = null;
+  const flushMessage = (phase) => {
+    if (!pendingMessage) return;
+    const { index, item } = pendingMessage;
+    pendingMessage = null;
+    item.phase = phase;
+    output.push(item);
+    send({ type: "response.output_item.done", output_index: index, item });
+  };
+
   const closeMessage = () => {
     if (!message) return;
     const current = message;
@@ -10147,13 +10194,13 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
       phase: "commentary",
       role: "assistant",
     };
-    output.push(item);
-    send({ type: "response.output_item.done", output_index: current.index, item });
+    pendingMessage = { index: current.index, item };
   };
 
   const appendReasoning = (text) => {
     if (!text) return;
     closeMessage();
+    flushMessage("commentary");
     if (!reasoning) {
       reasoning = { itemId: randomId("rs_", 53), index: outputIndex++, text: "" };
       send({ type: "response.output_item.added", output_index: reasoning.index, item: { id: reasoning.itemId, type: "reasoning", content: [], encrypted_content: "", summary: [] } });
@@ -10167,6 +10214,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     if (!text) return;
     closeReasoning();
     if (!message) {
+      flushMessage("commentary");
       message = { itemId: randomId("msg_", 54), index: outputIndex++, text: "" };
       send({ type: "response.output_item.added", output_index: message.index, item: { id: message.itemId, type: "message", status: "in_progress", content: [], phase: "commentary", role: "assistant" } });
       send({ type: "response.content_part.added", content_index: 0, item_id: message.itemId, output_index: message.index, part: { type: "output_text", annotations: [], logprobs: [], text: "" } });
@@ -10183,6 +10231,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
   };
 
   const announce = (entry) => {
+    flushMessage("commentary");
     entry.announced = true;
     entry.callId ||= randomId("call_", 29);
     entry.index = outputIndex++;
@@ -10261,6 +10310,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     routeSplit(splitter.flush());
     closeReasoning();
     closeMessage();
+    flushMessage(calls.size === 0 && (!finishReason || finishReason === "stop") ? "final_answer" : "commentary");
     const pending = [...calls.values()];
     if (pending.some((entry) => !entry.announced)) {
       fail({ code: "invalid_tool_arguments", message: "上游工具呼叫缺少名稱；未執行，請重新產生該工具呼叫。" });
@@ -11122,6 +11172,10 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
       "--include-partial-messages", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
       "--mcp-config", join(directory, "mcp.json"), "--disable-slash-commands", "--no-chrome",
       "--permission-mode", "dontAsk", "--max-turns", "1", ...isolationArgs,
+      // Claude 5 系列預設不回傳思考文字（display: omitted）。要求摘要後 Codex 才能顯示
+      // 思考過程；計費不變。這個參數不在 --help 中，2.1.231 起可用，且只附加在
+      // adaptive／enabled 思考設定上，不會與關閉思考同時送出。
+      "--thinking-display", "summarized",
       "--system-prompt-file", join(directory, "system.txt"), "--model", request.model];
     const stream = new ReadableStream({ start(controller) { streamController = controller; },
       cancel() { terminal = true; return cleanup(); } });

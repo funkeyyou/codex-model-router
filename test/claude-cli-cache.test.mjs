@@ -97,7 +97,7 @@ test("Claude bridge keeps leading developer messages in system and later ones in
   const before = bridge.toAnthropicRequest({ instructions: "base", input: first }, route).request;
   const after = bridge.toAnthropicRequest({ instructions: "base",
     input: [...first, dev("<skills_instructions>new</skills_instructions>"), user("second question")] }, route).request;
-  assert.deepEqual(before.system.map((block) => block.text), ["base", "permissions", "apps"]);
+  assert.deepEqual(before.system.map((block) => block.text), ["base", "permissions", "apps", bridge.CLAUDE_CODEX_GUIDANCE]);
   assert.deepEqual(after.system, before.system);
   assert.deepEqual(after.messages.slice(0, before.messages.length), before.messages);
   assert.deepEqual(after.messages.at(-1).content.map((block) => block.text), [
@@ -112,7 +112,7 @@ test("Claude bridge keeps leading developer messages in system and later ones in
   const content = between.messages.at(-1).content;
   assert.equal(content[0].type, "tool_result");
   assert.match(content[1].text, /Codex developer message:\nmode changed/);
-  assert.equal(between.system, undefined);
+  assert.deepEqual(between.system.map((block) => block.text), [bridge.CLAUDE_CODEX_GUIDANCE]);
 });
 
 // 假的 Claude CLI：記錄每次收到的重播歷史，並可在歷史帶斷點時模擬 API 拒收。
@@ -125,7 +125,8 @@ function fakeCli(directory) {
     'const resume = args.includes("--resume") ? args[args.indexOf("--resume") + 1] : null;',
     'const history = resume ? fs.readFileSync(resume, "utf8") : "";',
     'const marked = history.includes("cache_control");',
-    'fs.appendFileSync(process.env.FAKE_CLI_LOG, JSON.stringify({ resume: resume && path.basename(resume), marked }) + "\\n");',
+    'const display = args.includes("--thinking-display") ? args[args.indexOf("--thinking-display") + 1] : null;',
+    'fs.appendFileSync(process.env.FAKE_CLI_LOG, JSON.stringify({ resume: resume && path.basename(resume), marked, display }) + "\\n");',
     'const out = (record) => process.stdout.write(JSON.stringify(record) + "\\n");',
     'process.stdin.resume(); process.stdin.on("end", () => {',
     '  out({ type: "system", subtype: "init" });',
@@ -171,18 +172,19 @@ test("a rejected history breakpoint is resent once without it and paused for lat
   assert.equal(first.match(/"type":"message_start"/g)?.length, 1);
   assert.match(first, /"type":"message_stop"/);
   assert.doesNotMatch(first, /claude_cli_/);
-  assert.deepEqual(calls(), [{ resume: "history.jsonl", marked: true }, { resume: "history-plain.jsonl", marked: false }]);
+  assert.deepEqual(calls(), [{ resume: "history.jsonl", marked: true, display: "summarized" },
+    { resume: "history-plain.jsonl", marked: false, display: "summarized" }], "thinking summaries are requested on every launch");
   assert.equal(diagnostics.filter((event) => event.type === "cache_marker_fallback").length, 1);
   assert.equal(cli.cliCacheMarkerEnabled(), false);
 
   await (await cli.fetchClaudeCli(request, { binary, timeoutMs: 10000 }, null, { env })).text();
-  assert.deepEqual(calls().slice(2), [{ resume: "history.jsonl", marked: false }], "the paused marker costs no extra process");
+  assert.deepEqual(calls().slice(2), [{ resume: "history.jsonl", marked: false, display: "summarized" }], "the paused marker costs no extra process");
 
   cli.resetCliCacheMarker();
   const unrelated = await (await cli.fetchClaudeCli(request, { binary, timeoutMs: 10000 }, null,
     { env: { ...env, FAKE_CLI_ERROR: '{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}' } })).text();
   assert.match(unrelated, /claude_cli_context_length_exceeded/);
-  assert.deepEqual(calls().slice(3), [{ resume: "history.jsonl", marked: true }], "other errors are never retried");
+  assert.deepEqual(calls().slice(3), [{ resume: "history.jsonl", marked: true, display: "summarized" }], "other errors are never retried");
   assert.equal(cli.cliCacheMarkerEnabled(), true);
 
   const alwaysRejected = await (await cli.fetchClaudeCli(request, { binary, timeoutMs: 10000 }, null,

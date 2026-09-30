@@ -465,6 +465,12 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   兩項探測失敗或不支援時都自動沿用原有行為。
   1.26.5 起，對話中途補送的 developer 訊息（技能清單、協作模式、切換模型等）留在原位，
   以 `<system-reminder>` 標示來源，不再改寫 system；開頭那組仍放在 system。
+- **Claude 會回報進度，最後答案標成最終答案**——Codex 送給自訂模型的是 GPT 版系統提示，
+  要求把進度送到 `commentary` 頻道；Claude 的輸出沒有頻道，實測在 Codex 裡很少於工具之間說話。
+  1.26.6 起在 Claude 路由的 system 最後加一段固定說明，把頻道對應到 Claude 的文字輸出，
+  並比照 Claude Code 要求「第一次呼叫工具前說明要做什麼、有重要發現時簡短更新」。
+  同版本起轉譯路由（Claude 與 Chat Completions）把整輪最後一段、沒有接工具呼叫的文字標成
+  `final_answer`，其餘維持 `commentary`；串流時先以進度更新顯示，完成時才定案。
 - **有狀態接續的本機重建**——Codex 在工具接續回合只送工具結果並倚賴
   `previous_response_id`，但該參數需要真正的 WebSocket 上游。本路由改以
   「上次完整輸入 + 該輪輸出 + 本次新項目」在本機重建等價的完整請求；每條

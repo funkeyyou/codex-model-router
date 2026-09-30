@@ -333,6 +333,10 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
       "--include-partial-messages", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
       "--mcp-config", join(directory, "mcp.json"), "--disable-slash-commands", "--no-chrome",
       "--permission-mode", "dontAsk", "--max-turns", "1", ...isolationArgs,
+      // Claude 5 系列預設不回傳思考文字（display: omitted）。要求摘要後 Codex 才能顯示
+      // 思考過程；計費不變。這個參數不在 --help 中，2.1.231 起可用，且只附加在
+      // adaptive／enabled 思考設定上，不會與關閉思考同時送出。
+      "--thinking-display", "summarized",
       "--system-prompt-file", join(directory, "system.txt"), "--model", request.model];
     const stream = new ReadableStream({ start(controller) { streamController = controller; },
       cancel() { terminal = true; return cleanup(); } });

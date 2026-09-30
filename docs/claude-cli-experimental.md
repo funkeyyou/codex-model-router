@@ -37,6 +37,12 @@ CLI 只看得到以 MCP 提供的 Codex 工具定義；原生 Bash／Edit／Read
 
 Claude CLI 預設把每個 MCP 工具說明截斷在 2,048 字元，Codex Code Mode 的巢狀工具文件因此看不到。1.26.5 起路由器以 `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` 保留完整說明，並以 `ENABLE_TOOL_SEARCH=false` 讓所有 Codex 工具直接可用，不改成延遲載入。
 
+### 思考摘要與進度更新
+
+Claude 5 系列預設不回傳思考文字（`display: omitted`），Codex 因此看不到思考過程。1.26.6 起 CLI 路由加上 `--thinking-display summarized`，思考摘要會以 Codex 的推理摘要顯示；依 Anthropic 說明計費不變，只會稍微增加延遲。這個參數不在 `--help` 中，2.1.231 起可用，而且只會附加在 adaptive／enabled 思考設定上。
+
+Claude Code 自己的系統提示要求模型在工具之間簡短回報進度，但 CLI 路由以 Codex 的提示取代了它。1.26.6 起 Claude 路由在 system 最後加一段固定說明，把 Codex 的 `commentary`／`final` 頻道對應到 Claude 的文字輸出，並要求相同的更新方式。
+
 ### 提示快取
 
 CLI 會把最後一個快取斷點放在它附加於歷史之後、每個行程重建的環境內容上，下一輪無法重用，每輪幾乎都要重寫整段對話。1.26.5 起：

@@ -36,14 +36,23 @@ test("real Codex executes a Claude CLI tool call and receives the final response
     upstreamRequests.push(parsed);
     const tool = parsed.tools.find((tool) => tool.description?.split("\n")[0].endsWith("exec_command"));
     const final = upstreamRequests.length > 1;
+    const block = (index, start, deltas) => [
+      { type: "content_block_start", index, content_block: start },
+      ...deltas.map((delta) => ({ type: "content_block_delta", index, delta })),
+      { type: "content_block_stop", index },
+    ];
+    // 第一輪：先寫一句進度再呼叫工具；第二輪：思考摘要加最終答案。
+    const content = final
+      ? [...block(0, { type: "thinking", thinking: "" }, [{ type: "thinking_delta", thinking: "Checking the echoed output." },
+        { type: "signature_delta", signature: "fixture-signature" }]),
+        ...block(1, { type: "text", text: "" }, [{ type: "text_delta", text: "CLI roundtrip verified." }])]
+      : [...block(0, { type: "text", text: "" }, [{ type: "text_delta", text: "Running the echo check first." }]),
+        ...block(1, { type: "tool_use", id: "toolu_echo", name: tool?.name || "missing_exec_command", input: {} },
+          [{ type: "input_json_delta", partial_json: '{"cmd":"echo router-cli-ok"}' }])];
     const events = [
       { type: "message_start", message: { id: `msg_${upstreamRequests.length}`, type: "message", role: "assistant", content: [],
         model: route.upstreamModel, stop_reason: null, stop_sequence: null, usage: { input_tokens: 100, output_tokens: 0 } } },
-      { type: "content_block_start", index: 0, content_block: final ? { type: "text", text: "" }
-        : { type: "tool_use", id: "toolu_echo", name: tool?.name || "missing_exec_command", input: {} } },
-      { type: "content_block_delta", index: 0, delta: final ? { type: "text_delta", text: "CLI roundtrip verified." }
-        : { type: "input_json_delta", partial_json: '{"cmd":"echo router-cli-ok"}' } },
-      { type: "content_block_stop", index: 0 },
+      ...content,
       { type: "message_delta", delta: { stop_reason: final ? "end_turn" : "tool_use", stop_sequence: null }, usage: { output_tokens: 10 } },
       { type: "message_stop" },
     ];
@@ -113,5 +122,16 @@ test("real Codex executes a Claude CLI tool call and receives the final response
       && JSON.stringify(message.content).includes("router-cli-ok") && JSON.stringify(message.content).includes("tool_result")));
     assert.match(JSON.stringify(notifications), /CLI roundtrip verified/);
     assert.equal(notifications.find((n) => n.method === "turn/completed")?.params?.turn?.status, "completed");
+    // Codex 桌面版收到的階段標記：工具前的文字是進度更新，最後一段是最終答案。
+    const completedItems = notifications.filter((n) => n.method === "item/completed").map((n) => n.params.item);
+    // 串流時一律先以進度更新開始（無法預知後面是否還有工具呼叫），完成時才定案。
+    assert.ok(notifications.filter((n) => n.method === "item/started" && n.params.item.type === "agentMessage")
+      .every((n) => n.params.item.phase === "commentary"));
+    assert.deepEqual(completedItems.filter((item) => item.type === "agentMessage").map((item) => [item.text, item.phase]),
+      [["Running the echo check first.", "commentary"], ["CLI roundtrip verified.", "final_answer"]]);
+    assert.match(JSON.stringify(completedItems.filter((item) => item.type === "reasoning")), /Checking the echoed output\./,
+      "the thinking summary reaches Codex");
+    assert.ok(upstreamRequests.every((request) => request.thinking?.display === "summarized"), JSON.stringify(upstreamRequests.map((r) => r.thinking)));
+    assert.ok(upstreamRequests.every((request) => JSON.stringify(request.system).includes("Notes for Claude models in Codex")));
   } finally { app.kill(); await exited; }
 });

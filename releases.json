@@ -1,6 +1,16 @@
 {
-  "latest": "1.26.5",
+  "latest": "1.26.6",
   "releases": [
+    {
+      "version": "1.26.6",
+      "date": "2026-09-30",
+      "changes": [
+        "Claude 路由在系統提示最後加入固定說明，把 Codex 為 GPT 設計的 commentary／final 頻道對應到 Claude 的文字輸出，並比照 Claude Code 在工具之間簡短回報進度；內容固定，不影響提示快取。",
+        "Claude CLI 路由改為要求思考摘要（--thinking-display summarized），Codex 可顯示 Opus 等模型的思考過程；依 Anthropic 說明計費不變。",
+        "Claude 與 Chat Completions 轉譯把整輪最後一段、沒有接工具呼叫的文字標成 final_answer，其餘維持 commentary，讓 Codex 桌面版正確辨識最終答案。",
+        "新增階段標記、事件順序、系統說明快取穩定性及真實 Codex app-server 端對端回歸測試。"
+      ]
+    },
     {
       "version": "1.26.5",
       "date": "2026-09-30",

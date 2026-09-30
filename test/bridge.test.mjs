@@ -60,15 +60,16 @@ test("沒有 effort 就不送 thinking", () => {
 
 // --- 訊息結構 ---------------------------------------------------------------
 
-test("developer / system 訊息進 system，最後一段掛 cache_control", () => {
+test("developer / system 訊息進 system，Claude 說明放最後並掛 cache_control", () => {
   const request = build([
     { type: "message", role: "developer", content: [{ type: "input_text", text: "規則 A" }] },
     { type: "message", role: "system", content: [{ type: "input_text", text: "規則 B" }] },
     userMessage("hi"),
   ]);
-  assert.deepEqual(request.system.map((b) => b.text), ["規則 A", "規則 B"]);
+  assert.deepEqual(request.system.map((b) => b.text), ["規則 A", "規則 B", bridge.CLAUDE_CODEX_GUIDANCE]);
   assert.equal(request.system[0].cache_control, undefined);
-  assert.deepEqual(request.system[1].cache_control, { type: "ephemeral" });
+  assert.equal(request.system[1].cache_control, undefined);
+  assert.deepEqual(request.system[2].cache_control, { type: "ephemeral" });
 });
 
 test("連續同 role 的區塊會合併成一則訊息", () => {

@@ -18,6 +18,8 @@ Short text and tool roundtrips passed with a live subscription on macOS; Chrome,
 
 Since v1.26.5, the replayed history ends with a one-hour prompt-cache breakpoint and the CLI's own cache TTL is pinned to one hour, so each turn can read the previous turn's history from cache. In a local fake-API simulation of 4 turns and 10 requests, the cache hit rate rose from about 37% to about 85%; real usage still depends on the conversation and Anthropic's accounting. Codex tool descriptions are now sent in full instead of being truncated by the CLI at 2,048 characters. Developer messages that Codex adds mid-conversation stay in place, marked with `<system-reminder>`, instead of rewriting the system prompt.
 
+Since v1.26.6, Claude routes add a fixed note at the end of the system prompt that maps Codex's GPT-specific `commentary` and `final` channels to Claude's text output and asks for Claude Code-style progress updates, so Claude no longer runs through tool calls in silence. The CLI route requests summarized thinking (`--thinking-display summarized`; billing is unchanged), and translated routes label the last text of a turn without tool calls as `final_answer` instead of `commentary`.
+
 A local model router for macOS and Windows. Add your own API providers to the Codex model picker, keep their API keys separate, and switch models without repeatedly changing the global provider configuration.
 
 <img src="docs/images/codex-model-picker.png" alt="Codex Desktop model picker showing official GPT models alongside custom GPT and Claude models from multiple providers" width="420">

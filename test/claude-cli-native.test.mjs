@@ -71,6 +71,7 @@ test("real Claude CLI preserves replay roles/tool results and exposes only Codex
   assert.match(output, /"name":"exec"/);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].output_config?.effort, "max", "CLI forwards the selected effort to its upstream");
+  assert.equal(requests[0].thinking?.display, "summarized", "thinking summaries are requested so Codex can show them");
   assert.match(JSON.stringify(requests[0].messages), /fixture-anchor-123/);
   assert.match(JSON.stringify(requests[0].messages), /fixture-result-456/);
   assert.ok(requests[0].messages.some((m) => m.role === "assistant" && m.content.some((b) => b.type === "tool_use" && b.id === "toolu_old")));

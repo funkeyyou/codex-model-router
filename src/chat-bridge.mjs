@@ -633,6 +633,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
 
   const fail = (error) => {
     if (failed || done) return;
+    flushMessage("commentary");
     failed = true;
     suppress = false;
     const response = base();
@@ -658,6 +659,18 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     send({ type: "response.output_item.done", output_index: current.index, item });
   };
 
+  // 與 Claude 轉譯相同：文字項目的 output_item.done 延到確定後面接什麼才送出，
+  // 最後一段且這一輪沒有工具呼叫的才標成最終答案（final_answer）。
+  let pendingMessage = null;
+  const flushMessage = (phase) => {
+    if (!pendingMessage) return;
+    const { index, item } = pendingMessage;
+    pendingMessage = null;
+    item.phase = phase;
+    output.push(item);
+    send({ type: "response.output_item.done", output_index: index, item });
+  };
+
   const closeMessage = () => {
     if (!message) return;
     const current = message;
@@ -673,13 +686,13 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
       phase: "commentary",
       role: "assistant",
     };
-    output.push(item);
-    send({ type: "response.output_item.done", output_index: current.index, item });
+    pendingMessage = { index: current.index, item };
   };
 
   const appendReasoning = (text) => {
     if (!text) return;
     closeMessage();
+    flushMessage("commentary");
     if (!reasoning) {
       reasoning = { itemId: randomId("rs_", 53), index: outputIndex++, text: "" };
       send({ type: "response.output_item.added", output_index: reasoning.index, item: { id: reasoning.itemId, type: "reasoning", content: [], encrypted_content: "", summary: [] } });
@@ -693,6 +706,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     if (!text) return;
     closeReasoning();
     if (!message) {
+      flushMessage("commentary");
       message = { itemId: randomId("msg_", 54), index: outputIndex++, text: "" };
       send({ type: "response.output_item.added", output_index: message.index, item: { id: message.itemId, type: "message", status: "in_progress", content: [], phase: "commentary", role: "assistant" } });
       send({ type: "response.content_part.added", content_index: 0, item_id: message.itemId, output_index: message.index, part: { type: "output_text", annotations: [], logprobs: [], text: "" } });
@@ -709,6 +723,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
   };
 
   const announce = (entry) => {
+    flushMessage("commentary");
     entry.announced = true;
     entry.callId ||= randomId("call_", 29);
     entry.index = outputIndex++;
@@ -787,6 +802,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     routeSplit(splitter.flush());
     closeReasoning();
     closeMessage();
+    flushMessage(calls.size === 0 && (!finishReason || finishReason === "stop") ? "final_answer" : "commentary");
     const pending = [...calls.values()];
     if (pending.some((entry) => !entry.announced)) {
       fail({ code: "invalid_tool_arguments", message: "上游工具呼叫缺少名稱；未執行，請重新產生該工具呼叫。" });
