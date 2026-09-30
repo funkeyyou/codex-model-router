@@ -1,6 +1,31 @@
 # codex-model-router
 
-讓 Codex Desktop 在保留官方模型的同時，額外使用相容 OpenAI 介面的自訂供應商。
+[繁體中文](README.md) · [English](README.en.md) · [下載 Releases](https://github.com/funkeyyou/codex-model-router/releases) · [問題回報](https://github.com/funkeyyou/codex-model-router/issues)
+
+**在 Codex Desktop 使用 Claude 與第三方模型，同時保留官方 GPT 模型。**
+
+Use Claude and OpenAI-compatible models in Codex Desktop alongside official GPT models.
+Local multi-provider routing for macOS and Windows.
+
+- **同一個模型選單**：在官方 GPT、自訂 GPT 與 Claude 之間選擇，無需反覆更換全域供應商。
+- **多家 API 各自管理**：每家保存自己的 API Key，支援模型偵測、添加、刪除與更換 Key。
+- **相容多種介面**：支援 Responses API、Claude Messages 轉譯，以及 Chat Completions 相容端點；實際能力會先探測。
+- **macOS／Windows 安裝器**：互動設定、更新備份與回退，另可啟用中轉 API 生圖技能。
+
+<img src="docs/images/codex-model-picker.png" alt="Codex Desktop 模型選單：官方 GPT、ark 自訂 GPT 與兩家供應商的 Claude 模型並列" width="420">
+
+*實際模型選單示例。前綴與模型可用性取決於你的供應商及帳號；截圖不是預裝模型清單。*
+
+### 開始前需要什麼？
+
+已安裝的 Codex Desktop／ChatGPT Desktop、已登入的 ChatGPT 帳號，以及中轉供應商的 Base URL 和 API Key。
+第三方 API 的費用由供應商計算；工具不提供模型額度，也不解鎖帳號未開放的內建工具。
+本專案是非官方社群工具，與 OpenAI、Anthropic 無隸屬關係。
+
+自訂模型的工具能力依模型與 API 而異，請參考[工具相容性說明](#工具可用性與相容範圍)。
+若要移除，先閱讀[回退與舊對話注意事項](#回退之後用過-claude-模型的舊對話會壞掉)。
+
+### 請求如何路由？
 
 官方 ChatGPT 模型仍直接送往 OpenAI，只有你選取的自訂模型會送往你設定的 Base URL。
 可以同時設定多家供應商，各自保存 API Key（見「[同時使用多家供應商](#同時使用多家供應商)」）；
