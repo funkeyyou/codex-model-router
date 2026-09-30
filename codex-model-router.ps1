@@ -154,7 +154,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.26.3";
+const INSTALLER_VERSION = "1.26.4";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8266,6 +8266,23 @@ export function flattenTools(items, out = [], namespace = null, targets = new Ma
   return { tools: out, targets };
 }
 
+// 只讀取協議指定的工具載體，不從訊息正文或任意巢狀 JSON 發掘工具。
+// 搜尋載入的定義先加入；本輪明確宣告的工具可以覆蓋歷史中的舊定義。
+export function collectToolDefinitions(body, inputItems) {
+  const definitions = [];
+  for (const item of inputItems) {
+    if (item?.type === "tool_search_output" && item.execution !== "server" &&
+        (!item.status || item.status === "completed") && Array.isArray(item.tools)) {
+      definitions.push(...item.tools);
+    }
+  }
+  if (Array.isArray(body.tools)) definitions.push(...body.tools);
+  for (const item of inputItems) {
+    if (item?.type === "additional_tools" && Array.isArray(item.tools)) definitions.push(...item.tools);
+  }
+  return definitions;
+}
+
 // Codex 的 type:"custom" 是自由格式工具（input 為原始字串），
 // Anthropic 沒有對應概念，用單一 string 參數的 schema 模擬。
 const FREEFORM_KEY = "input";
@@ -8407,6 +8424,13 @@ function toAnthropicTools(codexTools) {
         toolContext.forwardedChars += compacted.description.length;
         toolContext.charsSaved += compacted.charsSaved;
         description = compacted.description;
+      }
+      // Anthropic 沒有自由格式工具的 grammar 欄位；保留在說明中，避免模型
+      // 知道工具存在卻不知道 apply_patch 等工具所需的精確輸入格式。
+      const grammar = tool.format?.type === "grammar" && typeof tool.format.definition === "string"
+        ? tool.format.definition.replaceAll("\r\n", "\n").trim() : "";
+      if (grammar) {
+        description += `\n\nPut the raw payload in the \`${FREEFORM_KEY}\` string. It must follow this ${tool.format.syntax || ""} grammar:\n${grammar}`;
       }
       tools.push({
         name: tool.name,
@@ -8592,8 +8616,7 @@ export function toAnthropicRequest(body, route) {
     : (Array.isArray(body.input) ? body.input : []);
 
   // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
-  const toolDefinitions = [...(Array.isArray(body.tools) ? body.tools : [])];
-  for (const item of inputItems) if (item?.type === "additional_tools") toolDefinitions.push(...(item.tools || []));
+  const toolDefinitions = collectToolDefinitions(body, inputItems);
   const { tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions);
   const unavailable = [];
   const inspectTools = (tools) => {
@@ -8872,7 +8895,11 @@ export function toAnthropicRequest(body, route) {
       request.thinking = { type: "adaptive", display: "summarized" };
     }
   } else if (budget >= 1024) {
-    request.thinking = { type: "enabled", budget_tokens: budget };
+    // 手動 thinking 不能與 any/tool 並用；保留呼叫方的工具限制，只關閉本輪
+    // 手動思考。新式 output_config / adaptive 路由不受這個限制。
+    request.thinking = ["any", "tool"].includes(request.tool_choice?.type)
+      ? { type: "disabled" }
+      : { type: "enabled", budget_tokens: budget };
   }
 
   return {
@@ -9020,6 +9047,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   // 目前正在組裝的 content block
   let cur = null;
   let failed = false;
+  let completed = false;
 
   const decoder = new TextDecoder();
   let pending = "";
@@ -9049,7 +9077,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
   };
 
   const handle = (event) => {
-    if (failed) return;
+    if (failed || completed) return;
     switch (event.type) {
       case "content_block_start": {
         const block = event.content_block || {};
@@ -9325,6 +9353,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           response.incomplete_details = { reason: "max_output_tokens" };
         }
         send({ type: response.status === "incomplete" ? "response.incomplete" : "response.completed", response });
+        completed = true;
         break;
       }
 
@@ -9340,20 +9369,89 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
     }
   };
 
-  for await (const chunk of upstreamBody) {
-    pending += decoder.decode(chunk, { stream: true });
+  const consume = (block) => {
+    const lines = block.split(/\r?\n/);
+    const data = lines.filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
+    if (!data) return;
+    let event;
+    try { event = JSON.parse(data); } catch {
+      failResponse({ code: "invalid_upstream_response", message: "Claude 上游串流含有無法解析的事件。" });
+      return;
+    }
+    if (!event || typeof event !== "object" || Array.isArray(event)) {
+      failResponse({ code: "invalid_upstream_response", message: "Claude 上游串流事件格式不正確。" });
+      return;
+    }
+    // 相容只在 SSE event 欄位標示類型的閘道。
+    const eventName = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+    handle({ ...event, type: event.type || eventName });
+  };
+  let mode = null;
+  const maxBufferedBytes = 16 * 1024 * 1024;
+  const drain = () => {
+    if (!mode && pending.trimStart()) mode = pending.trimStart().startsWith("{") ? "json" : "sse";
+    if (mode !== "sse") return;
     for (;;) {
       const match = /\r?\n\r?\n/.exec(pending);
-      if (!match) break;
+      if (!match || failed || completed) break;
       const block = pending.slice(0, match.index);
       pending = pending.slice(match.index + match[0].length);
-      const line = /^data:\s*(.*)$/m.exec(block);
-      if (!line) continue;
-      let event;
-      try { event = JSON.parse(line[1]); } catch { continue; }
-      handle(event);
+      consume(block);
+    }
+  };
+  for await (const chunk of upstreamBody) {
+    pending += decoder.decode(chunk, { stream: true });
+    drain();
+    if (failed || completed) break;
+    if (Buffer.byteLength(pending, "utf8") > maxBufferedBytes) {
+      failResponse({ code: "invalid_upstream_response", message: "Claude 上游回應超過轉譯緩衝上限。" });
+      break;
     }
   }
+  if (failed || completed) return;
+  pending += decoder.decode();
+  drain();
+  if (failed || completed) return;
+  if (mode === "json") {
+    // 部分中轉忽略 stream:true。完整 JSON 也走同一組事件處理，保留工具、
+    // 推理、拒答、用量與壓縮語意；沒有明確終止原因時不可假裝成功。
+    let message;
+    try { message = JSON.parse(pending); } catch {
+      failResponse({ code: "invalid_upstream_response", message: "Claude 上游 JSON 回應不完整或格式錯誤。" });
+      return;
+    }
+    if (message?.type === "error" || message?.error) {
+      handle({ type: "error", error: message.error });
+      return;
+    }
+    if (message?.type !== "message" || message.role !== "assistant" ||
+        !Array.isArray(message.content) || typeof message.stop_reason !== "string" || !message.stop_reason) {
+      failResponse({ code: "invalid_upstream_response", message: "Claude 上游 JSON 缺少完整訊息或終止原因。" });
+      return;
+    }
+    if (message.content.some((block) => !["text", "thinking", "redacted_thinking", "tool_use"].includes(block?.type))) {
+      failResponse({ code: "invalid_upstream_response", message: "Claude 上游 JSON 含有尚未支援的內容區塊。" });
+      return;
+    }
+    handle({ type: "message_start", message });
+    // 先處理拒答，避免把被拒絕回合的工具當成有效呼叫。
+    handle({ type: "message_delta", delta: { stop_reason: message.stop_reason }, stop_details: message.stop_details });
+    for (const [index, block] of message.content.entries()) {
+      handle({ type: "content_block_start", index, content_block: block.type === "text" ? { ...block, text: "" } : block });
+      if (block.type === "text") handle({ type: "content_block_delta", index, delta: { type: "text_delta", text: block.text } });
+      if (block.type === "thinking") {
+        handle({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: block.thinking } });
+        handle({ type: "content_block_delta", index, delta: { type: "signature_delta", signature: block.signature } });
+      }
+      handle({ type: "content_block_stop", index });
+    }
+    handle({ type: "message_stop" });
+  } else if (pending.trim()) {
+    consume(pending);
+  }
+  // 真正缺少 message_stop 的串流仍交由 router 補失敗，不因收到部分文字而
+  // 自行合成成功；只有最後一筆事件少了結尾空行時才在上面正常讀取它。
 }
 __CODEX_MODEL_ROUTER_CHAT_JS__
 // Codex Responses API <-> OpenAI Chat Completions 雙向轉譯。
@@ -9371,6 +9469,7 @@ import {
   COMPACTION_PROMPT,
   COMPACTION_REPLAY_PREFIX,
   bridgeInputError,
+  collectToolDefinitions,
   agentMessageText,
   codexErrorFromUpstream,
   compactCodeModeDescription,
@@ -9548,8 +9647,7 @@ export function toChatRequest(body, route) {
     : (Array.isArray(body.input) ? body.input : []);
 
   // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
-  const toolDefinitions = [...(Array.isArray(body.tools) ? body.tools : [])];
-  for (const item of inputItems) if (item?.type === "additional_tools") toolDefinitions.push(...(item.tools || []));
+  const toolDefinitions = collectToolDefinitions(body, inputItems);
   const { tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions);
   const unavailable = [];
   const inspectTools = (tools) => {
@@ -9799,6 +9897,9 @@ export function toChatRequest(body, route) {
 
   const { tools, freeform, toolContext } = toChatTools(codexTools);
   const request = { model: upstreamModel, messages: chatMessages, stream: true };
+  for (const key of ["temperature", "top_p"]) {
+    if (body[key] !== undefined) request[key] = body[key];
+  }
   // 串流預設不回用量；要明確要求。少數閘道不認得 stream_options，探測時會記下來。
   if (route?.chatStreamOptions !== false) request.stream_options = { include_usage: true };
 
@@ -9806,6 +9907,7 @@ export function toChatRequest(body, route) {
   // 不要求本輪一定要定義 tools。
   if (tools.length && !compaction && !textOnlyTools) {
     request.tools = tools;
+    if (typeof body.parallel_tool_calls === "boolean") request.parallel_tool_calls = body.parallel_tool_calls;
     const choice = body.tool_choice;
     if (choice === "none") request.tool_choice = "none";
     else if (choice === "required") request.tool_choice = "required";

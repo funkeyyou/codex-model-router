@@ -1,6 +1,16 @@
 {
-  "latest": "1.26.3",
+  "latest": "1.26.4",
   "releases": [
+    {
+      "version": "1.26.4",
+      "date": "2026-09-30",
+      "changes": [
+        "修復 Claude 串流最後事件缺少結尾空行、多行 data 與忽略串流參數而回傳完整 JSON 的相容問題；保留真正中斷、拒答及不完整壓縮的失敗處理。",
+        "Claude 與 Chat Completions 轉譯可載入 tool_search_output 中的用戶端工具定義，保留命名空間與本輪定義優先順序；不新增未提供的搜尋或生圖工具。",
+        "強制工具呼叫時關閉不相容的手動 thinking，保留 adaptive 思考；補齊 Chat Completions 的並行工具、temperature 與 top_p 參數轉送。",
+        "補上 Claude 自由格式工具的文法說明，新增協議相容性、工具載入及串流失敗回歸測試；本機生圖功能維持不變。"
+      ]
+    },
     {
       "version": "1.26.3",
       "date": "2026-09-30",

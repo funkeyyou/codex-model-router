@@ -13,6 +13,7 @@ import {
   COMPACTION_PROMPT,
   COMPACTION_REPLAY_PREFIX,
   bridgeInputError,
+  collectToolDefinitions,
   agentMessageText,
   codexErrorFromUpstream,
   compactCodeModeDescription,
@@ -190,8 +191,7 @@ export function toChatRequest(body, route) {
     : (Array.isArray(body.input) ? body.input : []);
 
   // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
-  const toolDefinitions = [...(Array.isArray(body.tools) ? body.tools : [])];
-  for (const item of inputItems) if (item?.type === "additional_tools") toolDefinitions.push(...(item.tools || []));
+  const toolDefinitions = collectToolDefinitions(body, inputItems);
   const { tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions);
   const unavailable = [];
   const inspectTools = (tools) => {
@@ -441,6 +441,9 @@ export function toChatRequest(body, route) {
 
   const { tools, freeform, toolContext } = toChatTools(codexTools);
   const request = { model: upstreamModel, messages: chatMessages, stream: true };
+  for (const key of ["temperature", "top_p"]) {
+    if (body[key] !== undefined) request[key] = body[key];
+  }
   // 串流預設不回用量；要明確要求。少數閘道不認得 stream_options，探測時會記下來。
   if (route?.chatStreamOptions !== false) request.stream_options = { include_usage: true };
 
@@ -448,6 +451,7 @@ export function toChatRequest(body, route) {
   // 不要求本輪一定要定義 tools。
   if (tools.length && !compaction && !textOnlyTools) {
     request.tools = tools;
+    if (typeof body.parallel_tool_calls === "boolean") request.parallel_tool_calls = body.parallel_tool_calls;
     const choice = body.tool_choice;
     if (choice === "none") request.tool_choice = "none";
     else if (choice === "required") request.tool_choice = "required";
