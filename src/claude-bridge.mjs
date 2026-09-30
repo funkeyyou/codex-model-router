@@ -271,6 +271,24 @@ export function bridgeInputError(message) {
   return Object.assign(new Error(message), { name: "BridgeRequestError" });
 }
 
+// Codex protocol AgentMessage: inter-agent input, not this assistant's reply
+// or a tool result. Keep provenance and every plaintext block in order.
+export function agentMessageText(item) {
+  if (!Array.isArray(item.content) || typeof item.author !== "string" || typeof item.recipient !== "string") {
+    throw bridgeInputError("agent_message 欄位不完整，無法安全轉譯；請提供明文工作摘要。");
+  }
+  const parts = item.content.map((part) => {
+    if (part?.type === "encrypted_content") {
+      throw bridgeInputError("agent_message 包含無法解密的跨 Agent 訊息；請由來源 Agent 提供明文摘要，或改用原模型繼續。");
+    }
+    if (part?.type !== "input_text" || typeof part.text !== "string") {
+      throw bridgeInputError("agent_message 包含不支援的內容格式，無法安全省略；請提供明文工作摘要。");
+    }
+    return part.text;
+  });
+  return `Inter-agent message ${JSON.stringify({ author: item.author, recipient: item.recipient })}\n${parts.join("\n")}`;
+}
+
 export function parseToolArguments(value) {
   let parsed;
   try { parsed = typeof value === "string" ? JSON.parse(value || "{}") : value; }
@@ -711,6 +729,10 @@ export function toAnthropicRequest(body, route) {
       case "additional_tools": {
         break;
       }
+
+      case "agent_message":
+        push("user", { type: "text", text: agentMessageText(item) });
+        break;
 
       case "message": {
         if (item.role === "developer" || item.role === "system") {

@@ -13,6 +13,7 @@ import {
   COMPACTION_PROMPT,
   COMPACTION_REPLAY_PREFIX,
   bridgeInputError,
+  agentMessageText,
   codexErrorFromUpstream,
   compactCodeModeDescription,
   decodeCompaction,
@@ -322,6 +323,13 @@ export function toChatRequest(body, route) {
     switch (item?.type || (item?.role ? "message" : null)) {
       case "additional_tools":
         break;
+
+      case "agent_message": {
+        const text = agentMessageText(item);
+        closeToolGroup();
+        pushUser([{ type: "text", text }]);
+        break;
+      }
 
       case "message": {
         if (item.role === "developer" || item.role === "system") {

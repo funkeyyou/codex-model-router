@@ -1,6 +1,14 @@
 {
-  "latest": "1.26.1",
+  "latest": "1.26.2",
   "releases": [
+    {
+      "version": "1.26.2",
+      "date": "2026-09-30",
+      "changes": [
+        "修復跨 Agent 明文訊息 agent_message 在 Claude API／CLI 及 Chat Completions 轉譯時觸發 422；保留發送者、接收者、完整內容與訊息順序。",
+        "加密或格式異常的跨 Agent 訊息仍明確報錯，不靜默遺失正文；新增訊息保留、工具結果配對與錯誤處理回歸測試。"
+      ]
+    },
     {
       "version": "1.26.1",
       "date": "2026-09-30",
