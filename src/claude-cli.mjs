@@ -20,6 +20,63 @@ export function claudeCliEnvironment(source = process.env) {
 
 const isolationArgs = ["--setting-sources", "", "--settings", '{"disableAllHooks":true}'];
 
+// SDK initialize exposes ModelInfo[] without sending a user/model turn.
+// Return only models, never the account metadata also present in this response.
+export async function discoverClaudeCliModels(binary, { timeoutMs = 15000, env = claudeCliEnvironment() } = {}) {
+  if (!isAbsolute(binary || "")) throw new Error("Claude CLI 路徑必須是絕對路徑。");
+  const directory = await mkdtemp(join(tmpdir(), "codex-claude-models-"));
+  let child, closedPromise;
+  try {
+    return await new Promise((resolve, reject) => {
+      const id = randomUUID();
+      let pending = "", settled = false, killTimer;
+      const finish = (error, models) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.kill();
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+        if (error) reject(error); else resolve(models);
+      };
+      child = spawn(binary, ["-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json",
+        "--no-session-persistence", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--disable-slash-commands", "--no-chrome", ...isolationArgs],
+      { cwd: directory, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+      closedPromise = new Promise((resolve) => child.once("close", resolve));
+      const timer = setTimeout(() => finish(new Error("讀取 Claude CLI 模型清單逾時。")), timeoutMs);
+      child.once("error", () => finish(new Error("無法啟動 Claude CLI 模型查詢。")));
+      child.once("close", () => {
+        if (!settled) finish(new Error("Claude CLI 未回傳模型清單。"));
+        clearTimeout(killTimer);
+      });
+      child.stderr.resume();
+      child.stdin.on("error", () => finish(new Error("Claude CLI 模型查詢中斷。")));
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        if (settled) return;
+        pending += chunk;
+        if (pending.length > 4 * 1024 * 1024) return finish(new Error("Claude CLI 模型清單過大。"));
+        let newline;
+        while (!settled && (newline = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+          let message;
+          try { message = JSON.parse(line); } catch { finish(new Error("Claude CLI 模型清單格式不相容。")); return; }
+          if (message?.type !== "control_response" || message.response?.request_id !== id) continue;
+          const models = message.response?.response?.models;
+          if (message.response.subtype !== "success" || !Array.isArray(models) || !models.length) {
+            finish(new Error("Claude CLI 未提供可用的模型清單。")); return;
+          }
+          finish(null, models);
+        }
+      });
+      child.stdin.write(JSON.stringify({ type: "control_request", request_id: id, request: { subtype: "initialize" } }) + "\n");
+    });
+  } finally {
+    if (closedPromise) await closedPromise;
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
+}
+
 export async function claudeCliAuth(binary, { login = false, signal } = {}) {
   if (!isAbsolute(binary || "")) throw new Error("Claude CLI 路徑必須是絕對路徑。");
   const directory = await mkdtemp(join(tmpdir(), "codex-claude-auth-"));

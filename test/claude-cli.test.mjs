@@ -12,6 +12,39 @@ const state = () => ({ providers: [provider], manifest: { port: 4567, providers:
   settings: { port: 4567, providers: [provider], routes: [] },
   catalog: { models: [{ slug: "gpt-fixture", priority: 1, context_window: 200000, visibility: "list" }] } });
 
+test("CLI numbered selection supports multiple models, manual IDs, cancellation and existing versions", () => {
+  const choices = installer.claudeCliModelChoices([
+    { transport: "claude-cli", upstreamModel: "claude-opus-5" },
+    { transport: "claude-cli", upstreamModel: "claude-sonnet-fixture" },
+    { transport: "anthropic", upstreamModel: "claude-not-cli" },
+  ]);
+  assert.equal(choices[0].id, "claude-opus-5-5");
+  assert.equal(choices[1].configured, true);
+  assert.equal(choices.at(-1).id, "claude-sonnet-fixture");
+  assert.deepEqual(installer.parseClaudeCliSelection("1，2,1", choices), ["claude-opus-5-5", "claude-opus-5"]);
+  assert.deepEqual(installer.parseClaudeCliSelection("1-2", choices), ["claude-opus-5-5", "claude-opus-5"]);
+  assert.deepEqual(installer.parseClaudeCliSelection("all", choices), choices.map((choice) => choice.id));
+  assert.deepEqual(installer.parseClaudeCliSelection("claude-new-version", choices), ["claude-new-version"]);
+  assert.equal(installer.parseClaudeCliSelection("CANCEL", choices), null);
+  assert.throws(() => installer.parseClaudeCliSelection("99", choices));
+  assert.throws(() => installer.parseClaudeCliSelection("gpt-fixture", choices));
+});
+
+test("CLI discovery takes priority, deduplicates resolved aliases and retains descriptions and configured models", () => {
+  const choices = installer.claudeCliModelChoices([{ transport: "claude-cli", upstreamModel: "claude-opus-5" }], [
+    { value: "default", resolvedModel: "claude-opus-5-5", description: "Opus 5.5" },
+    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus" },
+    { value: "claude-fable-5[1m]", resolvedModel: "claude-fable-5", description: "Fable · credits required" },
+    { value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet 5.5" },
+    { value: "bad; command", description: "invalid" },
+  ]);
+  assert.deepEqual(choices.map((choice) => choice.id), ["claude-opus-5-5", "claude-fable-5", "claude-sonnet-5-5", "claude-opus-5"]);
+  assert.equal(choices[1].label, "Fable · credits required");
+  assert.equal(choices.at(-1).source, "configured");
+  assert.equal(choices.at(-1).configured, true);
+  assert.ok(installer.claudeCliModelChoices([], [{ value: "unsupported" }]).every((choice) => choice.source === "fallback"));
+});
+
 test("model-specific CLI version errors retain a validated minimum version", () => {
   const required = cli.requiredCliVersion({ message: { content: [{ type: "text", text:
     "API Error: 400 Claude Code 2.1.231 does not support this model; version 2.1.280 or newer is required. Run claude update." }] } });

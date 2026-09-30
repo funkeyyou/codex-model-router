@@ -1,6 +1,12 @@
 # codex-model-router
 
-Experimental [Claude CLI subscription routing](docs/claude-cli-experimental.md) is available in v1.26.0 through the `claude-cli` command. It asks before installing or updating Claude Code and guides subscription sign-in when needed. Short text and tool roundtrips passed with a live subscription on macOS; Chrome, image generation, long conversations and Windows subscription execution still need validation.
+Experimental [Claude CLI subscription routing](docs/claude-cli-experimental.md) is available through menu item 6 or the `claude-cli` command. It asks before installing or updating Claude Code and guides subscription sign-in when needed.
+
+Since v1.26.1, the installer reads the CLI's current model list first and shows numbered entries with full model IDs. Enter `1`, `1,3`, `1-3`, or `all`; you can also enter an explicit model ID or `cancel`. Numbers follow the current list order. Aliases resolving to the same version are deduplicated, and previously configured models remain listed.
+
+Listing models sends no inference request. Only selected models are tested, using subscription quota. If discovery fails, the installer clearly labels its built-in fallback candidates. The CLI list may differ from Claude Desktop and does not guarantee available quota for every model; unlisted versions can still be tested by explicit ID.
+
+Short text and tool roundtrips passed with a live subscription on macOS; Chrome, image generation, long conversations and Windows subscription execution still need validation. Context limits are manual settings, not verified capacities: a 1M setting with the retained 95% usable ratio appears as about 950K in Codex.
 
 [English](README.en.md) · [繁體中文 / Full reference](README.md) · [Releases](https://github.com/funkeyyou/codex-model-router/releases) · [Report an issue](https://github.com/funkeyyou/codex-model-router/issues)
 

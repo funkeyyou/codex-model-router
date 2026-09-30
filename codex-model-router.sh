@@ -100,7 +100,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.26.0";
+const INSTALLER_VERSION = "1.26.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3323,6 +3323,38 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
   return backupDir;
 }
 
+export function claudeCliModelChoices(routes = [], discovered = []) {
+  const choices = [];
+  for (const model of discovered) {
+    const id = model?.resolvedModel || model?.value;
+    if (typeof id !== "string" || !/^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/.test(id)) continue;
+    if (choices.some((choice) => choice.id === id)) continue;
+    choices.push({ id, label: terminalSafeText(model.description || model.displayName || id, 220), source: "cli" });
+  }
+  if (!choices.length) choices.push(...[
+    { id: "claude-opus-5-5", label: "Opus 5.5" },
+    { id: "claude-opus-5", label: "Opus 5" },
+    { id: "sonnet", label: "Sonnet（CLI 別名，測試後確認完整版本）" },
+    { id: "haiku", label: "Haiku（CLI 別名，測試後確認完整版本）" },
+    { id: "fable", label: "Fable（CLI 別名，測試後確認完整版本）" },
+  ].map((choice) => ({ ...choice, source: "fallback" })));
+  for (const route of routes) {
+    if (route.transport !== "claude-cli" || !/^claude-[a-zA-Z0-9._-]+$/.test(route.upstreamModel || "")) continue;
+    if (!choices.some((choice) => choice.id === route.upstreamModel)) choices.push({ id: route.upstreamModel, label: route.upstreamModel, source: "configured" });
+  }
+  return choices.map((choice) => ({ ...choice, configured: routes.some((route) =>
+    route.transport === "claude-cli" && route.upstreamModel === choice.id) }));
+}
+
+export function parseClaudeCliSelection(value, choices) {
+  if (String(value).trim().toLowerCase() === "cancel") return null;
+  const models = parseModelSelection(value, choices.map((choice) => choice.id));
+  if (models.some((model) => !/^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/.test(model))) {
+    fail("請選擇模型編號，或輸入 opus、sonnet、haiku、fable／完整 claude-* 模型名稱。");
+  }
+  return models;
+}
+
 export function planClaudeCliModels(state, binary, models, contextWindow = 200000, resolvedModels = {}) {
   if (!models.length || models.some((model) => !/^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/.test(model))) {
     fail("請填寫 opus、sonnet、haiku、fable 或完整 claude-* 模型名稱。");
@@ -3473,11 +3505,20 @@ async function configureClaudeCli(subcommand = null) {
   if (!codexBin) fail("未找到 Codex CLI。");
   verifyLogin();
   printHeading("連接 Claude 訂閱帳號（實驗性）");
-  console.log("可填 opus、sonnet、haiku、fable 或完整 claude-* 名稱；測試後會顯示並固定使用回應中的完整模型編號。");
+  console.log("正在讀取 Claude CLI 模型清單（不發送推理請求）...");
+  let discovered = [];
+  try { discovered = await transport.discoverClaudeCliModels(binary); }
+  catch (error) { console.log(`模型清單讀取失敗：${error.message}`); }
+  const choices = claudeCliModelChoices(state.settings.routes, discovered);
+  console.log(choices.some((choice) => choice.source === "cli")
+    ? "來源：Claude CLI 當前模型清單；另保留已添加模型。清單不保證各模型皆有可用額度，亦不一定包含桌面版的全部模型。"
+    : "來源：內建候選列表（CLI 未提供可辨識清單）；尚未驗證帳號權限。");
+  choices.forEach((choice, index) => console.log(`  ${index + 1}. ${choice.label} — ${choice.id}${choice.configured ? "（已添加，可重新設定）" : ""}${choice.source === "configured" ? "（既有設定，CLI 本次未列出）" : ""}`));
+  console.log("用量與額外計費依 Claude 帳號方案；未列出的模型可直接輸入完整 ID。測試後固定使用回應中的完整版本。");
   console.log("每個選定模型會發送一次短測試並使用訂閱用量；只有通過的模型會添加。輸入 cancel 取消。");
-  const answer = await ask("模型名稱（逗號分隔）", "opus");
-  if (answer.toLowerCase() === "cancel") { console.log("未修改路由配置。"); return; }
-  const models = [...new Set(answer.split(",").map((model) => model.trim()).filter(Boolean))];
+  const answer = await ask("請輸入模型編號（逗號分隔、範圍或 all；也可直接輸入完整模型 ID）", "1");
+  const models = parseClaudeCliSelection(answer, choices);
+  if (!models) { console.log("未修改路由配置。"); return; }
   const contextWindow = Number(await ask("上下文上限（非自動探測；未知時先用保守值）", "200000"));
   planClaudeCliModels(state, binary, models, contextWindow); // validate before any inference
   const userConfig = await readUserConfig();
@@ -10558,6 +10599,63 @@ export function claudeCliEnvironment(source = process.env) {
 }
 
 const isolationArgs = ["--setting-sources", "", "--settings", '{"disableAllHooks":true}'];
+
+// SDK initialize exposes ModelInfo[] without sending a user/model turn.
+// Return only models, never the account metadata also present in this response.
+export async function discoverClaudeCliModels(binary, { timeoutMs = 15000, env = claudeCliEnvironment() } = {}) {
+  if (!isAbsolute(binary || "")) throw new Error("Claude CLI 路徑必須是絕對路徑。");
+  const directory = await mkdtemp(join(tmpdir(), "codex-claude-models-"));
+  let child, closedPromise;
+  try {
+    return await new Promise((resolve, reject) => {
+      const id = randomUUID();
+      let pending = "", settled = false, killTimer;
+      const finish = (error, models) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.kill();
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+        if (error) reject(error); else resolve(models);
+      };
+      child = spawn(binary, ["-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json",
+        "--no-session-persistence", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--disable-slash-commands", "--no-chrome", ...isolationArgs],
+      { cwd: directory, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+      closedPromise = new Promise((resolve) => child.once("close", resolve));
+      const timer = setTimeout(() => finish(new Error("讀取 Claude CLI 模型清單逾時。")), timeoutMs);
+      child.once("error", () => finish(new Error("無法啟動 Claude CLI 模型查詢。")));
+      child.once("close", () => {
+        if (!settled) finish(new Error("Claude CLI 未回傳模型清單。"));
+        clearTimeout(killTimer);
+      });
+      child.stderr.resume();
+      child.stdin.on("error", () => finish(new Error("Claude CLI 模型查詢中斷。")));
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        if (settled) return;
+        pending += chunk;
+        if (pending.length > 4 * 1024 * 1024) return finish(new Error("Claude CLI 模型清單過大。"));
+        let newline;
+        while (!settled && (newline = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+          let message;
+          try { message = JSON.parse(line); } catch { finish(new Error("Claude CLI 模型清單格式不相容。")); return; }
+          if (message?.type !== "control_response" || message.response?.request_id !== id) continue;
+          const models = message.response?.response?.models;
+          if (message.response.subtype !== "success" || !Array.isArray(models) || !models.length) {
+            finish(new Error("Claude CLI 未提供可用的模型清單。")); return;
+          }
+          finish(null, models);
+        }
+      });
+      child.stdin.write(JSON.stringify({ type: "control_request", request_id: id, request: { subtype: "initialize" } }) + "\n");
+    });
+  } finally {
+    if (closedPromise) await closedPromise;
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
+}
 
 export async function claudeCliAuth(binary, { login = false, signal } = {}) {
   if (!isAbsolute(binary || "")) throw new Error("Claude CLI 路徑必須是絕對路徑。");

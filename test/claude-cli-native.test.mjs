@@ -6,7 +6,7 @@ import http from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fetchClaudeCli, claudeCliEnvironment } from "../src/claude-cli.mjs";
+import { fetchClaudeCli, claudeCliEnvironment, discoverClaudeCliModels } from "../src/claude-cli.mjs";
 
 test("real Claude CLI preserves replay roles/tool results and exposes only Codex MCP tools", {
   skip: !process.env.TEST_CLAUDE_CLI_BIN, timeout: 45000,
@@ -55,6 +55,9 @@ test("real Claude CLI preserves replay roles/tool results and exposes only Codex
   t.after(() => { server.closeAllConnections(); server.close(); });
   const env = { ...claudeCliEnvironment(), CLAUDE_CONFIG_DIR: directory, ANTHROPIC_API_KEY: "fixture-key",
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`, CLAUDE_CODE_MAX_RETRIES: "0" };
+  const discovered = await discoverClaudeCliModels(process.env.TEST_CLAUDE_CLI_BIN, { env });
+  assert.ok(discovered.length > 0);
+  assert.equal(requests.length, 0, "model discovery never sends a model inference request");
   const response = await fetchClaudeCli({ model: "claude-opus-4-6", system: [{ type: "text", text: "Preserve the fixture." }],
     max_tokens: 100, tools: [{ name: "exec", description: "Fixture tool", input_schema: {
       type: "object", properties: { text: { type: "string" } }, required: ["text"] } }],
