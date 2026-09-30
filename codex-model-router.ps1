@@ -154,7 +154,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.26.2";
+const INSTALLER_VERSION = "1.26.3";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -665,26 +665,31 @@ async function storeApiKey(service, baseUrl) {
   }
 
   const label = `Codex 模型路由器：${new URL(baseUrl).host}`;
-  console.log("請在 macOS 鑰匙圈提示中輸入 API Key。" );
+  console.log("API Key 將儲存到 macOS 鑰匙圈，只需輸入一次。" );
   console.log("API Key 不會寫入 config.toml 或安裝器檔案。" );
-  const result = spawnSync(
-    "/usr/bin/security",
-    [
-      "add-generic-password",
-      "-U",
-      "-a",
-      "codex",
-      "-s",
-      service,
-      "-l",
-      label,
-      "-j",
-      "供 Codex 本機模型路由器使用",
-      "-w",
-    ],
-    { stdio: "inherit" },
-  );
-  if (result.status !== 0) fail("API Key 未能儲存到鑰匙圈。" );
+  const apiKey = await askSecret("API Key（輸入不會顯示）");
+  if (!apiKey) fail("API Key 不能為空。" );
+  storeMacosApiKey(service, label, apiKey);
+}
+
+export function storeMacosApiKey(service, label, apiKey, run = spawnSync, keychain = null) {
+  // security -i reads commands from stdin. Hex data avoids command-language
+  // quoting of the secret; neither the key nor its hex form enters argv.
+  const quote = (value) => {
+    if (/["\\\r\n\0]/.test(value)) throw new Error("鑰匙圈項目名稱包含不支援的字元。");
+    return `"${value}"`;
+  };
+  const suffix = keychain ? ` ${quote(keychain)}` : "";
+  const command = `add-generic-password -U -a codex -s ${quote(service)} -l ${quote(label)} -X ${Buffer.from(apiKey, "utf8").toString("hex")}${suffix}\n`;
+  const result = run("/usr/bin/security", ["-i"], { input: command, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+  // Interactive security may exit successfully even when a command failed.
+  // Verify the actual saved value, without exposing captured output on errors.
+  const saved = result.status === 0 ? run("/usr/bin/security",
+    ["find-generic-password", "-a", "codex", "-s", service, "-w", ...(keychain ? [keychain] : [])],
+    { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }) : null;
+  if (!saved || saved.status !== 0 || saved.stdout?.replace(/\r?\n$/, "") !== apiKey) {
+    throw new Error("API Key 未能儲存到鑰匙圈。");
+  }
 }
 
 function readApiKey(service) {
