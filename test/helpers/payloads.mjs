@@ -17,7 +17,8 @@ const MARKERS = {
   router: ["__CODEX_MODEL_ROUTER_ROUTER_JS__", "__CODEX_MODEL_ROUTER_BRIDGE_JS__"],
   bridge: ["__CODEX_MODEL_ROUTER_BRIDGE_JS__", "__CODEX_MODEL_ROUTER_CHAT_JS__"],
   "chat-bridge": ["__CODEX_MODEL_ROUTER_CHAT_JS__", "__CODEX_MODEL_ROUTER_IMAGEGEN_JS__"],
-  imagegen: ["__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", "__CODEX_MODEL_ROUTER_EMBEDDED__"],
+  imagegen: ["__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", "__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__"],
+  "claude-cli": ["__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__", "__CODEX_MODEL_ROUTER_EMBEDDED__"],
 };
 
 // 與安裝器的 awk 同樣的切法：起始標記的下一行起，到結束標記的前一行為止。

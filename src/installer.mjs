@@ -22,7 +22,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-const INSTALLER_VERSION = "1.25.3";
+const INSTALLER_VERSION = "1.26.0";
+export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
 const secretStoreLabel = isWindows ? "Windows 憑證保護（DPAPI）" : "macOS 鑰匙圈";
@@ -60,6 +61,7 @@ const manifestPath = join(installRoot, "install.json");
 const routerPath = join(installRoot, "router.mjs");
 const bridgePath = join(installRoot, "claude-bridge.mjs");
 const chatBridgePath = join(installRoot, "chat-bridge.mjs");
+const claudeCliPath = join(installRoot, "claude-cli.mjs");
 const settingsPath = join(installRoot, "settings.json");
 const catalogPath = join(installRoot, "models.json");
 const logPath = join(installRoot, "router.err.log");
@@ -355,29 +357,42 @@ function loadChatBridgeSource() {
   return source.slice(start + marker.length, end) + "\n";
 }
 
-// 轉譯層有兩支：claude-bridge.mjs，以及 1.25.0 起的 chat-bridge.mjs。後者在舊安裝裡
-// 不存在，備份時沒有就跳過；還原時備份裡沒有它，就刪掉這次新寫的那份（舊版路由器用不到）。
+// 較新的 Chat 與 Claude CLI 轉接檔在舊安裝裡不存在，備份時跳過；
+// 還原時備份裡沒有它，就刪掉這次新寫的那份（舊版路由器用不到）。
 function writeBridgeSources() {
   writeFileSync(bridgePath, loadBridgeSource(), { mode: 0o600 });
   chmodSync(bridgePath, 0o600);
   writeFileSync(chatBridgePath, loadChatBridgeSource(), { mode: 0o600 });
   chmodSync(chatBridgePath, 0o600);
+  writeFileSync(claudeCliPath, loadClaudeCliSource(), { mode: 0o600 });
+  chmodSync(claudeCliPath, 0o600);
 }
 
 function backupChatBridge(directory) {
   copyIfExists(chatBridgePath, join(directory, "chat-bridge.mjs"));
+  copyIfExists(claudeCliPath, join(directory, "claude-cli.mjs"));
 }
 
 function restoreChatBridge(directory) {
   if (!copyIfExists(join(directory, "chat-bridge.mjs"), chatBridgePath)) rmSync(chatBridgePath, { force: true });
+  if (!copyIfExists(join(directory, "claude-cli.mjs"), claudeCliPath)) rmSync(claudeCliPath, { force: true });
 }
 
 export function loadImagegenSource(sourcePath = scriptPath) {
   const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
   const marker = "\n__CODEX_MODEL_ROUTER_IMAGEGEN_JS__\n";
   const start = source.indexOf(marker);
-  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__");
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__");
   if (start < 0 || end <= start) fail("安裝器中缺少中轉生圖命令。");
+  return source.slice(start + marker.length, end) + "\n";
+}
+
+export function loadClaudeCliSource(sourcePath = scriptPath) {
+  const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__");
+  if (start < 0 || end <= start) fail("安裝器中缺少 Claude CLI 轉接程式碼。");
   return source.slice(start + marker.length, end) + "\n";
 }
 
@@ -1258,7 +1273,7 @@ export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeL
 export const DEFAULT_PROVIDER_ID = "default";
 const LEGACY_PROVIDER_FIELDS = ["apiRoot", "baseUrl", "keychainService", "keychainAccount", "credentialPath"];
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
-const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official"]);
+const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official", "claude-cli"]);
 
 function providerRecord(source, id) {
   return {
@@ -1525,6 +1540,7 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // 不再詢問隱藏模型，改由 hidden-models 命令單獨管理。
 // 路由器讀取的每一個可調設定都要列在這裡；test/settings-keys.test.mjs 會核對。
 export const preservedSettingKeys = [
+  "claudeCli",
   "authProbeGraceMs",
   "captureDir",
   "catalogRefresh",
@@ -3229,6 +3245,211 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
   return backupDir;
 }
 
+export function planClaudeCliModels(state, binary, models, contextWindow = 200000, resolvedModels = {}) {
+  if (!models.length || models.some((model) => !/^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/.test(model))) {
+    fail("請填寫 opus、sonnet、haiku、fable 或完整 claude-* 模型名稱。");
+  }
+  if (!Number.isSafeInteger(contextWindow) || contextWindow < 16000 || contextWindow > 1000000) {
+    fail("上下文上限必須介於 16000 與 1000000。");
+  }
+  if (state.providers.some((provider) => provider.id === "claude-cli")) fail("既有供應商名稱與 Claude CLI 保留名稱衝突，請先更名。");
+  const unique = new Map(models.map((model) => [resolvedModels[model] || model, model]));
+  const newRoutes = [...unique].map(([resolved, requested]) => {
+    const previous = state.settings.routes.find((route) => route.transport === "claude-cli"
+      && (route.upstreamModel === resolved || route.upstreamModel === requested));
+    return {
+      pickerSlug: previous?.pickerSlug || pickerSlug(resolved, "claude-cli"), upstreamModel: resolved,
+      requestedModel: requested,
+      displayName: `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
+      transport: "claude-cli", translate: "anthropic", efforts: [...EFFORTS],
+      contextWindow, maxOutputTokens: 32000,
+    };
+  });
+  const replaced = new Set(newRoutes.map((route) => route.pickerSlug));
+  const routes = [...state.settings.routes.filter((route) => !replaced.has(route.pickerSlug)), ...newRoutes];
+  const official = state.catalog.models.filter((model) => !String(model.slug).startsWith("custom/"));
+  if (!official.length) fail("找不到官方模型模板，請先更新路由工具。");
+  const retained = state.catalog.models.filter((model) => !replaced.has(model.slug));
+  const maxPriority = Math.max(0, ...retained.map((model) => Number(model.priority) || 0));
+  const entries = newRoutes.map((route, index) => ({ ...customCatalogEntry(official, route, index),
+    priority: maxPriority + index + 1, description: "實驗性 Claude CLI 訂閱路由；上下文為手動設定，非探測值。" }));
+  const claudeCli = { binary, timeoutMs: state.settings.claudeCli?.timeoutMs || 180000 };
+  return { settings: { ...state.settings, version: INSTALLER_VERSION, codexBin, routes, claudeCli },
+    manifest: { ...state.manifest, version: INSTALLER_VERSION, codexBin, routes, claudeCli },
+    catalog: { ...state.catalog, models: [...retained, ...entries] } };
+}
+
+export async function ensureClaudeCliReady({ inspect, consent, install, update, readOnly = false,
+  minimumVersion = CLAUDE_CLI_MIN_VERSION }) {
+  let current = await inspect();
+  if (readOnly) return current;
+  if (!current) {
+    if (!await consent("未安裝 Claude CLI，是否透過 Anthropic 官方安裝程式安裝？")) return null;
+    await install();
+    current = await inspect();
+    if (!current) fail("安裝後仍找不到 Claude CLI，請檢查官方安裝程式輸出，或以 CODEX_MODEL_ROUTER_CLAUDE_BIN 指定執行檔。");
+  }
+  if (!current.version || compareVersions(current.version, minimumVersion) < 0) {
+    if (!await consent(`Claude CLI ${current.version || "版本未知"} 低於最低要求 ${minimumVersion}，是否備份並更新？`)) return null;
+    await update(current.binary);
+    current = await inspect();
+    if (!current?.version || compareVersions(current.version, minimumVersion) < 0) {
+      fail(`更新後仍未達 ${minimumVersion}；請確認指定的 CLI 路徑與安裝來源。Homebrew／WinGet 安裝請透過原套件管理器更新。`);
+    }
+  }
+  return current;
+}
+
+export async function ensureClaudeCliLogin(binary, { auth, login, notify, force = false }) {
+  let status = await auth(binary);
+  if (force || !status.loggedIn || status.authMethod !== "claude.ai") {
+    notify("接下來使用 Claude 官方登入流程，請在瀏覽器中完成授權。路由器不保存登入 token。");
+    await login(binary);
+    status = await auth(binary);
+  }
+  if (!status.loggedIn || status.authMethod !== "claude.ai") fail("未登入 Claude 訂閱帳號；路由配置未修改。API Key 請使用原本的供應商流程。");
+  return status;
+}
+
+// Never inherit the router installer's blanket YES flag for installing software.
+async function confirmClaudeCliChange(question) {
+  if (!input.isTTY) {
+    console.log("安裝／更新 Claude CLI 需要在互動終端機明確確認；未執行任何安裝或更新。");
+    return false;
+  }
+  const rl = createInterface({ input, output });
+  try { return /^(y|yes)$/i.test((await rl.question(`${question} [y/N]: `)).trim()); }
+  finally { rl.close(); }
+}
+
+export function claudeCliInstallCommand(platform, directory) {
+  const windows = platform === "win32";
+  const file = join(directory, windows ? "install.ps1" : "install.sh");
+  return { url: windows ? "https://claude.ai/install.ps1" : "https://claude.ai/install.sh", file,
+    binary: windows ? "powershell.exe" : "bash",
+    args: windows ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file, "latest"] : [file, "latest"] };
+}
+
+async function runClaudeCliSetup(command, args, directory, environment) {
+  await new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: directory, env: environment, stdio: "inherit", windowsHide: false });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill(); }, 300000);
+    child.once("error", () => { clearTimeout(timer); reject(new Error("無法啟動 Claude 安裝／更新程式，路由配置未修改。")); });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && !timedOut) resolve();
+      else reject(new Error(timedOut ? "Claude 安裝／更新逾時，路由配置未修改。" : "Claude 安裝／更新未完成，請查看上方輸出；路由配置未修改。"));
+    });
+  });
+}
+
+async function configureClaudeCli(subcommand = null) {
+  if (subcommand && !["status", "login"].includes(subcommand)) fail("用法：claude-cli [status|login]");
+  const state = requireInstallation();
+  const transport = await import(`data:text/javascript;base64,${Buffer.from(loadClaudeCliSource()).toString("base64")}`);
+  const inspect = () => {
+    const binary = findExecutable([env.CODEX_MODEL_ROUTER_CLAUDE_BIN, state.settings.claudeCli?.binary,
+      join(homeDir, ".local", "bin", isWindows ? "claude.exe" : "claude"), commandPath(isWindows ? "claude.exe" : "claude")]);
+    if (!binary) return null;
+    const result = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 15000, maxBuffer: 65536, windowsHide: true });
+    const version = result.status === 0 ? /\b(\d+\.\d+\.\d+)\b/.exec(result.stdout || "")?.[1] : null;
+    return { binary, version };
+  };
+  const setup = { inspect, consent: confirmClaudeCliChange, readOnly: subcommand === "status",
+    install: async () => {
+      const directory = mkdtempSync(join(tmpdir(), "codex-claude-install-"));
+      try {
+        const command = claudeCliInstallCommand(process.platform, directory);
+        console.log(`從 ${command.url} 下載官方安裝程式。`);
+        const response = await fetch(command.url, { signal: AbortSignal.timeout(60000) });
+        if (!response.ok) fail(`無法下載官方安裝程式（HTTP ${response.status}），路由配置未修改。`);
+        const script = await response.text();
+        if (!script.trim() || script.length > 2 * 1024 * 1024 || /^\s*<(?:!doctype|html)/i.test(script)) fail("官方安裝程式內容異常，已取消執行。");
+        writeFileSync(command.file, script, { mode: 0o600 });
+        await runClaudeCliSetup(command.binary, command.args, directory, transport.claudeCliEnvironment());
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    },
+    update: async (binary) => {
+      const backup = join(backupsRoot, `claude-cli-update-${timestamp()}`);
+      ensureDirectory(backup);
+      copyFileSync(binary, join(backup, isWindows ? "claude.exe" : "claude"));
+      console.log(`Claude CLI 執行檔已備份：${backup}`);
+      await runClaudeCliSetup(binary, ["update"], backup, transport.claudeCliEnvironment());
+    },
+  };
+  const ready = await ensureClaudeCliReady(setup);
+  if (!ready) { console.log(subcommand === "status" ? "Claude CLI：未安裝。" : "已取消，路由配置未修改。"); return; }
+  let { binary, version } = ready;
+  console.log(`\nClaude CLI：${binary}（${version || "未知"}）`);
+  if (subcommand === "status") {
+    if (!version || compareVersions(version, CLAUDE_CLI_MIN_VERSION) < 0) console.log(`版本過舊，需要 ${CLAUDE_CLI_MIN_VERSION} 或更新版本；執行 claude-cli 可開啟更新引導。`);
+    const auth = await transport.claudeCliAuth(binary);
+    console.log(`訂閱登入：${auth.loggedIn && auth.authMethod === "claude.ai" ? "已登入" : "尚未登入訂閱帳號"}`);
+    return;
+  }
+  await ensureClaudeCliLogin(binary, { auth: transport.claudeCliAuth,
+    login: (path) => transport.claudeCliAuth(path, { login: true }), notify: console.log, force: subcommand === "login" });
+  console.log("訂閱登入：已登入。");
+  if (subcommand === "login") return;
+  if (!codexBin) fail("未找到 Codex CLI。");
+  verifyLogin();
+  printHeading("連接 Claude 訂閱帳號（實驗性）");
+  console.log("可填 opus、sonnet、haiku、fable 或完整 claude-* 名稱；測試後會顯示並固定使用回應中的完整模型編號。");
+  console.log("每個選定模型會發送一次短測試並使用訂閱用量；只有通過的模型會添加。輸入 cancel 取消。");
+  const answer = await ask("模型名稱（逗號分隔）", "opus");
+  if (answer.toLowerCase() === "cancel") { console.log("未修改路由配置。"); return; }
+  const models = [...new Set(answer.split(",").map((model) => model.trim()).filter(Boolean))];
+  const contextWindow = Number(await ask("上下文上限（非自動探測；未知時先用保守值）", "200000"));
+  planClaudeCliModels(state, binary, models, contextWindow); // validate before any inference
+  const userConfig = await readUserConfig();
+  if (Number(userConfig.config.model_context_window) > contextWindow) {
+    console.log(`注意：全域 model_context_window=${userConfig.config.model_context_window} 可能覆蓋此模型的 ${contextWindow} 設定；本功能不修改全域值，請先用短對話測試。`);
+  }
+  const passed = [];
+  const resolvedModels = {};
+  const probe = async (model) => {
+    const response = await transport.fetchClaudeCli({ model, max_tokens: 1024, system: "Reply briefly.",
+      messages: [{ role: "user", content: "Reply with OK only." }] }, { binary, effort: "medium", timeoutMs: 45000 });
+    if (!response.ok) return { events: [], failure: (await response.json()).error || { message: "Claude CLI 無法使用。" } };
+    const text = await response.text();
+    const events = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+    return { events, failure: events.find((event) => event.type === "error")?.error };
+  };
+  for (const model of models) {
+    console.log(`正在測試 Claude CLI：${model}...`);
+    let { events, failure } = await probe(model);
+    if (failure?.type === "claude_cli_upgrade_required" && /^\d+\.\d+\.\d+$/.test(failure.requiredVersion || "")
+      && compareVersions(version, failure.requiredVersion) < 0) {
+      console.log(`  ${failure.message}`);
+      const updated = await ensureClaudeCliReady({ ...setup, minimumVersion: failure.requiredVersion });
+      if (!updated) { console.log("已取消，路由配置未修改。"); return; }
+      ({ binary, version } = updated);
+      console.log(`CLI 已更新至 ${version}，重新測試 ${model} 一次。`);
+      ({ events, failure } = await probe(model));
+    }
+    const stop = events.find((event) => event.type === "message_delta")?.delta?.stop_reason;
+    const hasText = events.some((event) => event.delta?.text?.trim() || event.content_block?.text?.trim());
+    const resolved = events.find((event) => event.type === "message_start")?.message?.model;
+    if (!failure && hasText && stop === "end_turn" && events.some((event) => event.type === "message_stop")) {
+      if (typeof resolved !== "string" || !/^claude-[a-zA-Z0-9._-]+$/.test(resolved) || !/\d/.test(resolved)) {
+        console.log("  未添加：回應沒有明確的模型版本編號，無法可靠標示實際模型。");
+        continue;
+      }
+      console.log(`  實際模型：${model} → ${resolved}`);
+      resolvedModels[model] = resolved;
+      passed.push(model);
+    }
+    else console.log(`  未通過：${failure?.message || "沒有收到完整的文字回應。"}`);
+  }
+  if (!passed.length) { console.log("沒找到可用模型，路由配置未修改。"); return; }
+  // Re-read after login/probing; never overwrite intervening catalog refreshes.
+  const plan = planClaudeCliModels(requireInstallation(), binary, passed, contextWindow, resolvedModels);
+  const backup = await commitRouterChange("claude-cli", plan);
+  console.log(`已添加：${[...new Set(passed.map((model) => `claude-cli/${resolvedModels[model]}`))].join("、")}。請重開 Codex 後選擇模型。`);
+  console.log(`可從「刪除自訂模型」移除；不會登出 Claude。備份：${backup}`);
+}
+
 async function manageProviders(subcommand = null) {
   const { settings, providers } = requireInstallation();
   let action = subcommand ? String(subcommand).toLowerCase() : null;
@@ -3434,7 +3655,9 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
   const providers = installedProviders(settings, manifest);
   if (providers.length === 0) return { ok: false, reason: "no-providers" };
   const providerIds = new Set(providers.map((provider) => provider.id));
-  if (routes.some((route) => !providerIds.has(routeProviderId(route)))) {
+  if (routes.some((route) => route.transport === "claude-cli"
+    ? route.translate !== "anthropic" || !settings.claudeCli?.binary
+    : !providerIds.has(routeProviderId(route)))) {
     return { ok: false, reason: "unknown-provider" };
   }
 
@@ -4115,6 +4338,8 @@ async function status() {
     });
   }
   console.log(`路由器：http://127.0.0.1:${manifest.port}`);
+  const cliRoutes = routes.filter((route) => route.transport === "claude-cli");
+  if (cliRoutes.length) console.log(`Claude CLI（實驗性）：${cliRoutes.map((route) => route.displayName).join("、")}；登入狀態請執行 claude-cli status。`);
   console.log(
     `背景服務：${manifest.serviceName || manifest.launchLabel}（${serviceKindLabel}）`,
   );
@@ -4212,6 +4437,7 @@ export const MENU_ITEMS = [
   ["add", "添加自訂模型"],
   ["remove", "刪除自訂模型"],
   ["providers", "管理供應商（新增／移除／更換 API Key）"],
+  ["claude-cli", "連接 Claude 訂閱帳號（實驗性）"],
   ["hidden-models", "管理隱藏的官方模型"],
   ["context-1m", "設定全域上下文 100 萬"],
   ["imagegen", "中轉 API 生圖（添加／設定）"],
@@ -4233,6 +4459,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} remove
   ${basename(scriptPath || "codex-model-router.command")} providers [add|remove|key]
+  ${basename(scriptPath || "codex-model-router.command")} claude-cli [status|login]
   ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} context-1m
   ${basename(scriptPath || "codex-model-router.command")} imagegen
@@ -4301,6 +4528,7 @@ async function chooseAction() {
     providers: "providers",
     provider: "providers",
     "manage-providers": "providers",
+    "claude-cli": "claude-cli",
     hidden: "hidden-models",
     "hidden-models": "hidden-models",
     "unhide-models": "hidden-models",
@@ -4336,6 +4564,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       "delete-model",
       "delete-models",
       "providers",
+      "claude-cli",
       "provider",
       "hidden-models",
       "hidden",
@@ -4348,7 +4577,8 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       await printVersionSummary();
     }
     const action = requestedAction || (await chooseAction());
-    if (action === "context-1m") await configureMillionTokenContext();
+    if (action === "claude-cli") await configureClaudeCli(requestedAction ? process.argv[3] : null);
+    else if (action === "context-1m") await configureMillionTokenContext();
     else if (action === "imagegen" || action === "relay-imagegen") await configureRelayImagegen();
     else if (action === "imagegen-disable") {
       const backup = join(backupsRoot, `imagegen-disabled-${timestamp()}`);

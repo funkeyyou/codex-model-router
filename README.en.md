@@ -1,5 +1,7 @@
 # codex-model-router
 
+Experimental [Claude CLI subscription routing](docs/claude-cli-experimental.md) is available in v1.26.0 through the `claude-cli` command. It asks before installing or updating Claude Code and guides subscription sign-in when needed. Short text and tool roundtrips passed with a live subscription on macOS; Chrome, image generation, long conversations and Windows subscription execution still need validation.
+
 [English](README.en.md) · [繁體中文 / Full reference](README.md) · [Releases](https://github.com/funkeyyou/codex-model-router/releases) · [Report an issue](https://github.com/funkeyyou/codex-model-router/issues)
 
 **Use Claude and OpenAI-compatible models in Codex Desktop alongside official GPT models.**

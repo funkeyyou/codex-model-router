@@ -96,6 +96,8 @@ Select-String codex-model-router.ps1 .\SHA256SUMS
 
 ## 升級
 
+1.26.0 新增實驗性的「[Claude CLI 訂閱路由](docs/claude-cli-experimental.md)」：主選單第 6 項或 `claude-cli`。缺少 CLI 或版本過舊時會先詢問是否安裝／更新，未登入時引導官方登入。真實訂閱已通過短文字與一般工具往返測試，Chrome、生圖、長對話及 Windows 訂閱執行流程仍待驗收。
+
 已經裝過的話，日常升級用 `update`，不要重跑 `install`：
 
 ```bash
@@ -201,11 +203,11 @@ DeepSeek、通義千問、GLM、Kimi、Gemini 的 OpenAI 相容介面、Ollama�
 
 ## 其他指令
 
-選單第 7 項「設定全域上下文 100 萬」也可用
+選單第 8 項「設定全域上下文 100 萬」也可用
 `bash codex-model-router.sh context-1m` 執行；Windows 使用
 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 context-1m`。
 功能會備份使用者配置，只將全域 `model_context_window` 設為 1000000，並讀回驗證。
-最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 8 項為中轉 API 生圖，第 11 項為退出。
+最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 9 項為中轉 API 生圖，第 12 項為退出。
 完成後重新開啟桌面版並建立新任務。配置不會增加上游模型本身的能力或帳號權限。
 
 不帶參數執行會出現選單，也可以直接指定動作。
@@ -240,7 +242,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 
 ## 中轉 API 生圖（可選）
 
-安裝時同意啟用，或事後選擇選單第 8 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
+安裝時同意啟用，或事後選擇選單第 9 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
 不修改官方 `.system/imagegen`，也不需要內建 `image_gen` 工具。請求經本機路由器使用已保存的
 API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案內含生圖額度。
 設定了多家供應商時會先問要用哪一家；技能會記住這個選擇，之後的生圖都送到那一家，
@@ -687,7 +689,7 @@ Anthropic 路由前，把它們改寫或剝除掉**——健康檢查的 `bridge
 
 ## 開發
 
-程式碼放在 `src/`：五段 JavaScript（`installer.mjs`、`router.mjs`、`claude-bridge.mjs`、
+程式碼放在 `src/`：六段 JavaScript（`installer.mjs`、`router.mjs`、`claude-bridge.mjs`、`claude-cli.mjs`、
 `chat-bridge.mjs`、`imagegen.mjs`）都是一般模組，另有 `wrapper.sh` 與 `wrapper.ps1` 兩個啟動外殼。
 repo 根目錄的 `codex-model-router.sh`／`.ps1` 是建置產物：同一份負載分別包進 bash heredoc
 與 PowerShell 註解區塊，讓使用者只需下載單一檔案。改完 `src/` 之後要重新建置：
@@ -714,7 +716,7 @@ git push origin v1.23.0
 
 ### 測試
 
-測試直接把建置後 `.sh` 裡的五段負載取出來 import，所以測到的一定是會發佈出去的那份。
+測試直接把建置後 `.sh` 裡的六段負載取出來 import，所以測到的一定是會發佈出去的那份。
 
 ```bash
 npm test        # node --test，無需安裝任何相依套件
@@ -756,7 +758,7 @@ Windows 上會變成普通相對路徑，測試照樣綠燈，其實什麼都沒
 
 - `.ps1` 開頭必須保留 UTF-8 BOM。PowerShell 5.1 少了 BOM 會改用 ANSI 代碼頁讀檔，
   安裝器的所有中文訊息都會變成亂碼。
-- 五段負載要整批寫入。只更新其中一段會讓某個平台靜默停留在舊的 router 或轉譯層。
+- 六段負載要整批寫入。只更新其中一段會讓某個平台靜默停留在舊的 router 或轉譯層。
 - 負載裡不能出現標記行或 `#>`，否則 bash heredoc 或 PowerShell 註解會提早結束。
 
 換行由 `.gitattributes` 統一成 LF；混進 CRLF 會讓 `--check` 在不同平台的簽出上誤報。

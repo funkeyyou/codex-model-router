@@ -918,6 +918,7 @@ function contextProvider(context) {
   if (context.route !== "custom") return null;
   if ("provider" in context) return context.provider;
   const route = typeof context.model === "string" ? routeMap.get(context.model) : null;
+  if (route?.transport === "claude-cli") return null;
   return (route && providerById.get(route.providerId || DEFAULT_PROVIDER_ID)) || primaryProvider;
 }
 
@@ -1392,7 +1393,7 @@ export async function fetchModelUpstream(
 ) {
   const route = chooseRoute(requestHeaders, body);
   const isCustom = route != null;
-  const provider = isCustom ? providerForRoute(route) : null;
+  const provider = isCustom && route.transport !== "claude-cli" ? providerForRoute(route) : null;
   rememberRoute(requestHeaders, route);
 
   // HTTP 回退與第三方上游不保證支援 previous_response_id，從對應的成功回合重播。
@@ -1469,6 +1470,15 @@ export async function fetchModelUpstream(
       const anthropicBody = budget.buffer;
       if (upstreamRequestTooLarge(anthropicBody.length)) {
         return oversizeResponse(anthropicBody.length);
+      }
+      if (route.transport === "claude-cli") {
+        const { fetchClaudeCli } = await import("./claude-cli.mjs");
+        const translated = await fetchClaudeCli(budget.request, {
+          ...settings.claudeCli, effort: outboundBodyObject?.reasoning?.effort,
+        }, signal);
+        stats.lastCustomStatus = translated.status;
+        stats.lastProvider = "claude-cli";
+        return translated;
       }
       const translated = await fetchCustom(
         provider,
