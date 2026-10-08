@@ -546,7 +546,17 @@ test("一鍵更新：下載並核對 SHA256SUMS 與版本後才執行新版安�
   // 第二次提供真的新版管理頁，只把 update 寫檔步驟換成 fixture。送出後完全不輪詢，
   // 模擬瀏覽器已關閉；新版必須自己接手同一個埠，且舊程序退出後仍可使用。
   const installedScript = readFileSync(shellPath, "utf8").replace(`const INSTALLER_VERSION = "${releases.latest}";`, 'const INSTALLER_VERSION = "9.9.9";');
-  writeFileSync(join(root, "new-manager.sh"), installedScript);
+  // 成品 .sh 只支援 macOS，Linux CI 用相同的 Node 負載啟動 ui，仍驗證真的伺服器交接。
+  // macOS 留用原本外殼；測試不改生產用安裝器的平台限制。
+  let managerBootstrap = "";
+  if (process.platform === "linux") {
+    writeFileSync(join(root, "new-manager.mjs"), readFileSync(join(payloadDir, "installer.mjs"), "utf8")
+      .replace(`const INSTALLER_VERSION = "${releases.latest}";`, 'const INSTALLER_VERSION = "9.9.9";'));
+    managerBootstrap = ['if [ "$1" = ui ]; then',
+      '  export CODEX_MODEL_ROUTER_SCRIPT_PATH="$0"',
+      '  exec "$CODEX_MODEL_ROUTER_NODE_BIN" "$CODEX_HOME/new-manager.mjs" "$@"', "fi", ""].join("\n");
+  }
+  writeFileSync(join(root, "new-manager.sh"), "#!/bin/bash\n" + managerBootstrap + installedScript.slice("#!/bin/bash\n".length));
   const entry = ["#!/bin/bash", 'if [ "$1" = update ]; then',
     '  cp "$CODEX_HOME/new-manager.sh" "$CODEX_MODEL_ROUTER_HOME/codex-model-router.sh"',
     '  echo "fixture: update complete"', "  exit 0", "fi", ""].join("\n");
@@ -558,7 +568,8 @@ test("一鍵更新：下載並核對 SHA256SUMS 與版本後才執行新版安�
     try { await ui.call("/api/shutdown", { method: "POST" }); } catch {}
     for (let attempt = 0; attempt < 200 && readdirSync(runtime).some((name) => /^manager-worker-.*\.mjs$/.test(name)); attempt += 1) await delay(50);
   });
-  assert.equal((await ui.waitExit())[0], 0, ui.output());
+  const workerLog = () => existsSync(join(runtime, "manager-worker.log")) ? readFileSync(join(runtime, "manager-worker.log"), "utf8") : "";
+  assert.equal((await ui.waitExit())[0], 0, ui.output() + "\n" + workerLog());
   const newPing = (await ui.call("/api/ping", { method: "POST" })).json;
   assert.equal(newPing.version, "9.9.9");
   assert.notEqual(newPing.instanceId, previousPing.instanceId);
