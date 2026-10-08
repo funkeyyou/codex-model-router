@@ -159,7 +159,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 
-const INSTALLER_VERSION = "1.27.1";
+const INSTALLER_VERSION = "1.27.2";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2313,15 +2313,32 @@ async function readUserConfig() {
   };
 }
 
+// Codex 以「寫暫存檔再改名」更新 config.toml。Windows 上目標檔若正被其他程式短暫開著（例如防毒
+// 掃描剛寫入的檔案），改名會失敗並回報 failed to persist（CI 的 Windows 環境實際遇到）。
+// 寫入的是同一組鍵值，重寫是冪等的；稍等後重試，其他錯誤照常拋出。
+export const CONFIG_WRITE_RETRY_DELAYS_MS = [300, 800, 1500];
+
+export async function retryConfigWrite(write, { delays = CONFIG_WRITE_RETRY_DELAYS_MS,
+  wait = (milliseconds) => new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds)) } = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await write();
+    } catch (error) {
+      if (!/failed to persist/i.test(error?.message || "") || attempt >= delays.length) throw error;
+      await wait(delays[attempt]);
+    }
+  }
+}
+
 async function writeConfigEdits(edits) {
-  return codexRpc("config/batchWrite", {
+  return retryConfigWrite(() => codexRpc("config/batchWrite", {
     edits: edits.map(({ keyPath, value }) => ({
       keyPath,
       value,
       mergeStrategy: "replace",
     })),
     reloadUserConfig: false,
-  });
+  }));
 }
 
 function xmlEscape(value) {

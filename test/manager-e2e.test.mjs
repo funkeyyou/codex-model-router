@@ -47,6 +47,16 @@ async function stopChild(child) {
 
 const removeTree = (path) => rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 
+// Windows 上設定寫入失敗時，附上仍在執行的 codex 行程，判斷是不是有行程沒結束、還開著檔案。
+function windowsProcesses() {
+  if (process.platform !== "win32") return "";
+  try {
+    return "\n" + execFileSync("tasklist", ["/FI", "IMAGENAME eq codex.exe"], { encoding: "utf8", timeout: 10000 });
+  } catch (error) {
+    return "\n(tasklist 失敗：" + error.message + ")";
+  }
+}
+
 function baseEnv(root, runtime, extra = {}) {
   const env = {
     ...process.env, CODEX_HOME: root, CODEX_MODEL_ROUTER_HOME: runtime,
@@ -216,7 +226,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   const contextBefore = await query("global-context");
   assert.equal(contextBefore.value, null, JSON.stringify(contextBefore));
   const setContext = await ui.runJob("set-global-context", { value: 1000000 });
-  assert.equal(setContext.status, "succeeded", setContext.output);
+  assert.equal(setContext.status, "succeeded", setContext.output + windowsProcesses());
   assert.equal(setContext.result.restartDesktop, true);
   assert.match(readFileSync(join(root, "config.toml"), "utf8"), /model_context_window = 1000000/);
   assert.ok(readFileSync(join(root, "config.toml"), "utf8").includes("http://127.0.0.1:" + port + "/v1"), "其他設定保留");
@@ -229,7 +239,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.equal(badContext.status, "failed");
   assert.match(badContext.error, /全域上下文必須是/);
   const clearContext = await ui.runJob("set-global-context", { value: null });
-  assert.equal(clearContext.status, "succeeded", clearContext.output);
+  assert.equal(clearContext.status, "succeeded", clearContext.output + windowsProcesses());
   assert.doesNotMatch(readFileSync(join(root, "config.toml"), "utf8"), /model_context_window/);
   const contextCleared = await query("global-context");
   assert.equal(contextCleared.value, null, JSON.stringify(contextCleared));

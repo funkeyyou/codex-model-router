@@ -38,6 +38,33 @@ test("Codex 子行程一次只跑一個：工作依序執行，前一個失敗�
   assert.equal(results[1].reason.message, "b failed");
 });
 
+test("寫入 Codex 設定遇到 failed to persist 會稍等重試，其他錯誤與重試用完時照常拋出", async () => {
+  const waits = [];
+  const wait = async (milliseconds) => { waits.push(milliseconds); };
+  const flaky = (failures, message) => {
+    let calls = 0;
+    const write = async () => {
+      calls += 1;
+      if (calls <= failures) throw new Error(message);
+      return { ok: true, calls };
+    };
+    return { write, calls: () => calls };
+  };
+  const persist = "failed to persist config.toml: failed to persist config at C:\\Users\\me\\.codex\\config.toml";
+  const recovered = flaky(2, persist);
+  assert.deepEqual(await installer.retryConfigWrite(recovered.write, { wait }), { ok: true, calls: 3 });
+  assert.deepEqual(waits, installer.CONFIG_WRITE_RETRY_DELAYS_MS.slice(0, 2));
+
+  waits.length = 0;
+  const other = flaky(1, "Configuration was modified since last read. Fetch latest version and retry.");
+  await assert.rejects(installer.retryConfigWrite(other.write, { wait }), /modified since last read/);
+  assert.deepEqual([other.calls(), waits], [1, []], "不是改名失敗就不重試");
+
+  const stuck = flaky(99, persist);
+  await assert.rejects(installer.retryConfigWrite(stuck.write, { wait }), /failed to persist/);
+  assert.equal(stuck.calls(), installer.CONFIG_WRITE_RETRY_DELAYS_MS.length + 1, "重試次數有上限");
+});
+
 test("隱藏官方模型的可選清單：只列內建目錄標成 hide 的官方模型，並標出目前強制顯示的", () => {
   const bundled = { models: [
     { slug: "gpt-visible", display_name: "Visible", visibility: "list" },
