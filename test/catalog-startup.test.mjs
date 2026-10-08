@@ -98,7 +98,8 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
     } finally { app.kill(); await exited; }
   }
   // 舊安裝的固定目錄用與 installer 相同的 Codex RPC 移除；其他全域配置保留。
-  await picker(undefined, true);
+  // Windows 暫存檔也可能短暫被鎖住；沿用正式安裝器的有限次、僅針對 persist 錯誤的重試。
+  await installer.retryConfigWrite(() => picker(undefined, true));
   const migratedConfig = readFileSync(join(root, "config.toml"), "utf8");
   assert.doesNotMatch(migratedConfig, /model_catalog_json/);
   assert.match(migratedConfig, /model_context_window = 1000000/);
