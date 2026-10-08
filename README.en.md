@@ -8,7 +8,7 @@ A local LLM proxy and multi-provider model router for Codex Desktop / ChatGPT De
 
 ## Claude Code subscription routing (experimental)
 
-Experimental [Claude CLI subscription routing](docs/claude-cli-experimental.md) is available through menu item 6 or the `claude-cli` command. It asks before installing or updating Claude Code and guides subscription sign-in when needed.
+Experimental [Claude CLI subscription routing](docs/claude-cli-experimental.md) is available through menu item 7 or the `claude-cli` command, and since v1.27.0 also from Add provider or Add model in the [web manager](#web-manager). It asks before installing or updating Claude Code and guides subscription sign-in when needed.
 
 Since v1.26.1, the installer reads the CLI's current model list first and shows numbered entries with full model IDs. Enter `1`, `1,3`, `1-3`, or `all`; you can also enter an explicit model ID or `cancel`. Numbers follow the current list order. Aliases resolving to the same version are deduplicated, and previously configured models remain listed.
 
@@ -32,6 +32,7 @@ A local model router for macOS and Windows. Add your own API providers to the Co
 - Supports OpenAI Responses API endpoints, translates Claude Messages, and probes Chat Completions as a fallback for compatible models.
 - Manages multiple providers, API keys, model discovery, model removal, and provider-scoped routing IDs.
 - Provides interactive macOS and Windows installers, backups during updates, and rollback.
+- Includes a local [web manager](#web-manager) for models, providers, the Claude subscription, image generation, settings, and one-click updates.
 - Optionally installs a separate relay image-generation skill using your provider's supported image models.
 
 Chat Completions support can be useful for compatible DeepSeek, Qwen, GLM, Kimi, Gemini, Ollama, or vLLM endpoints. Availability and tool support depend on the endpoint and the model; installation probes capabilities rather than assuming support.
@@ -66,11 +67,33 @@ The installer prompts for your Base URL, API key, and models. API key input is h
 
 For a pinned version, download the installers and `SHA256SUMS` from [Releases](https://github.com/funkeyyou/codex-model-router/releases).
 
+## Web manager
+
+Since v1.27.0, menu item 2 or the `ui` command opens a local management page in your browser:
+
+```bash
+bash codex-model-router.sh ui
+```
+
+After installing or updating, the installer keeps a copy of itself in the router directory and creates a "Codex 模型路由器" shortcut (`~/Applications` on macOS, the Start menu on Windows), so you can reopen the page without finding the downloaded installer.
+
+- **Overview**: router status, request counts, recent errors with diagnostic IDs, and the runtime environment.
+- **Models**: drag to reorder; edit display names, context and output limits; remove models. When adding models you can pick an API provider or the Claude subscription. New models default to a 1,000,000-token context and 128,000-token output, capped by any smaller limit the upstream reports.
+- **Providers**: add an OpenAI-compatible API or a Claude subscription (Claude CLI), change API keys, and remove providers. The Claude subscription path checks the CLI installation, version, and subscription sign-in in order, and lets you fix each step in place.
+- **Image generation**: detect, enable, or disable relay image generation.
+- **Settings**: set or remove the global context window, and force-show official models hidden by Codex's bundled catalog.
+- **Version**: shows the current version, lists changes when a new release exists, and updates in one click.
+
+It uses the same backup-and-restore flows as the menu. Probes that cost money or subscription quota are listed and confirmed first. Reordering, renaming, and context changes only rewrite the model catalog; output changes and adding or removing models restart the router. Output limits apply only to Claude models (Claude's `max_tokens`, or `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for Claude CLI); GPT and Chat Completions routes leave output length to the upstream.
+
+The page listens only on `127.0.0.1`. Its URL carries this session's access token (do not share it), and it checks Host and Origin, accepts only JSON requests, and sets a strict CSP. API keys go only to the macOS Keychain or Windows DPAPI and are never sent back to the page. It exits when you close the terminal window, click "結束管理頁", or after 20 idle minutes; the background router serves no web pages. First-time installation and rollback still run in the terminal. The page is currently in Traditional Chinese.
+
 ## Manage models and providers
 
 Run these commands from the directory containing the downloaded installer:
 
 ```bash
+bash codex-model-router.sh ui                 # Open the web manager
 bash codex-model-router.sh add                # Add custom models
 bash codex-model-router.sh remove             # Remove custom models
 bash codex-model-router.sh providers add      # Add an API provider
@@ -93,6 +116,8 @@ bash codex-model-router.sh update
 ```
 
 Updates preserve configured providers and models and back up managed files. A failed update attempts to restore the prior installation and restart the service.
+
+Since v1.27.0 you can also update from the version menu in the web manager. It downloads the new installer from GitHub Releases, verifies it against `SHA256SUMS`, and runs the same `update`; on macOS it can restart ChatGPT afterwards.
 
 To remove the router configuration:
 

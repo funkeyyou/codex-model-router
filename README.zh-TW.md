@@ -13,9 +13,10 @@ Local multi-provider routing for macOS and Windows.
 - **多家 API 各自管理**：每家保存自己的 API Key，支援模型偵測、添加、刪除與更換 Key。
 - **相容多種介面**：支援 Responses API、Claude Messages 轉譯，以及 Chat Completions 相容端點；實際能力會先探測。
 - **macOS／Windows 安裝器**：互動設定、更新備份與回退，另可啟用中轉 API 生圖技能。
+- **網頁管理介面**：在瀏覽器管理模型、供應商、Claude 訂閱、生圖與全域設定，可檢查更新並一鍵升級。
 - **Claude Code 訂閱路由（實驗性）**：透過已登入的 Claude CLI 探測並添加模型，工具仍由 Codex 執行；需要可用的訂閱權限與額度。
 
-[安裝](#安裝) · [升級](#升級) · [多供應商](#同時使用多家供應商) · [Chat Completions](#只有-chat-completions-的模型) · [Claude CLI 說明](docs/claude-cli-experimental.md)
+[安裝](#安裝) · [網頁管理](#網頁管理介面) · [升級](#升級) · [多供應商](#同時使用多家供應商) · [Chat Completions](#只有-chat-completions-的模型) · [Claude CLI 說明](docs/claude-cli-experimental.md)
 
 ### 適合哪些使用情境？
 
@@ -105,9 +106,34 @@ Select-String codex-model-router.ps1 .\SHA256SUMS
 
 兩行輸出的雜湊相同再執行安裝器。
 
+## 網頁管理介面
+
+從 1.27.0 起，選單第 2 項「開啟網頁管理介面」或 `ui` 指令會在瀏覽器打開本機管理頁：
+
+```bash
+bash codex-model-router.sh ui
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
+```
+
+安裝或更新完成後，安裝器會在路由器目錄放一份安裝器副本，並建立「Codex 模型路由器」捷徑（macOS 在 `~/Applications`，Windows 在開始功能表），之後雙擊即可開啟，不必再找當初下載的安裝器。
+
+- **總覽**：路由器狀態、請求統計、最近的錯誤與診斷 ID、執行環境。
+- **模型**：拖曳排序，修改顯示名稱、上下文與輸出，勾選刪除。新增模型時可選中轉供應商或 Claude 訂閱；預設上下文 1,000,000、輸出 128,000，上游回報的上限較小時以上游為準。
+- **供應商**：新增「OpenAI 相容 API」或「Claude 訂閱帳號（Claude CLI）」，更換 API Key、移除供應商。選 Claude 訂閱時會依序檢查 CLI 是否安裝、版本與訂閱登入，缺少的步驟可直接處理。
+- **生圖**：偵測、啟用或停用中轉 API 生圖。
+- **設定**：設定或移除全域上下文，勾選強制顯示被隱藏的官方模型。
+- **版本**：左上角顯示目前版本，有新版時列出更新內容，可一鍵更新。
+
+背後沿用選單的流程：寫入前備份，失敗自動還原；會產生費用或使用訂閱額度的探測、生圖偵測與 Claude 測試，都會先列出內容再確認。排序、改名與修改上下文只寫入模型目錄，不重啟路由器；修改輸出、添加或刪除模型會重啟路由器。輸出上限只對 Claude 模型有效（送往 Claude 的 `max_tokens`，或 Claude CLI 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`），GPT 與 Chat Completions 模型不送這個值，由上游決定。
+
+管理頁只監聽 `127.0.0.1`，網址附帶這次的存取權杖（請勿分享），並檢查 Host 與 Origin、只接受 JSON 請求、啟用 CSP。API Key 只寫入鑰匙圈或 DPAPI，不會回傳到頁面。關閉終端視窗、按「結束管理頁」或閒置 20 分鐘後自動結束；常駐的路由器本身不提供網頁。首次安裝與回退仍在終端執行。
+
 ## 升級
 
-實驗性的「[Claude CLI 訂閱路由](docs/claude-cli-experimental.md)」可從主選單第 6 項或 `claude-cli` 開啟。缺少 CLI 或版本過舊時會先詢問是否安裝／更新，未登入時引導官方登入。
+實驗性的「[Claude CLI 訂閱路由](docs/claude-cli-experimental.md)」可從主選單第 7 項或 `claude-cli` 開啟，1.27.0 起也可在網頁管理介面的「新增供應商」或「新增模型」選擇 Claude 訂閱。缺少 CLI 或版本過舊時會先詢問是否安裝／更新，未登入時引導官方登入。
 
 從 1.26.1 起，優先讀取 Claude CLI 當前模型清單並以編號列出完整版本。輸入 `1` 選一個、`1,3` 複選、`1-3` 選範圍，也支援 `all`、完整模型 ID 及 `cancel` 返回。編號依當次清單排列，已添加的項目會標示；相同版本的別名會合併。
 
@@ -127,6 +153,8 @@ bash codex-model-router.sh update
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 ```
 
+從 1.27.0 起，也可以在網頁管理介面左上角的版本選單一鍵更新：從 GitHub Release 下載新版安裝器、核對 `SHA256SUMS` 後執行同樣的 `update`；macOS 上可選擇完成後重新啟動 ChatGPT。
+
 `update` 只換掉路由器與轉譯層的程式碼並重寫服務定義，然後重啟服務並做健康檢查。
 Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，不會重問任何一項。
 從 1.22.0 起，更新會透過 Codex CLI 備份並移除本工具舊版寫入的
@@ -145,7 +173,7 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 `add` 只探測新選的模型；完成後，自訂模型會按本次探測清單的順序排列。
 已配置但未出現在本次清單的模型會留在後方，原有名稱與能力設定不變。
 
-`remove` 或選單第 4 項可複選刪除已配置的自訂模型；空白／`cancel` 返回，刪除前會再確認。
+`remove` 或選單第 5 項可複選刪除已配置的自訂模型；空白／`cancel` 返回，刪除前會再確認。
 安裝器先備份設定、模型目錄與路由程式，再移除選中的模型並驗證 Codex 選單；失敗會還原。
 官方模型、API Key 與中轉生圖技能不受影響；若刪除全域預設模型，會清除指向該模型的 `model` 設定。
 可以刪到零個自訂模型，日後仍可更新或重新添加。
@@ -154,7 +182,7 @@ Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，�
 ## 同時使用多家供應商
 
 從 1.24.0 起可以同時設定多家中轉供應商，各自保存 API Key，模型都會出現在 Codex 的選單上，
-可以混用，也可以把另一家當備援。用 `providers`（選單第 5 項）管理：
+可以混用，也可以把另一家當備援。用 `providers`（選單第 6 項）管理：
 
 ```bash
 bash codex-model-router.sh providers add      # 新增一家：Base URL、API Key，探測並添加它的模型
@@ -222,11 +250,12 @@ DeepSeek、通義千問、GLM、Kimi、Gemini 的 OpenAI 相容介面、Ollama�
 
 ## 其他指令
 
-選單第 8 項「設定全域上下文 100 萬」也可用
+選單第 9 項「設定全域上下文 100 萬」也可用
 `bash codex-model-router.sh context-1m` 執行；Windows 使用
 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 context-1m`。
 功能會備份使用者配置，只將全域 `model_context_window` 設為 1000000，並讀回驗證。
-最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 9 項為中轉 API 生圖，第 12 項為退出。
+最大輸出、模型目錄與路由器設定均不修改，也不重啟路由器。選單第 10 項為中轉 API 生圖，第 13 項為退出。
+網頁管理介面的「設定」頁也能把全域上下文改成其他值或移除。
 完成後重新開啟桌面版並建立新任務。配置不會增加上游模型本身的能力或帳號權限。
 
 不帶參數執行會出現選單，也可以直接指定動作。
@@ -235,6 +264,7 @@ macOS：
 
 ```bash
 bash codex-model-router.sh update     # 升級程式碼，保留現有設定
+bash codex-model-router.sh ui         # 開啟網頁管理介面
 bash codex-model-router.sh add        # 添加自訂模型
 bash codex-model-router.sh remove     # 刪除自訂模型
 bash codex-model-router.sh providers  # 新增／移除供應商、更換 API Key
@@ -248,6 +278,7 @@ Windows：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
+powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 add
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 remove
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 providers
@@ -261,7 +292,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 rollback
 
 ## 中轉 API 生圖（可選）
 
-安裝時同意啟用，或事後選擇選單第 9 項／執行 `imagegen`，即可添加獨立的 `$router-imagegen` 技能。
+安裝時同意啟用，或事後選擇選單第 10 項／執行 `imagegen`／在網頁管理介面的「生圖」頁，即可添加獨立的 `$router-imagegen` 技能。
 不修改官方 `.system/imagegen`，也不需要內建 `image_gen` 工具。請求經本機路由器使用已保存的
 API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案內含生圖額度。
 設定了多家供應商時會先問要用哪一家；技能會記住這個選擇，之後的生圖都送到那一家，

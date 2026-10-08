@@ -1,14 +1,18 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   cpSync,
   copyFileSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -17,12 +21,13 @@ import {
 import { createServer, isIP } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { Writable } from "node:stream";
-import { basename, dirname, join, resolve, win32 } from "node:path";
+import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { pathToFileURL } from "node:url";
 
-const INSTALLER_VERSION = "1.26.6";
+const INSTALLER_VERSION = "1.27.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -97,6 +102,10 @@ const testMode = env.CODEX_MODEL_ROUTER_TEST_MODE === "1";
 const assumeYes = env.CODEX_MODEL_ROUTER_YES === "1";
 const releasesUrl = env.CODEX_MODEL_ROUTER_RELEASES_URL || DEFAULT_RELEASES_URL;
 let releaseCatalogPromise = null;
+let releaseCatalogLoadedAt = 0;
+// 網頁管理介面執行期間沒有人在終端回答問題；任何流程若走到提問，直接當成程式錯誤，
+// 不能讓背景工作卡在等待 stdin。
+let managerMode = false;
 
 function fail(message) {
   throw new Error(message);
@@ -391,12 +400,36 @@ export function loadClaudeCliSource(sourcePath = scriptPath) {
   const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
   const marker = "\n__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__\n";
   const start = source.indexOf(marker);
-  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__");
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_MANAGER_JS__");
   if (start < 0 || end <= start) fail("安裝器中缺少 Claude CLI 轉接程式碼。");
   return source.slice(start + marker.length, end) + "\n";
 }
 
+// 網頁管理介面只在執行 ui 命令時取出，不寫進路由器目錄。
+export function loadManagerSource(sourcePath = scriptPath) {
+  const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_MANAGER_JS__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_MANAGER_HTML__");
+  if (start < 0 || end <= start) fail("安裝器中缺少網頁管理介面程式碼。");
+  return source.slice(start + marker.length, end) + "\n";
+}
+
+export function loadManagerPage(sourcePath = scriptPath) {
+  const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_MANAGER_HTML__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__");
+  if (start < 0 || end <= start) fail("安裝器中缺少網頁管理介面頁面。");
+  return source.slice(start + marker.length, end) + "\n";
+}
+
+function assertTerminalPrompt(question) {
+  if (managerMode) fail(`內部錯誤：網頁管理介面不能等待終端輸入（${question}）。`);
+}
+
 async function ask(question, defaultValue = null) {
+  assertTerminalPrompt(question);
   if (defaultValue != null && env.CODEX_MODEL_ROUTER_BASE_URL) {
     return defaultValue;
   }
@@ -411,6 +444,7 @@ async function ask(question, defaultValue = null) {
 }
 
 async function confirm(question, defaultYes = true) {
+  assertTerminalPrompt(question);
   if (assumeYes) return true;
   const rl = createInterface({ input, output });
   try {
@@ -429,6 +463,7 @@ async function confirm(question, defaultYes = true) {
 // 隱藏輸入的提問。這一段一定要留在本行程：spawnSync 期間本行程的 stdin
 // 仍掛在同一個主控台上，交給子行程 Read-Host 會被吃掉第一次輸入。
 async function askSecret(question) {
+  assertTerminalPrompt(question);
   let muted = false;
   const maskedOutput = new Writable({
     write(chunk, encoding, callback) {
@@ -497,8 +532,6 @@ async function storeApiKey(service, baseUrl) {
   }
 
   if (isWindows) {
-    ensureDirectory(credentialsRoot);
-    const target = credentialFileFor(service);
     console.log("API Key 會用 Windows 憑證保護（DPAPI）以當前使用者身份加密儲存，" );
     console.log("不會寫入 config.toml 或安裝器檔案。" );
     let apiKey = "";
@@ -506,7 +539,25 @@ async function storeApiKey(service, baseUrl) {
       if (attempt > 0) console.log("API Key 不能為空，請重新輸入。" );
       apiKey = await askSecret("API Key（輸入不會顯示）");
     }
-    if (!apiKey) fail("API Key 不能為空。" );
+    storeApiKeyValue(service, baseUrl, apiKey);
+    return;
+  }
+
+  console.log("API Key 將儲存到 macOS 鑰匙圈，只需輸入一次。" );
+  console.log("API Key 不會寫入 config.toml 或安裝器檔案。" );
+  const apiKey = await askSecret("API Key（輸入不會顯示）");
+  storeApiKeyValue(service, baseUrl, apiKey);
+}
+
+// 不經終端提問的版本：互動流程問完後呼叫它，網頁管理介面直接用表單送來的值。
+function storeApiKeyValue(service, baseUrl, value) {
+  const apiKey = String(value ?? "").trim();
+  if (!apiKey) fail("API Key 不能為空。" );
+  if (env.CODEX_MODEL_ROUTER_TEST_API_KEY) return;
+
+  if (isWindows) {
+    ensureDirectory(credentialsRoot);
+    const target = credentialFileFor(service);
     // 明文以管線交給 PowerShell 做 DPAPI 加密：不會出現在命令列或行程清單。
     const result = powershell(
       [
@@ -532,12 +583,7 @@ async function storeApiKey(service, baseUrl) {
     return;
   }
 
-  const label = `Codex 模型路由器：${new URL(baseUrl).host}`;
-  console.log("API Key 將儲存到 macOS 鑰匙圈，只需輸入一次。" );
-  console.log("API Key 不會寫入 config.toml 或安裝器檔案。" );
-  const apiKey = await askSecret("API Key（輸入不會顯示）");
-  if (!apiKey) fail("API Key 不能為空。" );
-  storeMacosApiKey(service, label, apiKey);
+  storeMacosApiKey(service, `Codex 模型路由器：${new URL(baseUrl).host}`, apiKey);
 }
 
 export function storeMacosApiKey(service, label, apiKey, run = spawnSync, keychain = null) {
@@ -677,9 +723,13 @@ export function normalizeReleaseCatalog(payload) {
   return { latest, releases };
 }
 
-async function loadReleaseCatalog() {
-  if (releaseCatalogPromise) return releaseCatalogPromise;
-  releaseCatalogPromise = (async () => {
+// force 時重新抓取；maxAgeMs 讓長時間開著的管理頁定期更新。失敗的結果不快取，下次再試。
+async function loadReleaseCatalog({ force = false, maxAgeMs = Infinity } = {}) {
+  if (releaseCatalogPromise && !force && Date.now() - releaseCatalogLoadedAt < maxAgeMs) {
+    return releaseCatalogPromise;
+  }
+  releaseCatalogLoadedAt = Date.now();
+  const promise = (async () => {
     let raw;
     if (env.CODEX_MODEL_ROUTER_RELEASES_JSON) {
       raw = env.CODEX_MODEL_ROUTER_RELEASES_JSON;
@@ -702,7 +752,11 @@ async function loadReleaseCatalog() {
     }
     return normalizeReleaseCatalog(JSON.parse(raw));
   })();
-  return releaseCatalogPromise;
+  releaseCatalogPromise = promise;
+  promise.catch(() => {
+    if (releaseCatalogPromise === promise) releaseCatalogPromise = null;
+  });
+  return promise;
 }
 
 export function releasesBetween(catalog, installedVersion) {
@@ -1550,6 +1604,8 @@ export const preservedSettingKeys = [
   "captureDir",
   "catalogRefresh",
   "closeOnUpstreamError",
+  // 網頁管理介面拖曳排序後設為 "manual"：之後新增的模型接在最後，不再依探測清單重排。
+  "customModelOrder",
   "heartbeatIntervalMs",
   "historyTtlMs",
   "maxHistoryBytes",
@@ -1688,7 +1744,27 @@ export function orderCustomModelsByDiscovery(officialModels, customModels, route
 // 照 orderCustomModelsByDiscovery 的規則排；其他家維持現有目錄裡的相對順序——
 // settings 裡的順序是添加的先後，不是選單上的順序。只有一家時結果與
 // orderCustomModelsByDiscovery 完全相同。
-export function arrangeCustomModels(officialModels, customModels, routes, providerIds, probed, currentCatalog = null) {
+//
+// manual：使用者在網頁管理介面拖曳排過順序。既有模型一律維持目前目錄裡的位置，
+// 新模型接在最後（彼此之間依探測清單的順序），不再依供應商分組。
+export function arrangeCustomModels(officialModels, customModels, routes, providerIds, probed, currentCatalog = null,
+  { manual = false } = {}) {
+  const maxPriority = Math.max(0, ...officialModels.map((model) => Number(model.priority) || 0));
+  if (manual) {
+    const catalogOrder = new Map((currentCatalog?.models || [])
+      .filter((model) => String(model.slug).startsWith("custom/"))
+      .map((model, index) => [model.slug, index]));
+    const upstreamBySlug = new Map(routes.map((route) => [route.pickerSlug, route.upstreamModel]));
+    const rank = new Map((probed?.models || []).map((model, index) => [model, index]));
+    const position = (model) => catalogOrder.has(model.slug)
+      ? [0, catalogOrder.get(model.slug)]
+      : [1, rank.get(upstreamBySlug.get(model.slug)) ?? Number.MAX_SAFE_INTEGER];
+    return customModels
+      .map((model, index) => ({ model, index, position: position(model) }))
+      .sort((left, right) => left.position[0] - right.position[0] ||
+        left.position[1] - right.position[1] || left.index - right.index)
+      .map(({ model }, index) => ({ ...model, priority: maxPriority + index + 1 }));
+  }
   const providerOf = new Map(routes.map((route) => [route.pickerSlug, routeProviderId(route)]));
   const probedRoutes = routes.filter((route) => routeProviderId(route) === probed.providerId);
   const ranked = orderCustomModelsByDiscovery(officialModels, customModels, probedRoutes, probed.models);
@@ -1701,11 +1777,217 @@ export function arrangeCustomModels(officialModels, customModels, routes, provid
     if (providerOf.get(model.slug) === probed.providerId) return [0, index];
     return catalogOrder.has(model.slug) ? [0, catalogOrder.get(model.slug)] : [1, index];
   };
-  const maxPriority = Math.max(0, ...officialModels.map((model) => Number(model.priority) || 0));
   return ranked
     .map((model, index) => ({ model, group: groupOf(model), key: orderKey(model, index) }))
     .sort((left, right) => left.group - right.group || left.key[0] - right.key[0] || left.key[1] - right.key[1])
     .map(({ model }, index) => ({ ...model, priority: maxPriority + index + 1 }));
+}
+
+// 在既有供應商追加模型。純函式：寫檔、重啟與驗證交給 commitRouterChange。
+export function planAddModels(manifest, settings, catalog, templates, provider, newRoutes, discoveredModels,
+  binary = codexBin) {
+  const providers = installedProviders(settings, manifest);
+  if (!providers.some((item) => item.id === provider?.id)) fail(`找不到供應商：${provider?.id}`);
+  if (!Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
+    fail("安裝設定或模型目錄不完整，無法添加模型。");
+  }
+  if (newRoutes.some((route) => routeProviderId(route) !== provider.id)) fail("新模型與供應商不一致，配置未改動。");
+  const existing = new Set(settings.routes.map((route) => route.pickerSlug));
+  const added = newRoutes.filter((route) => !existing.has(route.pickerSlug));
+  if (added.length === 0) fail("所選模型都已配置，配置未改動。");
+  const routes = [...settings.routes, ...added];
+  const officialModels = applyForcedVisibility(
+    templates.models.filter((model) => !String(model.slug).startsWith("custom/")),
+    settings.forceListedModels,
+  );
+  const customModels = arrangeCustomModels(
+    officialModels,
+    mergeAddedModels(officialModels, catalog, routes, added),
+    routes,
+    providers.map((item) => item.id),
+    { providerId: provider.id, models: discoveredModels },
+    catalog,
+    { manual: settings.customModelOrder === "manual" },
+  );
+  const binaryField = binary ? { codexBin: binary } : {};
+  return {
+    added,
+    settings: withProviders({ ...settings, version: INSTALLER_VERSION, routes, ...binaryField }, providers),
+    manifest: manifestWithProviders({ ...manifest, version: INSTALLER_VERSION, routes, ...binaryField }, providers),
+    catalog: { ...templates, models: [...officialModels, ...customModels] },
+  };
+}
+
+// 依使用者在網頁上排好的順序重排自訂模型。路由器每次回應 /models 都會重讀 models.json，
+// 自訂項目的順序就是陣列順序（見 router.mjs 的 mergeCatalog），因此不必重啟路由器。
+export function planReorderModels(manifest, settings, catalog, orderedSlugs) {
+  if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
+    fail("安裝設定或模型目錄不完整，無法調整順序。");
+  }
+  const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
+  const official = catalog.models.filter((model) => !isCustom(model));
+  const custom = catalog.models.filter(isCustom);
+  const bySlug = new Map(custom.map((model) => [model.slug, model]));
+  if (!Array.isArray(orderedSlugs) || orderedSlugs.length !== custom.length ||
+      new Set(orderedSlugs).size !== orderedSlugs.length || orderedSlugs.some((slug) => !bySlug.has(slug))) {
+    fail("排序清單與目前的自訂模型不一致，請重新整理頁面後再試。");
+  }
+  const maxPriority = Math.max(0, ...official.map((model) => Number(model.priority) || 0));
+  return {
+    changed: orderedSlugs.some((slug, index) => custom[index].slug !== slug),
+    settings: { ...settings, customModelOrder: "manual" },
+    manifest,
+    catalog: {
+      ...catalog,
+      models: [...official, ...orderedSlugs.map((slug, index) => ({ ...bySlug.get(slug), priority: maxPriority + index + 1 }))],
+    },
+  };
+}
+
+export const MIN_CONTEXT_WINDOW = 16000;
+export const MAX_CONTEXT_WINDOW = 4000000;
+// Claude 轉譯每次至少送出 4,096（claude-bridge 的 OUTPUT_HEADROOM，留給回答的餘裕），
+// 設得更小也不會生效，因此最小值與它相同。
+export const MIN_OUTPUT_TOKENS = 4096;
+export const MAX_OUTPUT_TOKENS = 1000000;
+// 網頁新增模型時預先填入的上下文與輸出，表單上可以改。
+export const NEW_MODEL_DEFAULTS = Object.freeze({ contextWindow: 1000000, maxOutputTokens: 128000 });
+// 與 claude-bridge.mjs 的 DEFAULT_MAX_TOKENS 相同：路由沒有設定預設輸出時，每次回覆送出的 max_tokens。
+export const CLAUDE_DEFAULT_MAX_OUTPUT = 32000;
+
+const positiveNumber = (value) => (Number.isFinite(value) && value > 0 ? value : null);
+const positiveSafeInteger = (value) => (Number.isSafeInteger(value) && value > 0 ? value : null);
+
+// 只有 Claude 路由（API 轉譯與 Claude CLI）會把輸出上限送往上游；Responses 與 Chat 路由
+// 不送 max_output_tokens，輸出長度由上游模型自己決定，設定了也沒有作用。
+export function routeUsesOutputSetting(route) {
+  return route?.translate === "anthropic";
+}
+
+// 每次回覆實際送出的輸出上限。算法與 claude-bridge 的 toAnthropicRequest 相同：
+// 路由的預設輸出（沒設定時 32,000，至少 4,096），再以模型上限（maxOutputTokens）夾住。
+// 舊式 thinking budget 在最高強度可能再往上加一點，這裡不計入。
+export function routeOutputLimit(route) {
+  if (!routeUsesOutputSetting(route)) return null;
+  const configured = Math.max(positiveSafeInteger(route.defaultMaxOutputTokens) ?? CLAUDE_DEFAULT_MAX_OUTPUT, MIN_OUTPUT_TOKENS);
+  const cap = positiveNumber(route.maxOutputTokens);
+  return cap ? Math.min(configured, cap) : configured;
+}
+
+function parseTokenSetting(value, { label, min, max }) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < min || number > max) {
+    fail(`${label}必須是 ${min.toLocaleString("en-US")} 到 ${max.toLocaleString("en-US")} 之間的整數。`);
+  }
+  return number;
+}
+
+export function normalizeNewModelDefaults({ contextWindow, maxOutputTokens } = {}) {
+  const pick = (value, fallback) => (value === undefined || value === null || value === "" ? fallback : value);
+  const context = parseTokenSetting(pick(contextWindow, NEW_MODEL_DEFAULTS.contextWindow),
+    { label: "上下文上限", min: MIN_CONTEXT_WINDOW, max: MAX_CONTEXT_WINDOW });
+  const output = parseTokenSetting(pick(maxOutputTokens, NEW_MODEL_DEFAULTS.maxOutputTokens),
+    { label: "最大輸出", min: MIN_OUTPUT_TOKENS, max: MAX_OUTPUT_TOKENS });
+  if (output > context) fail("最大輸出不能超過上下文上限。");
+  return { contextWindow: context, maxOutputTokens: output };
+}
+
+// 套用新增模型的上下文與輸出設定。探測到上游的實際上限時以較小者為準，不會設定超過
+// 模型能接受的範圍；探測不到（GPT、Chat 模型的上下文，或閘道不回報上限）才直接用設定值。
+export function applyNewModelDefaults(route, defaults) {
+  const next = { ...route };
+  const probedContext = positiveNumber(route.contextWindow);
+  next.contextWindow = probedContext ? Math.min(probedContext, defaults.contextWindow) : defaults.contextWindow;
+  if (routeUsesOutputSetting(route)) {
+    const cap = positiveNumber(route.maxOutputTokens);
+    next.defaultMaxOutputTokens = cap ? Math.min(cap, defaults.maxOutputTokens) : defaults.maxOutputTokens;
+  }
+  return next;
+}
+
+export function describeRouteLimits(route) {
+  const context = positiveNumber(route.contextWindow);
+  const output = routeOutputLimit(route);
+  return `上下文 ${context ? context.toLocaleString("en-US") : "沿用模板"}，輸出 ${output ? output.toLocaleString("en-US") : "由上游決定"}`;
+}
+
+// 修改選擇器顯示名稱、上下文上限與輸出上限。名稱與上下文只影響模型目錄，路由器轉發時
+// 用不到，不必重啟；輸出上限由路由器在轉送 Claude 請求時套用，改了要重啟路由器才會生效
+// （restartRouter）。上游 ID、選擇器 ID、推理強度與憑證一律不變。
+export function planEditModel(manifest, settings, catalog, slug, { displayName, contextWindow, maxOutputTokens } = {}) {
+  if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
+    fail("安裝設定或模型目錄不完整，無法修改模型。");
+  }
+  const route = settings.routes.find((item) => item.pickerSlug === slug);
+  const entry = catalog.models.find((model) => model.slug === slug);
+  if (!route || !entry || !String(slug).startsWith("custom/")) fail(`所選模型不是已配置的自訂模型：${slug}`);
+
+  let name = entry.display_name || route.displayName || route.upstreamModel;
+  if (displayName !== undefined && displayName !== null) {
+    name = String(displayName).replace(/\s+/g, " ").trim();
+    if (!name) fail("顯示名稱不能是空白。");
+    if (name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) fail("顯示名稱最多 80 個字，且不能包含控制字元。");
+  }
+
+  let context = null;
+  if (contextWindow !== undefined && contextWindow !== null && contextWindow !== "") {
+    const ceiling = route.transport === "claude-cli" ? 1000000 : MAX_CONTEXT_WINDOW;
+    context = parseTokenSetting(contextWindow, { label: "上下文上限", min: MIN_CONTEXT_WINDOW, max: ceiling });
+  }
+
+  let outputPatch = null;
+  if (maxOutputTokens !== undefined && maxOutputTokens !== null && maxOutputTokens !== "") {
+    if (!routeUsesOutputSetting(route)) {
+      fail("這個模型的輸出上限由上游決定：路由器不會送出 max_output_tokens，因此無法在這裡設定。");
+    }
+    const value = parseTokenSetting(maxOutputTokens, { label: "最大輸出", min: MIN_OUTPUT_TOKENS, max: MAX_OUTPUT_TOKENS });
+    const contextLimit = context ?? positiveNumber(entry.context_window) ?? positiveNumber(route.contextWindow);
+    if (contextLimit && value > contextLimit) fail("最大輸出不能超過上下文上限。");
+    if (route.transport === "claude-cli") {
+      // CLI 路由的上限是連接時填的保守值，不是探測結果；兩者一起調整，
+      // Claude CLI 才會收到新的 CLAUDE_CODE_MAX_OUTPUT_TOKENS。
+      outputPatch = { maxOutputTokens: value, defaultMaxOutputTokens: value };
+    } else {
+      const cap = positiveNumber(route.maxOutputTokens);
+      if (cap && value > cap) {
+        fail(`最大輸出不能超過這個模型的輸出上限 ${cap.toLocaleString("en-US")}（新增時由上游回報）。`);
+      }
+      outputPatch = { defaultMaxOutputTokens: value };
+    }
+    // 與目前實際送出的值相同就不寫入，免得無謂地重啟路由器。
+    if (value === routeOutputLimit(route) && (!outputPatch.maxOutputTokens || outputPatch.maxOutputTokens === route.maxOutputTokens)) {
+      outputPatch = null;
+    }
+  }
+
+  const contextChanged = context != null && context !== entry.context_window;
+  const nameChanged = name !== entry.display_name || name !== route.displayName;
+  const routeContextChanged = context != null && route.contextWindow !== context;
+  const outputChanged = Boolean(outputPatch) && Object.entries(outputPatch).some(([key, value]) => route[key] !== value);
+  const editRoute = (item) => item.pickerSlug !== slug ? item : {
+    ...item, displayName: name, ...(context != null ? { contextWindow: context } : {}), ...(outputChanged ? outputPatch : {}),
+  };
+  const routes = settings.routes.map(editRoute);
+  return {
+    changed: nameChanged || contextChanged || routeContextChanged || outputChanged,
+    restartRouter: outputChanged,
+    restartDesktop: nameChanged || contextChanged || routeContextChanged,
+    settings: { ...settings, routes },
+    manifest: { ...manifest, routes: Array.isArray(manifest.routes) ? manifest.routes.map(editRoute) : routes },
+    catalog: {
+      ...catalog,
+      models: catalog.models.map((model) => model.slug !== slug ? model : {
+        ...model,
+        display_name: name,
+        ...(context != null ? {
+          context_window: context,
+          max_context_window: context,
+          effective_context_window_percent: model.effective_context_window_percent ?? 95,
+        } : {}),
+        ...(outputChanged && outputPatch.maxOutputTokens ? { max_output_tokens: outputPatch.maxOutputTokens } : {}),
+      }),
+    },
+  };
 }
 
 export function customCatalogEntry(officialModels, route, index) {
@@ -2630,7 +2912,9 @@ async function install() {
   }, ...otherProviders];
   // 主要供應商的項目依這次探測重建；其他供應商的沿用現有目錄裡那份。
   const allRoutes = [...routes, ...otherRoutes];
-  const currentCatalog = otherRoutes.length ? readCatalogIfExists() : null;
+  // 網頁上手動排過順序時，重新配置也保留既有模型的位置。
+  const manualOrder = readSettingsIfExists().customModelOrder === "manual";
+  const currentCatalog = otherRoutes.length || manualOrder ? readCatalogIfExists() : null;
   const customModels = arrangeCustomModels(
     officialModels,
     mergeAddedModels(officialModels, currentCatalog, allRoutes, routes),
@@ -2638,6 +2922,7 @@ async function install() {
     providers.map((provider) => provider.id),
     { providerId: primaryId, models: discovery.models },
     currentCatalog,
+    { manual: manualOrder },
   );
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
@@ -2805,6 +3090,7 @@ async function install() {
   console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
   console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
   console.log(`回退命令：${basename(scriptPath)} rollback`);
+  printManagerLauncher(installManagerLauncher());
   await offerInstalledRelayImagegen();
 }
 
@@ -2868,88 +3154,29 @@ async function addModels() {
   const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean);
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
 
-  const routes = [...existingRoutes, ...newRoutes];
-  const backupDir = join(backupsRoot, `add-model-${timestamp()}`);
-  ensureDirectory(backupDir);
-  copyIfExists(routerPath, join(backupDir, "router.mjs"));
-  copyIfExists(bridgePath, join(backupDir, "claude-bridge.mjs"));
-  backupChatBridge(backupDir);
-  copyIfExists(settingsPath, join(backupDir, "settings.json"));
-  copyIfExists(catalogPath, join(backupDir, "models.json"));
-  copyIfExists(manifestPath, join(backupDir, "install.json"));
-
-  const bundledCatalog = loadCatalogTemplates();
-  // 這裡不重問隱藏模型（add 的用意就是不重問設定），但既有的選擇要沿用，
-  // 否則加一個模型就會把強制顯示的那些又藏回去。
-  const officialModels = applyForcedVisibility(
-    bundledCatalog.models.filter((model) => !String(model.slug).startsWith("custom/")),
-    settings.forceListedModels,
-  );
-  const currentCatalog = JSON.parse(readFileSync(catalogPath, "utf8"));
-  const customModels = arrangeCustomModels(
-    officialModels,
-    mergeAddedModels(officialModels, currentCatalog, routes, newRoutes),
-    routes,
-    providers.map((item) => item.id),
-    { providerId: provider.id, models: discovery.models },
-    currentCatalog,
-  );
-  const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
-
-  try {
-    // 路由器與轉譯層一併刷新，否則 settings.version 會與實際執行的程式碼對不上。
-    writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
-    chmodSync(routerPath, 0o600);
-    writeBridgeSources();
-    writeJsonAtomic(catalogPath, combinedCatalog);
-    writeJsonAtomic(settingsPath, withProviders({ ...settings, version: INSTALLER_VERSION, routes, codexBin }, providers));
-    writeJsonAtomic(manifestPath, manifestWithProviders({
-      ...manifest,
-      version: INSTALLER_VERSION,
-      updatedAt: new Date().toISOString(),
-      routes,
-      codexBin,
-    }, providers));
-    // 路由變了但服務定義沒變，原地重啟就好——重新註冊需要提權，沒必要冒那個險。
-    restartServiceInPlace();
-    await waitForHealth(port);
-
-    await waitForPickerModels(routes);
-  } catch (error) {
-    console.error("\n添加失敗，正在還原之前的配置...");
-    copyIfExists(join(backupDir, "router.mjs"), routerPath);
-    copyIfExists(join(backupDir, "claude-bridge.mjs"), bridgePath);
-    restoreChatBridge(backupDir);
-    copyIfExists(join(backupDir, "settings.json"), settingsPath);
-    copyIfExists(join(backupDir, "models.json"), catalogPath);
-    copyIfExists(join(backupDir, "install.json"), manifestPath);
-    // 還原完必須確認服務真的回來了。之前這裡吞掉例外，結果是
-    // 「添加失敗」變成「添加失敗而且路由器停著」，所有對話都會卡住。
-    try {
-      restartServiceInPlace();
-      await waitForHealth(port);
-      console.error("已還原到添加前的配置，路由器運作正常。");
-    } catch (restartError) {
-      console.error(
-        `\n嚴重：配置已還原，但路由器沒有起來（${restartError.message}）。\n` +
-          `請手動啟動：${manualStartHint()}\n` +
-          `在它恢復之前，所有經過 127.0.0.1:${port} 的請求都會失敗。`,
-      );
-    }
-    throw error;
-  }
+  const { plan, backupDir } = await commitAddedModels(provider, newRoutes, discovery.models);
 
   printHeading("添加完成");
   console.log("本次新增：");
-  for (const route of newRoutes) {
+  for (const route of plan.added) {
     const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供應商預設值";
     console.log(`  - ${route.displayName}`);
     console.log(`    選擇器 ID：${route.pickerSlug}`);
     console.log(`    推理強度：${effortText}`);
   }
-  console.log(`\n現共 ${routes.length} 個自訂模型。`);
+  console.log(`\n現共 ${plan.settings.routes.length} 個自訂模型。`);
   console.log(`備份：${backupDir}`);
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
+}
+
+// 探測完才寫入：探測可能花上一分鐘，期間設定或官方目錄可能被更新，因此以最新的檔案規劃。
+// 這裡不重問隱藏模型，但既有的強制顯示設定由 planAddModels 沿用。路由器與轉譯層一併刷新，
+// 否則 settings.version 會與實際執行的程式碼對不上；失敗時 commitRouterChange 會還原並確認服務回來。
+async function commitAddedModels(provider, newRoutes, discoveredModels) {
+  const { manifest, settings, catalog } = requireInstallation();
+  const plan = planAddModels(manifest, settings, catalog, loadCatalogTemplates(), provider, newRoutes, discoveredModels);
+  const backupDir = await commitRouterChange("add-model", plan);
+  return { plan, backupDir };
 }
 
 export function planRemoveModels(manifest, settings, catalog, selectedSlugs) {
@@ -3019,95 +3246,53 @@ async function removeModels() {
   }
   const selectedSlugs = parseSelection(answer, available.length)
     .map(index => available[index].pickerSlug);
-  let plan = planRemoveModels(manifest, settings, catalog, selectedSlugs);
-  let userConfig = await readUserConfig();
+  const preview = planRemoveModels(manifest, settings, catalog, selectedSlugs);
+  const userConfig = await readUserConfig();
   const defaultModel = removedDefaultModel(userConfig.config, selectedSlugs);
   console.log("\n即將刪除：");
-  for (const route of plan.removed) console.log(`  - ${route.displayName || route.upstreamModel}`);
+  for (const route of preview.removed) console.log(`  - ${route.displayName || route.upstreamModel}`);
   if (defaultModel) console.log("這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
   console.log("使用上述模型的既有任務需切換到其他模型後才能繼續。");
   if (!(await confirm("確認刪除所選自訂模型？", false))) {
     console.log("未進行任何修改。");
     return;
   }
-  // 確認期間官方清單或路由可能剛好更新；只按仍然存在的精確 slug 刪除。
-  userConfig = await readUserConfig();
-  if (removedDefaultModel(userConfig.config, selectedSlugs) !== defaultModel) {
-    fail("全域預設模型在確認期間變更，請重新執行刪除。" );
-  }
-  const currentManifest = readManifest();
-  const currentSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
-  const currentCatalog = JSON.parse(readFileSync(catalogPath, "utf8"));
-  plan = planRemoveModels(currentManifest, currentSettings, currentCatalog, selectedSlugs);
-  const port = Number(currentSettings.port ?? currentManifest.port);
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) fail("現有安裝沒有可用的連接埠設定。");
-
-  const backupDir = join(backupsRoot, `remove-model-${timestamp()}`);
-  ensureDirectory(backupDir);
-  for (const [source, name] of [
-    [routerPath, "router.mjs"], [bridgePath, "claude-bridge.mjs"],
-    [settingsPath, "settings.json"], [catalogPath, "models.json"],
-    [manifestPath, "install.json"],
-  ]) {
-    if (!copyIfExists(source, join(backupDir, name))) fail(`無法備份 ${name}，已取消刪除。`);
-  }
-  backupChatBridge(backupDir);
-  if (defaultModel && !copyIfExists(userConfig.filePath, join(backupDir, "config.toml"))) {
-    fail("無法備份全域預設模型設定，已取消刪除。");
-  }
-
-  let configChangeAttempted = false;
-  try {
-    writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
-    chmodSync(routerPath, 0o600);
-    writeBridgeSources();
-    writeJsonAtomic(catalogPath, plan.catalog);
-    writeJsonAtomic(settingsPath, plan.settings);
-    writeJsonAtomic(manifestPath, { ...plan.manifest, updatedAt: new Date().toISOString() });
-    restartServiceInPlace();
-    await waitForHealth(port);
-    if (defaultModel) {
-      configChangeAttempted = true;
-      await writeConfigEdits([{ keyPath: "model", value: null }]);
-      if (deepGet((await readUserConfig()).config, "model").present) {
-        fail("全域預設模型設定未成功清除。");
-      }
-    }
-    await waitForPickerModels(plan.settings.routes, selectedSlugs);
-  } catch (error) {
-    console.error("\n刪除失敗，正在還原之前的配置...");
-    const restoreFailures = [];
-    for (const [name, target] of [
-      ["router.mjs", routerPath], ["claude-bridge.mjs", bridgePath],
-      ["settings.json", settingsPath], ["models.json", catalogPath],
-      ["install.json", manifestPath],
-    ]) {
-      try {
-        if (!copyIfExists(join(backupDir, name), target)) fail(`找不到 ${name} 備份。`);
-      } catch (restoreError) { restoreFailures.push(`${name}：${restoreError.message}`); }
-    }
-    try { restoreChatBridge(backupDir); }
-    catch (restoreError) { restoreFailures.push(`chat-bridge.mjs：${restoreError.message}`); }
-    if (configChangeAttempted) {
-      try { await writeConfigEdits([{ keyPath: "model", value: defaultModel }]); }
-      catch (restoreError) { restoreFailures.push(`全域預設模型：${restoreError.message}`); }
-    }
-    try {
-      restartServiceInPlace();
-      await waitForHealth(port);
-      if (restoreFailures.length === 0) console.error("已還原到刪除前的配置，路由器運作正常。");
-    } catch (restartError) {
-      restoreFailures.push(`路由器無法啟動：${restartError.message}；請手動啟動：${manualStartHint()}`);
-    }
-    if (restoreFailures.length) console.error(`\n還原未完成：${restoreFailures.join("；")}。備份：${backupDir}`);
-    throw error;
-  }
+  const { plan, backupDir } = await executeRemoveModels(selectedSlugs, { expectedDefault: defaultModel });
 
   printHeading("刪除完成");
   console.log(`已刪除 ${plan.removed.length} 個自訂模型，剩餘 ${plan.settings.routes.length} 個。`);
   if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
   console.log(`備份：${backupDir}`);
   console.log(`請完全退出並重新打開 ${desktopAppName}。`);
+}
+
+// 刪除模型的寫入段，終端與網頁共用。以最新的檔案重新規劃，只按仍然存在的精確 slug 刪除；
+// 全域預設模型指向被刪的模型時一併清除，失敗時連同 config.toml 一起還原。
+// expectedDefault：互動流程確認前看到的預設模型；確認期間被改過就停下來，不憑舊資訊動手。
+async function executeRemoveModels(selectedSlugs, { expectedDefault } = {}) {
+  const userConfig = await readUserConfig();
+  const defaultModel = removedDefaultModel(userConfig.config, selectedSlugs);
+  if (expectedDefault !== undefined && defaultModel !== expectedDefault) {
+    fail("全域預設模型在確認期間變更，請重新執行刪除。" );
+  }
+  const { manifest, settings, catalog } = requireInstallation();
+  if (!existsSync(routerPath) || !existsSync(bridgePath)) {
+    fail("路由器程式檔案不完整，請先執行 update 修復安裝。");
+  }
+  const plan = planRemoveModels(manifest, settings, catalog, selectedSlugs);
+  const backupDir = await commitRouterChange("remove-model", {
+    ...plan,
+    absent: selectedSlugs,
+    configFile: defaultModel ? userConfig.filePath : null,
+    apply: defaultModel ? clearDefaultModel : null,
+    restore: defaultModel ? () => writeConfigEdits([{ keyPath: "model", value: defaultModel }]) : null,
+  });
+  return { plan, defaultModel, backupDir };
+}
+
+async function clearDefaultModel() {
+  await writeConfigEdits([{ keyPath: "model", value: null }]);
+  if (deepGet((await readUserConfig()).config, "model").present) fail("全域預設模型設定未成功清除。");
 }
 
 // --- 管理供應商 ---------------------------------------------------------------
@@ -3136,6 +3321,7 @@ export function planAddProvider(manifest, settings, catalog, templates, provider
     nextProviders.map((item) => item.id),
     { providerId: provider.id, models: discoveredModels },
     catalog,
+    { manual: settings.customModelOrder === "manual" },
   );
   return {
     providers: nextProviders,
@@ -3250,6 +3436,35 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
   return backupDir;
 }
 
+// 只改模型目錄與路由描述（排序、顯示名稱、上下文上限）時用：路由器轉發用不到這些欄位，
+// 每次回應 /models 又會重讀 models.json，所以不重啟路由器，進行中的對話也不會斷線。
+// 寫完以 Codex 的 model/list 確認目錄仍可讀、模型都在；失敗就還原三個檔案。
+async function commitCatalogChange(label, { settings, manifest, catalog }) {
+  const backupDir = join(backupsRoot, `${label}-${timestamp()}`);
+  ensureDirectory(backupDir);
+  const files = [[settingsPath, "settings.json"], [catalogPath, "models.json"], [manifestPath, "install.json"]];
+  for (const [source, name] of files) {
+    if (!copyIfExists(source, join(backupDir, name))) fail(`無法備份 ${name}，已取消。`);
+  }
+  try {
+    writeJsonAtomic(catalogPath, catalog);
+    writeJsonAtomic(settingsPath, settings);
+    writeJsonAtomic(manifestPath, { ...manifest, updatedAt: new Date().toISOString() });
+    await waitForPickerModels(settings.routes);
+  } catch (error) {
+    console.error("\n修改失敗，正在還原之前的配置...");
+    const failures = [];
+    for (const [target, name] of files) {
+      try {
+        if (!copyIfExists(join(backupDir, name), target)) failures.push(`找不到 ${name} 備份`);
+      } catch (restoreError) { failures.push(`${name}：${restoreError.message}`); }
+    }
+    console.error(failures.length ? `還原未完成：${failures.join("；")}。備份：${backupDir}` : "已還原到修改前的配置。");
+    throw error;
+  }
+  return backupDir;
+}
+
 export function claudeCliModelChoices(routes = [], discovered = []) {
   const choices = [];
   for (const model of discovered) {
@@ -3282,13 +3497,19 @@ export function parseClaudeCliSelection(value, choices) {
   return models;
 }
 
-export function planClaudeCliModels(state, binary, models, contextWindow = 200000, resolvedModels = {}) {
+// maxOutputTokens：網頁新增時填的輸出上限，同時寫成模型上限與預設輸出（Claude CLI 會把
+// 超過模型上限的值自動壓到上限）。終端流程不傳，維持原本的保守值 32,000。
+export function planClaudeCliModels(state, binary, models, contextWindow = 200000, resolvedModels = {},
+  { maxOutputTokens = null } = {}) {
   if (!models.length || models.some((model) => !/^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/.test(model))) {
     fail("請填寫 opus、sonnet、haiku、fable 或完整 claude-* 模型名稱。");
   }
   if (!Number.isSafeInteger(contextWindow) || contextWindow < 16000 || contextWindow > 1000000) {
     fail("上下文上限必須介於 16000 與 1000000。");
   }
+  const output = maxOutputTokens === null || maxOutputTokens === undefined ? null
+    : parseTokenSetting(maxOutputTokens, { label: "最大輸出", min: MIN_OUTPUT_TOKENS, max: MAX_OUTPUT_TOKENS });
+  if (output && output > contextWindow) fail("最大輸出不能超過上下文上限。");
   if (state.providers.some((provider) => provider.id === "claude-cli")) fail("既有供應商名稱與 Claude CLI 保留名稱衝突，請先更名。");
   const unique = new Map(models.map((model) => [resolvedModels[model] || model, model]));
   const newRoutes = [...unique].map(([resolved, requested]) => {
@@ -3299,7 +3520,7 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
       requestedModel: requested,
       displayName: `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
       transport: "claude-cli", translate: "anthropic", efforts: [...EFFORTS],
-      contextWindow, maxOutputTokens: 32000,
+      contextWindow, maxOutputTokens: output ?? 32000, ...(output ? { defaultMaxOutputTokens: output } : {}),
     };
   });
   const replaced = new Set(newRoutes.map((route) => route.pickerSlug));
@@ -3368,8 +3589,15 @@ export function claudeCliInstallCommand(platform, directory) {
 }
 
 async function runClaudeCliSetup(command, args, directory, environment) {
+  // 網頁管理介面沒有終端機可以直接顯示，改以管線收集輸出，顯示在操作記錄裡。
+  const capture = managerMode;
   await new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd: directory, env: environment, stdio: "inherit", windowsHide: false });
+    const child = spawn(command, args, { cwd: directory, env: environment,
+      stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit", windowsHide: capture });
+    if (capture) {
+      child.stdout.on("data", (chunk) => process.stdout.write(chunk));
+      child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+    }
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, 300000);
     child.once("error", () => { clearTimeout(timer); reject(new Error("無法啟動 Claude 安裝／更新程式，路由配置未修改。")); });
@@ -3381,19 +3609,37 @@ async function runClaudeCliSetup(command, args, directory, environment) {
   });
 }
 
-async function configureClaudeCli(subcommand = null) {
-  if (subcommand && !["status", "login"].includes(subcommand)) fail("用法：claude-cli [status|login]");
-  const state = requireInstallation();
-  const transport = await import(`data:text/javascript;base64,${Buffer.from(loadClaudeCliSource()).toString("base64")}`);
-  const inspect = () => {
-    const binary = findExecutable([env.CODEX_MODEL_ROUTER_CLAUDE_BIN, state.settings.claudeCli?.binary,
-      join(homeDir, ".local", "bin", isWindows ? "claude.exe" : "claude"), commandPath(isWindows ? "claude.exe" : "claude")]);
-    if (!binary) return null;
-    const result = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 15000, maxBuffer: 65536, windowsHide: true });
-    const version = result.status === 0 ? /\b(\d+\.\d+\.\d+)\b/.exec(result.stdout || "")?.[1] : null;
-    return { binary, version };
-  };
-  const setup = { inspect, consent: confirmClaudeCliChange, readOnly: subcommand === "status",
+function claudeCliBinaryCandidates(settings) {
+  return [env.CODEX_MODEL_ROUTER_CLAUDE_BIN, settings?.claudeCli?.binary,
+    join(homeDir, ".local", "bin", isWindows ? "claude.exe" : "claude"), commandPath(isWindows ? "claude.exe" : "claude")];
+}
+
+const claudeCliVersionOf = (output) => /\b(\d+\.\d+\.\d+)\b/.exec(output || "")?.[1] || null;
+
+function inspectClaudeCli(settings = readSettingsIfExists()) {
+  const binary = findExecutable(claudeCliBinaryCandidates(settings));
+  if (!binary) return null;
+  const result = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 15000, maxBuffer: 65536, windowsHide: true });
+  return { binary, version: result.status === 0 ? claudeCliVersionOf(result.stdout) : null };
+}
+
+// 非同步版本：網頁查詢狀態時不阻塞管理頁回應其他請求。
+async function inspectClaudeCliAsync(settings = readSettingsIfExists()) {
+  const binary = findExecutable(claudeCliBinaryCandidates(settings));
+  if (!binary) return null;
+  const result = await commandOutput(binary, ["--version"], { timeoutMs: 15000 });
+  return { binary, version: result.status === 0 ? claudeCliVersionOf(result.stdout) : null };
+}
+
+let claudeCliTransport = null;
+function loadClaudeCliTransport() {
+  claudeCliTransport ??= import(`data:text/javascript;base64,${Buffer.from(loadClaudeCliSource()).toString("base64")}`);
+  return claudeCliTransport;
+}
+
+// 只使用 Anthropic 官方安裝程式與 claude update；呼叫端必須先取得使用者明確同意。
+function claudeCliSetupActions(transport) {
+  return {
     install: async () => {
       const directory = mkdtempSync(join(tmpdir(), "codex-claude-install-"));
       try {
@@ -3415,6 +3661,67 @@ async function configureClaudeCli(subcommand = null) {
       await runClaudeCliSetup(binary, ["update"], backup, transport.claudeCliEnvironment());
     },
   };
+}
+
+// 每個模型送一次短測試（使用訂閱用量）。只有回傳完整文字、正常結束、且帶有明確模型版本
+// 的才算通過，並記下實際的模型 ID。遇到「需要較新的 CLI」時交給 onUpgradeRequired（終端會
+// 詢問是否更新）；沒有提供時記為未通過，不會自動安裝任何東西。
+export async function testClaudeCliModels(transport, { binary, version, models, onUpgradeRequired = null }) {
+  const passed = [];
+  const resolvedModels = {};
+  const failures = {};
+  const probe = async (model) => {
+    const response = await transport.fetchClaudeCli({ model, max_tokens: 1024, system: "Reply briefly.",
+      messages: [{ role: "user", content: "Reply with OK only." }] }, { binary, effort: "medium", timeoutMs: 45000 });
+    if (!response.ok) return { events: [], failure: (await response.json()).error || { message: "Claude CLI 無法使用。" } };
+    const text = await response.text();
+    const events = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+    return { events, failure: events.find((event) => event.type === "error")?.error };
+  };
+  for (const model of models) {
+    console.log(`正在測試 Claude CLI：${model}...`);
+    let { events, failure } = await probe(model);
+    if (failure?.type === "claude_cli_upgrade_required" && /^\d+\.\d+\.\d+$/.test(failure.requiredVersion || "")
+      && compareVersions(version, failure.requiredVersion) < 0) {
+      console.log(`  ${failure.message}`);
+      if (!onUpgradeRequired) {
+        failures[model] = failure.message;
+        continue;
+      }
+      const updated = await onUpgradeRequired(failure.requiredVersion);
+      if (!updated) return { cancelled: true, passed, resolvedModels, failures, binary, version };
+      ({ binary, version } = updated);
+      console.log(`CLI 已更新至 ${version}，重新測試 ${model} 一次。`);
+      ({ events, failure } = await probe(model));
+    }
+    const stop = events.find((event) => event.type === "message_delta")?.delta?.stop_reason;
+    const hasText = events.some((event) => event.delta?.text?.trim() || event.content_block?.text?.trim());
+    const resolved = events.find((event) => event.type === "message_start")?.message?.model;
+    if (!failure && hasText && stop === "end_turn" && events.some((event) => event.type === "message_stop")) {
+      if (typeof resolved !== "string" || !/^claude-[a-zA-Z0-9._-]+$/.test(resolved) || !/\d/.test(resolved)) {
+        console.log("  未添加：回應沒有明確的模型版本編號，無法可靠標示實際模型。");
+        failures[model] = "回應沒有明確的模型版本編號。";
+        continue;
+      }
+      console.log(`  實際模型：${model} → ${resolved}`);
+      resolvedModels[model] = resolved;
+      passed.push(model);
+    } else {
+      const message = failure?.message || "沒有收到完整的文字回應。";
+      console.log(`  未通過：${message}`);
+      failures[model] = message;
+    }
+  }
+  return { cancelled: false, passed, resolvedModels, failures, binary, version };
+}
+
+async function configureClaudeCli(subcommand = null) {
+  if (subcommand && !["status", "login"].includes(subcommand)) fail("用法：claude-cli [status|login]");
+  const state = requireInstallation();
+  const transport = await loadClaudeCliTransport();
+  const actions = claudeCliSetupActions(transport);
+  const setup = { inspect: () => inspectClaudeCli(state.settings), consent: confirmClaudeCliChange,
+    readOnly: subcommand === "status", install: actions.install, update: actions.update };
   const ready = await ensureClaudeCliReady(setup);
   if (!ready) { console.log(subcommand === "status" ? "Claude CLI：未安裝。" : "已取消，路由配置未修改。"); return; }
   let { binary, version } = ready;
@@ -3452,42 +3759,11 @@ async function configureClaudeCli(subcommand = null) {
   if (Number(userConfig.config.model_context_window) > contextWindow) {
     console.log(`注意：全域 model_context_window=${userConfig.config.model_context_window} 可能覆蓋此模型的 ${contextWindow} 設定；本功能不修改全域值，請先用短對話測試。`);
   }
-  const passed = [];
-  const resolvedModels = {};
-  const probe = async (model) => {
-    const response = await transport.fetchClaudeCli({ model, max_tokens: 1024, system: "Reply briefly.",
-      messages: [{ role: "user", content: "Reply with OK only." }] }, { binary, effort: "medium", timeoutMs: 45000 });
-    if (!response.ok) return { events: [], failure: (await response.json()).error || { message: "Claude CLI 無法使用。" } };
-    const text = await response.text();
-    const events = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
-    return { events, failure: events.find((event) => event.type === "error")?.error };
-  };
-  for (const model of models) {
-    console.log(`正在測試 Claude CLI：${model}...`);
-    let { events, failure } = await probe(model);
-    if (failure?.type === "claude_cli_upgrade_required" && /^\d+\.\d+\.\d+$/.test(failure.requiredVersion || "")
-      && compareVersions(version, failure.requiredVersion) < 0) {
-      console.log(`  ${failure.message}`);
-      const updated = await ensureClaudeCliReady({ ...setup, minimumVersion: failure.requiredVersion });
-      if (!updated) { console.log("已取消，路由配置未修改。"); return; }
-      ({ binary, version } = updated);
-      console.log(`CLI 已更新至 ${version}，重新測試 ${model} 一次。`);
-      ({ events, failure } = await probe(model));
-    }
-    const stop = events.find((event) => event.type === "message_delta")?.delta?.stop_reason;
-    const hasText = events.some((event) => event.delta?.text?.trim() || event.content_block?.text?.trim());
-    const resolved = events.find((event) => event.type === "message_start")?.message?.model;
-    if (!failure && hasText && stop === "end_turn" && events.some((event) => event.type === "message_stop")) {
-      if (typeof resolved !== "string" || !/^claude-[a-zA-Z0-9._-]+$/.test(resolved) || !/\d/.test(resolved)) {
-        console.log("  未添加：回應沒有明確的模型版本編號，無法可靠標示實際模型。");
-        continue;
-      }
-      console.log(`  實際模型：${model} → ${resolved}`);
-      resolvedModels[model] = resolved;
-      passed.push(model);
-    }
-    else console.log(`  未通過：${failure?.message || "沒有收到完整的文字回應。"}`);
-  }
+  const tested = await testClaudeCliModels(transport, { binary, version, models,
+    onUpgradeRequired: (requiredVersion) => ensureClaudeCliReady({ ...setup, minimumVersion: requiredVersion }) });
+  if (tested.cancelled) { console.log("已取消，路由配置未修改。"); return; }
+  binary = tested.binary;
+  const { passed, resolvedModels } = tested;
   if (!passed.length) { console.log("沒找到可用模型，路由配置未修改。"); return; }
   // Re-read after login/probing; never overwrite intervening catalog refreshes.
   const plan = planClaudeCliModels(requireInstallation(), binary, passed, contextWindow, resolvedModels);
@@ -3595,7 +3871,7 @@ async function addProvider() {
 }
 
 async function removeProvider() {
-  let { manifest, settings, catalog, providers } = requireInstallation();
+  const { manifest, settings, catalog, providers } = requireInstallation();
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   printHeading("移除供應商");
   if (providers.length <= 1) {
@@ -3607,14 +3883,14 @@ async function removeProvider() {
     console.log("未進行任何修改。");
     return;
   }
-  let plan = planRemoveProvider(manifest, settings, catalog, chosen.id);
-  let userConfig = await readUserConfig();
-  const defaultModel = removedDefaultModel(userConfig.config, plan.removedRoutes.map((route) => route.pickerSlug));
+  const preview = planRemoveProvider(manifest, settings, catalog, chosen.id);
+  const userConfig = await readUserConfig();
+  const defaultModel = removedDefaultModel(userConfig.config, preview.removedRoutes.map((route) => route.pickerSlug));
   const imagegen = relayConfig();
   const imagegenAffected = Boolean(imagegen) && (imagegen.providerId ?? DEFAULT_PROVIDER_ID) === chosen.id;
-  console.log(`\n即將移除供應商「${chosen.id}」（${chosen.baseUrl}）與它的 ${plan.removedRoutes.length} 個模型：`);
-  for (const route of plan.removedRoutes) console.log(`  - ${route.displayName || route.upstreamModel}`);
-  if (providers[0].id === chosen.id) console.log(`移除後由「${plan.providers[0].id}」擔任主要供應商。`);
+  console.log(`\n即將移除供應商「${chosen.id}」（${chosen.baseUrl}）與它的 ${preview.removedRoutes.length} 個模型：`);
+  for (const route of preview.removedRoutes) console.log(`  - ${route.displayName || route.upstreamModel}`);
+  if (providers[0].id === chosen.id) console.log(`移除後由「${preview.providers[0].id}」擔任主要供應商。`);
   if (defaultModel) console.log("這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
   if (imagegenAffected) console.log("中轉 API 生圖使用這家供應商，會一併停用；之後可從選單重新設定。");
   console.log("使用上述模型的既有任務需切換到其他模型後才能繼續。");
@@ -3622,22 +3898,36 @@ async function removeProvider() {
     console.log("未進行任何修改。");
     return;
   }
-  // 確認期間設定可能被其他命令改過，以最新的檔案重新規劃。
-  ({ manifest, settings, catalog } = requireInstallation());
-  plan = planRemoveProvider(manifest, settings, catalog, chosen.id);
+  const { plan, backupDir } = await executeRemoveProvider(chosen.id, { expectedDefault: defaultModel });
+
+  printHeading("移除完成");
+  console.log(`已移除供應商「${chosen.id}」與 ${plan.removedRoutes.length} 個模型，剩餘 ${plan.providers.length} 家供應商。`);
+  if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
+  console.log(`備份：${backupDir}`);
+  if (await confirm(`是否從${secretStoreLabel}中刪除「${chosen.id}」的 API Key？`, true)) {
+    deleteApiKey(chosen.keychainService, chosen.keychainAccount || "codex");
+  }
+  console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
+}
+
+// 移除供應商的寫入段，終端與網頁共用：以最新檔案重新規劃，必要時清除全域預設模型，
+// 這家供應商負責中轉生圖時一併停用該技能。是否刪除 API Key 由呼叫端決定。
+async function executeRemoveProvider(providerId, { expectedDefault } = {}) {
+  const { manifest, settings, catalog } = requireInstallation();
+  const plan = planRemoveProvider(manifest, settings, catalog, providerId);
   const removedSlugs = plan.removedRoutes.map((route) => route.pickerSlug);
-  userConfig = await readUserConfig();
-  if (removedDefaultModel(userConfig.config, removedSlugs) !== defaultModel) {
+  const userConfig = await readUserConfig();
+  const defaultModel = removedDefaultModel(userConfig.config, removedSlugs);
+  if (expectedDefault !== undefined && defaultModel !== expectedDefault) {
     fail("全域預設模型在確認期間變更，請重新執行。");
   }
+  const imagegen = relayConfig();
+  const imagegenAffected = Boolean(imagegen) && (imagegen.providerId ?? DEFAULT_PROVIDER_ID) === providerId;
   const backupDir = await commitRouterChange("remove-provider", {
     ...plan,
     absent: removedSlugs,
     configFile: defaultModel ? userConfig.filePath : null,
-    apply: defaultModel ? async () => {
-      await writeConfigEdits([{ keyPath: "model", value: null }]);
-      if (deepGet((await readUserConfig()).config, "model").present) fail("全域預設模型設定未成功清除。");
-    } : null,
+    apply: defaultModel ? clearDefaultModel : null,
     restore: defaultModel ? () => writeConfigEdits([{ keyPath: "model", value: defaultModel }]) : null,
   });
   if (imagegenAffected) {
@@ -3648,15 +3938,7 @@ async function removeProvider() {
       console.error(`中轉 API 生圖未能停用：${error.message}。請從選單重新設定或停用。`);
     }
   }
-
-  printHeading("移除完成");
-  console.log(`已移除供應商「${chosen.id}」與 ${plan.removedRoutes.length} 個模型，剩餘 ${plan.providers.length} 家供應商。`);
-  if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
-  console.log(`備份：${backupDir}`);
-  if (await confirm(`是否從${secretStoreLabel}中刪除「${chosen.id}」的 API Key？`, true)) {
-    deleteApiKey(chosen.keychainService, chosen.keychainAccount || "codex");
-  }
-  console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
+  return { plan, defaultModel, imagegenAffected, backupDir };
 }
 
 async function replaceProviderKey() {
@@ -3901,10 +4183,23 @@ async function update() {
   try { refreshRelayImagegen(); } catch (error) {
     console.error(`路由器已更新，中轉生圖技能保持原狀：${error.message}`);
   }
+  printManagerLauncher(installManagerLauncher());
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
-async function manageHiddenModels() {
+// 可強制顯示的隱藏官方模型：Codex 內建目錄標成 hide 的項目，並標出目前已強制顯示的。
+export function hiddenModelChoices(bundledCatalog, forceListed = []) {
+  const official = (bundledCatalog?.models || []).filter((model) => !String(model?.slug || "").startsWith("custom/"));
+  const forced = new Set(normalizeForceListedModels(official, forceListed));
+  return official.filter((model) => model?.visibility === "hide").map((model) => ({
+    slug: model.slug,
+    displayName: model.display_name || model.slug,
+    description: typeof model.description === "string" ? model.description : "",
+    forced: forced.has(model.slug),
+  }));
+}
+
+function requireHiddenModelsInstallation() {
   const manifest = readManifest();
   if (manifest?.version) assertInstallerNotOlder(manifest.version);
   if (!manifest) {
@@ -3922,9 +4217,13 @@ async function manageHiddenModels() {
   const currentCatalog = JSON.parse(readFileSync(catalogPath, "utf8"));
   const port = Number(settings.port ?? manifest.port);
   if (!Number.isFinite(port) || port <= 0) fail("現有安裝沒有可用的連接埠設定。");
+  return { settings, currentCatalog, port };
+}
 
-  printHeading("管理隱藏的官方模型");
-  const bundledCatalog = loadBundledCatalog();
+// 寫入強制顯示的清單並重啟路由器（路由器啟動時才讀這個設定），再以 Codex 實際讀到的
+// 目錄驗證；任何一步失敗就還原檔案並確認路由器回來。終端選單與網頁共用。
+async function executeHiddenModels(requested, { bundledCatalog = loadBundledCatalog() } = {}) {
+  const { settings, currentCatalog, port } = requireHiddenModelsInstallation();
   const officialModels = bundledCatalog.models.filter(
     (model) => !String(model?.slug || "").startsWith("custom/"),
   );
@@ -3932,10 +4231,7 @@ async function manageHiddenModels() {
     officialModels,
     settings.forceListedModels,
   );
-  const chosen = normalizeForceListedModels(
-    officialModels,
-    await chooseForcedModels(officialModels, previous),
-  );
+  const chosen = normalizeForceListedModels(officialModels, requested);
   const combinedCatalog = mergeCatalogForForcedModels(
     bundledCatalog,
     currentCatalog,
@@ -3949,9 +4245,7 @@ async function manageHiddenModels() {
     JSON.stringify(currentCatalog) === JSON.stringify(combinedCatalog);
 
   if (unchanged) {
-    console.log("\n設定沒有變更，未重寫模型目錄或重啟路由器。");
-    console.log(`目前強制顯示 ${chosen.length} 個隱藏模型。`);
-    return;
+    return { changed: false, chosen, customCount: customSlugs.length };
   }
 
   const backupDir = join(backupsRoot, `hidden-models-${timestamp()}`);
@@ -4009,16 +4303,32 @@ async function manageHiddenModels() {
     }
     throw error;
   }
+  return { changed: true, chosen, health, customCount: customSlugs.length, backupDir };
+}
 
+async function manageHiddenModels() {
+  const { settings } = requireHiddenModelsInstallation();
+  printHeading("管理隱藏的官方模型");
+  const bundledCatalog = loadBundledCatalog();
+  const officialModels = bundledCatalog.models.filter(
+    (model) => !String(model?.slug || "").startsWith("custom/"),
+  );
+  const previous = normalizeForceListedModels(officialModels, settings.forceListedModels);
+  const result = await executeHiddenModels(await chooseForcedModels(officialModels, previous), { bundledCatalog });
+  if (!result.changed) {
+    console.log("\n設定沒有變更，未重寫模型目錄或重啟路由器。");
+    console.log(`目前強制顯示 ${result.chosen.length} 個隱藏模型。`);
+    return;
+  }
   printHeading("隱藏模型設定完成");
   console.log(
-    chosen.length
-      ? `已強制顯示 ${chosen.length} 個模型：${chosen.join(", ")}`
+    result.chosen.length
+      ? `已強制顯示 ${result.chosen.length} 個模型：${result.chosen.join(", ")}`
       : "已恢復預設，不強制顯示任何隱藏模型。",
   );
-  console.log(`健康檢查：${health?.status || "未知"}`);
-  console.log(`保留 ${customSlugs.length} 個自訂模型。`);
-  console.log(`備份：${backupDir}`);
+  console.log(`健康檢查：${result.health?.status || "未知"}`);
+  console.log(`保留 ${result.customCount} 個自訂模型。`);
+  console.log(`備份：${result.backupDir}`);
   console.log(`\n請完全退出並重新打開 ${desktopAppName}，模型選擇器才會刷新。`);
 }
 
@@ -4245,9 +4555,8 @@ async function configureRelayImagegen() {
   const testAnswer = await ask("選擇要偵測的模型編號（逗號分隔或 all；none 停用；cancel 返回）", defaultTests);
   if (/^cancel$/i.test(testAnswer)) return;
   if (/^none$/i.test(testAnswer)) {
-    if (!current) { console.log("中轉 API 生圖尚未啟用。"); return; }
-    const backup = join(backupsRoot, `imagegen-disabled-${timestamp()}`);
-    archiveRelayImageSkill(backup);
+    const backup = disableRelayImagegen();
+    if (!backup) { console.log("中轉 API 生圖尚未啟用。"); return; }
     console.log(`已停用，技能可從備份恢復：${backup}`);
     return;
   }
@@ -4257,6 +4566,22 @@ async function configureRelayImagegen() {
   const provider = providers.length === 1
     ? providers[0]
     : await chooseProvider(providers, settings.routes || [], "用哪一家供應商生圖", { preferredId: currentProviderId });
+  await runRelayImagegenSetup({ provider, selected, current, settings, providers });
+}
+
+// 停用中轉生圖：把技能封存到備份目錄，可以原樣搬回來恢復。尚未啟用時回傳 null。
+function disableRelayImagegen() {
+  if (!relayConfig()) return null;
+  const backup = join(backupsRoot, `imagegen-disabled-${timestamp()}`);
+  archiveRelayImageSkill(backup);
+  return backup;
+}
+
+// 偵測並啟用中轉生圖，終端選單與網頁共用：推斷名稱前綴、只對勾選的模型實際生圖
+// （先通用介面，全部失敗才改 Ark 任務介面）、保存測試圖，再安裝技能。
+// 沒有模型通過時不動既有技能，回傳 available 為空陣列。
+async function runRelayImagegenSetup({ provider, selected, current, settings, providers }) {
+  const currentProviderId = current ? current.providerId ?? DEFAULT_PROVIDER_ID : null;
   const apiKey = readApiKey(provider.keychainService);
   console.log("正在查詢模型名稱與前綴...");
   let names = [];
@@ -4287,7 +4612,7 @@ async function configureRelayImagegen() {
     });
   } catch { /* 診斷寫檔失敗不影響模型結果與技能安裝。 */ }
   const available = discovery.models;
-  if (!available.length) { console.log("沒找到可用模型。"); return; }
+  if (!available.length) { console.log("沒找到可用模型。"); return { available: [], discovery }; }
   for (const model of available) {
     ensureDirectory(probeRoot);
     const imagePath = join(probeRoot, `${model.id}.png`);
@@ -4305,6 +4630,7 @@ async function configureRelayImagegen() {
   if (result.preserved.length) console.log(`保留手動修改的檔案：${result.preserved.join(", ")}`);
   console.log("請建立新任務使用 $router-imagegen；若尚未出現，重新啟動 Codex。所選模型已通過本次生圖測試。");
   if (discovery.apiMode === "ark-task") console.log("Ark 生圖需要此版本的本機路由器；若只執行了 imagegen，請執行同一份安裝器的 update 更新路由器。");
+  return { available, discovery, result, probeRoot };
 }
 
 export async function offerRelayImagegen({ existing = null, consent, configure, refresh } = {}) {
@@ -4332,34 +4658,48 @@ async function offerInstalledRelayImagegen() {
   }
 }
 
-export async function configureMillionTokenContext() {
+// 全域上下文（config.toml 的 model_context_window）會覆蓋所有模型自己的上下文。
+// null 表示移除這個設定，讓各模型回到自己的上下文。
+export function normalizeGlobalContextWindow(value) {
+  if (value === undefined || value === null || value === "") return null;
+  return parseTokenSetting(value, { label: "全域上下文", min: MIN_CONTEXT_WINDOW, max: MAX_CONTEXT_WINDOW });
+}
+
+// 經由 Codex 的設定 API 寫入，不直接改 config.toml；先備份，驗證不符就寫回原值。
+async function setGlobalContextWindow(value, { label = "global-context" } = {}) {
   if (!codexBin) fail("未找到 Codex CLI。");
+  const target = normalizeGlobalContextWindow(value);
   const userConfig = await readUserConfig();
   const previous = deepGet(userConfig.config, "model_context_window");
-  if (previous.value === 1000000) {
-    console.log("全域上下文已是 1,000,000 tokens，無需修改。");
-    return;
+  const previousValue = previous.present ? previous.value : null;
+  if (target === null ? !previous.present : previousValue === target) {
+    return { changed: false, previous: previousValue, value: target, filePath: userConfig.filePath };
   }
-  const backupDir = join(backupsRoot, `context-1m-${timestamp()}`);
+  const backupDir = join(backupsRoot, `${label}-${timestamp()}`);
   ensureDirectory(backupDir);
   copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
   try {
-    await writeConfigEdits([{ keyPath: "model_context_window", value: 1000000 }]);
-    const verified = await readUserConfig();
-    if (deepGet(verified.config, "model_context_window").value !== 1000000) {
-      fail("全域上下文配置驗證失敗。");
-    }
+    await writeConfigEdits([{ keyPath: "model_context_window", value: target }]);
+    const verified = deepGet((await readUserConfig()).config, "model_context_window");
+    if (target === null ? verified.present : verified.value !== target) fail("全域上下文配置驗證失敗。");
   } catch (error) {
     try {
-      await writeConfigEdits([
-        { keyPath: "model_context_window", value: previous.present ? previous.value : null },
-      ]);
+      await writeConfigEdits([{ keyPath: "model_context_window", value: previousValue }]);
     } catch (restoreError) {
       console.error(`配置還原失敗：${restoreError.message}；備份：${backupDir}`);
     }
     throw error;
   }
-  console.log(`全域 model_context_window 已設為 1000000。備份：${backupDir}`);
+  return { changed: true, previous: previousValue, value: target, filePath: userConfig.filePath, backupDir };
+}
+
+export async function configureMillionTokenContext() {
+  const result = await setGlobalContextWindow(1000000, { label: "context-1m" });
+  if (!result.changed) {
+    console.log("全域上下文已是 1,000,000 tokens，無需修改。");
+    return;
+  }
+  console.log(`全域 model_context_window 已設為 1000000。備份：${result.backupDir}`);
   console.log(`請完全退出並重新打開 ${desktopAppName}，再建立新任務。`);
 }
 
@@ -4384,6 +4724,8 @@ async function status() {
     });
   }
   console.log(`路由器：http://127.0.0.1:${manifest.port}`);
+  const shortcut = managerShortcutPath();
+  console.log(`網頁管理介面：${existsSync(shortcut) ? `雙擊「${shortcut}」，或` : ""}選單第 ${menuNumber("ui")} 項`);
   const cliRoutes = routes.filter((route) => route.transport === "claude-cli");
   if (cliRoutes.length) console.log(`Claude CLI（實驗性）：${cliRoutes.map((route) => route.displayName).join("、")}；登入狀態請執行 claude-cli status。`);
   console.log(
@@ -4456,6 +4798,7 @@ async function rollback() {
   try { archiveRelayImageSkill(archiveDir); } catch (error) {
     console.error(`中轉生圖技能未移動：${error.message}`);
   }
+  archiveManagerShortcut(archiveDir);
   for (const path of serviceArchivePaths()) {
     if (path.startsWith(installRoot)) continue;
     if (existsSync(path)) renameSync(path, join(archiveDir, basename(path)));
@@ -4477,8 +4820,1389 @@ async function rollback() {
   console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
 }
 
+// --- 網頁管理介面 -------------------------------------------------------------
+//
+// ui 命令在本機開一個臨時網頁，背後呼叫的是與終端選單相同的函式：備份、寫入、重啟、
+// 健康檢查與 Codex 模型清單驗證，失敗一律還原。網頁伺服器只在這個命令執行期間存在，
+// 關閉終端視窗、按 Ctrl+C 或閒置太久就結束；常駐的路由器本身不提供任何網頁。
+
+const MANAGER_REPO_URL = "https://github.com/funkeyyou/codex-model-router";
+const MANAGER_RELEASES_PAGE = `${MANAGER_REPO_URL}/releases`;
+const releaseDownloadBase = (env.CODEX_MODEL_ROUTER_RELEASE_DOWNLOAD_URL || `${MANAGER_RELEASES_PAGE}/download`)
+  .replace(/\/+$/, "");
+const MANAGER_IDLE_MS = 20 * 60 * 1000;
+const MANAGER_DRAFT_TTL_MS = 30 * 60 * 1000;
+const MANAGER_SHORTCUT_NAME = "Codex 模型路由器";
+const managerInstallerName = isWindows ? "codex-model-router.ps1" : "codex-model-router.sh";
+const managerInstallerPath = join(installRoot, managerInstallerName);
+const managerLockPath = join(installRoot, "manager.json");
+// 記錄檔裡跟故障有關的前綴；ready、log-truncated 之類的例行訊息不顯示。
+const MANAGER_LOG_KINDS = new Set([
+  "error", "websocket-error", "catalog-refresh-failed", "request-too-large", "upstream-ws-cooldown", "auth-probe-grace",
+]);
+
+function delay(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+export function managerShortcutPath(platform = process.platform, {
+  home = homeDir, appData = env.APPDATA, directory = env.CODEX_MODEL_ROUTER_SHORTCUT_DIR,
+} = {}) {
+  const windows = platform === "win32";
+  const file = `${MANAGER_SHORTCUT_NAME}${windows ? ".lnk" : ".command"}`;
+  if (directory) return (windows ? win32 : posix).join(directory, file);
+  if (windows) {
+    return win32.join(appData || win32.join(home, "AppData", "Roaming"),
+      "Microsoft", "Windows", "Start Menu", "Programs", file);
+  }
+  return posix.join(home, "Applications", file);
+}
+
+// 不是預設位置的 CODEX_HOME／安裝目錄要寫進捷徑，否則雙擊時會找不到這份安裝。
+function managerLaunchEnv() {
+  const values = {};
+  if (env.CODEX_HOME) values.CODEX_HOME = codexHome;
+  if (env.CODEX_MODEL_ROUTER_HOME) values.CODEX_MODEL_ROUTER_HOME = installRoot;
+  return values;
+}
+
+export function managerCommandFile({ installer, launchEnv = {} }) {
+  const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+  return [
+    "#!/bin/bash",
+    "# Codex 模型路由器：雙擊開啟網頁管理介面。由安裝器產生，刪除不影響路由器運作。",
+    ...Object.entries(launchEnv).map(([name, value]) => `export ${name}=${quote(value)}`),
+    `exec /bin/bash ${quote(installer)} ui`,
+    "",
+  ].join("\n");
+}
+
+// 開始功能表捷徑：以 PowerShell 5.1 執行安裝器副本的 ui 命令，主控台視窗即管理頁的記錄。
+export function windowsShortcutScript({ shortcut, installer, workingDirectory, launchEnv = {} }) {
+  const literal = (value) => `'${String(value).replaceAll("'", "''")}'`;
+  const assignments = Object.entries(launchEnv).map(([name, value]) => `$env:${name}=${literal(value)}`);
+  const argumentsText = assignments.length
+    ? `-NoProfile -ExecutionPolicy Bypass -Command "${[...assignments, `& ${literal(installer)} ui`].join("; ")}"`
+    : `-NoProfile -ExecutionPolicy Bypass -File "${installer}" ui`;
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `$path = ${psQuote(shortcut)}`,
+    "$null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path)",
+    "$shell = New-Object -ComObject WScript.Shell",
+    "$link = $shell.CreateShortcut($path)",
+    "$link.TargetPath = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+    `$link.Arguments = ${psQuote(argumentsText)}`,
+    `$link.WorkingDirectory = ${psQuote(workingDirectory)}`,
+    `$link.Description = ${psQuote("開啟 Codex 模型路由器的網頁管理介面")}`,
+    "$link.Save()",
+  ].join("\n");
+}
+
+// 安裝與更新成功後放一份安裝器到路由器目錄，並建立雙擊即可開啟管理頁的捷徑。
+// 失敗只提醒，不影響路由器本身。測試模式沒指定捷徑目錄時不碰使用者的應用程式資料夾。
+function installManagerLauncher() {
+  try {
+    if (scriptPath && existsSync(scriptPath) && resolve(scriptPath) !== resolve(managerInstallerPath)) {
+      // 先寫暫存檔再改名：正在執行舊副本的 bash 握著舊檔，不會讀到寫到一半的內容。
+      const temporary = `${managerInstallerPath}.tmp-${process.pid}`;
+      copyFileSync(scriptPath, temporary);
+      chmodSync(temporary, 0o700);
+      renameSync(temporary, managerInstallerPath);
+    }
+  } catch (error) {
+    return { ok: false, message: `無法放置網頁管理介面用的安裝器副本（${error.message}）` };
+  }
+  if (testMode && !env.CODEX_MODEL_ROUTER_SHORTCUT_DIR) return { ok: true, shortcut: null };
+  const shortcut = managerShortcutPath();
+  try {
+    const launchEnv = managerLaunchEnv();
+    if (isWindows) {
+      powershell(windowsShortcutScript({ shortcut, installer: managerInstallerPath, workingDirectory: installRoot, launchEnv }));
+    } else {
+      mkdirSync(dirname(shortcut), { recursive: true });
+      writeFileSync(shortcut, managerCommandFile({ installer: managerInstallerPath, launchEnv }), { mode: 0o755 });
+      chmodSync(shortcut, 0o755);
+    }
+    return { ok: true, shortcut };
+  } catch (error) {
+    return { ok: false, message: `無法建立網頁管理介面的捷徑（${error.message}）` };
+  }
+}
+
+function printManagerLauncher(result) {
+  if (result.ok && result.shortcut) console.log(`網頁管理介面：雙擊「${result.shortcut}」開啟。`);
+  else if (result.ok) console.log(`網頁管理介面：執行 ${managerInstallerName} ui 開啟。`);
+  else console.log(`注意：${result.message}；仍可執行安裝器的 ui 命令開啟網頁管理介面。`);
+}
+
+function archiveManagerShortcut(archiveDir) {
+  const shortcut = managerShortcutPath();
+  if (!existsSync(shortcut)) return;
+  const target = join(archiveDir, basename(shortcut));
+  try {
+    renameSync(shortcut, target);
+  } catch {
+    try {
+      copyFileSync(shortcut, target);
+      rmSync(shortcut, { force: true });
+    } catch (error) {
+      console.error(`網頁管理介面的捷徑未移除：${error.message}`);
+    }
+  }
+}
+
+function managerUrl(port, token) {
+  return `http://127.0.0.1:${port}/#t=${encodeURIComponent(token)}`;
+}
+
+function readManagerLock() {
+  try {
+    return JSON.parse(readFileSync(managerLockPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function removeManagerLock(token) {
+  if (readManagerLock()?.token === token) rmSync(managerLockPath, { force: true });
+}
+
+async function managerAlive(lock) {
+  if (!Number.isInteger(lock?.port) || typeof lock?.token !== "string") return false;
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${lock.port}/api/ping`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-router-manager-token": lock.token },
+      body: "{}",
+    }, 1500);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+function openBrowser(url) {
+  try {
+    const child = isWindows
+      ? spawn("rundll32.exe", ["url.dll,FileProtocolHandler", url], { detached: true, stdio: "ignore", windowsHide: true })
+      : spawn("/usr/bin/open", [url], { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 非同步版的 shell()：等待外部程式期間管理頁仍要能回應網頁的輪詢。
+function commandOutput(command, args, { timeoutMs = 30000, environment = env } = {}) {
+  return new Promise((resolvePromise) => {
+    let stdout = "";
+    let stderr = "";
+    let child;
+    try {
+      child = spawn(command, args, { env: environment, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    } catch (error) {
+      resolvePromise({ status: null, stdout, stderr: error.message });
+      return;
+    }
+    const timer = setTimeout(() => child.kill(), timeoutMs);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      resolvePromise({ status: null, stdout, stderr: error.message });
+    });
+    child.once("close", (status) => {
+      clearTimeout(timer);
+      resolvePromise({ status, stdout, stderr });
+    });
+  });
+}
+
+// --- 重新啟動桌面版（僅 macOS）-------------------------------------------------
+
+// Codex 執行檔在桌面版的 App bundle 裡（可能還包了一層 CodexCLI.app），取最外層的那個。
+export function desktopAppBundle(binaryPath) {
+  if (typeof binaryPath !== "string") return null;
+  const index = binaryPath.indexOf(".app/");
+  return index < 0 ? null : binaryPath.slice(0, index + 4);
+}
+
+let cachedDesktopApp;
+function desktopApp() {
+  if (cachedDesktopApp !== undefined) return cachedDesktopApp;
+  cachedDesktopApp = null;
+  // Windows 的桌面版是 MSIX 應用程式，無法安全地從外部結束再開啟，改請使用者手動重開。
+  if (process.platform !== "darwin") return cachedDesktopApp;
+  // 測試時絕不能碰到真的桌面版，只認明確指定的測試用 App。
+  const override = env.CODEX_MODEL_ROUTER_DESKTOP_APP;
+  if (testMode && !override) return cachedDesktopApp;
+  const candidates = override
+    ? [override]
+    : [desktopAppBundle(readManifest()?.codexBin), desktopAppBundle(codexBin), "/Applications/ChatGPT.app"];
+  for (const app of new Set(candidates.filter(Boolean))) {
+    const plist = join(app, "Contents", "Info.plist");
+    if (!existsSync(plist)) continue;
+    const result = shell("/usr/bin/plutil", ["-extract", "CFBundleIdentifier", "raw", plist], { allowFailure: true });
+    const bundleId = (result.stdout || "").trim();
+    if (result.status === 0 && /^[A-Za-z0-9.-]{3,200}$/.test(bundleId)) {
+      cachedDesktopApp = { path: app, bundleId, name: basename(app, ".app") };
+      break;
+    }
+  }
+  return cachedDesktopApp;
+}
+
+// 以 Apple Event 正常結束（等同按 Command+Q），等它真的退出後再開啟。
+// 有視窗在等確認或使用者拒絕授權時，停下來請使用者手動處理，不會強制結束。
+async function restartDesktopApp() {
+  const app = desktopApp();
+  if (!app) fail(`找不到可重新啟動的桌面版應用程式，請手動完全退出並重新打開 ${desktopAppName}。`);
+  const running = async () => (await commandOutput("/usr/bin/osascript",
+    ["-e", `application id "${app.bundleId}" is running`], { timeoutMs: 10000 })).stdout.trim() === "true";
+  if (await running()) {
+    console.log(`正在結束 ${app.name}；若 macOS 詢問是否允許控制「${app.name}」，請選擇允許。`);
+    const quit = await commandOutput("/usr/bin/osascript", [
+      "-e", "with timeout of 30 seconds",
+      "-e", `tell application id "${app.bundleId}" to quit`,
+      "-e", "end timeout",
+    ], { timeoutMs: 45000 });
+    if (quit.status !== 0) {
+      fail(`無法結束 ${app.name}（${terminalSafeText(quit.stderr, 200) || "未知錯誤"}）。請手動完全退出並重新打開。`);
+    }
+    const deadline = Date.now() + 30000;
+    while (await running()) {
+      if (Date.now() > deadline) fail(`${app.name} 沒有在 30 秒內結束，可能正在等待確認。請手動完全退出並重新打開。`);
+      await delay(500);
+    }
+    await delay(1000);
+  }
+  // 用實際路徑開啟：電腦上留著多份同名 App（例如下載資料夾裡的舊版）時，open -b 可能開錯那份。
+  const opened = await commandOutput("/usr/bin/open", [app.path], { timeoutMs: 30000 });
+  if (opened.status !== 0) {
+    fail(`已結束 ${app.name}，但無法重新開啟（${terminalSafeText(opened.stderr, 200) || "未知錯誤"}）。請手動打開。`);
+  }
+  console.log(`已重新開啟 ${app.name}。`);
+  return { restarted: app.name };
+}
+
+// 更新後重啟桌面版失敗不該讓整個更新被標成失敗：路由器已經是新版了。
+async function restartDesktopAfter(result) {
+  try {
+    await restartDesktopApp();
+    return { ...result, desktopRestarted: true, restartDesktop: false };
+  } catch (error) {
+    console.error(error.message);
+    return { ...result, desktopError: error.message };
+  }
+}
+
+// --- 一鍵更新 -------------------------------------------------------------------
+
+export function parseSha256Sums(text) {
+  const sums = {};
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const match = /^([0-9a-fA-F]{64})\s+\*?(\S.*?)\s*$/.exec(line);
+    if (match) sums[match[2]] = match[1].toLowerCase();
+  }
+  return sums;
+}
+
+// 雜湊之外再看內容：格式、版本號與必要的內嵌段落。標記名稱拼接而成，
+// 免得這段原始碼自己被當成標記行。
+export function verifyInstallerScript(content, version, platform = process.platform) {
+  const text = Buffer.from(content).toString("utf8");
+  const windows = platform === "win32";
+  if (windows ? !text.startsWith("\uFEFF") : !text.startsWith("#!/bin/bash\n")) {
+    fail("下載的檔案不是預期的安裝器格式，已停止更新。");
+  }
+  const normalized = text.replaceAll("\r\n", "\n");
+  if (!normalized.includes(`\nconst INSTALLER_VERSION = "${version}";\n`)) {
+    fail(`下載的安裝器不是 ${version} 版，已停止更新。`);
+  }
+  for (const name of ["INSTALLER_JS", "ROUTER_JS", "EMBEDDED"]) {
+    if (!normalized.includes(`\n__CODEX_MODEL_ROUTER_${name}__\n`)) fail("下載的安裝器不完整，已停止更新。");
+  }
+}
+
+async function downloadReleaseAsset(version, name, limit) {
+  const url = `${releaseDownloadBase}/v${version}/${name}`;
+  const response = await fetchWithTimeout(url, {
+    headers: { "user-agent": `codex-model-router/${INSTALLER_VERSION}` },
+  }, 60000);
+  if (!response.ok) {
+    fail(response.status === 404
+      ? `GitHub 上還沒有 v${version} 的發佈檔案（可能仍在建立中），請稍後再試。`
+      : `下載 ${name} 失敗（HTTP ${response.status}）。`);
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > limit) fail(`${name} 超過大小限制，已停止更新。`);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+// 由新版安裝器自己執行 update：換掉路由器程式碼、重啟服務、更新安裝器副本與捷徑。
+function runDownloadedUpdate(path) {
+  const childEnv = { ...env };
+  for (const name of ["CODEX_MODEL_ROUTER_SCRIPT_PATH", "CODEX_MODEL_ROUTER_UI_TOKEN", "CODEX_MODEL_ROUTER_UI_NO_OPEN"]) {
+    delete childEnv[name];
+  }
+  const [command, args] = isWindows
+    ? ["powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path, "update"]]
+    : ["/bin/bash", [path, "update"]];
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    child.stdout.on("data", (chunk) => process.stdout.write(chunk));
+    child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+    child.once("error", rejectPromise);
+    child.once("close", (code) => resolvePromise(code));
+  });
+}
+
+async function managerUpdate({ restartDesktop = false } = {}) {
+  const catalog = await loadReleaseCatalog({ force: true });
+  const latest = catalog.latest;
+  const installed = readManifest()?.version || null;
+  if (compareVersions(latest, installed) !== 1) fail(`已是最新版本（${installed || INSTALLER_VERSION}）。`);
+  console.log(`正在從 GitHub 下載 v${latest} 的安裝器與 SHA256SUMS…`);
+  const sums = parseSha256Sums((await downloadReleaseAsset(latest, "SHA256SUMS", 64 * 1024)).toString("utf8"));
+  const expected = sums[managerInstallerName];
+  if (!expected) fail("SHA256SUMS 裡沒有安裝器的雜湊，已停止更新。");
+  const content = await downloadReleaseAsset(latest, managerInstallerName, 16 * 1024 * 1024);
+  if (createHash("sha256").update(content).digest("hex") !== expected) {
+    fail("下載的安裝器與 SHA256SUMS 不符，已停止更新。");
+  }
+  verifyInstallerScript(content, latest);
+  console.log("雜湊與版本核對通過，開始更新。\n");
+  const directory = mkdtempSync(join(tmpdir(), "codex-model-router-update-"));
+  try {
+    const target = join(directory, managerInstallerName);
+    writeFileSync(target, content, { mode: 0o700 });
+    const code = await runDownloadedUpdate(target);
+    if (code !== 0) fail(`更新沒有完成（結束代碼 ${code}），已保留或還原原本的版本。`);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+  const result = { version: latest, managerRestart: existsSync(managerInstallerPath), restartDesktop: true };
+  return restartDesktop ? restartDesktopAfter(result) : result;
+}
+
+// 這個管理頁本身就是較新的安裝器（例如剛下載還沒執行 update）：直接在本行程執行 update。
+async function managerApplyLocalUpdate({ restartDesktop = false } = {}) {
+  const installed = readManifest()?.version || null;
+  if (compareVersions(INSTALLER_VERSION, installed) !== 1) fail("這個管理頁沒有比已安裝的版本新，不需要套用。");
+  await update();
+  const result = { version: INSTALLER_VERSION, managerRestart: false, restartDesktop: true };
+  return restartDesktop ? restartDesktopAfter(result) : result;
+}
+
+// --- 網頁管理介面的讀取與操作 -----------------------------------------------------
+
+let managerConfigHintsPromise = null;
+let managerConfigHintsAt = 0;
+
+// config.toml 裡會影響模型頁顯示的兩個值：全域預設模型與全域上下文。讀它要開一個
+// Codex app-server，因此在背景讀、快取一分鐘。
+function managerConfigHints(force = false) {
+  if (!codexBin) return Promise.resolve(null);
+  if (!managerConfigHintsPromise || force || Date.now() - managerConfigHintsAt > 60000) {
+    managerConfigHintsAt = Date.now();
+    managerConfigHintsPromise = readUserConfig().then(({ config }) => {
+      const contextWindow = Number(config.model_context_window);
+      return {
+        model: typeof config.model === "string" ? config.model : null,
+        modelContextWindow: config.model_context_window != null && Number.isFinite(contextWindow) ? contextWindow : null,
+      };
+    }).catch(() => null);
+  }
+  return managerConfigHintsPromise;
+}
+
+async function routerHealth(port) {
+  if (!Number.isInteger(port) || port <= 0) return { ok: false, error: "沒有可用的連接埠設定" };
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${port}/healthz`, {}, 1500);
+    if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
+    const health = await response.json();
+    return {
+      ok: health.status === "ok", status: health.status ?? null, version: health.version ?? null,
+      uptimeSeconds: health.uptimeSeconds ?? null, stats: health.stats || {},
+    };
+  } catch (error) {
+    return { ok: false, error: error?.name === "AbortError" ? "逾時" : (error?.cause?.code || error?.message || "無法連線") };
+  }
+}
+
+function routeTransport(route) {
+  if (route.transport === "claude-cli") return "claude-cli";
+  if (route.translate === "anthropic") return "anthropic";
+  if (route.translate === "chat") return "chat";
+  return "responses";
+}
+
+function summarizeRoute(route) {
+  return {
+    slug: route.pickerSlug, displayName: route.displayName || route.upstreamModel,
+    upstreamModel: route.upstreamModel, efforts: Array.isArray(route.efforts) ? route.efforts : [],
+  };
+}
+
+function managerWriteGuard() {
+  const manifest = readManifest();
+  if (!manifest) return "尚未安裝路由器，請先在終端執行「安裝或重新配置」。";
+  const comparison = compareVersions(INSTALLER_VERSION, manifest.version);
+  if (comparison != null && comparison < 0) {
+    return `路由器已是 ${manifest.version}，這個管理頁仍是 ${INSTALLER_VERSION}；請關閉管理頁後重新開啟。`;
+  }
+  if (comparison != null && comparison > 0) {
+    return `這個管理頁是 ${INSTALLER_VERSION}，路由器仍是 ${manifest.version}；請先從左上角的版本選單套用新版本。`;
+  }
+  if (!codexBin) return `未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`;
+  return null;
+}
+
+function assertManagerWritable() {
+  const blocked = managerWriteGuard();
+  if (blocked) fail(blocked);
+}
+
+async function managerState() {
+  const manifest = readManifest();
+  if (!manifest) return { installed: false, versions: { manager: INSTALLER_VERSION } };
+  const settings = readSettingsIfExists();
+  const catalog = readCatalogIfExists();
+  const providers = installedProviders(settings, manifest);
+  const routes = Array.isArray(settings.routes) ? settings.routes : (Array.isArray(manifest.routes) ? manifest.routes : []);
+  const catalogModels = Array.isArray(catalog?.models) ? catalog.models : [];
+  const position = new Map(catalogModels.map((model, index) => [model.slug, index]));
+  const entries = new Map(catalogModels.map((model) => [model.slug, model]));
+  const port = Number(settings.port ?? manifest.port);
+  const [health, hints] = await Promise.all([
+    routerHealth(port),
+    Promise.race([managerConfigHints(), delay(2500).then(() => undefined)]),
+  ]);
+  const models = routes.map((route) => {
+    const entry = entries.get(route.pickerSlug);
+    const context = positiveNumber(Number(entry?.context_window ?? route.contextWindow));
+    const outputConfigurable = routeUsesOutputSetting(route);
+    const outputCap = outputConfigurable ? positiveNumber(route.maxOutputTokens) : null;
+    return {
+      slug: route.pickerSlug,
+      displayName: entry?.display_name || route.displayName || route.upstreamModel,
+      upstreamModel: route.upstreamModel,
+      providerId: routeProviderId(route),
+      transport: routeTransport(route),
+      efforts: Array.isArray(route.efforts) ? route.efforts : [],
+      defaultEffort: entry?.default_reasoning_level || null,
+      contextWindow: context,
+      // configured：探測、新增時的預設值或手動修改；template：沿用官方模型模板，未實測。
+      contextSource: positiveNumber(route.contextWindow) ? "configured" : context ? "template" : null,
+      // 只有 Claude 路由會送出輸出上限；其他介面為 null，由上游決定。
+      outputConfigurable,
+      outputTokens: routeOutputLimit(route),
+      outputCap,
+      // API 路由的上限是新增時上游回報的值，修改不能超過；CLI 路由的上限可以一起調整。
+      outputCapFixed: outputConfigurable && route.transport !== "claude-cli" && Boolean(outputCap),
+      inCatalog: Boolean(entry),
+    };
+  }).sort((left, right) => (position.get(left.slug) ?? Number.MAX_SAFE_INTEGER) -
+    (position.get(right.slug) ?? Number.MAX_SAFE_INTEGER));
+  let imagegen;
+  try {
+    const config = relayConfig();
+    imagegen = config ? { models: config.models || [], providerId: config.providerId ?? DEFAULT_PROVIDER_ID } : null;
+  } catch (error) {
+    imagegen = { error: error.message };
+  }
+  const desktop = desktopApp();
+  const shortcut = managerShortcutPath();
+  return {
+    installed: true,
+    platform: process.platform,
+    versions: {
+      manager: INSTALLER_VERSION,
+      installed: terminalSafeText(manifest.version, 32) || null,
+      router: health.version || null,
+    },
+    writeBlocked: managerWriteGuard(),
+    router: { port, ...health },
+    providers: providers.map((provider, index) => ({
+      id: provider.id, baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
+      modelCount: routes.filter((route) => routeProviderId(route) === provider.id).length,
+      keyStored: env.CODEX_MODEL_ROUTER_TEST_API_KEY ? true : keychainHas(provider.keychainService),
+    })),
+    models,
+    officialModelCount: catalogModels.filter((model) => !String(model.slug).startsWith("custom/")).length,
+    customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
+    config: hints === undefined ? null : hints,
+    imagegen,
+    claudeCli: {
+      binary: settings.claudeCli?.binary || null,
+      routeCount: routes.filter((route) => route.transport === "claude-cli").length,
+    },
+    desktop: { name: desktop?.name || desktopAppName, canRestart: Boolean(desktop) },
+    paths: {
+      codexHome, installRoot, logPath,
+      nodeBin: manifest.nodeBin || nodeBin || null,
+      codexBin: manifest.codexBin || codexBin || null,
+      shortcut: existsSync(shortcut) ? shortcut : null,
+    },
+    service: { name: manifest.serviceName || manifest.launchLabel || serviceName, kind: serviceKindLabel },
+  };
+}
+
+async function managerVersionInfo({ refresh = false } = {}) {
+  const manifest = readManifest();
+  const installed = terminalSafeText(manifest?.version, 32) || null;
+  const settings = readSettingsIfExists();
+  const health = await routerHealth(Number(settings.port ?? manifest?.port));
+  let catalog = null;
+  let error = null;
+  try {
+    catalog = await loadReleaseCatalog({ force: refresh, maxAgeMs: 30 * 60 * 1000 });
+  } catch {
+    error = "無法連線到 GitHub 檢查更新，請稍後再試。";
+  }
+  const latest = catalog?.latest || null;
+  const comparison = latest && installed ? compareVersions(installed, latest) : null;
+  const status = comparison == null ? "unknown" : comparison < 0 ? "update-available" : comparison === 0 ? "latest" : "ahead";
+  const desktop = desktopApp();
+  return {
+    manager: INSTALLER_VERSION,
+    installed,
+    router: health.version || null,
+    latest,
+    status,
+    localNewer: installed ? compareVersions(INSTALLER_VERSION, installed) === 1 : false,
+    releases: catalog ? releasesBetween(catalog, installed).slice(-10) : [],
+    releaseUrl: latest ? `${MANAGER_RELEASES_PAGE}/tag/v${latest}` : MANAGER_RELEASES_PAGE,
+    releasesUrl: MANAGER_RELEASES_PAGE,
+    canRestartDesktop: Boolean(desktop),
+    desktopName: desktop?.name || desktopAppName,
+    checkedAt: catalog ? new Date(releaseCatalogLoadedAt).toISOString() : null,
+    error,
+  };
+}
+
+export function parseRouterLog(text, limit = 50) {
+  const entries = [];
+  const clip = (value, max = 300) => (value == null ? null : terminalSafeText(value, max) || null);
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const match = /^model-router-([a-z-]+):(.*)$/.exec(line);
+    if (!match || !MANAGER_LOG_KINDS.has(match[1])) continue;
+    const [, kind, rest] = match;
+    let record = null;
+    if (kind === "error" && rest.trim().startsWith("{")) {
+      try { record = JSON.parse(rest); } catch {}
+    }
+    if (!record || typeof record !== "object") {
+      entries.push({ kind, message: clip(rest) });
+      continue;
+    }
+    entries.push({
+      kind, at: clip(record.at, 40), requestId: clip(record.requestId, 40), code: clip(record.code, 80),
+      status: Number.isInteger(record.status) ? record.status : null, message: clip(record.message),
+      model: clip(record.model, 160), provider: clip(record.provider, 40), upstreamHost: clip(record.upstreamHost, 200),
+      transport: clip(record.transport, 20), route: clip(record.route, 20), phase: clip(record.phase, 40),
+      causeCode: clip(record.causeCode, 60),
+      upstreamStatus: Number.isInteger(record.upstreamStatus) ? record.upstreamStatus : null,
+    });
+  }
+  return entries.slice(-limit).reverse();
+}
+
+function readFileTail(path, maxBytes = 256 * 1024) {
+  const descriptor = openSync(path, "r");
+  try {
+    const { size } = fstatSync(descriptor);
+    const length = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    readSync(descriptor, buffer, 0, length, size - length);
+    const text = buffer.toString("utf8");
+    return size > length ? text.slice(text.indexOf("\n") + 1) : text;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function managerRecentErrors() {
+  if (!existsSync(logPath)) return { entries: [], logPath };
+  try {
+    return { entries: parseRouterLog(readFileTail(logPath)), logPath };
+  } catch (error) {
+    return { entries: [], logPath, error: `無法讀取記錄檔：${error.message}` };
+  }
+}
+
+function managerProvider(providers, providerId) {
+  const provider = providers.find((item) => item.id === providerId);
+  if (!provider) fail(`找不到供應商：${providerId}`);
+  return provider;
+}
+
+function describeDiscoveredModel(id, configured = new Set()) {
+  const owner = modelOwners.get(id) || null;
+  return {
+    id,
+    configured: configured.has(id),
+    anthropic: owner === "anthropic" || ((!owner || owner === "unknown") && looksAnthropic(id)),
+  };
+}
+
+function configuredUpstreams(settings, providerId) {
+  return new Set(settings.routes
+    .filter((route) => routeProviderId(route) === providerId)
+    .map((route) => route.upstreamModel));
+}
+
+// 查詢模型清單只讀不寫，也不花額度。
+async function managerDiscover({ providerId } = {}) {
+  const { settings, providers } = requireInstallation();
+  const provider = managerProvider(providers, String(providerId || ""));
+  const discovery = await discoverApiRoot(provider.baseUrl, readApiKey(provider.keychainService));
+  const configured = configuredUpstreams(settings, provider.id);
+  return {
+    providerId: provider.id,
+    apiRoot: discovery.apiRoot,
+    models: discovery.models.map((model) => describeDiscoveredModel(model, configured)),
+  };
+}
+
+// 新增供應商分兩步：先以表單的 Key 查模型清單（不存 Key），選好模型才探測並寫入。
+// Key 只留在這個行程的記憶體裡，30 分鐘後失效，從不回傳給網頁。
+const managerDrafts = new Map();
+
+async function managerProviderDraft({ baseUrl, apiKey } = {}) {
+  const { providers } = requireInstallation();
+  const normalized = normalizeUrl(String(baseUrl || "").trim());
+  const key = String(apiKey ?? "").trim();
+  if (!key) fail("請填寫 API Key。");
+  const clash = providers.find((provider) => provider.baseUrl === normalized);
+  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」；要添加它的模型請到「模型」頁新增。`);
+  const discovery = await discoverApiRoot(normalized, key);
+  const now = Date.now();
+  for (const [id, draft] of managerDrafts) {
+    if (now - draft.createdAt > MANAGER_DRAFT_TTL_MS) managerDrafts.delete(id);
+  }
+  const draftId = randomUUID();
+  managerDrafts.set(draftId, { baseUrl: normalized, apiKey: key, discovery, createdAt: now });
+  return {
+    draftId,
+    baseUrl: normalized,
+    apiRoot: discovery.apiRoot,
+    suggestedId: suggestProviderId(normalized, providers.map((provider) => provider.id)),
+    models: discovery.models.map((model) => describeDiscoveredModel(model)),
+  };
+}
+
+function managerModelSelection(models, configured = new Set()) {
+  if (!Array.isArray(models)) fail("請至少選擇一個模型。");
+  const selected = [];
+  for (const raw of models) {
+    const model = String(raw ?? "").trim();
+    if (!model || selected.includes(model) || configured.has(model)) continue;
+    if (!MODEL_ID_PATTERN.test(model)) fail(`模型 ID 格式無效：${terminalSafeText(model, 80)}`);
+    selected.push(model);
+  }
+  if (selected.length === 0) fail("沒有需要探測的新模型。");
+  if (selected.length > 40) fail("一次最多探測 40 個模型。");
+  return selected;
+}
+
+async function managerAddModels({ providerId, models, contextWindow, maxOutputTokens } = {}) {
+  assertManagerWritable();
+  verifyLogin();
+  const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
+  const { settings, providers } = requireInstallation();
+  const provider = managerProvider(providers, String(providerId || ""));
+  const selected = managerModelSelection(models, configuredUpstreams(settings, provider.id));
+  const apiKey = readApiKey(provider.keychainService);
+  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log("正在查詢模型清單…");
+  const discovery = await discoverApiRoot(provider.baseUrl, apiKey);
+  console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
+  const outcomes = await probeModelsInParallel(selected,
+    (model, log) => buildRouteForModel(discovery, apiKey, model, log, provider.id));
+  const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean)
+    .map((route) => applyNewModelDefaults(route, defaults));
+  if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
+  console.log("\n探測完成，正在寫入設定並重新啟動路由器…");
+  const { plan, backupDir } = await commitAddedModels(provider, newRoutes, discovery.models);
+  printAddedLimits(plan.added, defaults);
+  console.log(`備份：${backupDir}`);
+  return {
+    added: plan.added.map(summarizeRoute),
+    skipped: selected.filter((model) => !plan.added.some((route) => route.upstreamModel === model)),
+    backupDir,
+    restartDesktop: true,
+  };
+}
+
+// 新增完成後列出每個模型實際寫入的上下文與輸出，並說明與表單設定不同的原因。
+function printAddedLimits(routes, defaults) {
+  console.log(`\n已添加 ${routes.length} 個模型：`);
+  for (const route of routes) {
+    console.log(`  - ${route.displayName || route.upstreamModel}：${describeRouteLimits(route)}`);
+    const output = routeOutputLimit(route);
+    if (positiveNumber(route.contextWindow) && route.contextWindow < defaults.contextWindow) {
+      console.log("    上游回報的上下文上限較小，已改用上游的值。");
+    }
+    if (output != null && output < defaults.maxOutputTokens) {
+      console.log("    上游回報的輸出上限較小，已改用上游的值。");
+    }
+    if (output != null && !positiveNumber(route.maxOutputTokens)) {
+      console.log("    ⚠️  上游沒有回報輸出上限；若回覆出現 max_tokens 錯誤，請到模型頁調低輸出。");
+    }
+  }
+}
+
+async function managerRemoveModels({ slugs } = {}) {
+  assertManagerWritable();
+  if (!Array.isArray(slugs) || slugs.length === 0) fail("沒有選擇要刪除的模型。");
+  console.log("正在刪除所選模型並重新啟動路由器…");
+  const { plan, defaultModel, backupDir } = await executeRemoveModels(slugs.map(String));
+  for (const route of plan.removed) console.log(`  - ${route.displayName || route.upstreamModel}`);
+  if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
+  console.log(`已刪除 ${plan.removed.length} 個模型。備份：${backupDir}`);
+  managerConfigHints(true);
+  return { removed: plan.removed.map(summarizeRoute), defaultCleared: Boolean(defaultModel), backupDir, restartDesktop: true };
+}
+
+async function managerReorderModels({ slugs } = {}) {
+  assertManagerWritable();
+  const { manifest, settings, catalog } = requireInstallation();
+  const plan = planReorderModels(manifest, settings, catalog, Array.isArray(slugs) ? slugs.map(String) : slugs);
+  if (!plan.changed && settings.customModelOrder === "manual") {
+    console.log("順序沒有變更。");
+    return { changed: false };
+  }
+  console.log("正在寫入新的順序（不需要重新啟動路由器）…");
+  const backupDir = await commitCatalogChange("reorder-models", plan);
+  console.log(`已更新順序。備份：${backupDir}`);
+  return { changed: true, backupDir, restartDesktop: true };
+}
+
+async function managerEditModel({ slug, displayName, contextWindow, maxOutputTokens } = {}) {
+  assertManagerWritable();
+  const { manifest, settings, catalog } = requireInstallation();
+  const plan = planEditModel(manifest, settings, catalog, String(slug || ""), { displayName, contextWindow, maxOutputTokens });
+  if (!plan.changed) {
+    console.log("沒有任何變更。");
+    return { changed: false };
+  }
+  if (plan.restartRouter) {
+    // 輸出上限由路由器在轉送時套用，路由器沒有熱重載，必須重啟才會生效。
+    console.log("正在寫入模型設定並重新啟動路由器（輸出上限要重啟後才會套用）…");
+    const backupDir = await commitRouterChange("edit-model", plan);
+    console.log(`已儲存。備份：${backupDir}`);
+    return { changed: true, backupDir, restartDesktop: plan.restartDesktop };
+  }
+  console.log("正在寫入模型設定（不需要重新啟動路由器）…");
+  const backupDir = await commitCatalogChange("edit-model", plan);
+  console.log(`已儲存。備份：${backupDir}`);
+  return { changed: true, backupDir, restartDesktop: plan.restartDesktop };
+}
+
+async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens } = {}) {
+  assertManagerWritable();
+  verifyLogin();
+  const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
+  const draftKey = String(draftId || "");
+  const draft = managerDrafts.get(draftKey);
+  if (!draft || Date.now() - draft.createdAt > MANAGER_DRAFT_TTL_MS) fail("新增供應商的資料已過期，請重新查詢模型。");
+  const { providers } = requireInstallation();
+  const clash = providers.find((provider) => provider.baseUrl === draft.baseUrl);
+  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」。`);
+  const selected = managerModelSelection(models);
+  const takenIds = providers.map((provider) => provider.id);
+  const prefixed = selected.every((model) => model.includes("/"));
+  const id = prefixed ? suggestProviderId(draft.baseUrl, takenIds) : String(providerId || "").trim().toLowerCase();
+  const problem = providerIdError(id, takenIds);
+  if (problem) fail(problem);
+  if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商管理名稱自動設為「${id}」。`);
+  console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
+  const outcomes = await probeModelsInParallel(selected,
+    (model, log) => buildRouteForModel(draft.discovery, draft.apiKey, model, log, id));
+  const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean)
+    .map((route) => applyNewModelDefaults(route, defaults));
+  if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
+
+  const keychainService = keychainServiceFor(draft.baseUrl);
+  let previousKey = null;
+  if (keychainHas(keychainService)) {
+    try { previousKey = readApiKey(keychainService); } catch {}
+  }
+  storeApiKeyValue(keychainService, draft.baseUrl, draft.apiKey);
+  try {
+    const { manifest, settings, catalog } = requireInstallation();
+    const provider = {
+      id, baseUrl: draft.baseUrl, apiRoot: draft.discovery.apiRoot, keychainService, keychainAccount: "codex",
+      credentialPath: isWindows ? credentialFileFor(keychainService) : null,
+    };
+    console.log("\n探測完成，正在寫入設定並重新啟動路由器…");
+    const plan = planAddProvider(manifest, settings, catalog, loadCatalogTemplates(), provider, newRoutes, draft.discovery.models);
+    const backupDir = await commitRouterChange("add-provider", plan);
+    managerDrafts.delete(draftKey);
+    console.log(`已新增供應商「${id}」。`);
+    printAddedLimits(newRoutes, defaults);
+    console.log(`備份：${backupDir}`);
+    return { providerId: id, added: newRoutes.map(summarizeRoute), backupDir, restartDesktop: true };
+  } catch (error) {
+    // 寫入失敗時把憑證放回原狀，不留下沒有供應商在用的 Key。
+    if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+      try {
+        if (previousKey) storeApiKeyValue(keychainService, draft.baseUrl, previousKey);
+        else deleteApiKey(keychainService);
+      } catch {}
+    }
+    throw error;
+  }
+}
+
+async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
+  assertManagerWritable();
+  const { providers } = requireInstallation();
+  const provider = managerProvider(providers, String(providerId || ""));
+  if (providers.length <= 1) fail("至少要保留一家供應商；要整個移除路由器請在終端選單使用「回退配置」。");
+  console.log(`正在移除供應商「${provider.id}」與它的模型，並重新啟動路由器…`);
+  const { plan, defaultModel, imagegenAffected, backupDir } = await executeRemoveProvider(provider.id);
+  let keyDeleted = false;
+  const shared = providers.some((item) => item.id !== provider.id && item.keychainService === provider.keychainService);
+  if (deleteKey !== false && !shared && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+    try {
+      deleteApiKey(provider.keychainService, provider.keychainAccount || "codex");
+      keyDeleted = true;
+    } catch (error) {
+      console.error(`API Key 未能刪除：${error.message}`);
+    }
+  }
+  if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
+  console.log(`已移除供應商「${provider.id}」與 ${plan.removedRoutes.length} 個模型。備份：${backupDir}`);
+  managerConfigHints(true);
+  return {
+    removed: plan.removedRoutes.map(summarizeRoute), defaultCleared: Boolean(defaultModel),
+    imagegenDisabled: imagegenAffected, keyDeleted, primary: plan.providers[0]?.id || null, backupDir, restartDesktop: true,
+  };
+}
+
+// 先用新 Key 查模型清單：上游明確拒絕（401／403）就不換，免得把能用的舊 Key 蓋掉。
+// 網路錯誤或其他狀態無法判斷 Key 本身的對錯，照樣更換並提醒。
+async function managerReplaceKey({ providerId, apiKey } = {}) {
+  const { providers } = requireInstallation();
+  const provider = managerProvider(providers, String(providerId || ""));
+  const key = String(apiKey ?? "").trim();
+  if (!key) fail("請填寫新的 API Key。");
+  console.log(`正在用新 Key 查詢「${provider.id}」的模型清單…`);
+  let status = null;
+  let problem = null;
+  try {
+    const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
+      headers: { authorization: `Bearer ${key}` },
+    }, 15000);
+    await response.arrayBuffer();
+    status = response.status;
+  } catch (error) {
+    problem = error?.name === "AbortError" ? "逾時" : error.message;
+  }
+  if (status === 401 || status === 403) fail(`上游拒絕這把 Key（HTTP ${status}），沒有更換。`);
+  storeApiKeyValue(provider.keychainService, provider.baseUrl, key);
+  const verified = status != null && status >= 200 && status < 300;
+  console.log(verified
+    ? "已更換，新 Key 可以正常查詢模型清單。"
+    : `已更換，但無法確認新 Key 是否可用（${status != null ? `HTTP ${status}` : problem}）。`);
+  console.log(isWindows
+    ? "路由器下一個請求就會改用新 Key，不必重啟。"
+    : "路由器最晚 5 分鐘內改用新 Key；上游拒絕舊 Key 時會立即改用。");
+  return { verified, status };
+}
+
+async function managerRestartRouter() {
+  const manifest = readManifest();
+  if (!manifest) fail("尚未安裝路由器。");
+  const settings = readSettingsIfExists();
+  console.log("正在重新啟動路由器…");
+  restartServiceInPlace();
+  const health = await waitForHealth(Number(settings.port ?? manifest.port));
+  console.log(`路由器已重新啟動（${health.version || "版本未知"}）。`);
+  return { version: health.version || null };
+}
+
+// --- 第二階段：全域上下文、隱藏官方模型、中轉生圖、Claude CLI ------------------------
+
+async function managerGlobalContext() {
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  const { config, filePath } = await readUserConfig();
+  const current = deepGet(config, "model_context_window");
+  const value = current.present ? Number(current.value) : null;
+  return { value: Number.isFinite(value) ? value : null, filePath };
+}
+
+async function managerSetGlobalContext({ value } = {}) {
+  assertManagerWritable();
+  const target = normalizeGlobalContextWindow(value);
+  console.log(target === null
+    ? "正在移除全域 model_context_window…"
+    : `正在把全域 model_context_window 設為 ${target.toLocaleString("en-US")}…`);
+  const result = await setGlobalContextWindow(target);
+  managerConfigHints(true);
+  if (!result.changed) {
+    console.log("設定沒有變更。");
+    return { changed: false, value: target };
+  }
+  console.log(target === null ? "已移除全域上下文，各模型改用自己的上下文。" : "已更新全域上下文。");
+  console.log(`設定檔：${result.filePath}`);
+  console.log(`備份：${result.backupDir}`);
+  return { changed: true, value: target, backupDir: result.backupDir, restartDesktop: true };
+}
+
+// 與 loadBundledCatalog 相同，但不阻塞管理頁回應其他請求。
+async function readBundledCatalogAsync() {
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  const result = await commandOutput(codexBin,
+    ["debug", "models", "--bundled", "-c", "model_catalog_json=null", "-c", 'model_provider="openai"'],
+    { timeoutMs: 60000, environment: { ...env, CODEX_HOME: codexHome } });
+  let catalog = null;
+  try { catalog = JSON.parse(result.stdout); } catch {}
+  if (result.status !== 0 || !Array.isArray(catalog?.models) || catalog.models.length === 0) {
+    fail("無法讀取 Codex 內建模型目錄。");
+  }
+  return catalog;
+}
+
+async function managerHiddenModels() {
+  const settings = readSettingsIfExists();
+  return { models: hiddenModelChoices(await readBundledCatalogAsync(), settings.forceListedModels) };
+}
+
+async function managerSetHiddenModels({ slugs } = {}) {
+  assertManagerWritable();
+  if (!Array.isArray(slugs)) fail("請提供要強制顯示的模型清單。");
+  const bundledCatalog = loadBundledCatalog();
+  const hidden = new Set(hiddenModelChoices(bundledCatalog).map((model) => model.slug));
+  const requested = [...new Set(slugs.map(String))];
+  const unknown = requested.filter((slug) => !hidden.has(slug));
+  if (unknown.length) fail(`不是可強制顯示的隱藏模型：${unknown.map((slug) => terminalSafeText(slug, 80)).join("、")}`);
+  console.log(requested.length
+    ? `正在設定強制顯示 ${requested.length} 個隱藏模型，並重新啟動路由器…`
+    : "正在恢復預設（不強制顯示任何隱藏模型），並重新啟動路由器…");
+  const result = await executeHiddenModels(requested, { bundledCatalog });
+  if (!result.changed) {
+    console.log("設定沒有變更，未重寫模型目錄或重啟路由器。");
+    return { changed: false, chosen: result.chosen };
+  }
+  console.log(result.chosen.length ? `已強制顯示：${result.chosen.join(", ")}` : "已恢復預設，不強制顯示任何隱藏模型。");
+  console.log(`備份：${result.backupDir}`);
+  return { changed: true, chosen: result.chosen, backupDir: result.backupDir, restartDesktop: true };
+}
+
+function relayImagegenStatus() {
+  let config = null;
+  let error = null;
+  try { config = relayConfig(); } catch (caught) { error = caught.message; }
+  let lastCheck = null;
+  try {
+    const saved = JSON.parse(readFileSync(join(installRoot, "imagegen-last-check.json"), "utf8"));
+    lastCheck = {
+      checkedAt: terminalSafeText(saved.checkedAt, 40) || null,
+      checks: (Array.isArray(saved.checks) ? saved.checks : []).slice(0, 12).map((check) => ({
+        apiMode: check?.apiMode === "ark-task" ? "ark-task" : "images",
+        model: terminalSafeText(check?.model, 120),
+        ok: check?.ok === true,
+        error: check?.ok === true ? null : terminalSafeText(check?.error, 300) || null,
+      })),
+    };
+  } catch {}
+  return {
+    enabled: Boolean(config),
+    error,
+    models: Array.isArray(config?.models) ? config.models : [],
+    upstreamModels: config?.upstreamModels || {},
+    apiMode: config?.apiMode || null,
+    // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。
+    providerId: config ? config.providerId ?? DEFAULT_PROVIDER_ID : null,
+    root: relaySkillRoot,
+    choices: RELAY_IMAGE_MODELS,
+    lastCheck,
+  };
+}
+
+async function managerImagegenSetup({ providerId, models } = {}) {
+  assertManagerWritable();
+  const { settings, providers } = requireInstallation();
+  const allowed = RELAY_IMAGE_MODELS.map((model) => model.id);
+  const selected = Array.isArray(models) ? [...new Set(models.map(String))] : [];
+  if (selected.length === 0 || selected.some((model) => !allowed.includes(model))) {
+    fail("請從 Image 2、Image 2.5 Sunburst、Image 2.5 Flare 中至少選擇一個模型。");
+  }
+  const provider = providers.length === 1 && !providerId ? providers[0] : managerProvider(providers, String(providerId || ""));
+  const current = relayConfig();
+  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log("偵測會實際生圖並依供應商計費；先測通用介面，全部未通過時自動改測 Ark 任務介面。");
+  const outcome = await runRelayImagegenSetup({ provider, selected, current, settings, providers });
+  if (!outcome.available.length) fail("沒找到可用模型，生圖設定沒有變更。");
+  return {
+    models: outcome.available.map((model) => model.id),
+    apiMode: outcome.discovery.apiMode,
+    root: outcome.result.root,
+    probeRoot: outcome.probeRoot,
+  };
+}
+
+async function managerImagegenDisable() {
+  assertManagerWritable();
+  const backup = disableRelayImagegen();
+  if (!backup) fail("中轉 API 生圖尚未啟用。");
+  console.log(`已停用中轉 API 生圖，技能已封存至：${backup}`);
+  console.log("要恢復時重新偵測並啟用即可，或把封存的 router-imagegen 資料夾搬回 skills 目錄。");
+  return { backup };
+}
+
+const CLAUDE_CLI_MODEL_PATTERN = /^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/;
+
+async function managerClaudeCliStatus() {
+  const settings = readSettingsIfExists();
+  const routes = (Array.isArray(settings.routes) ? settings.routes : []).filter((route) => route.transport === "claude-cli");
+  const found = await inspectClaudeCliAsync(settings);
+  let auth = null;
+  let authError = null;
+  if (found) {
+    try { auth = await (await loadClaudeCliTransport()).claudeCliAuth(found.binary); }
+    catch (error) { authError = error.message; }
+  }
+  return {
+    installed: Boolean(found),
+    binary: found?.binary || null,
+    version: found?.version || null,
+    minimumVersion: CLAUDE_CLI_MIN_VERSION,
+    upToDate: Boolean(found?.version && compareVersions(found.version, CLAUDE_CLI_MIN_VERSION) >= 0),
+    loggedIn: Boolean(auth?.loggedIn),
+    authMethod: auth?.authMethod || null,
+    subscription: Boolean(auth?.loggedIn && auth.authMethod === "claude.ai"),
+    authError,
+    installerUrl: claudeCliInstallCommand(process.platform, tmpdir()).url,
+    routes: routes.map((route) => ({ slug: route.pickerSlug, displayName: route.displayName, upstreamModel: route.upstreamModel })),
+  };
+}
+
+async function managerClaudeCliModels() {
+  const settings = readSettingsIfExists();
+  const found = await inspectClaudeCliAsync(settings);
+  if (!found) fail("尚未安裝 Claude CLI。");
+  let discovered = [];
+  let warning = null;
+  try { discovered = await (await loadClaudeCliTransport()).discoverClaudeCliModels(found.binary); }
+  catch (error) { warning = `模型清單讀取失敗：${error.message}`; }
+  const choices = claudeCliModelChoices(Array.isArray(settings.routes) ? settings.routes : [], discovered);
+  return { choices, fromCli: choices.some((choice) => choice.source === "cli"), warning };
+}
+
+async function managerClaudeCliInstall() {
+  if (inspectClaudeCli()) fail("已經安裝 Claude CLI；需要新版本請按「更新 CLI」。");
+  const transport = await loadClaudeCliTransport();
+  await claudeCliSetupActions(transport).install();
+  const found = inspectClaudeCli();
+  if (!found) fail("安裝後仍找不到 Claude CLI，請檢查上方安裝程式輸出，或以 CODEX_MODEL_ROUTER_CLAUDE_BIN 指定執行檔。");
+  console.log(`已安裝 Claude CLI：${found.binary}（${found.version || "版本未知"}）`);
+  return { binary: found.binary, version: found.version };
+}
+
+async function managerClaudeCliUpdate() {
+  const found = inspectClaudeCli();
+  if (!found) fail("尚未安裝 Claude CLI。");
+  await claudeCliSetupActions(await loadClaudeCliTransport()).update(found.binary);
+  const after = inspectClaudeCli();
+  console.log(`Claude CLI：${after?.binary || found.binary}（${after?.version || "版本未知"}）`);
+  if (!after?.version || compareVersions(after.version, CLAUDE_CLI_MIN_VERSION) < 0) {
+    fail(`更新後仍未達 ${CLAUDE_CLI_MIN_VERSION}；Homebrew／WinGet 安裝請透過原套件管理器更新。`);
+  }
+  return { version: after.version };
+}
+
+// 登入沿用終端流程：在執行管理頁的終端機視窗啟動 claude auth login（Claude 官方流程會開啟
+// 瀏覽器授權；需要貼上代碼時也在那個視窗）。路由器不經手、不保存登入 token。
+async function managerClaudeCliLogin({ force = false } = {}) {
+  const found = inspectClaudeCli();
+  if (!found) fail("尚未安裝 Claude CLI，請先安裝。");
+  const transport = await loadClaudeCliTransport();
+  await ensureClaudeCliLogin(found.binary, {
+    auth: transport.claudeCliAuth,
+    login: (path) => {
+      console.log("已在執行管理頁的終端機視窗啟動 claude auth login，等待你在瀏覽器完成授權（最多 5 分鐘）。");
+      console.log("若瀏覽器沒有自動開啟，或畫面要求貼上代碼，請切到那個終端機視窗操作。");
+      return transport.claudeCliAuth(path, { login: true });
+    },
+    notify: console.log,
+    force: force === true,
+  });
+  console.log("Claude 訂閱帳號：已登入。");
+  return { loggedIn: true };
+}
+
+async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = {}) {
+  assertManagerWritable();
+  verifyLogin();
+  const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
+  if (defaults.contextWindow > 1000000) fail("Claude CLI 模型的上下文上限最多 1,000,000。");
+  const requested = Array.isArray(models) ? [...new Set(models.map((model) => String(model).trim()))].filter(Boolean) : [];
+  if (requested.length === 0) fail("請至少選擇一個模型。");
+  if (requested.length > 10) fail("一次最多測試 10 個模型。");
+  const invalid = requested.filter((model) => !CLAUDE_CLI_MODEL_PATTERN.test(model));
+  if (invalid.length) fail(`模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：${invalid.map((model) => terminalSafeText(model, 80)).join("、")}`);
+  const state = requireInstallation();
+  const found = inspectClaudeCli(state.settings);
+  if (!found) fail("尚未安裝 Claude CLI，請先在供應商頁安裝。");
+  if (!found.version || compareVersions(found.version, CLAUDE_CLI_MIN_VERSION) < 0) {
+    fail(`Claude CLI ${found.version || "版本未知"} 低於最低要求 ${CLAUDE_CLI_MIN_VERSION}，請先更新。`);
+  }
+  const transport = await loadClaudeCliTransport();
+  const auth = await transport.claudeCliAuth(found.binary);
+  if (!auth.loggedIn || auth.authMethod !== "claude.ai") fail("尚未登入 Claude 訂閱帳號，請先按「登入 Claude」。");
+  // 送出任何測試前先驗證設定，避免花了用量才發現參數不對。
+  planClaudeCliModels(state, found.binary, requested, defaults.contextWindow, {}, { maxOutputTokens: defaults.maxOutputTokens });
+  console.log(`Claude CLI：${found.binary}（${found.version}）`);
+  console.log(`將測試 ${requested.length} 個模型，每個發送一次短測試並使用訂閱用量；只有通過的會添加。`);
+  const tested = await testClaudeCliModels(transport, { binary: found.binary, version: found.version, models: requested });
+  if (!tested.passed.length) fail("沒有模型通過測試，路由配置未修改。");
+  // 測試期間設定可能被更新，以最新檔案重新規劃。
+  const plan = planClaudeCliModels(requireInstallation(), tested.binary, tested.passed, defaults.contextWindow,
+    tested.resolvedModels, { maxOutputTokens: defaults.maxOutputTokens });
+  console.log("\n測試完成，正在寫入設定並重新啟動路由器…");
+  const backupDir = await commitRouterChange("claude-cli", plan);
+  const added = [...new Set(tested.passed.map((model) => tested.resolvedModels[model]))];
+  console.log(`已添加：${added.map((id) => `claude-cli/${id}`).join("、")}`);
+  console.log(`上下文 ${defaults.contextWindow.toLocaleString("en-US")}，輸出 ${defaults.maxOutputTokens.toLocaleString("en-US")}（超過模型上限時 Claude CLI 會自動壓到上限）。`);
+  console.log(`備份：${backupDir}`);
+  return { added, failures: tested.failures, backupDir, restartDesktop: true };
+}
+
+function managerOperations() {
+  const job = (title, run) => ({ title, run });
+  return {
+    state: () => managerState(),
+    version: (options) => managerVersionInfo(options),
+    errors: () => managerRecentErrors(),
+    discover: (body) => managerDiscover(body),
+    providerDraft: (body) => managerProviderDraft(body),
+    // 唯讀查詢：不改任何設定、不花額度。
+    queries: {
+      "global-context": () => managerGlobalContext(),
+      "hidden-models": () => managerHiddenModels(),
+      imagegen: () => relayImagegenStatus(),
+      "claude-cli": () => managerClaudeCliStatus(),
+      "claude-cli-models": () => managerClaudeCliModels(),
+    },
+    jobs: {
+      "add-models": job("添加模型", managerAddModels),
+      "remove-models": job("刪除模型", managerRemoveModels),
+      "reorder-models": job("調整模型順序", managerReorderModels),
+      "edit-model": job("修改模型", managerEditModel),
+      "add-provider": job("新增供應商", managerAddProvider),
+      "remove-provider": job("移除供應商", managerRemoveProvider),
+      "replace-key": job("更換 API Key", managerReplaceKey),
+      "restart-router": job("重新啟動路由器", managerRestartRouter),
+      "restart-desktop": job("重新啟動桌面版", () => restartDesktopApp()),
+      update: job("更新路由器", managerUpdate),
+      "apply-update": job("套用新版本", managerApplyLocalUpdate),
+      "set-global-context": job("設定全域上下文", managerSetGlobalContext),
+      "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
+      "imagegen-setup": job("偵測並啟用中轉生圖", managerImagegenSetup),
+      "imagegen-disable": job("停用中轉生圖", managerImagegenDisable),
+      "claude-cli-install": job("安裝 Claude CLI", managerClaudeCliInstall),
+      "claude-cli-update": job("更新 Claude CLI", managerClaudeCliUpdate),
+      "claude-cli-login": job("登入 Claude 訂閱帳號", managerClaudeCliLogin),
+      "claude-cli-add": job("添加 Claude 訂閱模型", managerClaudeCliAdd),
+    },
+  };
+}
+
+// --- ui 命令 --------------------------------------------------------------------
+
+async function importManagerModule() {
+  const directory = mkdtempSync(join(tmpdir(), "codex-model-router-ui-"));
+  const file = join(directory, "manager.mjs");
+  try {
+    writeFileSync(file, loadManagerSource(), { mode: 0o600 });
+    return await import(pathToFileURL(file).href);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function argOption(name) {
+  const args = process.argv.slice(3);
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === name) return args[index + 1] ?? null;
+    if (args[index].startsWith(`${name}=`)) return args[index].slice(name.length + 1);
+  }
+  return null;
+}
+
+function listenOnce(server, port) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      rejectPromise(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolvePromise(server.address().port);
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  });
+}
+
+// 更新後重新啟動時沿用原本的埠，瀏覽器分頁才能直接接上新版本。
+async function listenManager(server, preferredPort) {
+  if (preferredPort > 0) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        return await listenOnce(server, preferredPort);
+      } catch (error) {
+        if (error.code !== "EADDRINUSE") throw error;
+        await delay(250);
+      }
+    }
+    console.log(`連接埠 ${preferredPort} 仍被佔用，改用其他連接埠；請改開下面顯示的新網址。`);
+  }
+  return listenOnce(server, 0);
+}
+
+function closeManagerServer(server) {
+  return new Promise((resolvePromise) => {
+    server.close(() => resolvePromise());
+    server.closeAllConnections?.();
+  });
+}
+
+async function runManager() {
+  if (!readManifest()) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
+  const inheritedToken = env.CODEX_MODEL_ROUTER_UI_TOKEN || null;
+  const openPage = env.CODEX_MODEL_ROUTER_UI_NO_OPEN !== "1";
+  if (!inheritedToken) {
+    const existing = readManagerLock();
+    if (existing && existing.pid !== process.pid && await managerAlive(existing)) {
+      const url = managerUrl(existing.port, existing.token);
+      console.log(`網頁管理介面已經在執行（${existing.version || "版本未知"}）。`);
+      if (openPage && openBrowser(url)) console.log("已在瀏覽器重新開啟。");
+      else console.log(`請在瀏覽器開啟：${url}`);
+      return;
+    }
+  }
+
+  const manager = await importManagerModule();
+  const html = loadManagerPage();
+  const token = inheritedToken || manager.createToken();
+  const jobs = manager.createJobRunner();
+  const restoreOutput = manager.installOutputCapture(jobs);
+  managerMode = true;
+  let lastActivity = Date.now();
+  let finish = () => {};
+  const finished = new Promise((resolvePromise) => { finish = resolvePromise; });
+  const server = manager.createManagerServer({
+    html, token, version: INSTALLER_VERSION, ops: managerOperations(), jobs,
+    onActivity: () => { lastActivity = Date.now(); },
+    onShutdown: () => finish("shutdown"),
+    onRestart: () => finish("restart"),
+    restartBlocked: () => (existsSync(managerInstallerPath)
+      ? null
+      : "找不到已安裝的安裝器副本，請關閉這個分頁後重新開啟管理頁。"),
+  });
+  let port;
+  try {
+    port = await listenManager(server, Number(argOption("--port")) || 0);
+  } catch (error) {
+    restoreOutput();
+    managerMode = false;
+    throw error;
+  }
+  try {
+    writeJsonAtomic(managerLockPath, {
+      pid: process.pid, port, token, version: INSTALLER_VERSION, startedAt: new Date().toISOString(),
+    });
+  } catch {}
+  // 終端視窗被關掉後寫入會失敗；那時只剩背景工作要收尾，不能因此崩潰。
+  const ignoreStreamError = () => {};
+  process.stdout.on("error", ignoreStreamError);
+  process.stderr.on("error", ignoreStreamError);
+
+  const url = managerUrl(port, token);
+  printHeading("網頁管理介面");
+  console.log(`網址：${url}`);
+  console.log("網址含這次的存取權杖，請勿分享。關閉這個視窗或按 Ctrl+C 即結束；閒置 20 分鐘也會自動結束。");
+  if (inheritedToken) console.log("已載入新版本，瀏覽器分頁會自動重新整理。");
+  else if (openPage && !openBrowser(url)) console.log("無法自動開啟瀏覽器，請手動複製上面的網址。");
+
+  // 操作進行中收到結束訊號時先等它完成，免得設定寫到一半；再按一次 Ctrl+C 才強制結束。
+  let exitRequested = false;
+  let warned = false;
+  const onSignal = (signal) => {
+    if (!jobs.active()) {
+      finish("signal");
+      return;
+    }
+    if ((signal === "SIGINT" || signal === "SIGBREAK") && warned) process.exit(130);
+    exitRequested = true;
+    if (signal === "SIGINT" || signal === "SIGBREAK") {
+      warned = true;
+      console.log(`\n「${jobs.active().title}」還在進行，完成後會自動結束；再按一次 Ctrl+C 立即強制結束。`);
+    }
+  };
+  const signals = isWindows ? ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] : ["SIGINT", "SIGTERM", "SIGHUP"];
+  for (const signal of signals) process.on(signal, onSignal);
+  const watchdog = setInterval(() => {
+    if (jobs.active()) return;
+    if (exitRequested) finish("signal");
+    else if (Date.now() - lastActivity > MANAGER_IDLE_MS) finish("idle");
+  }, 2000);
+
+  const reason = await finished;
+  clearInterval(watchdog);
+  for (const signal of signals) process.off(signal, onSignal);
+  await closeManagerServer(server);
+  if (reason !== "restart") removeManagerLock(token);
+  restoreOutput();
+  managerMode = false;
+  if (reason === "restart") {
+    await restartIntoInstalledManager(port, token);
+    return;
+  }
+  console.log(reason === "idle"
+    ? "\n超過 20 分鐘沒有使用，網頁管理介面已自動結束。"
+    : "\n網頁管理介面已結束。");
+}
+
+// 一鍵更新後由新版安裝器接手同一個埠與權杖，網頁分頁不用重開。這個行程只等它結束，
+// 訊號交給新的管理頁處理。
+async function restartIntoInstalledManager(port, token) {
+  console.log("\n正在以新版本重新啟動網頁管理介面…");
+  const childEnv = { ...env, CODEX_MODEL_ROUTER_UI_TOKEN: token, CODEX_MODEL_ROUTER_UI_NO_OPEN: "1" };
+  delete childEnv.CODEX_MODEL_ROUTER_SCRIPT_PATH;
+  const [command, args] = isWindows
+    ? ["powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", managerInstallerPath, "ui", "--port", String(port)]]
+    : ["/bin/bash", [managerInstallerPath, "ui", "--port", String(port)]];
+  const ignore = () => {};
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, ignore);
+  const code = await new Promise((resolvePromise) => {
+    const child = spawn(command, args, { env: childEnv, stdio: "inherit" });
+    child.once("error", (error) => {
+      console.error(`無法重新啟動網頁管理介面：${error.message}`);
+      resolvePromise(1);
+    });
+    child.once("exit", (status) => resolvePromise(status ?? 0));
+  });
+  process.exitCode = code;
+}
+
 export const MENU_ITEMS = [
   ["install", "安裝或重新配置"],
+  ["ui", "開啟網頁管理介面"],
   ["update", "更新到最新版本（保留現有配置）"],
   ["add", "添加自訂模型"],
   ["remove", "刪除自訂模型"],
@@ -4501,6 +6225,7 @@ function help() {
 
 用法：
   ${basename(scriptPath || "codex-model-router.command")} install
+  ${basename(scriptPath || "codex-model-router.command")} ui
   ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} remove
@@ -4520,6 +6245,13 @@ function help() {
 探測時 /responses 不通的模型會改探 /chat/completions（DeepSeek、通義千問、Ollama 等），
 通過的由路由器在本機轉譯。
 路由器安裝成功後可選擇啟用中轉 API 生圖；預設不啟用，之後可從選單第 ${menuNumber("imagegen")} 項添加。
+
+ui 在瀏覽器開啟本機網頁管理介面：查看狀態與最近錯誤、添加／刪除／排序模型、修改顯示名稱、
+上下文與輸出、管理供應商與 API Key、中轉 API 生圖、全域上下文、隱藏的官方模型與 Claude 訂閱（CLI），
+並可檢查新版本、一鍵更新後重新啟動。背後用的是與選單相同的流程（先備份、失敗還原）。
+網址含一次性存取權杖，只接受本機連線；關閉終端視窗即結束。
+安裝與更新完成後會建立捷徑（macOS：~/Applications/Codex 模型路由器.command；
+Windows：開始功能表），雙擊即可開啟。
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
 沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
@@ -4561,6 +6293,9 @@ async function chooseAction() {
   const choices = {
     install: "install",
     setup: "install",
+    ui: "ui",
+    web: "ui",
+    manager: "ui",
     update: "update",
     upgrade: "update",
     add: "add",
@@ -4623,7 +6358,8 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       await printVersionSummary();
     }
     const action = requestedAction || (await chooseAction());
-    if (action === "claude-cli") await configureClaudeCli(requestedAction ? process.argv[3] : null);
+    if (action === "ui" || action === "web" || action === "manager") await runManager();
+    else if (action === "claude-cli") await configureClaudeCli(requestedAction ? process.argv[3] : null);
     else if (action === "context-1m") await configureMillionTokenContext();
     else if (action === "imagegen" || action === "relay-imagegen") await configureRelayImagegen();
     else if (action === "imagegen-disable") {

@@ -18,8 +18,11 @@ const MARKERS = {
   bridge: ["__CODEX_MODEL_ROUTER_BRIDGE_JS__", "__CODEX_MODEL_ROUTER_CHAT_JS__"],
   "chat-bridge": ["__CODEX_MODEL_ROUTER_CHAT_JS__", "__CODEX_MODEL_ROUTER_IMAGEGEN_JS__"],
   imagegen: ["__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", "__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__"],
-  "claude-cli": ["__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__", "__CODEX_MODEL_ROUTER_EMBEDDED__"],
+  "claude-cli": ["__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__", "__CODEX_MODEL_ROUTER_MANAGER_JS__"],
+  manager: ["__CODEX_MODEL_ROUTER_MANAGER_JS__", "__CODEX_MODEL_ROUTER_MANAGER_HTML__"],
 };
+// 網頁管理介面的頁面不是模組，另外存成 manager.html。
+const PAGE_MARKERS = ["__CODEX_MODEL_ROUTER_MANAGER_HTML__", "__CODEX_MODEL_ROUTER_EMBEDDED__"];
 
 // 與安裝器的 awk 同樣的切法：起始標記的下一行起，到結束標記的前一行為止。
 function slice(text, [begin, end]) {
@@ -64,6 +67,7 @@ function extractTo(settings) {
   for (const [name, markers] of Object.entries(MARKERS)) {
     writeFileSync(join(dir, `${name}.mjs`), slice(text, markers), "utf8");
   }
+  writeFileSync(join(dir, "manager.html"), slice(text, PAGE_MARKERS), "utf8");
   writeFileSync(join(dir, "settings.json"), JSON.stringify(settings), "utf8");
 
   // router.mjs 與 chat-bridge.mjs 只認同目錄下的 ./claude-bridge.mjs。
@@ -87,6 +91,8 @@ export async function loadPayloads() {
     bridge: await load("bridge"),
     chat: await load("chat-bridge"),
     imagegen: await load("imagegen"),
+    manager: await load("manager"),
+    managerPage: readFileSync(join(dir, "manager.html"), "utf8"),
   };
   return cached;
 }

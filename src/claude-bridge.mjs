@@ -725,6 +725,11 @@ export function toAnthropicRequest(body, route) {
     typeof route === "object" && Number.isFinite(route?.maxOutputTokens) && route.maxOutputTokens > 0
       ? route.maxOutputTokens
       : null;
+  // 個別路由可提高預設輸出預算，仍由模型上限夾住；其他路由沿用原本預設。
+  const defaultMaxOutput =
+    typeof route === "object" && Number.isSafeInteger(route?.defaultMaxOutputTokens) && route.defaultMaxOutputTokens > 0
+      ? route.defaultMaxOutputTokens
+      : DEFAULT_MAX_TOKENS;
   const systemParts = typeof body.instructions === "string" && body.instructions ? [body.instructions] : [];
   const messages = [];
   let compaction = false;
@@ -956,7 +961,7 @@ export function toAnthropicRequest(body, route) {
 
   let budget = useOutputConfig ? 0 : EFFORT_BUDGET[effort] || 0;
   let maxTokens = Math.max(
-    Number(body.max_output_tokens) || DEFAULT_MAX_TOKENS,
+    Number(body.max_output_tokens) || defaultMaxOutput,
     budget + OUTPUT_HEADROOM,
   );
   // 不可超過該模型實際允許的輸出上限，否則上游直接 400。

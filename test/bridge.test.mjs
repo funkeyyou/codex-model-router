@@ -39,6 +39,20 @@ test("模型輸出上限會夾住 max_tokens，且 budget 跟著縮", () => {
   assert.ok(request.thinking.budget_tokens < 8192);
 });
 
+test("可單獨提高路由預設輸出，仍尊重請求與模型上限", () => {
+  const route = {
+    upstreamModel: "claude-x", effortControl: "output_config",
+    maxOutputTokens: 128000, defaultMaxOutputTokens: 128000,
+  };
+  const input = [userMessage("hi")];
+  const extra = { reasoning: { effort: "max" } };
+  assert.equal(build(input, extra, route).max_tokens, 128000);
+  assert.equal(build(input, { ...extra, max_output_tokens: 4096 }, route).max_tokens, 4096);
+  assert.equal(build(input, extra, { ...route, maxOutputTokens: 64000 }).max_tokens, 64000);
+  assert.equal(build(input, extra, { ...route, defaultMaxOutputTokens: undefined }).max_tokens, 32000);
+  assert.equal(build(input, extra, { ...route, defaultMaxOutputTokens: -1 }).max_tokens, 32000);
+});
+
 test("輸出上限低到放不下 thinking 時，寧可不送 thinking 也不能違反不變式", () => {
   // 閘道的 maxOutputTokens 是從錯誤訊息正則抓的，可能回報極小的值。
   for (const maxOutputTokens of [4096, 2048, 1024, 512]) {
