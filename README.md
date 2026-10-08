@@ -122,6 +122,8 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 安装或更新完成后，安装器会在路由器目录放一份安装器副本，并建立「Codex 模型路由器」快捷方式（macOS 在 `~/Applications`，Windows 在开始菜单），之后双击即可打开，不必再找当初下载的安装器。
 
+将这个仓库作为 Codex 项目打开时，顶部 Actions 也会提供「自定义模型管理」入口（按钮显示「自訂模型管理」）；点击会执行已安装路由器的 `ui` 命令，直接打开管理页。配置在 [`.codex/environments/environment.toml`](.codex/environments/environment.toml)，按 macOS／Windows 选择对应命令，并沿用 `CODEX_MODEL_ROUTER_HOME` 或 `CODEX_HOME`；请先安装路由工具。这个入口按项目提供，不会加入原生模型菜单或切换模型。若未显示，重新打开该项目；要在其他项目使用，可合并配置文件中的 `[[actions]]` 项目，保留原有的 setup 和其他动作。
+
 - **总览**：路由器状态、请求统计、最近的错误与诊断 ID、执行环境。
 - **模型**：拖曳排序，修改显示名称、上下文与输出，勾选删除。新增模型时可选中转供应商或 Claude 订阅；默认上下文 1,000,000、输出 128,000，上游回报的上限较小时以上游为准。
 - **供应商**：新增「OpenAI 兼容 API」或「Claude 订阅账号（Claude CLI）」，更换 API Key、移除供应商。选 Claude 订阅时会依序检查 CLI 是否安装、版本与订阅登录，缺少的步骤可直接处理。
@@ -131,7 +133,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 背后沿用菜单的流程：写入前备份，失败自动还原；会产生费用或使用订阅额度的探测、生图检测与 Claude 测试，都会先列出内容再确认。排序、改名与修改上下文只写入模型目录，不重启路由器；修改输出、添加或删除模型会重启路由器。输出上限只对 Claude 模型有效（送往 Claude 的 `max_tokens`，或 Claude CLI 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`），GPT 与 Chat Completions 模型不送这个值，由上游决定。
 
-管理页只监听 `127.0.0.1`，网址附带本次的访问令牌（请勿分享），并检查 Host 与 Origin、只接受 JSON 请求、启用 CSP。API Key 只写入钥匙圈或 DPAPI，不会回传到页面。关闭终端窗口、点击「结束管理页」或闲置 20 分钟后自动结束；常驻的路由器本身不提供网页。首次安装与回退仍在终端执行。界面文字目前为繁体中文。
+管理页只监听 `127.0.0.1`，网址附带本次的访问令牌（请勿分享），并检查 Host 与 Origin、只接受 JSON 请求、启用 CSP。API Key 只写入钥匙圈或 DPAPI，不会回传到页面。一般启动时关闭终端窗口即结束；一键更新或重启桌面版后由独立程序接手，请点击「结束管理页」关闭，或闲置 20 分钟后自动结束。常驻的路由器本身不提供网页。首次安装与回退仍在终端执行。界面文字目前为繁体中文。
 
 ## 升级
 
@@ -156,6 +158,8 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 ```
 
 从 1.27.0 起，也可以在网页管理界面左上角的版本菜单一键更新：从 GitHub Release 下载新版安装器、核对 `SHA256SUMS` 后执行同样的 `update`；macOS 上可选择完成后重新启动 ChatGPT。
+
+1.27.3 起，更新成功后会自动交接新版管理程序，沿用同一个网址并恢复操作记录，不需要浏览器保持轮询；桌面重启由独立程序执行，重开后确认 App 确实启动。若交接或重启失败，可查看路由器目录内的 `manager-worker.log`。从 1.27.0～1.27.2 升级时，请先使用新安装器的 `update` 与 `ui` 命令重新打开管理页，旧版页面无法自行应用这项修复。
 
 `update` 只换掉路由器与转译层的代码并重写服务定义，然后重启服务并做健康检查。
 Base URL、API Key、连接埠与所有已设置的自定义模型全部沿用，不会重问任何一项。

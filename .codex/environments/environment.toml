@@ -1,0 +1,26 @@
+version = 1
+name = "Codex Model Router"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "自訂模型管理"
+icon = "tool"
+platform = "darwin"
+command = '''/bin/bash "${CODEX_MODEL_ROUTER_HOME:-${CODEX_HOME:-$HOME/.codex}/model-router}/codex-model-router.sh" ui'''
+
+[[actions]]
+name = "自訂模型管理"
+icon = "tool"
+platform = "win32"
+command = '''
+$routerManagerRoot = if ($env:CODEX_MODEL_ROUTER_HOME) {
+  $env:CODEX_MODEL_ROUTER_HOME
+} elseif ($env:CODEX_HOME) {
+  Join-Path $env:CODEX_HOME 'model-router'
+} else {
+  Join-Path $env:USERPROFILE '.codex\model-router'
+}
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $routerManagerRoot 'codex-model-router.ps1') ui
+'''

@@ -26,6 +26,58 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 逾時用的計時器要 unref：比賽贏的一方先結束時，它不能讓測試檔多掛著等它跑完。
 const timeoutAfter = (ms, value) => new Promise((resolve) => setTimeout(resolve, ms, value).unref());
 
+// 額外的本機驗收：只控制當次產生的測試 App，絕不重新啟動使用者的 ChatGPT。
+// 明確加 CODEX_MODEL_ROUTER_TEST_DESKTOP_RESTART=1 才跑，CI 不碰 GUI / launchd。
+test("macOS launchd 接手管理頁後，獨立 worker 能正常結束並重新開啟測試 App", {
+  skip: process.platform !== "darwin" || process.env.CODEX_MODEL_ROUTER_TEST_DESKTOP_RESTART !== "1",
+  timeout: 120000,
+}, async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-desktop-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  mkdirSync(runtime);
+  copyFileSync(shellPath, join(runtime, "codex-model-router.sh"));
+  const app = join(root, "RouterRestartTest-" + Date.now() + ".app");
+  execFileSync("/usr/bin/osacompile", ["-s", "-o", app, "-e", "on idle", "-e", "return 60", "-e", "end idle",
+    "-e", "on quit", "-e", "continue quit", "-e", "end quit"], { timeout: 30000 });
+  const bundleId = "com.example.router-restart-" + Date.now();
+  execFileSync("/usr/bin/plutil", ["-insert", "CFBundleIdentifier", "-string", bundleId, join(app, "Contents", "Info.plist")]);
+  execFileSync("/usr/bin/codesign", ["--force", "--sign", "-", app], { timeout: 10000 });
+  const running = () => execFileSync("/usr/bin/osascript", ["-e", `application ${JSON.stringify(app)} is running`], { encoding: "utf8", timeout: 10000 }).trim() === "true";
+  defer(() => { if (running()) execFileSync("/usr/bin/osascript", ["-e", `tell application ${JSON.stringify(app)} to quit`], { timeout: 15000 }); });
+  execFileSync("/usr/bin/open", ["-g", app], { timeout: 10000 });
+  for (let attempt = 0; attempt < 100 && !running(); attempt += 1) await delay(100);
+  assert.equal(running(), true, "測試 App 已啟動");
+  const provider = { baseUrl: "http://127.0.0.1:9", apiRoot: "http://127.0.0.1:9/v1", keychainService: "fixture.desktop" };
+  for (const name of ["install.json", "settings.json"]) writeFileSync(join(runtime, name), JSON.stringify({ version: releases.latest, port: 9, routes: [], ...provider }));
+  writeFileSync(join(runtime, "models.json"), JSON.stringify({ models: [] }));
+  const environment = baseEnv(root, runtime);
+  environment.CODEX_MODEL_ROUTER_TEST_MODE = "0"; // 真的走 launchctl submit，但 App 強制指定為測試用。
+  environment.CODEX_MODEL_ROUTER_DESKTOP_APP = app;
+  const ui = await startManager(defer, environment);
+  defer(async () => {
+    try { await ui.call("/api/shutdown", { method: "POST" }); } catch {}
+    for (let attempt = 0; attempt < 200 && readdirSync(runtime).some((name) => /^manager-worker-.*\.mjs$/.test(name)); attempt += 1) await delay(50);
+  });
+  const previousPing = (await ui.call("/api/ping", { method: "POST" })).json;
+  const started = await ui.call("/api/jobs", { method: "POST", body: { type: "restart-desktop", params: {} } });
+  assert.equal(started.status, 202);
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
+  assert.notEqual((await ui.call("/api/ping", { method: "POST" })).json.instanceId, previousPing.instanceId);
+  let finished;
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    finished = (await ui.call("/api/jobs/" + started.json.id)).json;
+    if (finished.status !== "running") break;
+    await delay(100);
+  }
+  assert.equal(finished.status, "succeeded", JSON.stringify(finished));
+  assert.equal(finished.result.desktopRestarted, true, finished.output + "\n" + finished.result.desktopError);
+  assert.match(finished.output, /正常結束/);
+  assert.match(finished.output, /已確認.*重新啟動/);
+  assert.equal(running(), true);
+});
+
 // 清理依登記的相反順序執行（像 defer）：先停子行程，最後才刪暫存目錄。Windows 不能刪除子行程
 // 還在使用的目錄（例如它的工作目錄）；刪除失敗也不能讓子行程留著，否則整個測試檔不會結束。
 function cleanupStack(t) {
@@ -442,13 +494,14 @@ test("一鍵更新：下載並核對 SHA256SUMS 與版本後才執行新版安�
     "",
   ].join("\n"));
   let mode = "ok";
+  let asset = fakeInstaller;
   const requests = [];
   const releaseServer = http.createServer((request, response) => {
     requests.push(request.url);
-    const sums = (mode === "bad-hash" ? "0".repeat(64) : createHash("sha256").update(fakeInstaller).digest("hex")) + "  codex-model-router.sh\n";
+    const sums = (mode === "bad-hash" ? "0".repeat(64) : createHash("sha256").update(asset).digest("hex")) + "  codex-model-router.sh\n";
     if (mode === "missing") { response.writeHead(404); response.end(); return; }
     if (request.url === "/v9.9.9/SHA256SUMS") { response.end(sums); return; }
-    if (request.url === "/v9.9.9/codex-model-router.sh") { response.end(fakeInstaller); return; }
+    if (request.url === "/v9.9.9/codex-model-router.sh") { response.end(asset); return; }
     response.writeHead(404);
     response.end();
   });
@@ -490,6 +543,30 @@ test("一鍵更新：下載並核對 SHA256SUMS 與版本後才執行新版安�
   assert.deepEqual(updated.result, { version: "9.9.9", managerRestart: false, restartDesktop: true });
   assert.deepEqual(requests.filter((url) => url.startsWith("/v9.9.9/")).slice(-2), ["/v9.9.9/SHA256SUMS", "/v9.9.9/codex-model-router.sh"]);
 
-  assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
+  // 第二次提供真的新版管理頁，只把 update 寫檔步驟換成 fixture。送出後完全不輪詢，
+  // 模擬瀏覽器已關閉；新版必須自己接手同一個埠，且舊程序退出後仍可使用。
+  const installedScript = readFileSync(shellPath, "utf8").replace(`const INSTALLER_VERSION = "${releases.latest}";`, 'const INSTALLER_VERSION = "9.9.9";');
+  writeFileSync(join(root, "new-manager.sh"), installedScript);
+  const entry = ["#!/bin/bash", 'if [ "$1" = update ]; then',
+    '  cp "$CODEX_HOME/new-manager.sh" "$CODEX_MODEL_ROUTER_HOME/codex-model-router.sh"',
+    '  echo "fixture: update complete"', "  exit 0", "fi", ""].join("\n");
+  asset = Buffer.from(entry + installedScript.slice("#!/bin/bash\n".length));
+  const previousPing = (await ui.call("/api/ping", { method: "POST" })).json;
+  const started = await ui.call("/api/jobs", { method: "POST", body: { type: "update", params: { restartDesktop: false } } });
+  assert.equal(started.status, 202);
+  defer(async () => {
+    try { await ui.call("/api/shutdown", { method: "POST" }); } catch {}
+    for (let attempt = 0; attempt < 200 && readdirSync(runtime).some((name) => /^manager-worker-.*\.mjs$/.test(name)); attempt += 1) await delay(50);
+  });
   assert.equal((await ui.waitExit())[0], 0, ui.output());
+  const newPing = (await ui.call("/api/ping", { method: "POST" })).json;
+  assert.equal(newPing.version, "9.9.9");
+  assert.notEqual(newPing.instanceId, previousPing.instanceId);
+  const handedOff = (await ui.call("/api/jobs/" + started.json.id)).json;
+  assert.equal(handedOff.id, started.json.id);
+  assert.equal(handedOff.status, "succeeded", JSON.stringify(handedOff));
+  assert.match(handedOff.output, /fixture: update complete/);
+  assert.equal(handedOff.result.managerRestart, false, "新程序不會再次交接形成迴圈");
+  assert.equal(existsSync(join(runtime, "manager-handoff.json")), false);
+  assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
 });

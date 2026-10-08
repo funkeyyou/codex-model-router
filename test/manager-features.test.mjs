@@ -8,6 +8,15 @@ import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer, dir } = await loadPayloads();
 
+test("背景管理程序不保存繼承來的 API Key、登入 token 或舊安裝器路徑", () => {
+  const kept = installer.managerBackgroundEnvironment({ PATH: "/fixture/bin", CODEX_HOME: "/fixture/codex",
+    CODEX_MODEL_ROUTER_NODE_BIN: "/fixture/node", OPENAI_API_KEY: "secret", ANTHROPIC_AUTH_TOKEN: "secret",
+    CODEX_MODEL_ROUTER_SCRIPT_PATH: "/fixture/old.sh", CODEX_MODEL_ROUTER_UI_TOKEN: "old-token",
+    HTTPS_PROXY: "http://127.0.0.1:7890", NODE_USE_ENV_PROXY: "1" });
+  assert.deepEqual(kept, { PATH: "/fixture/bin", HTTPS_PROXY: "http://127.0.0.1:7890", NODE_USE_ENV_PROXY: "1",
+    CODEX_HOME: "/fixture/codex", CODEX_MODEL_ROUTER_NODE_BIN: "/fixture/node" });
+});
+
 test("全域上下文：空值代表移除，其他必須是 16,000～4,000,000 的整數", () => {
   for (const value of [undefined, null, ""]) assert.equal(installer.normalizeGlobalContextWindow(value), null);
   assert.equal(installer.normalizeGlobalContextWindow(1000000), 1000000);

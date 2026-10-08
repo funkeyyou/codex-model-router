@@ -14,6 +14,8 @@
 import http from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 export const TOKEN_HEADER = "x-router-manager-token";
 const MAX_BODY_BYTES = 64 * 1024;
@@ -29,6 +31,103 @@ export function stripAnsi(text) {
   return String(text ?? "")
     .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function backgroundCommand(command, args, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => { child.kill(); reject(new Error("外部程式執行逾時。")); }, timeoutMs);
+    child.stdout.on("data", (chunk) => { stdout = (stdout + chunk).slice(-16384); });
+    child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-16384); });
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("close", (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+  });
+}
+
+// 必須在獨立的程序內執行：關閉桌面版時，由它啟動的工具程序也可能一起被結束。
+// open 成功還不代表應用程式已啟動，最後再確認程序真的存在。
+export async function restartDesktopProcess(app, {
+  run = backgroundCommand, wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now = () => Date.now(), timeoutMs = 30000, report = () => {},
+} = {}) {
+  if (!app || typeof app.path !== "string" || !/^[A-Za-z0-9.-]{3,200}$/.test(app.bundleId)) {
+    throw new Error("桌面版應用程式資料無效。");
+  }
+  // App 關閉後，僅以 bundle ID 查詢有時會失去 LaunchServices 的解析；固定實際路徑。
+  const application = `application ${JSON.stringify(app.path)}`;
+  const running = async () => {
+    const result = await run("/usr/bin/osascript", ["-e", `${application} is running`], 10000);
+    if (result.status !== 0 || !["true", "false"].includes(result.stdout.trim())) {
+      throw new Error(`無法確認 ${app.name} 是否正在執行（${stripAnsi(result.stderr).slice(0, 200) || "未知錯誤"}）。`);
+    }
+    return result.stdout.trim() === "true";
+  };
+  if (await running()) {
+    report(`正在正常結束 ${app.name}；若 macOS 詢問控制權限，請選擇允許。`);
+    const quit = await run("/usr/bin/osascript", ["-e", "with timeout of 30 seconds",
+      "-e", `tell ${application} to quit`, "-e", "end timeout"], 45000);
+    if (quit.status !== 0) throw new Error(`無法結束 ${app.name}（${stripAnsi(quit.stderr).slice(0, 200) || "未知錯誤"}）。請手動重新開啟。`);
+    const deadline = now() + timeoutMs;
+    while (await running()) {
+      if (now() >= deadline) throw new Error(`${app.name} 沒有正常結束，可能正在等待確認。請手動重新開啟。`);
+      await wait(250);
+    }
+    await wait(1000);
+  }
+  report(`正在重新開啟 ${app.name}…`);
+  const opened = await run("/usr/bin/open", [app.path], 30000);
+  if (opened.status !== 0) throw new Error(`無法重新開啟 ${app.name}（${stripAnsi(opened.stderr).slice(0, 200) || "未知錯誤"}）。請手動打開。`);
+  const deadline = now() + timeoutMs;
+  while (!await running()) {
+    if (now() >= deadline) throw new Error(`${app.name} 未在預期時間內啟動，請手動打開。`);
+    await wait(250);
+  }
+  report(`已確認 ${app.name} 重新啟動。`);
+  return { restarted: app.name };
+}
+
+// 這段模組會由安裝器另存為短期 worker。macOS 由 launchd 啟動，Windows／測試用 detached
+// 子程序；不依賴原本的桌面版、終端或瀏覽器。只記錄輸出和結果，不接受網路請求。
+export async function runBackgroundTask(specPath) {
+  const spec = JSON.parse(readFileSync(specPath, "utf8"));
+  const messages = [];
+  const report = (status, extra = {}) => {
+    if (extra.message) messages.push(extra.message);
+    const temporary = `${spec.statusPath}.tmp-${process.pid}`;
+    writeFileSync(temporary, JSON.stringify({ status, pid: process.pid, ...extra, messages: messages.slice(-20) }), { mode: 0o600 });
+    renameSync(temporary, spec.statusPath);
+    chmodSync(spec.statusPath, 0o600);
+  };
+  try {
+    report("ready");
+    let result;
+    if (spec.kind === "desktop") {
+      result = await restartDesktopProcess(spec.app, { report: (message) => { console.log(message); report("running", { message }); } });
+    } else if (spec.kind === "manager") {
+      const code = await new Promise((resolve, reject) => {
+        const child = spawn(spec.command, spec.args, { env: spec.environment, stdio: "inherit", windowsHide: true });
+        child.once("error", reject);
+        child.once("close", (code) => resolve(code));
+      });
+      if (code !== 0) throw new Error(`管理程序結束代碼：${code}`);
+      result = { code };
+    } else {
+      throw new Error("未知的背景工作。");
+    }
+    report("succeeded", { result });
+  } catch (error) {
+    report("failed", { error: messageOf(error) });
+    console.error(messageOf(error));
+    process.exitCode = 1;
+  } finally {
+    // 結果留給管理頁讀取；程式與含存取權杖的啟動參數在工作結束後立即刪除。
+    rmSync(specPath, { force: true });
+    rmSync(spec.workerPath, { force: true });
+    if (spec.kind === "manager" && process.exitCode !== 1) rmSync(spec.statusPath, { force: true });
+    if (spec.launchLabel) spawnSync("/bin/launchctl", ["remove", spec.launchLabel], { stdio: "ignore", timeout: 5000 });
+  }
 }
 
 // 瀏覽器對非 80 埠一定會在 Host 帶上埠號；不帶或埠號不符都拒絕。
@@ -68,7 +167,7 @@ function messageOf(error) {
 
 // 背景工作：同一時間只跑一項會改設定的操作。輸出由 installOutputCapture 依
 // AsyncLocalStorage 歸到對應的工作，網頁以 offset 輪詢增量內容。
-export function createJobRunner({ maxOutput = MAX_JOB_OUTPUT, keep = KEEP_FINISHED_JOBS, now = () => Date.now() } = {}) {
+export function createJobRunner({ maxOutput = MAX_JOB_OUTPUT, keep = KEEP_FINISHED_JOBS, now = () => Date.now(), onFinished = () => {} } = {}) {
   const jobs = new Map();
   const storage = new AsyncLocalStorage();
   let active = null;
@@ -77,6 +176,28 @@ export function createJobRunner({ maxOutput = MAX_JOB_OUTPUT, keep = KEEP_FINISH
   const prune = () => {
     const finished = [...jobs.values()].filter((job) => job.status !== "running");
     for (const job of finished.slice(0, Math.max(0, finished.length - keep))) jobs.delete(job.id);
+  };
+
+  const execute = (job, run) => {
+    if (active) throw httpError(409, `「${active.title}」正在進行中，請等它完成。`);
+    active = job;
+    job.status = "running";
+    job.finishedAt = null;
+    storage.run(job, () => {
+      Promise.resolve().then(() => run(job)).then(
+        (result) => { job.result = result ?? null; job.status = "succeeded"; },
+        (error) => {
+          job.error = messageOf(error);
+          job.status = "failed";
+          console.error(`\n錯誤：${job.error}`);
+        },
+      ).finally(async () => {
+        job.finishedAt = new Date(now()).toISOString();
+        if (active === job) active = null;
+        try { await onFinished(job); } catch (error) { console.error(messageOf(error)); }
+      });
+    });
+    return job;
   };
 
   const runner = {
@@ -101,28 +222,24 @@ export function createJobRunner({ maxOutput = MAX_JOB_OUTPUT, keep = KEEP_FINISH
         result: null, error: null, startedAt: new Date(now()).toISOString(), finishedAt: null,
       };
       jobs.set(job.id, job);
-      active = job;
       prune();
-      storage.run(job, () => {
-        Promise.resolve()
-          .then(() => run(job))
-          .then(
-            (result) => {
-              job.result = result ?? null;
-              job.status = "succeeded";
-            },
-            (error) => {
-              job.error = messageOf(error);
-              job.status = "failed";
-              console.error(`\n錯誤：${job.error}`);
-            },
-          )
-          .finally(() => {
-            job.finishedAt = new Date(now()).toISOString();
-            if (active === job) active = null;
-          });
-      });
+      return execute(job, run);
+    },
+    // 更新交接只恢復已完成的工作；不保存請求參數或 API Key。
+    restore(snapshot) {
+      if (!snapshot || !/^[A-Za-z0-9-]{1,64}$/.test(snapshot.id) || !["succeeded", "failed"].includes(snapshot.status)
+        || typeof snapshot.output !== "string" || typeof snapshot.type !== "string" || typeof snapshot.title !== "string") {
+        throw new Error("管理頁的工作交接記錄無效。");
+      }
+      const job = { ...snapshot, output: snapshot.output.slice(-maxOutput) };
+      job.base = Math.max(0, (Number(snapshot.offset) || 0) - job.output.length);
+      jobs.set(job.id, job);
+      prune();
       return job;
+    },
+    resume(job, run) {
+      if (jobs.get(job.id) !== job) throw new Error("找不到要繼續的工作。");
+      return execute(job, run);
     },
     view(job, offset = 0) {
       const start = Math.max(0, Math.min(job.output.length, Number(offset) - job.base));
@@ -221,7 +338,7 @@ async function readJson(request) {
 // 與 jobs（會改設定的背景工作，{ type: { title, run } }）。
 // restartBlocked() 回傳字串時拒絕重新啟動管理頁，回傳 null 才呼叫 onRestart。
 export function createManagerServer({
-  html, token, version, ops, jobs,
+  html, token, version, ops, jobs, instanceId = createToken(),
   onActivity = () => {}, onShutdown = () => {}, onRestart = null, restartBlocked = () => null,
 }) {
   if (!html || !token || !ops || !jobs) throw new Error("createManagerServer 缺少必要參數。");
@@ -269,11 +386,12 @@ export function createManagerServer({
       return;
     }
     onActivity();
+    response.setHeader("x-router-manager-instance", instanceId);
     const body = method === "POST" ? await readJson(request) : null;
     const route = `${method} ${pathname}`;
 
     if (route === "GET /api/state") {
-      sendJson(response, 200, { ...(await ops.state()), manager: { version, activeJob: activeSummary() } });
+      sendJson(response, 200, { ...(await ops.state()), manager: { version, instanceId, activeJob: activeSummary() } });
       return;
     }
     if (route === "GET /api/version") {
@@ -285,7 +403,7 @@ export function createManagerServer({
       return;
     }
     if (route === "POST /api/ping") {
-      sendJson(response, 200, { ok: true, version, activeJob: activeSummary() });
+      sendJson(response, 200, { ok: true, version, instanceId, activeJob: activeSummary() });
       return;
     }
     if (route === "POST /api/discover") {

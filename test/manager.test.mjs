@@ -139,7 +139,8 @@ test("API 需要權杖、本機 Host 與同源 Origin", async (t) => {
   assert.equal((await call("/api/state", { headers: { origin: "http://localhost:" + port, host: "localhost:" + port } })).status, 200);
   const state = await call("/api/state");
   assert.equal(state.status, 200);
-  assert.deepEqual(state.json, { installed: true, models: [], manager: { version: "9.9.9", activeJob: null } });
+  assert.match(state.json.manager.instanceId, /^[A-Za-z0-9_-]{32}$/);
+  assert.deepEqual(state.json, { installed: true, models: [], manager: { version: "9.9.9", instanceId: state.headers["x-router-manager-instance"], activeJob: null } });
   assert.equal((await call("/api/version?refresh=1")).json.refresh, true);
   assert.equal((await call("/api/nope")).status, 404);
   assert.equal((await raw("/elsewhere")).status, 404);
@@ -221,6 +222,82 @@ test("工作輸出超過上限時只保留最後一段，offset 仍然連續", a
   assert.deepEqual([jobs.view(job, 0).output, jobs.view(job, 0).offset], ["6789abcdef", 16]);
   assert.equal(jobs.view(job, 12).output, "cdef");
   assert.equal(jobs.view(job, 16).output, "");
+});
+
+test("完成事件不依賴瀏覽器輪詢，交接後恢復同一項操作與輸出", async () => {
+  let snapshot;
+  const first = manager.createJobRunner({ onFinished: (job) => { snapshot = first.view(job); } });
+  const job = first.start("update", "更新", () => ({ managerRestart: true }));
+  first.append(job, "已更新路由器\n");
+  await until(() => snapshot, "無瀏覽器請求也完成交接");
+  const next = manager.createJobRunner();
+  const restored = next.restore(snapshot);
+  assert.equal(restored.id, job.id);
+  assert.equal(next.view(restored).output, "已更新路由器\n");
+  next.resume(restored, () => { next.append(restored, "桌面版已重開\n"); return { desktopRestarted: true }; });
+  await until(() => !next.active(), "交接後完成桌面重啟");
+  assert.equal(next.view(restored).status, "succeeded");
+  assert.equal(next.view(restored, snapshot.offset).output, "桌面版已重開\n");
+  assert.equal(next.view(restored).result.desktopRestarted, true);
+  assert.throws(() => next.restore({ ...snapshot, status: "running" }), /交接記錄無效/);
+});
+
+test("桌面版重新開啟後必須確認程序存在，拒絕退出時不強制結束", async () => {
+  const app = { name: "測試 App", path: "/fixture/Test App.app", bundleId: "example.router.test" };
+  let running = true;
+  let opened = false;
+  let checksAfterOpen = 0;
+  let clock = 0;
+  const calls = [];
+  const run = async (command, args) => {
+    calls.push([command, args]);
+    if (command === "/usr/bin/open") { opened = true; return { status: 0, stdout: "", stderr: "" }; }
+    if (args.some((arg) => arg.includes("to quit"))) { running = false; return { status: 0, stdout: "", stderr: "" }; }
+    if (opened && ++checksAfterOpen >= 2) running = true;
+    return { status: 0, stdout: String(running), stderr: "" };
+  };
+  const result = await manager.restartDesktopProcess(app, { run, now: () => clock, wait: async (ms) => { clock += ms; } });
+  assert.deepEqual(result, { restarted: app.name });
+  assert.equal(checksAfterOpen, 2, "open 回傳成功後仍要等到應用程式真的啟動");
+  assert.deepEqual(calls.find(([command]) => command === "/usr/bin/open"), ["/usr/bin/open", [app.path]]);
+  let launches = 0;
+  await assert.rejects(manager.restartDesktopProcess(app, { run: async (command, args) => {
+    if (command === "/usr/bin/open") launches += 1;
+    return args.some((arg) => arg.includes("to quit"))
+      ? { status: 1, stdout: "", stderr: "使用者拒絕授權" }
+      : { status: 0, stdout: "true", stderr: "" };
+  } }), /使用者拒絕授權/);
+  assert.equal(launches, 0);
+});
+
+test("open 成功但應用程式未啟動時回報錯誤，狀態查詢失敗不能當成未執行", async () => {
+  const app = { name: "測試 App", path: "/fixture/Test.app", bundleId: "example.router.test" };
+  let clock = 0;
+  await assert.rejects(manager.restartDesktopProcess(app, { timeoutMs: 500, now: () => clock,
+    wait: async (ms) => { clock += ms; }, run: async () => ({ status: 0, stdout: "false", stderr: "" }),
+  }), /未在預期時間內啟動/);
+  await assert.rejects(manager.restartDesktopProcess(app, {
+    run: async () => ({ status: 1, stdout: "", stderr: "Apple Event 失敗" }),
+  }), /無法確認.*Apple Event 失敗/);
+});
+
+test("管理程序瞬間換新且沒有斷線時，頁面也會重新整理", async () => {
+  const start = managerPage.indexOf("async function restartManager(");
+  const end = managerPage.indexOf("\n// ---- 模型", start);
+  assert.ok(start >= 0 && end > start);
+  let polls = 0;
+  let restartCalls = 0;
+  let reloaded;
+  const done = new Promise((resolve) => { reloaded = resolve; });
+  const context = vm.createContext({ restartingManager: false, managerInstance: "old-instance", token: TOKEN, Date, AbortSignal,
+    showOverlay: () => ({ message: {} }), api: async () => { restartCalls += 1; },
+    fetch: async () => ({ ok: true, json: async () => ({ instanceId: ++polls === 1 ? "old-instance" : "new-instance", version: "1.27.3" }) }),
+    setTimeout: (fn) => { queueMicrotask(fn); }, location: { reload: () => reloaded() },
+  });
+  await vm.runInContext(managerPage.slice(start, end) + "\nrestartManager({ alreadyRequested: true });", context);
+  await Promise.race([done, delay(1000).then(() => { throw new Error("頁面沒有重新整理"); })]);
+  assert.equal(polls, 2);
+  assert.equal(restartCalls, 0, "更新程序自己交接，不需要由頁面觸發");
 });
 
 test("結束與重新啟動：有工作進行時拒絕；restartBlocked 擋下時回傳原因", async (t) => {

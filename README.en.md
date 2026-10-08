@@ -77,6 +77,8 @@ bash codex-model-router.sh ui
 
 After installing or updating, the installer keeps a copy of itself in the router directory and creates a "Codex 模型路由器" shortcut (`~/Applications` on macOS, the Start menu on Windows), so you can reopen the page without finding the downloaded installer.
 
+When this repository is opened as a Codex project, the top-bar Actions menu also includes "自訂模型管理" (custom model management). It runs the installed router's `ui` command to open the manager, using the macOS or Windows command and respecting `CODEX_MODEL_ROUTER_HOME` or `CODEX_HOME`. Install the router first. The configuration is in [`.codex/environments/environment.toml`](.codex/environments/environment.toml). This is a project action and does not switch models. Reopen the project if it has not appeared yet. To use it in another project, merge the `[[actions]]` entries into that project's environment file, keeping its existing setup and actions.
+
 - **Overview**: router status, request counts, recent errors with diagnostic IDs, and the runtime environment.
 - **Models**: drag to reorder; edit display names, context and output limits; remove models. When adding models you can pick an API provider or the Claude subscription. New models default to a 1,000,000-token context and 128,000-token output, capped by any smaller limit the upstream reports.
 - **Providers**: add an OpenAI-compatible API or a Claude subscription (Claude CLI), change API keys, and remove providers. The Claude subscription path checks the CLI installation, version, and subscription sign-in in order, and lets you fix each step in place.
@@ -86,7 +88,7 @@ After installing or updating, the installer keeps a copy of itself in the router
 
 It uses the same backup-and-restore flows as the menu. Probes that cost money or subscription quota are listed and confirmed first. Reordering, renaming, and context changes only rewrite the model catalog; output changes and adding or removing models restart the router. Output limits apply only to Claude models (Claude's `max_tokens`, or `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for Claude CLI); GPT and Chat Completions routes leave output length to the upstream.
 
-The page listens only on `127.0.0.1`. Its URL carries this session's access token (do not share it), and it checks Host and Origin, accepts only JSON requests, and sets a strict CSP. API keys go only to the macOS Keychain or Windows DPAPI and are never sent back to the page. It exits when you close the terminal window, click "結束管理頁", or after 20 idle minutes; the background router serves no web pages. First-time installation and rollback still run in the terminal. The page is currently in Traditional Chinese.
+The page listens only on `127.0.0.1`. Its URL carries this session's access token (do not share it), and it checks Host and Origin, accepts only JSON requests, and sets a strict CSP. API keys go only to the macOS Keychain or Windows DPAPI and are never sent back to the page. A normal launch exits when the terminal closes. After an update or desktop restart, an independent process takes over; use "結束管理頁" to close it, or let it exit after 20 idle minutes. The background router serves no web pages. First-time installation and rollback still run in the terminal. The page is currently in Traditional Chinese.
 
 ## Manage models and providers
 
@@ -118,6 +120,8 @@ bash codex-model-router.sh update
 Updates preserve configured providers and models and back up managed files. A failed update attempts to restore the prior installation and restart the service.
 
 Since v1.27.0 you can also update from the version menu in the web manager. It downloads the new installer from GitHub Releases, verifies it against `SHA256SUMS`, and runs the same `update`; on macOS it can restart ChatGPT afterwards.
+
+Since v1.27.3, updates hand off to the new manager automatically, keeping the URL and operation log even if the browser stops polling. An independent process restarts the desktop app and checks that it is running afterwards. See `manager-worker.log` in the router directory for handoff or restart errors. When upgrading from v1.27.0–1.27.2, run the new installer's `update` and `ui` commands to reopen the manager; the old page cannot apply this fix to itself.
 
 To remove the router configuration:
 

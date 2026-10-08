@@ -120,6 +120,8 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 安裝或更新完成後，安裝器會在路由器目錄放一份安裝器副本，並建立「Codex 模型路由器」捷徑（macOS 在 `~/Applications`，Windows 在開始功能表），之後雙擊即可開啟，不必再找當初下載的安裝器。
 
+將這個倉庫作為 Codex 專案開啟時，頂部 Actions 也會提供「自訂模型管理」入口；點擊會執行已安裝路由器的 `ui` 命令，直接開啟管理頁。設定在 [`.codex/environments/environment.toml`](.codex/environments/environment.toml)，依 macOS／Windows 選擇對應命令，並沿用 `CODEX_MODEL_ROUTER_HOME` 或 `CODEX_HOME`；請先安裝路由工具。這個入口按專案提供，不會加入原生模型選單或切換模型。若未顯示，重新開啟該專案；要在其他專案使用，可合併設定檔中的 `[[actions]]` 項目，保留原有的 setup 與其他動作。
+
 - **總覽**：路由器狀態、請求統計、最近的錯誤與診斷 ID、執行環境。
 - **模型**：拖曳排序，修改顯示名稱、上下文與輸出，勾選刪除。新增模型時可選中轉供應商或 Claude 訂閱；預設上下文 1,000,000、輸出 128,000，上游回報的上限較小時以上游為準。
 - **供應商**：新增「OpenAI 相容 API」或「Claude 訂閱帳號（Claude CLI）」，更換 API Key、移除供應商。選 Claude 訂閱時會依序檢查 CLI 是否安裝、版本與訂閱登入，缺少的步驟可直接處理。
@@ -129,7 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 背後沿用選單的流程：寫入前備份，失敗自動還原；會產生費用或使用訂閱額度的探測、生圖偵測與 Claude 測試，都會先列出內容再確認。排序、改名與修改上下文只寫入模型目錄，不重啟路由器；修改輸出、添加或刪除模型會重啟路由器。輸出上限只對 Claude 模型有效（送往 Claude 的 `max_tokens`，或 Claude CLI 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`），GPT 與 Chat Completions 模型不送這個值，由上游決定。
 
-管理頁只監聽 `127.0.0.1`，網址附帶這次的存取權杖（請勿分享），並檢查 Host 與 Origin、只接受 JSON 請求、啟用 CSP。API Key 只寫入鑰匙圈或 DPAPI，不會回傳到頁面。關閉終端視窗、按「結束管理頁」或閒置 20 分鐘後自動結束；常駐的路由器本身不提供網頁。首次安裝與回退仍在終端執行。
+管理頁只監聽 `127.0.0.1`，網址附帶這次的存取權杖（請勿分享），並檢查 Host 與 Origin、只接受 JSON 請求、啟用 CSP。API Key 只寫入鑰匙圈或 DPAPI，不會回傳到頁面。一般啟動時關閉終端視窗即結束；一鍵更新或重啟桌面版後由獨立程序接手，請按「結束管理頁」關閉，或閒置 20 分鐘後自動結束。常駐的路由器本身不提供網頁。首次安裝與回退仍在終端執行。
 
 ## 升級
 
@@ -154,6 +156,8 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 update
 ```
 
 從 1.27.0 起，也可以在網頁管理介面左上角的版本選單一鍵更新：從 GitHub Release 下載新版安裝器、核對 `SHA256SUMS` 後執行同樣的 `update`；macOS 上可選擇完成後重新啟動 ChatGPT。
+
+1.27.3 起，更新成功後會自動交接新版管理程序，沿用同一個網址並恢復操作記錄，不需要瀏覽器保持輪詢；桌面重啟由獨立程序執行，重開後確認 App 確實啟動。若交接或重啟失敗，可查看路由器目錄內的 `manager-worker.log`。從 1.27.0～1.27.2 升級時，請先使用新安裝器的 `update` 與 `ui` 命令重新開啟管理頁，舊版頁面無法自行套用這項修正。
 
 `update` 只換掉路由器與轉譯層的程式碼並重寫服務定義，然後重啟服務並做健康檢查。
 Base URL、API Key、連接埠與所有已設定的自訂模型全部沿用，不會重問任何一項。

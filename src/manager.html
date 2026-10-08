@@ -303,6 +303,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 
 const TOKEN_KEY = "codexModelRouterManagerToken";
 const VIEW_KEY = "codexModelRouterManagerView";
+const JOB_KEY = "codexModelRouterManagerJob";
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 // 與安裝器的 NEW_MODEL_DEFAULTS 及上下限相同；伺服器端會再驗證一次。
 const NEW_MODEL_DEFAULTS = { contextWindow: 1000000, maxOutputTokens: 128000 };
@@ -469,6 +470,7 @@ class ApiError extends Error {
 
 let connectionLost = false;
 let restartingManager = false;
+let managerInstance = null;
 
 async function api(path, options) {
   const method = (options && options.method) || "GET";
@@ -480,6 +482,7 @@ async function api(path, options) {
       cache: "no-store",
       headers: Object.assign({ "x-router-manager-token": token }, body !== undefined ? { "content-type": "application/json" } : {}),
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15000),
     });
   } catch {
     setConnection(false);
@@ -489,6 +492,13 @@ async function api(path, options) {
   let data = null;
   try { data = await response.json(); } catch { data = null; }
   if (!response.ok) throw new ApiError((data && data.error) || ("HTTP " + response.status), response.status);
+  const instance = response.headers.get("x-router-manager-instance");
+  if (instance && managerInstance && instance !== managerInstance) {
+    restartingManager = true;
+    location.reload();
+    throw new ApiError("管理頁已換新，正在重新整理。", 0);
+  }
+  if (instance) managerInstance = instance;
   return data;
 }
 
@@ -1541,6 +1551,7 @@ async function runJob(type, params, { title } = {}) {
 }
 
 function watchJob(job, title) {
+  try { sessionStorage.setItem(JOB_KEY, JSON.stringify({ id: job.id, title: title || job.title })); } catch { /* 僅影響重新整理後的記錄視窗 */ }
   return new Promise((resolve) => {
     const log = h("pre", { class: "log", "aria-live": "polite" });
     const status = h("div", { class: "grow" }, h("span", { class: "spinner" }), "進行中，請勿關閉終端視窗…");
@@ -1583,6 +1594,7 @@ function watchJob(job, title) {
       const result = view.result || {};
       if (ok && result.restartDesktop) pendingDesktopRestart = true;
       if (ok && result.desktopRestarted) pendingDesktopRestart = false;
+      if (result.desktopError || result.managerError) append("\n注意：" + (result.desktopError || result.managerError) + "\n");
       closeButton.disabled = false;
       closeButton.textContent = "關閉";
       closeButton.className = "button" + (ok ? " primary" : "");
@@ -1590,9 +1602,10 @@ function watchJob(job, title) {
       closeButton.onclick = () => modal.close();
       resolve(view);
       if (ok && result.managerRestart) {
-        restartManager();
+        restartManager({ alreadyRequested: true });
         return;
       }
+      try { sessionStorage.removeItem(JOB_KEY); } catch { /* 忽略 */ }
       invalidateQueries();
       refreshState(true);
       refreshVersion();
@@ -1609,31 +1622,31 @@ function showOverlay(text) {
   return { overlay, message };
 }
 
-// 一鍵更新後，新版安裝器接手同一個網址；等舊的管理程式停掉、新的回應後重新整理頁面。
-async function restartManager() {
+// 以程序識別碼確認交接，不需要先看到斷線（新程序可能在下一次輪詢前就已啟動）。
+async function restartManager({ alreadyRequested = false } = {}) {
+  if (restartingManager) return;
   restartingManager = true;
+  const previousInstance = managerInstance;
   const { message } = showOverlay("更新完成，正在以新版本重新啟動管理頁…");
   try {
-    await api("/api/restart", { method: "POST" });
+    if (!alreadyRequested) await api("/api/restart", { method: "POST" });
   } catch (error) {
     message.textContent = "無法自動重新啟動管理頁：" + error.message + "。請回到終端視窗，重新執行安裝器的 ui 命令。";
     return;
   }
   const started = Date.now();
-  let sawDown = false;
   const tick = async () => {
     try {
-      const response = await fetch("/api/ping", { method: "POST", cache: "no-store", headers: { "x-router-manager-token": token, "content-type": "application/json" }, body: "{}" });
-      if (response.ok && sawDown) {
+      const response = await fetch("/api/ping", { method: "POST", cache: "no-store", headers: { "x-router-manager-token": token, "content-type": "application/json" }, body: "{}", signal: AbortSignal.timeout(5000) });
+      const data = response.ok ? await response.json() : null;
+      if (data && data.instanceId && data.instanceId !== previousInstance) {
         location.reload();
         return;
       }
-      if (!response.ok) sawDown = true;
-    } catch {
-      sawDown = true;
-    }
+    } catch { /* 交接期間短暫無法連線，下次再試 */ }
     if (Date.now() - started > 120000) {
-      message.textContent = "管理頁沒有在兩分鐘內回來，請回到終端視窗查看訊息。";
+      message.textContent = "管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。";
+      message.parentNode.append(h("button", { type: "button", class: "button", text: "重新整理", onclick: () => location.reload() }));
       return;
     }
     setTimeout(tick, 1000);
@@ -2148,7 +2161,7 @@ function confirmRestartDesktop() {
   }).then(async (ok) => {
     if (!ok) return;
     const view = await runJob("restart-desktop", {}, { title: "重新啟動 " + name });
-    if (view && view.status === "succeeded") {
+    if (view && view.status === "succeeded" && view.result && view.result.desktopRestarted) {
       pendingDesktopRestart = false;
       renderBanners();
     }
@@ -2317,6 +2330,14 @@ async function start() {
   refreshErrors();
   if (state && state.manager && state.manager.activeJob) {
     watchJob({ id: state.manager.activeJob.id, title: state.manager.activeJob.title, output: "", offset: 0 }, state.manager.activeJob.title);
+  } else if (state) {
+    try {
+      const pending = JSON.parse(sessionStorage.getItem(JOB_KEY) || "null");
+      if (pending && pending.id) {
+        const view = await api("/api/jobs/" + encodeURIComponent(pending.id));
+        watchJob(view, pending.title);
+      }
+    } catch { try { sessionStorage.removeItem(JOB_KEY); } catch { /* 忽略 */ } }
   }
   // 定期刷新也當作心跳：分頁開著，管理程式就不會因為閒置而結束。
   setInterval(() => {
