@@ -27,7 +27,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 
-const INSTALLER_VERSION = "1.27.0";
+const INSTALLER_VERSION = "1.27.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2054,7 +2054,34 @@ function deepGet(object, path) {
   return { present: true, value: current };
 }
 
-export async function codexRpc(method, params, acceptResult = () => true, binary = codexBin, home = codexHome) {
+// 同一時間只讓本行程跑一個 Codex 子行程（app-server、debug models、login status）。網頁管理介面的
+// 背景刷新常和操作撞在一起；Windows 上同一個 CODEX_HOME 同時啟動兩個 Codex 行程，後啟動的那個
+// 會失敗（CI 上設定全域上下文後立即查詢就重現）。只包最底層的呼叫：被包的工作不能再取得這把鎖。
+let codexChain = Promise.resolve();
+export function withCodexLock(task) {
+  const run = codexChain.then(() => task());
+  codexChain = run.then(() => {}, () => {});
+  return run;
+}
+
+// 等子行程真的結束再放開鎖：Windows 上檔案要等行程結束才會釋放。最多等 5 秒。
+function stopChildProcess(child, timeoutMs = 5000) {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolvePromise) => {
+    const timer = setTimeout(resolvePromise, timeoutMs);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolvePromise();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+export function codexRpc(method, params, acceptResult = () => true, binary = codexBin, home = codexHome) {
+  return withCodexLock(() => codexRpcOnce(method, params, acceptResult, binary, home));
+}
+
+async function codexRpcOnce(method, params, acceptResult, binary, home) {
   const child = spawn(binary, ["app-server"], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...env, CODEX_HOME: home },
@@ -2122,7 +2149,7 @@ export async function codexRpc(method, params, acceptResult = () => true, binary
     settled = true;
     clearTimeout(timeout);
     clearTimeout(retryTimer);
-    child.kill("SIGTERM");
+    await stopChildProcess(child);
   }
 }
 
@@ -3173,8 +3200,9 @@ async function addModels() {
 // 這裡不重問隱藏模型，但既有的強制顯示設定由 planAddModels 沿用。路由器與轉譯層一併刷新，
 // 否則 settings.version 會與實際執行的程式碼對不上；失敗時 commitRouterChange 會還原並確認服務回來。
 async function commitAddedModels(provider, newRoutes, discoveredModels) {
+  const templates = await withCodexLock(() => loadCatalogTemplates());
   const { manifest, settings, catalog } = requireInstallation();
-  const plan = planAddModels(manifest, settings, catalog, loadCatalogTemplates(), provider, newRoutes, discoveredModels);
+  const plan = planAddModels(manifest, settings, catalog, templates, provider, newRoutes, discoveredModels);
   const backupDir = await commitRouterChange("add-model", plan);
   return { plan, backupDir };
 }
@@ -5183,7 +5211,8 @@ async function managerUpdate({ restartDesktop = false } = {}) {
   try {
     const target = join(directory, managerInstallerName);
     writeFileSync(target, content, { mode: 0o700 });
-    const code = await runDownloadedUpdate(target);
+    // 新版安裝器在另一個行程裡也會呼叫 Codex；更新期間本行程不另外啟動 Codex。
+    const code = await withCodexLock(() => runDownloadedUpdate(target));
     if (code !== 0) fail(`更新沒有完成（結束代碼 ${code}），已保留或還原原本的版本。`);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -5516,7 +5545,7 @@ function managerModelSelection(models, configured = new Set()) {
 
 async function managerAddModels({ providerId, models, contextWindow, maxOutputTokens } = {}) {
   assertManagerWritable();
-  verifyLogin();
+  await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
   const { settings, providers } = requireInstallation();
   const provider = managerProvider(providers, String(providerId || ""));
@@ -5610,7 +5639,7 @@ async function managerEditModel({ slug, displayName, contextWindow, maxOutputTok
 
 async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens } = {}) {
   assertManagerWritable();
-  verifyLogin();
+  await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
   const draftKey = String(draftId || "");
   const draft = managerDrafts.get(draftKey);
@@ -5639,13 +5668,14 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
   }
   storeApiKeyValue(keychainService, draft.baseUrl, draft.apiKey);
   try {
+    const templates = await withCodexLock(() => loadCatalogTemplates());
     const { manifest, settings, catalog } = requireInstallation();
     const provider = {
       id, baseUrl: draft.baseUrl, apiRoot: draft.discovery.apiRoot, keychainService, keychainAccount: "codex",
       credentialPath: isWindows ? credentialFileFor(keychainService) : null,
     };
     console.log("\n探測完成，正在寫入設定並重新啟動路由器…");
-    const plan = planAddProvider(manifest, settings, catalog, loadCatalogTemplates(), provider, newRoutes, draft.discovery.models);
+    const plan = planAddProvider(manifest, settings, catalog, templates, provider, newRoutes, draft.discovery.models);
     const backupDir = await commitRouterChange("add-provider", plan);
     managerDrafts.delete(draftKey);
     console.log(`已新增供應商「${id}」。`);
@@ -5763,9 +5793,9 @@ async function managerSetGlobalContext({ value } = {}) {
 // 與 loadBundledCatalog 相同，但不阻塞管理頁回應其他請求。
 async function readBundledCatalogAsync() {
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
-  const result = await commandOutput(codexBin,
+  const result = await withCodexLock(() => commandOutput(codexBin,
     ["debug", "models", "--bundled", "-c", "model_catalog_json=null", "-c", 'model_provider="openai"'],
-    { timeoutMs: 60000, environment: { ...env, CODEX_HOME: codexHome } });
+    { timeoutMs: 60000, environment: { ...env, CODEX_HOME: codexHome } }));
   let catalog = null;
   try { catalog = JSON.parse(result.stdout); } catch {}
   if (result.status !== 0 || !Array.isArray(catalog?.models) || catalog.models.length === 0) {
@@ -5782,7 +5812,7 @@ async function managerHiddenModels() {
 async function managerSetHiddenModels({ slugs } = {}) {
   assertManagerWritable();
   if (!Array.isArray(slugs)) fail("請提供要強制顯示的模型清單。");
-  const bundledCatalog = loadBundledCatalog();
+  const bundledCatalog = await withCodexLock(() => loadBundledCatalog());
   const hidden = new Set(hiddenModelChoices(bundledCatalog).map((model) => model.slug));
   const requested = [...new Set(slugs.map(String))];
   const unknown = requested.filter((slug) => !hidden.has(slug));
@@ -5790,7 +5820,8 @@ async function managerSetHiddenModels({ slugs } = {}) {
   console.log(requested.length
     ? `正在設定強制顯示 ${requested.length} 個隱藏模型，並重新啟動路由器…`
     : "正在恢復預設（不強制顯示任何隱藏模型），並重新啟動路由器…");
-  const result = await executeHiddenModels(requested, { bundledCatalog });
+  // executeHiddenModels 內部只用同步的 debug models 驗證，不會再取得這把鎖。
+  const result = await withCodexLock(() => executeHiddenModels(requested, { bundledCatalog }));
   if (!result.changed) {
     console.log("設定沒有變更，未重寫模型目錄或重啟路由器。");
     return { changed: false, chosen: result.chosen };
@@ -5945,7 +5976,7 @@ async function managerClaudeCliLogin({ force = false } = {}) {
 
 async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = {}) {
   assertManagerWritable();
-  verifyLogin();
+  await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
   if (defaults.contextWindow > 1000000) fail("Claude CLI 模型的上下文上限最多 1,000,000。");
   const requested = Array.isArray(models) ? [...new Set(models.map((model) => String(model).trim()))].filter(Boolean) : [];

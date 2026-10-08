@@ -23,6 +23,29 @@ const { dir: payloadDir } = await loadPayloads();
 const shellPath = fileURLToPath(new URL("../codex-model-router.sh", import.meta.url));
 const releases = JSON.parse(readFileSync(new URL("../releases.json", import.meta.url), "utf8"));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// 逾時用的計時器要 unref：比賽贏的一方先結束時，它不能讓測試檔多掛著等它跑完。
+const timeoutAfter = (ms, value) => new Promise((resolve) => setTimeout(resolve, ms, value).unref());
+
+// 清理依登記的相反順序執行（像 defer）：先停子行程，最後才刪暫存目錄。Windows 不能刪除子行程
+// 還在使用的目錄（例如它的工作目錄）；刪除失敗也不能讓子行程留著，否則整個測試檔不會結束。
+function cleanupStack(t) {
+  const tasks = [];
+  t.after(async () => {
+    for (const task of tasks.reverse()) {
+      try { await task(); } catch { /* 一項清理失敗不影響其他清理 */ }
+    }
+  });
+  return (task) => { tasks.push(task); };
+}
+
+async function stopChild(child) {
+  if (child.exitCode != null || child.signalCode != null) return;
+  const exited = once(child, "exit");
+  child.kill();
+  await Promise.race([exited, timeoutAfter(10000)]);
+}
+
+const removeTree = (path) => rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 
 function baseEnv(root, runtime, extra = {}) {
   const env = {
@@ -38,16 +61,11 @@ function baseEnv(root, runtime, extra = {}) {
   return env;
 }
 
-async function startManager(t, env) {
+async function startManager(defer, env) {
   const child = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "ui"], { env, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   const exited = once(child, "exit");
-  t.after(async () => {
-    if (child.exitCode == null && child.signalCode == null) {
-      child.kill();
-      await exited;
-    }
-  });
+  defer(() => stopChild(child));
   const match = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("ui 沒有啟動：\n" + output)), 20000);
     child.stdout.on("data", (chunk) => {
@@ -80,12 +98,15 @@ async function startManager(t, env) {
     }
     return { ...view, output: text };
   };
-  return { child, exited, port, token, call, runJob, output: () => output, url: match[1] };
+  // 結束時最多等 20 秒；逾時回傳 "timeout"，讓斷言失敗而不是卡住。
+  const waitExit = () => Promise.race([exited, timeoutAfter(20000, ["timeout"])]);
+  return { child, waitExit, port, token, call, runJob, output: () => output, url: match[1] };
 }
 
 test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清單仍完整", { skip: !codexBin && "需要 Codex CLI", timeout: 120000 }, async (t) => {
+  const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-e2e-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  defer(() => removeTree(root));
   const runtime = join(root, "model-router");
   mkdirSync(runtime);
   const codexEnv = { ...process.env, CODEX_HOME: root };
@@ -101,7 +122,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   });
   upstream.listen(0, "127.0.0.1");
   await once(upstream, "listening");
-  t.after(() => { upstream.closeAllConnections(); upstream.close(); });
+  defer(() => { upstream.closeAllConnections(); upstream.close(); });
   const reservation = http.createServer();
   reservation.listen(0, "127.0.0.1");
   await once(reservation, "listening");
@@ -131,7 +152,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
     tokens: { access_token: jwt, id_token: jwt, refresh_token: "fake", account_id: "fixture" } }));
 
   const router = spawn(process.execPath, [join(runtime, "router.mjs")], { env: codexEnv, cwd: root, stdio: ["ignore", "ignore", "pipe"] });
-  t.after(() => router.kill());
+  defer(() => stopChild(router));
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("router startup timeout")), 8000);
     router.stderr.on("data", (data) => { if (String(data).includes("model-router-ready:")) { clearTimeout(timer); resolve(); } });
@@ -139,7 +160,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   });
 
   const env = baseEnv(root, runtime, { CODEX_MODEL_ROUTER_CODEX_BIN: codexBin });
-  const ui = await startManager(t, env);
+  const ui = await startManager(defer, env);
   const lock = JSON.parse(readFileSync(join(runtime, "manager.json"), "utf8"));
   assert.equal(lock.port, ui.port);
 
@@ -158,10 +179,11 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
 
   // 重複開啟：沿用正在執行的管理頁，不另開第二個。
   const again = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "ui"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  defer(() => stopChild(again));
   let againOutput = "";
   again.stdout.on("data", (chunk) => { againOutput += chunk; });
   again.stderr.on("data", (chunk) => { againOutput += chunk; });
-  const [againCode] = await once(again, "exit");
+  const [againCode] = await Promise.race([once(again, "exit"), timeoutAfter(20000, ["timeout"])]);
   assert.equal(againCode, 0, againOutput);
   assert.match(againOutput, /網頁管理介面已經在執行/);
   assert.ok(againOutput.includes(ui.url), againOutput);
@@ -191,13 +213,16 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
 
   // 全域上下文：經由真的 Codex 設定 API 寫入與移除，其他設定保留。
   const query = async (type) => (await ui.call("/api/query", { method: "POST", body: { type } })).json;
-  assert.equal((await query("global-context")).value, null);
+  const contextBefore = await query("global-context");
+  assert.equal(contextBefore.value, null, JSON.stringify(contextBefore));
   const setContext = await ui.runJob("set-global-context", { value: 1000000 });
   assert.equal(setContext.status, "succeeded", setContext.output);
   assert.equal(setContext.result.restartDesktop, true);
   assert.match(readFileSync(join(root, "config.toml"), "utf8"), /model_context_window = 1000000/);
   assert.ok(readFileSync(join(root, "config.toml"), "utf8").includes("http://127.0.0.1:" + port + "/v1"), "其他設定保留");
-  assert.equal((await query("global-context")).value, 1000000);
+  // 設定完成後管理頁會在背景讀一次設定，這裡的查詢緊接在後；兩個 Codex 行程不能同時跑（Windows 會失敗）。
+  const contextAfter = await query("global-context");
+  assert.equal(contextAfter.value, 1000000, JSON.stringify(contextAfter));
   const sameContext = await ui.runJob("set-global-context", { value: 1000000 });
   assert.deepEqual([sameContext.status, sameContext.result.changed], ["succeeded", false]);
   const badContext = await ui.runJob("set-global-context", { value: 5 });
@@ -206,11 +231,14 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   const clearContext = await ui.runJob("set-global-context", { value: null });
   assert.equal(clearContext.status, "succeeded", clearContext.output);
   assert.doesNotMatch(readFileSync(join(root, "config.toml"), "utf8"), /model_context_window/);
-  assert.equal((await query("global-context")).value, null);
+  const contextCleared = await query("global-context");
+  assert.equal(contextCleared.value, null, JSON.stringify(contextCleared));
   assert.ok(readdirSync(join(root, "backups", "model-router")).filter((name) => name.startsWith("global-context-")).length >= 2);
 
   // 隱藏的官方模型：清單來自 Codex 內建目錄，只列 visibility=hide 的官方模型。
-  const hiddenModels = (await query("hidden-models")).models;
+  const hiddenResponse = await query("hidden-models");
+  assert.ok(Array.isArray(hiddenResponse.models), JSON.stringify(hiddenResponse));
+  const hiddenModels = hiddenResponse.models;
   const expectedHidden = bundled.models.filter((model) => model.visibility === "hide" && !model.slug.startsWith("custom/")).map((model) => model.slug);
   assert.deepEqual(hiddenModels.map((model) => model.slug), expectedHidden);
   const unknownHidden = await ui.runJob("set-hidden-models", { slugs: ["custom/e2e-a"] });
@@ -219,15 +247,16 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
 
   assert.equal((await ui.call("/api/jobs", { method: "POST", body: { type: "nope" } })).status, 400);
   assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
-  const [code] = await ui.exited;
+  const [code] = await ui.waitExit();
   assert.equal(code, 0, ui.output());
   assert.equal(existsSync(join(runtime, "manager.json")), false, "結束後移除管理頁的鎖檔");
 });
 
 // 中轉生圖：本機假圖片 API，驗證偵測、技能安裝、狀態查詢與停用；不送任何真的生圖請求。
 test("網頁管理介面：偵測並啟用中轉生圖，再停用封存", { timeout: 60000 }, async (t) => {
+  const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-imagegen-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  defer(() => removeTree(root));
   const runtime = join(root, "model-router");
   mkdirSync(runtime);
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
@@ -249,14 +278,14 @@ test("網頁管理介面：偵測並啟用中轉生圖，再停用封存", { tim
   });
   upstream.listen(0, "127.0.0.1");
   await once(upstream, "listening");
-  t.after(() => { upstream.closeAllConnections(); upstream.close(); });
+  defer(() => { upstream.closeAllConnections(); upstream.close(); });
   const origin = "http://127.0.0.1:" + upstream.address().port;
   const provider = { baseUrl: origin, apiRoot: origin + "/v1", keychainService: "fixture.imagegen" };
   writeFileSync(join(runtime, "settings.json"), JSON.stringify({ version: releases.latest, port: 9, routes: [], ...provider }));
   writeFileSync(join(runtime, "install.json"), JSON.stringify({ version: releases.latest, port: 9, routes: [], ...provider }));
   writeFileSync(join(runtime, "models.json"), JSON.stringify({ models: [] }));
 
-  const ui = await startManager(t, baseEnv(root, runtime));
+  const ui = await startManager(defer, baseEnv(root, runtime));
   const query = async (type) => (await ui.call("/api/query", { method: "POST", body: { type } })).json;
   const before = await query("imagegen");
   assert.deepEqual([before.enabled, before.models, before.lastCheck], [false, [], null]);
@@ -294,15 +323,16 @@ test("網頁管理介面：偵測並啟用中轉生圖，再停用封存", { tim
   assert.match(again.error, /尚未啟用/);
 
   assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
-  assert.equal((await ui.exited)[0], 0, ui.output());
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
 });
 
 // Claude CLI：用假的 CLI 驗證狀態查詢、模型清單與登入流程；不會呼叫真的 Claude，也不花用量。
 test("網頁管理介面：Claude CLI 的狀態、模型清單與登入", {
   skip: (process.platform === "win32" || /\s/.test(process.execPath)) && "需要可直接執行的 shebang 腳本", timeout: 60000,
 }, async (t) => {
+  const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-claude-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  defer(() => removeTree(root));
   const runtime = join(root, "model-router");
   mkdirSync(runtime);
   const loginMarker = join(root, "login-ran");
@@ -338,7 +368,7 @@ test("網頁管理介面：Claude CLI 的狀態、模型清單與登入", {
   writeFileSync(join(runtime, "install.json"), JSON.stringify({ version: releases.latest, port: 9, routes, ...provider }));
   writeFileSync(join(runtime, "models.json"), JSON.stringify({ models: [] }));
 
-  const ui = await startManager(t, baseEnv(root, runtime, { CODEX_MODEL_ROUTER_CLAUDE_BIN: fakeCli }));
+  const ui = await startManager(defer, baseEnv(root, runtime, { CODEX_MODEL_ROUTER_CLAUDE_BIN: fakeCli }));
   const query = async (type) => (await ui.call("/api/query", { method: "POST", body: { type } })).json;
   const status = await query("claude-cli");
   assert.deepEqual([status.installed, status.binary, status.version, status.upToDate, status.subscription],
@@ -372,12 +402,13 @@ test("網頁管理介面：Claude CLI 的狀態、模型清單與登入", {
   assert.match(bigContext.error, /最多 1,000,000/);
 
   assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
-  assert.equal((await ui.exited)[0], 0, ui.output());
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
 });
 
 test("一鍵更新：下載並核對 SHA256SUMS 與版本後才執行新版安裝器的 update", { skip: process.platform === "win32" && "用 bash 執行假的新版安裝器", timeout: 60000 }, async (t) => {
+  const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-update-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  defer(() => removeTree(root));
   const runtime = join(root, "model-router");
   mkdirSync(runtime);
   const provider = { baseUrl: "http://127.0.0.1:9/p1", apiRoot: "http://127.0.0.1:9/p1/v1", keychainService: "fixture.update" };
@@ -413,13 +444,13 @@ test("一鍵更新：下載並核對 SHA256SUMS 與版本後才執行新版安�
   });
   releaseServer.listen(0, "127.0.0.1");
   await once(releaseServer, "listening");
-  t.after(() => { releaseServer.closeAllConnections(); releaseServer.close(); });
+  defer(() => { releaseServer.closeAllConnections(); releaseServer.close(); });
 
   const catalog = { latest: "9.9.9", releases: [
     { version: "9.9.9", date: "2099-01-01", changes: ["假的新版本"] },
     { version: releases.latest, changes: ["目前的版本"] },
   ] };
-  const ui = await startManager(t, baseEnv(root, runtime, {
+  const ui = await startManager(defer, baseEnv(root, runtime, {
     CODEX_MODEL_ROUTER_RELEASES_JSON: JSON.stringify(catalog),
     CODEX_MODEL_ROUTER_RELEASE_DOWNLOAD_URL: "http://127.0.0.1:" + releaseServer.address().port + "/",
   }));
@@ -450,5 +481,5 @@ test("一鍵更新：下載並核對 SHA256SUMS 與版本後才執行新版安�
   assert.deepEqual(requests.filter((url) => url.startsWith("/v9.9.9/")).slice(-2), ["/v9.9.9/SHA256SUMS", "/v9.9.9/codex-model-router.sh"]);
 
   assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
-  assert.equal((await ui.exited)[0], 0, ui.output());
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
 });

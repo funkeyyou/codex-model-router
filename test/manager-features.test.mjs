@@ -17,6 +17,27 @@ test("全域上下文：空值代表移除，其他必須是 16,000～4,000,000 
   }
 });
 
+test("Codex 子行程一次只跑一個：工作依序執行，前一個失敗也不會卡住後面的", async () => {
+  const events = [];
+  const task = (name, ms, failure = false) => async () => {
+    events.push("start " + name);
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    events.push("end " + name);
+    if (failure) throw new Error(name + " failed");
+    return name;
+  };
+  const results = await Promise.allSettled([
+    installer.withCodexLock(task("a", 30)),
+    installer.withCodexLock(task("b", 5, true)),
+    installer.withCodexLock(() => "sync"),
+    installer.withCodexLock(task("c", 1)),
+  ]);
+  assert.deepEqual(events, ["start a", "end a", "start b", "end b", "start c", "end c"], "不能交錯執行");
+  assert.deepEqual(results.map((result) => result.status), ["fulfilled", "rejected", "fulfilled", "fulfilled"]);
+  assert.deepEqual([results[0].value, results[2].value, results[3].value], ["a", "sync", "c"]);
+  assert.equal(results[1].reason.message, "b failed");
+});
+
 test("隱藏官方模型的可選清單：只列內建目錄標成 hide 的官方模型，並標出目前強制顯示的", () => {
   const bundled = { models: [
     { slug: "gpt-visible", display_name: "Visible", visibility: "list" },

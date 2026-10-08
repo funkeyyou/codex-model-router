@@ -19,6 +19,8 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # 平常一兩分鐘跑完；測試若留下沒結束的子行程，不要一路掛到 GitHub 預設的 6 小時。
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +92,7 @@ jobs:
   #      實際上什麼都沒驗到，還會在系統磁碟根目錄寫出檔案。
   windows:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
