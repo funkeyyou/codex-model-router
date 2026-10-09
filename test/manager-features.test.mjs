@@ -95,7 +95,7 @@ const state = () => ({ providers: [provider], manifest: { port: 4567, providers:
   settings: { port: 4567, providers: [provider], routes: [] },
   catalog: { models: [{ slug: "gpt-fixture", priority: 1, context_window: 200000, visibility: "list" }] } });
 
-test("Claude CLI 新增模型：網頁的輸出設定同時寫成上限與預設輸出；終端流程維持 32,000", () => {
+test("Claude CLI 新增模型：明確輸出優先，終端 Opus 5.5 預設 128,000，重加保留設定", () => {
   const web = installer.planClaudeCliModels(state(), binary, ["opus"], 1000000, { opus: "claude-opus-5-5" }, { maxOutputTokens: 128000 });
   const route = web.settings.routes[0];
   assert.deepEqual([route.contextWindow, route.maxOutputTokens, route.defaultMaxOutputTokens], [1000000, 128000, 128000]);
@@ -103,6 +103,17 @@ test("Claude CLI 新增模型：網頁的輸出設定同時寫成上限與預設
   assert.equal(web.catalog.models.find((model) => model.slug === route.pickerSlug).max_output_tokens, 128000);
   const terminal = installer.planClaudeCliModels(state(), binary, ["opus"], 200000).settings.routes[0];
   assert.deepEqual([terminal.maxOutputTokens, terminal.defaultMaxOutputTokens], [32000, undefined]);
+  const opus = installer.planClaudeCliModels(state(), binary, ["opus"], 200000, { opus: "claude-opus-5-5" });
+  assert.deepEqual([opus.settings.routes[0].maxOutputTokens, opus.settings.routes[0].defaultMaxOutputTokens], [128000, 128000]);
+  const small = installer.planClaudeCliModels(state(), binary, ["claude-opus-5-5"], 64000);
+  assert.equal(small.settings.routes[0].maxOutputTokens, 64000);
+  const custom = installer.planClaudeCliModels(state(), binary, ["claude-opus-5-5"], 200000, {}, { maxOutputTokens: 64000 });
+  const readded = installer.planClaudeCliModels({ ...custom, providers: [provider] }, binary, ["claude-opus-5-5"]);
+  assert.deepEqual([readded.settings.routes[0].maxOutputTokens, readded.settings.routes[0].defaultMaxOutputTokens], [64000, 64000]);
+  assert.throws(() => installer.planClaudeCliModels({ ...custom, providers: [provider] }, binary,
+    ["claude-opus-5-5"], 16000), /既有最大輸出超過新的上下文上限/);
+  const sonnet = installer.planClaudeCliModels(state(), binary, ["claude-sonnet-5-5"]).settings.routes[0];
+  assert.deepEqual([sonnet.maxOutputTokens, sonnet.defaultMaxOutputTokens], [32000, undefined]);
   assert.throws(() => installer.planClaudeCliModels(state(), binary, ["opus"], 50000, {}, { maxOutputTokens: 64000 }), /不能超過上下文上限/);
   assert.throws(() => installer.planClaudeCliModels(state(), binary, ["opus"], 200000, {}, { maxOutputTokens: 100 }), /最大輸出必須是/);
 });

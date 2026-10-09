@@ -96,6 +96,50 @@ test("上游未標拒答卻回空內容時，也不再靜默完成", async () =>
   assert.equal(output.at(-1).response.error.code, "invalid_prompt");
   assert.match(output.at(-1).response.error.message, /沒有產生可顯示的回答/);
   assert.equal(context.claudeFailureKind, "empty_response");
+  assert.equal(context.claudeFailureDiagnostic.stop_reason, "end_turn");
+});
+
+test("只思考就耗盡輸出時明確報錯，保留停止原因與用量但不洩漏內容", async () => {
+  const context = { ...meta(), anthropicRequest: { max_tokens: 32000, system: "private prompt" } };
+  const output = [];
+  await bridge.bridgeAnthropicStream(sse([
+    opening,
+    { type: "content_block_start", content_block: { type: "thinking" } },
+    { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "private thinking" } },
+    { type: "content_block_delta", delta: { type: "signature_delta", signature: "private signature" } },
+    { type: "content_block_stop" },
+    { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: {
+      output_tokens: 32000, output_tokens_details: { thinking_tokens: 32000 },
+      unexpected_secret: "private usage data",
+    } },
+    { type: "message_stop" },
+  ]), (event) => output.push(event), context);
+  assert.equal(output.at(-1).type, "response.failed");
+  assert.match(output.at(-1).response.error.message, /輸出上限.*32000/);
+  assert.equal(output.at(-1).response.usage.output_tokens, 32000);
+  assert.equal(context.claudeFailureKind, "output_limit");
+  assert.deepEqual(context.claudeFailureDiagnostic, {
+    stop_reason: "max_tokens", max_tokens: 32000, input_tokens: 12, output_tokens: 32000,
+    thinking_tokens: 32000, cache_read_input_tokens: null, cache_creation_input_tokens: null,
+    reasoning_items: 1, text_items: 0, tool_calls: 0,
+  });
+  assert.doesNotMatch(JSON.stringify(context.claudeFailureDiagnostic), /private/);
+  assert.equal(output.some((event) => ["response.completed", "response.incomplete"].includes(event.type)), false);
+});
+
+test("已有可見文字的 max_tokens 仍為 incomplete；未知停止原因不寫入原文", async () => {
+  const result = await translate([
+    opening,
+    { type: "content_block_start", content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", delta: { type: "text_delta", text: "partial answer" } },
+    { type: "content_block_stop" }, ...ending("max_tokens"),
+  ]);
+  assert.equal(result.output.at(-1).type, "response.incomplete");
+  assert.equal(result.output.at(-1).response.incomplete_details.reason, "max_output_tokens");
+  assert.equal(result.context.claudeFailureDiagnostic, undefined);
+  const unknown = await translate([opening, ...ending("private unexpected reason")]);
+  assert.equal(unknown.context.claudeFailureDiagnostic.stop_reason, "unknown");
+  assert.doesNotMatch(JSON.stringify(unknown.context.claudeFailureDiagnostic), /private/);
 });
 
 test("HTTP 和 WebSocket 轉譯都送出失敗，健康檢查計入拒答、空回覆及壓縮失敗", async (t) => {
@@ -131,4 +175,22 @@ test("HTTP 和 WebSocket 轉譯都送出失敗，健康檢查計入拒答、空�
   assert.equal(after.claudeRefusals - before.claudeRefusals, 2);
   assert.equal(after.claudeEmptyResponses - before.claudeEmptyResponses, 1);
   assert.equal(after.claudeCompactionFailures - before.claudeCompactionFailures, 2);
+  const logs = [];
+  t.mock.method(process.stderr, "write", (line) => { logs.push(String(line)); return true; });
+  const exhausted = [opening, { type: "message_delta", delta: { stop_reason: "max_tokens" },
+    usage: { output_tokens: 32000, output_tokens_details: { thinking_tokens: 32000 } } }, { type: "message_stop" }];
+  for (const transport of ["http", "websocket"]) {
+    const context = { ...meta(), transport, anthropicRequest: { max_tokens: 32000, messages: ["private prompt"] } };
+    if (transport === "http") await router.bridgeTranslatedToHttp({ status: 200, body: sse(exhausted) }, response, context);
+    else await router.bridgeTranslatedToWebSocket({ status: 200, body: sse(exhausted) }, socket, context);
+    const stats = (await health()).stats;
+    assert.equal(stats.lastClaudeFailure.transport, transport);
+    assert.equal(stats.lastClaudeFailure.stop_reason, "max_tokens");
+    assert.equal(stats.lastClaudeFailure.output_tokens, 32000);
+    assert.equal(stats.lastClaudeFailure.max_tokens, 32000);
+    assert.equal(stats.lastClaudeFailure.kind, "output_limit");
+  }
+  assert.equal((await health()).stats.claudeOutputLimitFailures - after.claudeOutputLimitFailures, 2);
+  assert.equal(logs.filter((line) => line.startsWith("model-router-claude-failure:")).length, 2);
+  assert.doesNotMatch(logs.join(""), /private prompt/);
 });

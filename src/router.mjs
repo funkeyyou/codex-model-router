@@ -816,6 +816,8 @@ const stats = {
   translatedRequests: 0,
   claudeRefusals: 0,
   claudeEmptyResponses: 0,
+  claudeOutputLimitFailures: 0,
+  lastClaudeFailure: null,
   claudeCompactionFailures: 0,
   // Claude CLI 拒收路由器加的歷史快取斷點、改以無斷點重送的次數；應為 0。
   claudeCliCacheFallbacks: 0,
@@ -2528,8 +2530,20 @@ function streamBridgeFor(meta) {
 function recordClaudeBridgeFailure(event, meta) {
   if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
   if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
-  if (meta.claudeFailureKind === "empty_response") stats.claudeEmptyResponses += 1;
+  if (["empty_response", "output_limit"].includes(meta.claudeFailureKind)) stats.claudeEmptyResponses += 1;
   if (meta.claudeCompactionFailed) stats.claudeCompactionFailures += 1;
+  if (meta.claudeFailureDiagnostic?.stop_reason === "max_tokens") stats.claudeOutputLimitFailures += 1;
+  const route = routeMap.get(meta.model);
+  const record = {
+    at: new Date().toISOString(),
+    model: typeof meta.model === "string" ? meta.model.slice(0, 160) : null,
+    transport: meta.transport || null,
+    provider: route?.transport === "claude-cli" ? "claude-cli" : route?.providerId || null,
+    kind: meta.claudeFailureKind || "upstream_error",
+    ...meta.claudeFailureDiagnostic,
+  };
+  stats.lastClaudeFailure = record;
+  process.stderr.write(`model-router-claude-failure:${JSON.stringify(record)}\n`);
 }
 
 // HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回

@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.6";
+const INSTALLER_VERSION = "1.27.7";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3634,7 +3634,7 @@ export function parseClaudeCliSelection(value, choices) {
 }
 
 // maxOutputTokens：網頁新增時填的輸出上限，同時寫成模型上限與預設輸出（Claude CLI 會把
-// 超過模型上限的值自動壓到上限）。終端流程不傳，維持原本的保守值 32,000。
+// 超過模型上限的值自動壓到上限）。終端重加保留既有設定；新 Opus 5.5 預設 128,000。
 export function planClaudeCliModels(state, binary, models, contextWindow = 200000, resolvedModels = {},
   { maxOutputTokens = null } = {}) {
   if (!models.length || models.some((model) => !/^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/.test(model))) {
@@ -3651,12 +3651,17 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
   const newRoutes = [...unique].map(([resolved, requested]) => {
     const previous = state.settings.routes.find((route) => route.transport === "claude-cli"
       && (route.upstreamModel === resolved || route.upstreamModel === requested));
+    const opusDefault = resolved === "claude-opus-5-5" ? Math.min(128000, contextWindow) : null;
+    const outputLimit = output ?? previous?.maxOutputTokens ?? opusDefault ?? 32000;
+    const defaultOutput = output ?? previous?.defaultMaxOutputTokens ?? (!previous ? opusDefault : null);
+    if (previous && outputLimit > contextWindow) fail("既有最大輸出超過新的上下文上限，請一併調整輸出設定。");
     return {
       pickerSlug: previous?.pickerSlug || pickerSlug(resolved, "claude-cli"), upstreamModel: resolved,
       requestedModel: requested,
       displayName: `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
       transport: "claude-cli", translate: "anthropic", efforts: [...EFFORTS],
-      contextWindow, maxOutputTokens: output ?? 32000, ...(output ? { defaultMaxOutputTokens: output } : {}),
+      contextWindow, maxOutputTokens: outputLimit,
+      ...(defaultOutput ? { defaultMaxOutputTokens: defaultOutput } : {}),
     };
   });
   const replaced = new Set(newRoutes.map((route) => route.pickerSlug));
@@ -7632,6 +7637,8 @@ const stats = {
   translatedRequests: 0,
   claudeRefusals: 0,
   claudeEmptyResponses: 0,
+  claudeOutputLimitFailures: 0,
+  lastClaudeFailure: null,
   claudeCompactionFailures: 0,
   // Claude CLI 拒收路由器加的歷史快取斷點、改以無斷點重送的次數；應為 0。
   claudeCliCacheFallbacks: 0,
@@ -9344,8 +9351,20 @@ function streamBridgeFor(meta) {
 function recordClaudeBridgeFailure(event, meta) {
   if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
   if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
-  if (meta.claudeFailureKind === "empty_response") stats.claudeEmptyResponses += 1;
+  if (["empty_response", "output_limit"].includes(meta.claudeFailureKind)) stats.claudeEmptyResponses += 1;
   if (meta.claudeCompactionFailed) stats.claudeCompactionFailures += 1;
+  if (meta.claudeFailureDiagnostic?.stop_reason === "max_tokens") stats.claudeOutputLimitFailures += 1;
+  const route = routeMap.get(meta.model);
+  const record = {
+    at: new Date().toISOString(),
+    model: typeof meta.model === "string" ? meta.model.slice(0, 160) : null,
+    transport: meta.transport || null,
+    provider: route?.transport === "claude-cli" ? "claude-cli" : route?.providerId || null,
+    kind: meta.claudeFailureKind || "upstream_error",
+    ...meta.claudeFailureDiagnostic,
+  };
+  stats.lastClaudeFailure = record;
+  process.stderr.write(`model-router-claude-failure:${JSON.stringify(record)}\n`);
 }
 
 // HTTP 傳輸同樣需要轉譯。Codex 預設走 WebSocket，但連線反覆失敗後會退回
@@ -11142,6 +11161,22 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
     suppress = false;
     if (kind) ctx.claudeFailureKind = kind;
     if (compactionMode) ctx.claudeCompactionFailed = true;
+    // Retain only bounded protocol metadata, never prompts, thinking or signatures.
+    const tokens = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+    const knownStops = new Set(["end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn",
+      "refusal", "model_context_window_exceeded"]);
+    ctx.claudeFailureDiagnostic = {
+      stop_reason: stopReason === null ? null : knownStops.has(stopReason) ? stopReason : "unknown",
+      max_tokens: tokens(ctx.anthropicRequest?.max_tokens),
+      input_tokens: tokens(usage?.input_tokens),
+      output_tokens: tokens(usage?.output_tokens),
+      thinking_tokens: tokens(usage?.output_tokens_details?.thinking_tokens),
+      cache_read_input_tokens: tokens(usage?.cache_read_input_tokens),
+      cache_creation_input_tokens: tokens(usage?.cache_creation_input_tokens),
+      reasoning_items: output.filter((item) => item.type === "reasoning").length,
+      text_items: output.filter((item) => item.type === "message").length,
+      tool_calls: output.filter((item) => item.type === "function_call" || item.type === "custom_tool_call").length,
+    };
     const response = base();
     response.status = "failed";
     response.error = error;
@@ -11425,10 +11460,15 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           item.type === "function_call" || item.type === "custom_tool_call" ||
           (item.type === "message" && item.content?.some((part) =>
             part.type === "output_text" && part.text?.trim())))) {
+          const exhausted = stopReason === "max_tokens";
+          const limit = ctx.anthropicRequest?.max_tokens;
+          const limitText = Number.isSafeInteger(limit) && limit > 0 ? `（設定 ${limit} tokens）` : "";
           failResponse({
             code: "invalid_prompt",
-            message: "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
-          }, "empty_response");
+            message: exhausted
+              ? `Claude 已達輸出上限${limitText}，但尚未產生回答或工具呼叫。請提高輸出上限或降低思考強度。`
+              : "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
+          }, exhausted ? "output_limit" : "empty_response");
           break;
         }
         const response = base();

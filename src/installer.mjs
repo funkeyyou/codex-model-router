@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.6";
+const INSTALLER_VERSION = "1.27.7";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3556,7 +3556,7 @@ export function parseClaudeCliSelection(value, choices) {
 }
 
 // maxOutputTokens：網頁新增時填的輸出上限，同時寫成模型上限與預設輸出（Claude CLI 會把
-// 超過模型上限的值自動壓到上限）。終端流程不傳，維持原本的保守值 32,000。
+// 超過模型上限的值自動壓到上限）。終端重加保留既有設定；新 Opus 5.5 預設 128,000。
 export function planClaudeCliModels(state, binary, models, contextWindow = 200000, resolvedModels = {},
   { maxOutputTokens = null } = {}) {
   if (!models.length || models.some((model) => !/^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/.test(model))) {
@@ -3573,12 +3573,17 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
   const newRoutes = [...unique].map(([resolved, requested]) => {
     const previous = state.settings.routes.find((route) => route.transport === "claude-cli"
       && (route.upstreamModel === resolved || route.upstreamModel === requested));
+    const opusDefault = resolved === "claude-opus-5-5" ? Math.min(128000, contextWindow) : null;
+    const outputLimit = output ?? previous?.maxOutputTokens ?? opusDefault ?? 32000;
+    const defaultOutput = output ?? previous?.defaultMaxOutputTokens ?? (!previous ? opusDefault : null);
+    if (previous && outputLimit > contextWindow) fail("既有最大輸出超過新的上下文上限，請一併調整輸出設定。");
     return {
       pickerSlug: previous?.pickerSlug || pickerSlug(resolved, "claude-cli"), upstreamModel: resolved,
       requestedModel: requested,
       displayName: `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
       transport: "claude-cli", translate: "anthropic", efforts: [...EFFORTS],
-      contextWindow, maxOutputTokens: output ?? 32000, ...(output ? { defaultMaxOutputTokens: output } : {}),
+      contextWindow, maxOutputTokens: outputLimit,
+      ...(defaultOutput ? { defaultMaxOutputTokens: defaultOutput } : {}),
     };
   });
   const replaced = new Set(newRoutes.map((route) => route.pickerSlug));

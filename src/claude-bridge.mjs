@@ -1217,6 +1217,22 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
     suppress = false;
     if (kind) ctx.claudeFailureKind = kind;
     if (compactionMode) ctx.claudeCompactionFailed = true;
+    // Retain only bounded protocol metadata, never prompts, thinking or signatures.
+    const tokens = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+    const knownStops = new Set(["end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn",
+      "refusal", "model_context_window_exceeded"]);
+    ctx.claudeFailureDiagnostic = {
+      stop_reason: stopReason === null ? null : knownStops.has(stopReason) ? stopReason : "unknown",
+      max_tokens: tokens(ctx.anthropicRequest?.max_tokens),
+      input_tokens: tokens(usage?.input_tokens),
+      output_tokens: tokens(usage?.output_tokens),
+      thinking_tokens: tokens(usage?.output_tokens_details?.thinking_tokens),
+      cache_read_input_tokens: tokens(usage?.cache_read_input_tokens),
+      cache_creation_input_tokens: tokens(usage?.cache_creation_input_tokens),
+      reasoning_items: output.filter((item) => item.type === "reasoning").length,
+      text_items: output.filter((item) => item.type === "message").length,
+      tool_calls: output.filter((item) => item.type === "function_call" || item.type === "custom_tool_call").length,
+    };
     const response = base();
     response.status = "failed";
     response.error = error;
@@ -1500,10 +1516,15 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           item.type === "function_call" || item.type === "custom_tool_call" ||
           (item.type === "message" && item.content?.some((part) =>
             part.type === "output_text" && part.text?.trim())))) {
+          const exhausted = stopReason === "max_tokens";
+          const limit = ctx.anthropicRequest?.max_tokens;
+          const limitText = Number.isSafeInteger(limit) && limit > 0 ? `（設定 ${limit} tokens）` : "";
           failResponse({
             code: "invalid_prompt",
-            message: "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
-          }, "empty_response");
+            message: exhausted
+              ? `Claude 已達輸出上限${limitText}，但尚未產生回答或工具呼叫。請提高輸出上限或降低思考強度。`
+              : "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
+          }, exhausted ? "output_limit" : "empty_response");
           break;
         }
         const response = base();

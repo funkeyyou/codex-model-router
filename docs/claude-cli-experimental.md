@@ -47,6 +47,10 @@ Claude Code 自己的系統提示要求模型在工具之間簡短回報進度�
 
 ### 串流逾時
 
+1.27.7 起，終端新添加且已解析為 `claude-opus-5-5` 的 CLI 模型，預設輸出為 128,000 tokens（不超過設定的上下文）。明確指定的輸出值優先，重新添加會保留既有輸出設定；更新程式不會自動提高既有路由的額度，可在模型管理頁調整。
+
+若上游以 `max_tokens` 結束、只有思考而沒有回答或工具呼叫，會明確提示輸出額度耗盡，仍視為失敗。`/healthz` 的 `stats.lastClaudeFailure` 與 `router.err.log` 的 `model-router-claude-failure:` 記錄會保留 `stop_reason`、請求的 `max_tokens`、上游回報的 token 用量與內容類型數量；缺少的用量為 `null`，不推測為零。`claudeOutputLimitFailures` 計算這類停止原因的失敗。診斷不包含提示、思考文字或簽章。
+
 1.27.6 起，`settings.json` 的 `claudeCli.timeoutMs` 表示閒置時限（預設 `180000`，3 分鐘），收到有效的模型串流事件就重新計時，包含思考、文字與工具參數；CLI 啟動訊息、stderr 與尚未組成完整 JSON 的資料不延長計時。既有的 `timeoutMs` 設定會直接套用此語意。
 
 `claudeCli.totalTimeoutMs` 是獨立的單次生成總時限（預設 `900000`，15 分鐘），包含提示快取斷點被拒後的內部重送，不因持續輸出或重送而延長。它限制單次模型生成，不限制整個多輪工具任務。兩項設定皆須為 `1`～`2147483647` 的整數毫秒；無效值使用各自預設。重新添加 CLI 模型及更新安裝器會保留自訂值。
