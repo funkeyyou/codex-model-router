@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.8";
+const INSTALLER_VERSION = "1.28.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1342,9 +1342,11 @@ export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeL
 // 既有對話選的模型不會因為升級而失效。其他供應商的路由帶 providerId，
 // 選擇器 ID 與顯示名稱都含供應商名稱，同一個模型在兩家都有時才不會撞在一起。
 export const DEFAULT_PROVIDER_ID = "default";
+// Claude 訂閱（Claude CLI）的路由也帶 providerId，但它不在 providers 陣列裡：沒有 Base URL 與 API Key。
+export const CLAUDE_CLI_PROVIDER_ID = "claude-cli";
 const LEGACY_PROVIDER_FIELDS = ["apiRoot", "baseUrl", "keychainService", "keychainAccount", "credentialPath"];
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
-const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official", "claude-cli"]);
+const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official", CLAUDE_CLI_PROVIDER_ID]);
 
 function providerRecord(source, id) {
   return {
@@ -1354,6 +1356,9 @@ function providerRecord(source, id) {
     keychainService: source.keychainService,
     keychainAccount: source.keychainAccount || "codex",
     credentialPath: source.credentialPath ?? null,
+    // 顯示名稱與模型前綴是 1.28.0 起的選填欄位；舊設定沒有，讀到無效值也一律當作沒設定。
+    ...(validProviderName(source.name) ? { name: validProviderName(source.name) } : {}),
+    ...(validModelPrefix(source.modelPrefix) ? { modelPrefix: validModelPrefix(source.modelPrefix) } : {}),
   };
 }
 
@@ -1393,11 +1398,219 @@ export function routeProviderId(route) {
 
 export function providerIdError(id, takenIds = []) {
   if (!PROVIDER_ID_PATTERN.test(id)) {
-    return "名稱只能用小寫英文、數字與連字號，1 到 24 個字元，不能以連字號開頭或結尾。";
+    return "ID 只能用小寫英文、數字與連字號，1 到 24 個字元，不能以連字號開頭或結尾。";
   }
   if (RESERVED_PROVIDER_IDS.has(id)) return `「${id}」是保留名稱，請換一個。`;
   if (takenIds.includes(id)) return `已經有叫「${id}」的供應商了。`;
   return null;
+}
+
+// --- 供應商的顯示名稱與模型前綴 -------------------------------------------------
+//
+// id 一旦建立就不改：選擇器 ID、路由的 providerId、生圖設定與既有對話都靠它對應，
+// 主要供應商的 id 還是舊版留下的 default。使用者看到的「名稱」另存在 name，
+// 只影響管理頁、終端選單與記錄的顯示。
+//
+// 模型前綴決定這家模型在選擇器裡的顯示名稱。沒設定時沿用預設規則：上游已有前綴
+// （例如 ark/gpt-6-sol）就用上游原名，否則補「供應商 id/」，主要供應商補 api/。
+// 設定之後一律顯示成「前綴/模型名」，上游自帶的前綴會被取代，不會疊成兩層。
+// 只有自動產生的顯示名稱會跟著前綴改；使用者手動改過的名稱保留。
+export const PROVIDER_NAME_MAX_LENGTH = 32;
+const MODEL_PREFIX_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,30}[A-Za-z0-9])?$/;
+
+function validProviderName(value) {
+  if (typeof value !== "string") return null;
+  const name = value.replace(/\s+/g, " ").trim();
+  return name && name.length <= PROVIDER_NAME_MAX_LENGTH && !/[\u0000-\u001f\u007f]/.test(name) ? name : null;
+}
+
+function validModelPrefix(value) {
+  return typeof value === "string" && MODEL_PREFIX_PATTERN.test(value) ? value : null;
+}
+
+// 空白、null 代表沿用預設規則；結尾的斜線會被去掉（使用者常照著畫面輸入「ark/」）。
+export function normalizeModelPrefix(value) {
+  if (value === undefined || value === null) return null;
+  const prefix = String(value).trim().replace(/\/+$/, "");
+  if (!prefix) return null;
+  if (!MODEL_PREFIX_PATTERN.test(prefix)) {
+    fail("前綴只能用英文字母、數字、點、底線與連字號，1 到 32 個字元，開頭與結尾必須是英文字母或數字。");
+  }
+  return prefix;
+}
+
+// 空白、null 代表不另取名稱，顯示供應商 id。
+export function normalizeProviderName(value) {
+  if (value === undefined || value === null) return null;
+  const name = String(value).replace(/\s+/g, " ").trim();
+  if (!name) return null;
+  if (name.length > PROVIDER_NAME_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(name)) {
+    fail(`供應商名稱最多 ${PROVIDER_NAME_MAX_LENGTH} 個字，且不能包含控制字元。`);
+  }
+  return name;
+}
+
+export function providerName(provider) {
+  return provider?.name || provider?.id || "";
+}
+
+export function modelPrefixFor(settings, providerId) {
+  if (providerId === CLAUDE_CLI_PROVIDER_ID) return validModelPrefix(settings?.claudeCli?.modelPrefix);
+  const provider = installedProviders(settings).find((item) => item.id === providerId);
+  return provider?.modelPrefix || null;
+}
+
+// 預設規則或指定前綴下的自動顯示名稱。
+export function autoModelDisplayName(route, prefix = null) {
+  const model = String(route?.upstreamModel || "");
+  if (prefix) return `${prefix}/${model.split("/").at(-1)}`;
+  if (model.includes("/")) return model;
+  const providerId = routeProviderId(route);
+  return `${providerId === DEFAULT_PROVIDER_ID ? "api" : providerId}/${model}`;
+}
+
+// 同一家的自動顯示名稱。取代上游前綴後，同一家若有兩個模型最後一段相同
+// （例如 ark/x 與 azure/x），改用「前綴/完整上游 ID」，名稱才不會撞在一起。
+export function autoModelDisplayNames(routes, prefix = null) {
+  const counts = new Map();
+  const base = (route) => String(route.upstreamModel || "").split("/").at(-1);
+  if (prefix) for (const route of routes) counts.set(base(route), (counts.get(base(route)) || 0) + 1);
+  return new Map(routes.map((route) => [route.pickerSlug, prefix && counts.get(base(route)) > 1
+    ? `${prefix}/${route.upstreamModel}`
+    : autoModelDisplayName(route, prefix)]));
+}
+
+// 這個名稱是不是自動產生的：預設規則、指定前綴下的兩種寫法，或上游原名。
+function isAutoDisplayName(name, route, prefix) {
+  return name === route.upstreamModel || name === autoModelDisplayName(route, null) ||
+    (Boolean(prefix) && (name === autoModelDisplayName(route, prefix) || name === `${prefix}/${route.upstreamModel}`));
+}
+
+// 新加入的路由套用供應商的前綴。只動自動產生的名稱，並與同一家既有的模型一起檢查重名。
+export function applyModelPrefix(newRoutes, prefix, existingRoutes = []) {
+  if (!prefix) return newRoutes;
+  const added = new Set(newRoutes.map((route) => route.pickerSlug));
+  const siblings = existingRoutes.filter((route) => !added.has(route.pickerSlug) &&
+    newRoutes.some((item) => routeProviderId(item) === routeProviderId(route) &&
+      (item.transport === "claude-cli") === (route.transport === "claude-cli")));
+  const names = autoModelDisplayNames([...siblings, ...newRoutes], prefix);
+  return newRoutes.map((route) => (route.displayName && !isAutoDisplayName(route.displayName, route, null)
+    ? route
+    : { ...route, displayName: names.get(route.pickerSlug) }));
+}
+
+function providerRoutes(routes, providerId) {
+  return routes.filter((route) => providerId === CLAUDE_CLI_PROVIDER_ID
+    ? route.transport === "claude-cli"
+    : route.transport !== "claude-cli" && routeProviderId(route) === providerId);
+}
+
+// 修改供應商的顯示名稱與模型前綴。只改名稱欄位、自動產生的模型顯示名稱與模型目錄裡對應的
+// display_name；id、選擇器 ID、上游 ID、憑證與路由能力一律不變，路由器轉發用不到這些欄位，
+// 所以不必重啟路由器。name／modelPrefix 為 undefined 表示不修改，空字串代表恢復預設。
+// Claude 訂閱只能改前綴，名稱固定。
+export function planEditProvider(manifest, settings, catalog, providerId, { name, modelPrefix } = {}) {
+  if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
+    fail("安裝設定或模型目錄不完整，無法修改供應商。");
+  }
+  const cli = providerId === CLAUDE_CLI_PROVIDER_ID;
+  const providers = installedProviders(settings, manifest);
+  const provider = cli ? null : providers.find((item) => item.id === providerId);
+  if (!cli && !provider) fail(`找不到供應商：${terminalSafeText(providerId, 40)}`);
+  const routes = providerRoutes(settings.routes, providerId);
+  if (cli && routes.length === 0) fail("尚未連接 Claude 訂閱，沒有可以修改的模型前綴。");
+
+  let nextName = cli ? null : provider.name || null;
+  if (name !== undefined) {
+    if (cli) {
+      if (name !== null && String(name).trim() !== "") fail("Claude 訂閱的名稱目前不支援修改。");
+    } else {
+      nextName = normalizeProviderName(name);
+      if (nextName === provider.id) nextName = null;
+      if (nextName) {
+        const folded = nextName.toLowerCase();
+        const clash = providers.find((item) => item.id !== provider.id &&
+          [item.id, item.name].some((value) => typeof value === "string" && value.toLowerCase() === folded));
+        if (clash) fail(`已經有叫「${nextName}」的供應商了。`);
+        if (RESERVED_PROVIDER_IDS.has(folded) && folded !== provider.id) fail(`「${nextName}」是保留名稱，請換一個。`);
+      }
+    }
+  }
+  const previousPrefix = cli ? validModelPrefix(settings.claudeCli?.modelPrefix) : provider.modelPrefix || null;
+  const nextPrefix = modelPrefix === undefined ? previousPrefix : normalizeModelPrefix(modelPrefix);
+
+  const entries = new Map(catalog.models.map((model) => [model.slug, model]));
+  const targets = autoModelDisplayNames(routes, nextPrefix);
+  const renames = [];
+  const kept = [];
+  for (const route of routes) {
+    const current = entries.get(route.pickerSlug)?.display_name || route.displayName || route.upstreamModel;
+    if (!isAutoDisplayName(current, route, previousPrefix)) {
+      kept.push({ slug: route.pickerSlug, displayName: current, upstreamModel: route.upstreamModel });
+      continue;
+    }
+    const target = targets.get(route.pickerSlug);
+    if (target !== current || route.displayName !== target) {
+      renames.push({ slug: route.pickerSlug, from: current, to: target, upstreamModel: route.upstreamModel });
+    }
+  }
+  const renamed = new Map(renames.map((item) => [item.slug, item.to]));
+  const rename = (route) => (renamed.has(route.pickerSlug) ? { ...route, displayName: renamed.get(route.pickerSlug) } : route);
+  const nextCatalog = renames.length === 0 ? catalog : {
+    ...catalog,
+    models: catalog.models.map((model) => (renamed.has(model.slug) ? { ...model, display_name: renamed.get(model.slug) } : model)),
+  };
+  // 同名不擋：使用者可能就是想這樣命名；交給畫面提醒。
+  const counts = new Map();
+  for (const model of nextCatalog.models) {
+    if (!String(model.slug).startsWith("custom/") || typeof model.display_name !== "string") continue;
+    counts.set(model.display_name, [...(counts.get(model.display_name) || []), model.slug]);
+  }
+  const conflicts = [...counts].filter(([value, slugs]) => slugs.length > 1 && slugs.some((slug) => renamed.has(slug)) && value)
+    .map(([value, slugs]) => ({ displayName: value, slugs }));
+
+  const withFields = (record) => {
+    const next = { ...record };
+    delete next.name;
+    delete next.modelPrefix;
+    if (nextName) next.name = nextName;
+    if (nextPrefix) next.modelPrefix = nextPrefix;
+    return next;
+  };
+  const routesOf = (record) => (Array.isArray(record.routes) ? record.routes.map(rename) : record.routes);
+  let nextSettings;
+  let nextManifest;
+  if (cli) {
+    const claudeCli = (record) => {
+      const next = { ...(record || {}) };
+      delete next.modelPrefix;
+      if (nextPrefix) next.modelPrefix = nextPrefix;
+      return next;
+    };
+    nextSettings = { ...settings, routes: routesOf(settings), claudeCli: claudeCli(settings.claudeCli) };
+    nextManifest = { ...manifest, routes: routesOf(manifest),
+      ...(manifest.claudeCli || settings.claudeCli ? { claudeCli: claudeCli(manifest.claudeCli || settings.claudeCli) } : {}) };
+  } else {
+    const nextProviders = providers.map((item) => (item.id === provider.id ? withFields(item) : item));
+    nextSettings = withProviders({ ...settings, routes: routesOf(settings) }, nextProviders);
+    nextManifest = manifestWithProviders({ ...manifest, routes: routesOf(manifest) }, nextProviders);
+  }
+  const providerChanged = nextName !== (cli ? null : provider.name || null) || nextPrefix !== previousPrefix;
+  return {
+    changed: providerChanged || renames.length > 0,
+    providerId,
+    name: nextName,
+    previousName: cli ? null : provider.name || null,
+    modelPrefix: nextPrefix,
+    previousModelPrefix: previousPrefix,
+    renames,
+    kept,
+    conflicts,
+    restartDesktop: renames.length > 0,
+    settings: nextSettings,
+    manifest: nextManifest,
+    catalog: nextCatalog,
+  };
 }
 
 // 從網址猜一個好記的名稱：api.openrouter.ai → openrouter、relay.example.com.cn → example。
@@ -1430,7 +1643,8 @@ function hostOf(url) {
 
 function providerLine(provider, routes = []) {
   const count = routes.filter((route) => routeProviderId(route) === provider.id).length;
-  return `${provider.id}（${hostOf(provider.baseUrl || provider.apiRoot)}）— ${count} 個模型`;
+  const id = provider.name ? `ID ${provider.id}，` : "";
+  return `${providerName(provider)}（${id}${hostOf(provider.baseUrl || provider.apiRoot)}）— ${count} 個模型`;
 }
 
 function printProviders(providers, routes = []) {
@@ -1453,7 +1667,10 @@ async function chooseProvider(providers, routes, question, { preferredId = null,
     allowCancel ? null : String(preferred + 1),
   )).trim().toLowerCase();
   if (allowCancel && (!answer || answer === "cancel")) return null;
-  const provider = /^\d+$/.test(answer) ? providers[Number(answer) - 1] : providers.find((item) => item.id === answer);
+  // 名稱可以是另外取的顯示名稱，也可以是供應商 id；不分大小寫。
+  const provider = /^\d+$/.test(answer)
+    ? providers[Number(answer) - 1]
+    : providers.find((item) => item.id === answer || item.name?.toLowerCase() === answer);
   if (!provider) fail(`找不到供應商：${answer}`);
   return provider;
 }
@@ -1799,13 +2016,15 @@ export function arrangeCustomModels(officialModels, customModels, routes, provid
 export function planAddModels(manifest, settings, catalog, templates, provider, newRoutes, discoveredModels,
   binary = codexBin) {
   const providers = installedProviders(settings, manifest);
-  if (!providers.some((item) => item.id === provider?.id)) fail(`找不到供應商：${provider?.id}`);
+  const current = providers.find((item) => item.id === provider?.id);
+  if (!current) fail(`找不到供應商：${provider?.id}`);
   if (!Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
     fail("安裝設定或模型目錄不完整，無法添加模型。");
   }
   if (newRoutes.some((route) => routeProviderId(route) !== provider.id)) fail("新模型與供應商不一致，配置未改動。");
   const existing = new Set(settings.routes.map((route) => route.pickerSlug));
-  const added = newRoutes.filter((route) => !existing.has(route.pickerSlug));
+  // 供應商設了模型前綴時，新模型的自動名稱跟著前綴走，與既有模型一致。
+  const added = applyModelPrefix(newRoutes.filter((route) => !existing.has(route.pickerSlug)), current.modelPrefix, settings.routes);
   if (added.length === 0) fail("所選模型都已配置，配置未改動。");
   const routes = [...settings.routes, ...added];
   const officialModels = applyForcedVisibility(
@@ -2943,7 +3162,7 @@ async function install() {
   );
   const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
   if (clash) {
-    fail(`這個 Base URL 已經是供應商「${clash.id}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
+    fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
   }
   const keychainService = keychainServiceFor(baseUrl);
 
@@ -2999,9 +3218,13 @@ async function install() {
       console.log(`  保留 ${model} 既有的推理強度：${restored.join(", ")}（本次為暫時性失敗）。`);
       keptEfforts.push(`${model}: ${restored.join(", ")}`);
     }
-    routes.push(withDefaultModelPrefix(route));
+    // 重新探測的既有模型沿用原本的顯示名稱：使用者可能手動改過名，或依前綴命名過。
+    const previousName = previousRoutes.get(model)?.displayName;
+    routes.push(withDefaultModelPrefix(previousName && kept !== "model" ? { ...route, displayName: previousName } : route));
   }
   if (routes.length === 0) fail("選中的模型均未通過 Responses API 探測。" );
+  // 新模型依主要供應商的模型前綴命名；沿用的名稱只有仍是預設規則產生的才會補上前綴。
+  routes.splice(0, routes.length, ...applyModelPrefix(routes, primary?.modelPrefix || null));
   if (keptModels.length > 0 || keptEfforts.length > 0) {
     console.log("\n本次探測遇到暫時性故障，以下項目沿用上次已驗證的設定：" );
     for (const model of keptModels) console.log(`  - ${model}（整個模型）`);
@@ -3027,6 +3250,9 @@ async function install() {
     keychainService,
     keychainAccount: "codex",
     credentialPath: isWindows ? credentialFileFor(keychainService) : null,
+    // 顯示名稱與模型前綴屬於這家供應商本身，重新配置 Base URL 或 Key 時保留。
+    ...(primary?.name ? { name: primary.name } : {}),
+    ...(primary?.modelPrefix ? { modelPrefix: primary.modelPrefix } : {}),
   }, ...otherProviders];
   // 主要供應商的項目依這次探測重建；其他供應商的沿用現有目錄裡那份。
   const allRoutes = [...routes, ...otherRoutes];
@@ -3243,7 +3469,7 @@ async function addModels() {
   const { baseUrl, keychainService } = provider;
   const providerRoutes = existingRoutes.filter((route) => routeProviderId(route) === provider.id);
   const port = Number(settings.port || manifest.port);
-  if (providers.length > 1) console.log(`\n供應商：${provider.id}`);
+  if (providers.length > 1) console.log(`\n供應商：${providerName(provider)}`);
   console.log(`Base URL：${baseUrl}`);
   console.log(`端口：${port}`);
   console.log(`已配置 ${providerRoutes.length} 個自訂模型：`);
@@ -3428,7 +3654,7 @@ export function planAddProvider(manifest, settings, catalog, templates, provider
   const problem = providerIdError(provider.id, providers.map((item) => item.id));
   if (problem) fail(problem);
   const clash = providers.find((item) => item.baseUrl === provider.baseUrl);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」。`);
   if (newRoutes.length === 0 || newRoutes.some((route) => routeProviderId(route) !== provider.id)) {
     fail("新模型與供應商不一致，配置未改動。");
   }
@@ -3638,23 +3864,26 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
     : parseTokenSetting(maxOutputTokens, { label: "最大輸出", min: MIN_OUTPUT_TOKENS, max: MAX_OUTPUT_TOKENS });
   if (output && output > contextWindow) fail("最大輸出不能超過上下文上限。");
   if (state.providers.some((provider) => provider.id === "claude-cli")) fail("既有供應商名稱與 Claude CLI 保留名稱衝突，請先更名。");
+  const prefix = validModelPrefix(state.settings.claudeCli?.modelPrefix);
   const unique = new Map(models.map((model) => [resolvedModels[model] || model, model]));
-  const newRoutes = [...unique].map(([resolved, requested]) => {
+  const newRoutes = applyModelPrefix([...unique].map(([resolved, requested]) => {
     const previous = state.settings.routes.find((route) => route.transport === "claude-cli"
       && (route.upstreamModel === resolved || route.upstreamModel === requested));
     const opusDefault = resolved === "claude-opus-5-5" ? Math.min(128000, contextWindow) : null;
     const outputLimit = output ?? previous?.maxOutputTokens ?? opusDefault ?? 32000;
     const defaultOutput = output ?? previous?.defaultMaxOutputTokens ?? (!previous ? opusDefault : null);
     if (previous && outputLimit > contextWindow) fail("既有最大輸出超過新的上下文上限，請一併調整輸出設定。");
+    // 重新設定時保留使用者手動取的名稱；自動名稱一律依目前的前綴重算。
+    const manualName = previous?.displayName && !isAutoDisplayName(previous.displayName, previous, prefix) ? previous.displayName : null;
     return {
       pickerSlug: previous?.pickerSlug || pickerSlug(resolved, "claude-cli"), upstreamModel: resolved,
       requestedModel: requested,
-      displayName: `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
+      displayName: manualName || `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
       transport: "claude-cli", translate: "anthropic", efforts: [...EFFORTS],
       contextWindow, maxOutputTokens: outputLimit,
       ...(defaultOutput ? { defaultMaxOutputTokens: defaultOutput } : {}),
     };
-  });
+  }), prefix, state.settings.routes);
   const replaced = new Set(newRoutes.map((route) => route.pickerSlug));
   const routes = [...state.settings.routes.filter((route) => !replaced.has(route.pickerSlug)), ...newRoutes];
   const official = state.catalog.models.filter((model) => !String(model.slug).startsWith("custom/"));
@@ -3903,8 +4132,14 @@ async function configureClaudeCli(subcommand = null) {
   // Re-read after login/probing; never overwrite intervening catalog refreshes.
   const plan = planClaudeCliModels(requireInstallation(), binary, passed, contextWindow, resolvedModels);
   const backup = await commitRouterChange("claude-cli", plan);
-  console.log(`已添加：${[...new Set(passed.map((model) => `claude-cli/${resolvedModels[model]}`))].join("、")}。請重開 Codex 後選擇模型。`);
+  console.log(`已添加：${claudeCliDisplayNames(plan, passed.map((model) => resolvedModels[model])).join("、")}。請重開 Codex 後選擇模型。`);
   console.log(`可從「刪除自訂模型」移除；不會登出 Claude。備份：${backup}`);
+}
+
+// 添加完成的提示用實際寫入的顯示名稱：設了前綴或手動改過名時，不是固定的 claude-cli/模型。
+function claudeCliDisplayNames(plan, upstreamIds) {
+  const routes = plan.settings.routes.filter((route) => route.transport === "claude-cli");
+  return [...new Set(upstreamIds)].map((id) => routes.find((route) => route.upstreamModel === id)?.displayName || `claude-cli/${id}`);
 }
 
 async function manageProviders(subcommand = null) {
@@ -3917,6 +4152,7 @@ async function manageProviders(subcommand = null) {
     });
     console.log("");
     console.log("  add     新增供應商，探測並添加它的模型");
+    console.log("  edit    修改供應商的名稱與模型前綴（不重新探測）");
     console.log("  remove  移除供應商與它的模型");
     console.log("  key     更換某一家的 API Key");
     action = (await ask("請選擇操作（Enter 返回）")).trim().toLowerCase();
@@ -3926,20 +4162,93 @@ async function manageProviders(subcommand = null) {
     return;
   }
   if (["add", "a", "new"].includes(action)) await addProvider();
+  else if (["edit", "e", "rename", "prefix"].includes(action)) await editProvider();
   else if (["remove", "r", "rm", "delete"].includes(action)) await removeProvider();
   else if (["key", "k", "api-key"].includes(action)) await replaceProviderKey();
   else fail(`無法識別的操作：${action}`);
 }
 
+// 列出名稱、前綴與會改名的模型；終端與網頁共用。
+function printProviderEdit(plan) {
+  const label = (value) => value || plan.providerId;
+  const prefix = (value) => (value ? `${value}/` : "預設規則");
+  if (plan.name !== plan.previousName) console.log(`名稱：${label(plan.previousName)} → ${label(plan.name)}`);
+  if (plan.modelPrefix !== plan.previousModelPrefix) {
+    console.log(`模型前綴：${prefix(plan.previousModelPrefix)} → ${prefix(plan.modelPrefix)}`);
+  }
+  if (plan.renames.length) {
+    console.log(`選擇器裡會改名的模型（${plan.renames.length} 個）：`);
+    for (const item of plan.renames) console.log(`  - ${item.from} → ${item.to}`);
+  }
+  if (plan.kept.length && plan.modelPrefix !== plan.previousModelPrefix) {
+    console.log("以下模型手動改過顯示名稱，保留不變：");
+    for (const item of plan.kept) console.log(`  - ${item.displayName}（${item.upstreamModel}）`);
+  }
+  if (plan.conflicts.length) {
+    console.log(`⚠️  改名後與其他模型同名：${plan.conflicts.map((item) => item.displayName).join("、")}`);
+  }
+}
+
+// 修改名稱與模型前綴：只改顯示用的欄位與模型目錄，不重新探測、不重啟路由器。
+async function editProvider() {
+  const { settings, providers } = requireInstallation();
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  printHeading("修改供應商名稱與模型前綴");
+  const cliCount = settings.routes.filter((route) => route.transport === "claude-cli").length;
+  const options = [
+    ...providers.map((provider) => ({ id: provider.id, provider, label: providerLine(provider, settings.routes) })),
+    ...(cliCount ? [{ id: CLAUDE_CLI_PROVIDER_ID, provider: null, label: `Claude 訂閱（Claude CLI）— ${cliCount} 個模型` }] : []),
+  ];
+  options.forEach((option, index) => console.log(`  ${index + 1}. ${option.label}`));
+  const answer = (await ask("要修改哪一家（編號或名稱；Enter／cancel 返回）")).trim().toLowerCase();
+  if (!answer || answer === "cancel") {
+    console.log("未進行任何修改。");
+    return;
+  }
+  const chosen = /^\d+$/.test(answer)
+    ? options[Number(answer) - 1]
+    : options.find((option) => option.id === answer || option.provider?.name?.toLowerCase() === answer);
+  if (!chosen) fail(`找不到供應商：${answer}`);
+  let name;
+  if (chosen.provider) {
+    const value = (await ask("名稱（只用於顯示；Enter 保留，輸入 - 改回顯示 ID）", providerName(chosen.provider))).trim();
+    name = value === "-" ? "" : value;
+  } else {
+    console.log("Claude 訂閱的名稱目前不支援修改，只能調整模型前綴。");
+  }
+  const currentPrefix = modelPrefixFor(settings, chosen.id);
+  console.log(currentPrefix
+    ? `目前的模型前綴：${currentPrefix}/`
+    : "目前沒有設定模型前綴：上游已有前綴的模型沿用原名，其他模型補上供應商 ID（主要供應商補 api/）。");
+  console.log("設定前綴後，這家模型一律顯示成「前綴/模型名」，上游自帶的前綴會被取代；手動改過名稱的模型不受影響。");
+  const prefixAnswer = (await ask("模型前綴（Enter 保留；輸入 auto 恢復預設規則）", currentPrefix || "auto")).trim();
+  const modelPrefix = /^auto$/i.test(prefixAnswer) ? "" : prefixAnswer;
+  const state = requireInstallation();
+  const plan = planEditProvider(state.manifest, state.settings, state.catalog, chosen.id, { name, modelPrefix });
+  if (!plan.changed) {
+    console.log("沒有任何變更。");
+    return;
+  }
+  console.log("");
+  printProviderEdit(plan);
+  if (!(await confirm("確認修改？", true))) {
+    console.log("未進行任何修改。");
+    return;
+  }
+  const backupDir = await commitCatalogChange("edit-provider", plan);
+  console.log(`已修改，不需要重新啟動路由器。備份：${backupDir}`);
+  if (plan.restartDesktop) console.log(`請完全退出並重新打開 ${desktopAppName}，選擇器才會顯示新的名稱。`);
+}
+
 async function askProviderId(baseUrl, takenIds) {
   const suggested = suggestProviderId(baseUrl, takenIds);
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const answer = (await ask("供應商名稱（用於管理，僅為無前綴的模型補上名稱；Enter 使用預設）", suggested)).trim().toLowerCase();
+    const answer = (await ask("供應商 ID（用於管理與設定檔，並替無前綴的模型補上前綴；之後可另取顯示名稱；Enter 使用預設）", suggested)).trim().toLowerCase();
     const problem = providerIdError(answer, takenIds);
     if (!problem) return answer;
     console.log(problem);
   }
-  fail("供應商名稱無效，未進行任何修改。");
+  fail("供應商 ID 無效，未進行任何修改。");
 }
 
 async function addProvider() {
@@ -3950,7 +4259,7 @@ async function addProvider() {
   console.log("每家供應商各自保存 API Key；已有前綴的模型保留原名，無前綴的模型才加供應商名稱。");
   const baseUrl = normalizeUrl(await ask("兼容 OpenAI 的 Base URL"));
   const clash = providers.find((provider) => provider.baseUrl === baseUrl);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」；要添加它的模型請用「添加自訂模型」。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要添加它的模型請用「添加自訂模型」。`);
   const keychainService = keychainServiceFor(baseUrl);
   const keyExisted = keychainHas(keychainService);
   if (!keyExisted) await storeApiKey(keychainService, baseUrl);
@@ -3967,7 +4276,7 @@ async function addProvider() {
     const takenIds = providers.map((provider) => provider.id);
     const prefixed = selectedModels.length > 0 && selectedModels.every((model) => model.includes("/"));
     const id = prefixed ? suggestProviderId(baseUrl, takenIds) : await askProviderId(baseUrl, takenIds);
-    if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商管理名稱自動設為「${id}」。`);
+    if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商 ID 自動設為「${id}」。`);
     console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
     if (!(await confirm("是否繼續進行能力探測？", true))) fail("已在修改配置前取消。");
     const outcomes = await probeModelsInParallel(selectedModels,
@@ -4023,23 +4332,23 @@ async function removeProvider() {
   const defaultModel = removedDefaultModel(userConfig.config, preview.removedRoutes.map((route) => route.pickerSlug));
   const imagegen = relayConfig();
   const imagegenAffected = Boolean(imagegen) && (imagegen.providerId ?? DEFAULT_PROVIDER_ID) === chosen.id;
-  console.log(`\n即將移除供應商「${chosen.id}」（${chosen.baseUrl}）與它的 ${preview.removedRoutes.length} 個模型：`);
+  console.log(`\n即將移除供應商「${providerName(chosen)}」（${chosen.baseUrl}）與它的 ${preview.removedRoutes.length} 個模型：`);
   for (const route of preview.removedRoutes) console.log(`  - ${route.displayName || route.upstreamModel}`);
-  if (providers[0].id === chosen.id) console.log(`移除後由「${preview.providers[0].id}」擔任主要供應商。`);
+  if (providers[0].id === chosen.id) console.log(`移除後由「${providerName(preview.providers[0])}」擔任主要供應商。`);
   if (defaultModel) console.log("這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
   if (imagegenAffected) console.log("中轉 API 生圖使用這家供應商，會一併停用；之後可從選單重新設定。");
   console.log("使用上述模型的既有任務需切換到其他模型後才能繼續。");
-  if (!(await confirm(`確認移除供應商「${chosen.id}」？`, false))) {
+  if (!(await confirm(`確認移除供應商「${providerName(chosen)}」？`, false))) {
     console.log("未進行任何修改。");
     return;
   }
   const { plan, backupDir } = await executeRemoveProvider(chosen.id, { expectedDefault: defaultModel });
 
   printHeading("移除完成");
-  console.log(`已移除供應商「${chosen.id}」與 ${plan.removedRoutes.length} 個模型，剩餘 ${plan.providers.length} 家供應商。`);
+  console.log(`已移除供應商「${providerName(chosen)}」與 ${plan.removedRoutes.length} 個模型，剩餘 ${plan.providers.length} 家供應商。`);
   if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
   console.log(`備份：${backupDir}`);
-  if (await confirm(`是否從${secretStoreLabel}中刪除「${chosen.id}」的 API Key？`, true)) {
+  if (await confirm(`是否從${secretStoreLabel}中刪除「${providerName(chosen)}」的 API Key？`, true)) {
     deleteApiKey(chosen.keychainService, chosen.keychainAccount || "codex");
   }
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
@@ -4086,7 +4395,7 @@ async function replaceProviderKey() {
     console.log("未進行任何修改。");
     return;
   }
-  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   await storeApiKey(provider.keychainService, provider.baseUrl);
   // 舊 Key 已被覆寫，驗證不通過也無從還原，只提醒使用者。
   try {
@@ -4767,7 +5076,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   const models = available.map((model) => model.id);
   const aliases = Object.fromEntries(available.map((model) => [model.id, model.upstreamModel]));
   const result = installRelayImageSkill({ models, aliases, apiMode: discovery.apiMode, providerId: provider.id });
-  console.log(`已啟用 $router-imagegen：${result.root}${providers.length > 1 ? `（供應商 ${provider.id}）` : ""}`);
+  console.log(`已啟用 $router-imagegen：${result.root}${providers.length > 1 ? `（供應商 ${providerName(provider)}）` : ""}`);
   if (result.backup) console.log(`備份：${result.backup}`);
   if (result.preserved.length) console.log(`保留手動修改的檔案：${result.preserved.join(", ")}`);
   console.log("請建立新任務使用 $router-imagegen；若尚未出現，重新啟動 Codex。所選模型已通過本次生圖測試。");
@@ -4884,7 +5193,7 @@ async function status() {
     console.log("供應商：");
     providers.forEach((provider, index) => {
       const count = routes.filter((route) => routeProviderId(route) === provider.id).length;
-      console.log(`  ${index + 1}. ${provider.id}${index === 0 ? "（主要）" : ""}：${provider.apiRoot}，${count} 個模型`);
+      console.log(`  ${index + 1}. ${providerName(provider)}${index === 0 ? "（主要）" : ""}：${provider.apiRoot}，${count} 個模型`);
     });
   }
   console.log(`路由器：http://127.0.0.1:${manifest.port}`);
@@ -5027,6 +5336,28 @@ const managerInstallerName = isWindows ? "codex-model-router.ps1" : "codex-model
 const managerInstallerPath = join(installRoot, managerInstallerName);
 const managerLockPath = join(installRoot, "manager.json");
 const managerHandoffPath = join(installRoot, "manager-handoff.json");
+// 管理頁的介面偏好（目前只有語言）。值由 manager.mjs 驗證；尚未安裝時只留在記憶體裡。
+const managerPreferencesPath = join(installRoot, "manager-preferences.json");
+let unsavedManagerPreferences = {};
+
+function managerPreferences() {
+  return {
+    read() {
+      try { return { ...JSON.parse(readFileSync(managerPreferencesPath, "utf8")), ...unsavedManagerPreferences }; }
+      catch { return { ...unsavedManagerPreferences }; }
+    },
+    write(patch) {
+      const next = { ...this.read(), ...patch };
+      if (existsSync(installRoot)) {
+        writeJsonAtomic(managerPreferencesPath, next);
+        unsavedManagerPreferences = {};
+      } else {
+        unsavedManagerPreferences = next;
+      }
+      return next;
+    },
+  };
+}
 const MANAGER_HANDLER_KEY = "desktop.custom_file_handlers.model_router_manager";
 const MANAGER_MCP_KEY = "mcp_servers.model_router_manager";
 const managerMcpPath = join(installRoot, "manager-entry.mjs");
@@ -5657,7 +5988,8 @@ async function managerState() {
     writeBlocked: managerWriteGuard(),
     router: { port, ...health },
     providers: providers.map((provider, index) => ({
-      id: provider.id, baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
+      id: provider.id, name: provider.name || null, modelPrefix: provider.modelPrefix || null,
+      baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
       modelCount: routes.filter((route) => routeProviderId(route) === provider.id).length,
       keyStored: env.CODEX_MODEL_ROUTER_TEST_API_KEY ? true : keychainHas(provider.keychainService),
     })),
@@ -5669,6 +6001,7 @@ async function managerState() {
     claudeCli: {
       binary: settings.claudeCli?.binary || null,
       routeCount: routes.filter((route) => route.transport === "claude-cli").length,
+      modelPrefix: validModelPrefix(settings.claudeCli?.modelPrefix),
     },
     desktop: { name: desktop?.name || desktopAppName, canRestart: Boolean(desktop) },
     paths: {
@@ -5808,7 +6141,7 @@ async function managerProviderDraft({ baseUrl, apiKey } = {}) {
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫 API Key。");
   const clash = providers.find((provider) => provider.baseUrl === normalized);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」；要添加它的模型請到「模型」頁新增。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要添加它的模型請到「模型」頁新增。`);
   const discovery = await discoverApiRoot(normalized, key);
   const now = Date.now();
   for (const [id, draft] of managerDrafts) {
@@ -5847,7 +6180,7 @@ async function managerAddModels({ providerId, models, contextWindow, maxOutputTo
   const provider = managerProvider(providers, String(providerId || ""));
   const selected = managerModelSelection(models, configuredUpstreams(settings, provider.id));
   const apiKey = readApiKey(provider.keychainService);
-  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("正在查詢模型清單…");
   const discovery = await discoverApiRoot(provider.baseUrl, apiKey);
   console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
@@ -5933,6 +6266,46 @@ async function managerEditModel({ slug, displayName, contextWindow, maxOutputTok
   return { changed: true, backupDir, restartDesktop: plan.restartDesktop };
 }
 
+// 網頁送來的名稱與前綴：undefined 不修改，null 或空字串恢復預設，其他型別一律拒絕。
+function providerEditFields({ name, modelPrefix } = {}) {
+  for (const value of [name, modelPrefix]) {
+    if (value !== undefined && value !== null && typeof value !== "string") fail("供應商名稱與前綴必須是文字。");
+  }
+  return { name, modelPrefix };
+}
+
+// 修改前的預覽：列出會改名、保留與同名的模型，不寫任何檔案。輸入無效時回傳原因，
+// 讓頁面一邊輸入一邊提示，而不是當成請求失敗。
+function managerProviderPreview({ providerId, ...fields } = {}) {
+  const { manifest, settings, catalog } = requireInstallation();
+  try {
+    const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
+    return {
+      ok: true, changed: plan.changed, name: plan.name, modelPrefix: plan.modelPrefix,
+      renames: plan.renames, kept: plan.kept, conflicts: plan.conflicts,
+    };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+async function managerEditProvider({ providerId, ...fields } = {}) {
+  assertManagerWritable();
+  const { manifest, settings, catalog } = requireInstallation();
+  const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
+  if (!plan.changed) {
+    console.log("沒有任何變更。");
+    return { changed: false };
+  }
+  printProviderEdit(plan);
+  console.log(plan.renames.length
+    ? "正在寫入供應商設定與模型目錄（不需要重新啟動路由器）…"
+    : "正在寫入供應商設定（不需要重新啟動路由器）…");
+  const backupDir = await commitCatalogChange("edit-provider", plan);
+  console.log(`已儲存。備份：${backupDir}`);
+  return { changed: true, renamed: plan.renames.length, backupDir, restartDesktop: plan.restartDesktop };
+}
+
 async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens } = {}) {
   assertManagerWritable();
   await withCodexLock(() => verifyLogin());
@@ -5942,14 +6315,14 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
   if (!draft || Date.now() - draft.createdAt > MANAGER_DRAFT_TTL_MS) fail("新增供應商的資料已過期，請重新查詢模型。");
   const { providers } = requireInstallation();
   const clash = providers.find((provider) => provider.baseUrl === draft.baseUrl);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」。`);
   const selected = managerModelSelection(models);
   const takenIds = providers.map((provider) => provider.id);
   const prefixed = selected.every((model) => model.includes("/"));
   const id = prefixed ? suggestProviderId(draft.baseUrl, takenIds) : String(providerId || "").trim().toLowerCase();
   const problem = providerIdError(id, takenIds);
   if (problem) fail(problem);
-  if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商管理名稱自動設為「${id}」。`);
+  if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商 ID 自動設為「${id}」。`);
   console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
   const outcomes = await probeModelsInParallel(selected,
     (model, log) => buildRouteForModel(draft.discovery, draft.apiKey, model, log, id));
@@ -5995,7 +6368,7 @@ async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
   const { providers } = requireInstallation();
   const provider = managerProvider(providers, String(providerId || ""));
   if (providers.length <= 1) fail("至少要保留一家供應商；要整個移除路由器請在終端選單使用「回退配置」。");
-  console.log(`正在移除供應商「${provider.id}」與它的模型，並重新啟動路由器…`);
+  console.log(`正在移除供應商「${providerName(provider)}」與它的模型，並重新啟動路由器…`);
   const { plan, defaultModel, imagegenAffected, backupDir } = await executeRemoveProvider(provider.id);
   let keyDeleted = false;
   const shared = providers.some((item) => item.id !== provider.id && item.keychainService === provider.keychainService);
@@ -6008,7 +6381,7 @@ async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
     }
   }
   if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
-  console.log(`已移除供應商「${provider.id}」與 ${plan.removedRoutes.length} 個模型。備份：${backupDir}`);
+  console.log(`已移除供應商「${providerName(provider)}」與 ${plan.removedRoutes.length} 個模型。備份：${backupDir}`);
   managerConfigHints(true);
   return {
     removed: plan.removedRoutes.map(summarizeRoute), defaultCleared: Boolean(defaultModel),
@@ -6023,7 +6396,7 @@ async function managerReplaceKey({ providerId, apiKey } = {}) {
   const provider = managerProvider(providers, String(providerId || ""));
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫新的 API Key。");
-  console.log(`正在用新 Key 查詢「${provider.id}」的模型清單…`);
+  console.log(`正在用新 Key 查詢「${providerName(provider)}」的模型清單…`);
   let status = null;
   let problem = null;
   try {
@@ -6168,7 +6541,7 @@ async function managerImagegenSetup({ providerId, models } = {}) {
   }
   const provider = providers.length === 1 && !providerId ? providers[0] : managerProvider(providers, String(providerId || ""));
   const current = relayConfig();
-  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("偵測會實際生圖並依供應商計費；先測通用介面，全部未通過時自動改測 Ark 任務介面。");
   const outcome = await runRelayImagegenSetup({ provider, selected, current, settings, providers });
   if (!outcome.available.length) fail("沒找到可用模型，生圖設定沒有變更。");
@@ -6301,7 +6674,7 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = 
   console.log("\n測試完成，正在寫入設定並重新啟動路由器…");
   const backupDir = await commitRouterChange("claude-cli", plan);
   const added = [...new Set(tested.passed.map((model) => tested.resolvedModels[model]))];
-  console.log(`已添加：${added.map((id) => `claude-cli/${id}`).join("、")}`);
+  console.log(`已添加：${claudeCliDisplayNames(plan, added).join("、")}`);
   console.log(`上下文 ${defaults.contextWindow.toLocaleString("en-US")}，輸出 ${defaults.maxOutputTokens.toLocaleString("en-US")}（超過模型上限時 Claude CLI 會自動壓到上限）。`);
   console.log(`備份：${backupDir}`);
   return { added, failures: tested.failures, backupDir, restartDesktop: true };
@@ -6322,6 +6695,7 @@ function managerOperations() {
       imagegen: () => relayImagegenStatus(),
       "claude-cli": () => managerClaudeCliStatus(),
       "claude-cli-models": () => managerClaudeCliModels(),
+      "provider-preview": (params) => managerProviderPreview(params),
     },
     jobs: {
       "repair-models": job("同步與修復模型清單", repairModels),
@@ -6330,6 +6704,7 @@ function managerOperations() {
       "reorder-models": job("調整模型順序", managerReorderModels),
       "edit-model": job("修改模型", managerEditModel),
       "add-provider": job("新增供應商", managerAddProvider),
+      "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
       "replace-key": job("更換 API Key", managerReplaceKey),
       "restart-router": job("重新啟動路由器", managerRestartRouter),
@@ -6542,7 +6917,7 @@ async function runManager() {
   managerMode = true;
   let lastActivity = Date.now();
   const server = manager.createManagerServer({
-    html, token, version: INSTALLER_VERSION, instanceId, ops: managerOperations(), jobs,
+    html, token, version: INSTALLER_VERSION, instanceId, ops: managerOperations(), jobs, preferences: managerPreferences(),
     onActivity: () => { lastActivity = Date.now(); },
     onShutdown: () => finish("shutdown"),
     onRestart: () => finish("restart"),
@@ -6666,7 +7041,7 @@ export const MENU_ITEMS = [
   ["update", "更新到最新版本（保留現有配置）"],
   ["add", "添加自訂模型"],
   ["remove", "刪除自訂模型"],
-  ["providers", "管理供應商（新增／移除／更換 API Key）"],
+  ["providers", "管理供應商（新增／修改名稱與前綴／移除／更換 API Key）"],
   ["claude-cli", "連接 Claude 訂閱帳號（實驗性）"],
   ["hidden-models", "管理隱藏的官方模型"],
   ["context-1m", "設定全域上下文 100 萬"],
@@ -6690,7 +7065,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} remove
-  ${basename(scriptPath || "codex-model-router.command")} providers [add|remove|key]
+  ${basename(scriptPath || "codex-model-router.command")} providers [add|edit|remove|key]
   ${basename(scriptPath || "codex-model-router.command")} claude-cli [status|login]
   ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} context-1m
@@ -6708,8 +7083,9 @@ function help() {
 路由器安裝成功後可選擇啟用中轉 API 生圖；預設不啟用，之後可從選單第 ${menuNumber("imagegen")} 項添加。
 
 ui 在瀏覽器開啟本機網頁管理介面：查看狀態與最近錯誤、添加／刪除／排序模型、修改顯示名稱、
-上下文與輸出、管理供應商與 API Key、中轉 API 生圖、全域上下文、隱藏的官方模型與 Claude 訂閱（CLI），
-並可檢查新版本、一鍵更新後重新啟動。背後用的是與選單相同的流程（先備份、失敗還原）。
+上下文與輸出、管理供應商（名稱、模型前綴）與 API Key、中轉 API 生圖、全域上下文、隱藏的官方模型與
+Claude 訂閱（CLI），並可檢查新版本、一鍵更新後重新啟動。背後用的是與選單相同的流程（先備份、失敗還原）。
+介面支援繁體中文、簡體中文與英文，預設跟隨瀏覽器語言（都不符合時用英文），可在頁面左下角切換。
 網址含一次性存取權杖，只接受本機連線；背景執行，不需要保留終端視窗。
 從頁面結束或閒置 20 分鐘會自動退出；ui --foreground 可在終端顯示診斷。
 安裝與更新完成後會建立捷徑（macOS：~/Applications/Codex 模型路由器.command；

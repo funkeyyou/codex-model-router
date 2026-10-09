@@ -58,8 +58,8 @@ async function startServer(t, options = {}) {
   const restoreOutput = manager.installOutputCapture(jobs);
   const events = [];
   const server = manager.createManagerServer({
-    html: "<!doctype html><html><head><style>p{color:red}</style></head><body><script>1</script></body></html>",
-    token: TOKEN, version: "9.9.9", ops: options.ops || fakeOps(), jobs,
+    html: options.html || "<!doctype html><html><head><style>p{color:red}</style></head><body><script>1</script></body></html>",
+    token: TOKEN, version: "9.9.9", ops: options.ops || fakeOps(), jobs, preferences: options.preferences || null,
     onShutdown: () => events.push("shutdown"),
     onRestart: options.noRestart ? null : () => events.push("restart"),
     restartBlocked: options.restartBlocked || (() => null),
@@ -290,7 +290,7 @@ test("管理程序瞬間換新且沒有斷線時，頁面也會重新整理", as
   let reloaded;
   const done = new Promise((resolve) => { reloaded = resolve; });
   const context = vm.createContext({ restartingManager: false, managerInstance: "old-instance", token: TOKEN, Date, AbortSignal,
-    showOverlay: () => ({ message: {} }), api: async () => { restartCalls += 1; },
+    showOverlay: () => ({ message: {} }), api: async () => { restartCalls += 1; }, t: (key) => key,
     fetch: async () => ({ ok: true, json: async () => ({ instanceId: ++polls === 1 ? "old-instance" : "new-instance", version: "1.27.3" }) }),
     setTimeout: (fn) => { queueMicrotask(fn); }, location: { reload: () => reloaded() },
   });
@@ -317,6 +317,40 @@ test("結束與重新啟動：有工作進行時拒絕；restartBlocked 擋下�
 
   const noRestart = await startServer(t, { noRestart: true });
   assert.equal((await noRestart.call("/api/restart", { method: "POST", body: {} })).status, 400);
+});
+
+test("介面語言：頁面帶入已儲存的偏好，設定 API 只收支援的語言", async (t) => {
+  const html = '<!doctype html><html lang="zh-Hant" data-language-preference="auto"><head></head><body><script>1</script></body></html>';
+  let stored = { language: "zh-Hans", other: "kept" };
+  const writes = [];
+  const preferences = { read: () => stored, write: (patch) => { writes.push(patch); stored = { ...stored, ...patch }; return stored; } };
+  const server = await startServer(t, { html, preferences });
+  assert.match((await server.raw("/")).text, /<html lang="zh-Hant" data-language-preference="zh-Hans">/);
+  const saved = await server.call("/api/preferences", { method: "POST", body: { language: "en" } });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.json, { language: "en", saved: true });
+  assert.deepEqual(writes, [{ language: "en" }]);
+  assert.equal(stored.other, "kept", "只改語言");
+  assert.match((await server.raw("/")).text, /data-language-preference="en"/);
+  for (const language of ["fr", "", null, 1, "<script>"]) {
+    assert.equal((await server.call("/api/preferences", { method: "POST", body: { language } })).status, 400, String(language));
+  }
+  assert.equal((await server.raw("/api/preferences", { method: "POST", headers: { "content-type": "application/json" }, body: '{"language":"en"}' })).status, 401);
+  assert.equal(writes.length, 1, "無效或未授權的請求不寫入");
+
+  stored = { language: "<script>" };
+  assert.match((await server.raw("/")).text, /data-language-preference="auto"/, "讀到無效值時用自動");
+  const broken = await startServer(t, { html, preferences: { read: () => { throw new Error("讀不到"); }, write: () => ({}) } });
+  assert.match((await broken.raw("/")).text, /data-language-preference="auto"/);
+  const none = await startServer(t, { html });
+  assert.match((await none.raw("/")).text, /data-language-preference="auto"/);
+  assert.deepEqual((await none.call("/api/preferences", { method: "POST", body: { language: "zh-Hant" } })).json, { language: "zh-Hant", saved: false });
+
+  assert.equal(manager.pageWithLanguage(html, "xx"), html);
+  assert.equal(manager.pageWithLanguage("<html><body data-language-preference=\"auto\"></body></html>", "en"),
+    "<html><body data-language-preference=\"auto\"></body></html>", "只改 <html> 標籤上的屬性");
+  assert.deepEqual([...manager.MANAGER_LANGUAGES], ["auto", "zh-Hant", "zh-Hans", "en"]);
+  assert.match(managerPage, /<html lang="zh-Hant" data-language-preference="auto">/);
 });
 
 test("Host、Origin 與權杖的比對規則", () => {
@@ -360,18 +394,18 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   assert.equal(manager.TOKEN_HEADER, "x-router-manager-token");
   // 頁面裡實際呼叫的 API 都要存在於伺服器。
   const used = new Set([...managerPage.matchAll(/"\/api\/([a-z-]+)/g)].map((match) => match[1]));
-  for (const name of used) assert.ok(["state", "version", "errors", "ping", "discover", "provider-draft", "query", "jobs", "restart", "shutdown"].includes(name), name);
+  for (const name of used) assert.ok(["state", "version", "errors", "ping", "preferences", "discover", "provider-draft", "query", "jobs", "restart", "shutdown"].includes(name), name);
   // 頁面送出的工作類型都要是安裝器提供的。
   const jobTypes = new Set([...managerPage.matchAll(/runJob\("([a-z-]+)"/g)].map((match) => match[1]));
   jobTypes.add("update");
   jobTypes.add("apply-update");
   assert.deepEqual([...jobTypes].sort(), ["add-models", "add-provider", "apply-update", "claude-cli-add", "claude-cli-install",
-    "claude-cli-login", "claude-cli-update", "edit-model", "imagegen-disable", "imagegen-setup", "remove-models", "remove-provider",
+    "claude-cli-login", "claude-cli-update", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "remove-models", "remove-provider",
     "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "set-global-context", "set-hidden-models", "update"]);
   // 頁面用到的查詢都要是安裝器提供的。
   const queryTypes = new Set([...managerPage.matchAll(/(?:ensureQuery|refreshButton|reloadQuery)\("([a-z-]+)"/g)].map((match) => match[1]));
   for (const match of managerPage.matchAll(/type: "([a-z-]+)" \} \}\)/g)) queryTypes.add(match[1]);
-  assert.deepEqual([...queryTypes].sort(), ["claude-cli", "claude-cli-models", "global-context", "hidden-models", "imagegen"]);
+  assert.deepEqual([...queryTypes].sort(), ["claude-cli", "claude-cli-models", "global-context", "hidden-models", "imagegen", "provider-preview"]);
 });
 
 test("新增模型與新增供應商都提供 Claude 訂閱，並共用 Claude CLI 的準備檢查與確認步驟", () => {

@@ -33,6 +33,7 @@ A local model router for macOS and Windows. Add your own API providers to the Co
 - Keeps official ChatGPT model requests going to OpenAI; selected custom models use your configured API endpoint.
 - Supports OpenAI Responses API endpoints, translates Claude Messages, and probes Chat Completions as a fallback for compatible models.
 - Manages multiple providers, API keys, model discovery, model removal, and provider-scoped routing IDs.
+- Answers the warm-up request Codex sends when you open or create a chat locally for custom models, so it no longer becomes an extra paid generation (since v1.28.0). Chats still set to a deleted model stay quiet until you send a message, then name the model to replace.
 - Provides interactive macOS and Windows installers, backups during updates, and rollback.
 - Includes a local [web manager](#web-manager) for models, providers, the Claude subscription, image generation, settings, and one-click updates.
 - Optionally installs a separate relay image-generation skill using your provider's supported image models.
@@ -87,14 +88,16 @@ Git projects may also use the optional [Actions configuration](.codex/environmen
 
 - **Overview**: router status, request counts, recent errors with diagnostic IDs, and the runtime environment.
 - **Models**: drag to reorder; edit display names, context and output limits; remove models. When adding models you can pick an API provider or the Claude subscription. New models default to a 1,000,000-token context and 128,000-token output, capped by any smaller limit the upstream reports.
-- **Providers**: add an OpenAI-compatible API or a Claude subscription (Claude CLI), change API keys, and remove providers. The Claude subscription path checks the CLI installation, version, and subscription sign-in in order, and lets you fix each step in place.
+- **Providers**: add an OpenAI-compatible API or a Claude subscription (Claude CLI), change API keys, and remove providers. The Claude subscription path checks the CLI installation, version, and subscription sign-in in order, and lets you fix each step in place. Since v1.28.0 you can edit a provider's display name and model prefix: the name is display-only, so the internal ID, existing chats, and API key stay the same; the prefix sets "prefix/model" in the picker, replaces an upstream prefix such as `ark/`, changes only auto-generated names (manual renames are kept), and also applies to models added later. Changes are previewed first and don't restart the router. For the Claude subscription, only the prefix can be changed for now.
 - **Image generation**: detect, enable, or disable relay image generation.
 - **Settings**: set or remove the global context window, and force-show official models hidden by Codex's bundled catalog.
 - **Version**: shows the current version, lists changes when a new release exists, and updates in one click.
 
 It uses the same backup-and-restore flows as the menu. Probes that cost money or subscription quota are listed and confirmed first. Reordering, renaming, and context changes only rewrite the model catalog; output changes and adding or removing models restart the router. Output limits apply only to Claude models (Claude's `max_tokens`, or `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for Claude CLI); GPT and Chat Completions routes leave output length to the upstream.
 
-The page listens only on `127.0.0.1`. Its URL carries this session's access token (do not share it), and it checks Host and Origin, accepts only JSON requests, and sets a strict CSP. API keys go only to the macOS Keychain or Windows DPAPI and are never sent back to the page. Since v1.27.5, it runs in the background and the launch command exits once it is ready; Windows Codex entries and Start menu shortcuts leave no CMD or PowerShell window. Repeated launches reuse the same manager. Use "結束管理頁" to close it, or let it exit after 20 idle minutes; `ui --foreground` retains terminal diagnostics. The background router serves no web pages. First-time installation and rollback still run in the terminal. The page is currently in Traditional Chinese.
+The page listens only on `127.0.0.1`. Its URL carries this session's access token (do not share it), and it checks Host and Origin, accepts only JSON requests, and sets a strict CSP. API keys go only to the macOS Keychain or Windows DPAPI and are never sent back to the page. Since v1.27.5, it runs in the background and the launch command exits once it is ready; Windows Codex entries and Start menu shortcuts leave no CMD or PowerShell window. Repeated launches reuse the same manager. Use "Quit manager" to close it, or let it exit after 20 idle minutes; `ui --foreground` retains terminal diagnostics. The background router serves no web pages. First-time installation and rollback still run in the terminal.
+
+Since v1.28.0 the page is available in English, Simplified Chinese, and Traditional Chinese. It follows your browser language (English when none of them matches) and can be switched at the bottom left; the choice is remembered. Common errors are translated in English, while operation logs from the installer stay in Chinese (they're converted automatically in the Simplified Chinese interface).
 
 ## Manage models and providers
 

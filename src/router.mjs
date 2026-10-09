@@ -675,7 +675,9 @@ function rememberHistoryEvent(history, event) {
   }
   history.completed = true;
   historyCacheInfo();
-  const serialized = JSON.stringify({ input: history.input, output: history.output });
+  const serialized = JSON.stringify({
+    input: history.input, output: history.output, ...(history.prewarm ? { prewarm: true } : {}),
+  });
   // 用位元組計帳的不可變快照，避免共享物件被後續轉譯修改；超限不保存半份歷史。
   const bytes = Buffer.byteLength(serialized);
   if (bytes > maxHistoryBytes) return;
@@ -703,12 +705,27 @@ function rememberHistoryEvent(history, event) {
 
 function rebuildStatefulInput(key, incomingInput, previousId) {
   historyCacheInfo();
-  const snapshot = key ? threadHistories.get(key)?.get(previousId) : null;
+  const snapshot = findHistorySnapshot(key, previousId);
   const history = snapshot ? JSON.parse(snapshot.serialized) : null;
-  if (!history || history.input.length === 0) return null;
+  // 本機預熱的快照可以沒有輸入（只有指令與工具）；其他空快照一律視為遺失。
+  if (!history || (history.input.length === 0 && !history.prewarm)) return null;
   const incoming = typeof incomingInput === "string" ? [{ role: "user", content: incomingInput }]
     : Array.isArray(incomingInput) ? incomingInput : [];
   return [...history.input, ...history.output, ...incoming];
+}
+
+// 本機預熱的 id 是隨機且只回給發出預熱的那條連線；Codex 的預熱與下一輪若帶了不同的
+// 工作階段識別（client_metadata 與標頭），照 key 找不到時仍可憑這個唯一 id 找回。
+const PREWARM_ID_PREFIX = "resp_prewarm_";
+
+function findHistorySnapshot(key, previousId) {
+  const direct = key ? threadHistories.get(key)?.get(previousId) : null;
+  if (direct || typeof previousId !== "string" || !previousId.startsWith(PREWARM_ID_PREFIX)) return direct ?? null;
+  for (const responses of threadHistories.values()) {
+    const snapshot = responses.get(previousId);
+    if (snapshot) return snapshot;
+  }
+  return null;
 }
 
 // 從 Claude 轉譯路由切出去時，必須清掉轉譯層合成的內容，否則官方與其他供應商
@@ -790,6 +807,11 @@ const stats = {
   lastRequestBytesBeforeBudget: null,
   lastRequestBytesAfterBudget: null,
   websocketOnlyFieldsStripped: 0,
+  // Codex 開新任務或打開舊任務時送的 generate:false 預熱，由路由器本機回應的次數；
+  // stalePrewarms 是任務仍記著已刪除模型的預熱，只計數不記錯誤。
+  localPrewarms: 0,
+  stalePrewarms: 0,
+  lastStalePrewarmModel: null,
   queuedResponses: 0,
   responseInProgressRejects: 0,
   bridgeReasoningStripped: 0,
@@ -922,6 +944,8 @@ function contextProvider(context) {
   if (context.route !== "custom") return null;
   if ("provider" in context) return context.provider;
   const route = typeof context.model === "string" ? routeMap.get(context.model) : null;
+  // 未配置或已刪除的自訂模型不屬於任何供應商，不能記成主要供應商。
+  if (!route && typeof context.model === "string" && context.model.startsWith("custom/")) return null;
   if (route?.transport === "claude-cli") return null;
   return (route && providerById.get(route.providerId || DEFAULT_PROVIDER_ID)) || primaryProvider;
 }
@@ -1248,6 +1272,13 @@ function rememberedRoute(headers) {
   return null;
 }
 
+// 已刪除的自訂模型只剩選擇器 ID（custom/<名稱>-<8 碼雜湊>）可辨認；錯誤訊息用去掉雜湊的名稱。
+export function customModelLabel(slug) {
+  if (typeof slug !== "string") return "";
+  const label = slug.replace(/^custom\//, "").replace(/-[0-9a-f]{8}$/, "").slice(0, 80);
+  return label || slug.slice(0, 80);
+}
+
 function chooseRoute(headers, body) {
   if (typeof body?.model === "string" && routeMap.has(body.model)) {
     return routeMap.get(body.model);
@@ -1255,7 +1286,7 @@ function chooseRoute(headers, body) {
   if (typeof body?.model === "string" && body.model.startsWith("custom/")) {
     throw new RouterRequestError(
       404, "custom_model_not_configured",
-      "此自訂模型未配置或路由已遺失，請重新添加模型，並在新任務中選擇已配置的模型。",
+      `自訂模型「${customModelLabel(body.model)}」已從路由器移除或尚未配置。請在這個任務的模型選單改選現有模型再重送，不必開新任務；仍要使用它請重新添加。`,
       "routing",
     );
   }
@@ -2729,6 +2760,56 @@ async function tryUpstreamWebSocketTurn(
   return false;
 }
 
+// Codex 每次開新任務或打開舊任務，都會先用該任務記住的模型送一個 generate:false
+// 的預熱（startup prewarm）：官方後端只預先處理提示詞前綴、不生成內容，下一輪再以
+// 預熱回應的 id 增量接續。第三方上游與 HTTP 回退都沒有這種語意，而 generate 是
+// WebSocket 專用欄位、轉送前會被剝掉，結果每打開一個任務就多付一次完整生成。
+// 因此除了官方路由走得通上游 WebSocket 的情況，預熱一律由路由器本機回一個空的
+// 完成回應，並把預熱輸入記成歷史，讓下一輪的 previous_response_id 照常在本機重建。
+export function isPrewarmRequest(message) {
+  return message?.type === "response.create" && message.generate === false;
+}
+
+function answerPrewarmLocally(request, socket, message, connectionState, { stale = false } = {}) {
+  const createdAt = Math.floor(Date.now() / 1000);
+  const response = {
+    id: `${PREWARM_ID_PREFIX}${randomBytes(12).toString("hex")}`,
+    object: "response",
+    created_at: createdAt,
+    status: "in_progress",
+    model: typeof message?.model === "string" ? message.model : null,
+    error: null,
+    incomplete_details: null,
+    output: [],
+    usage: null,
+  };
+  const completed = { ...response, status: "completed", completed_at: createdAt };
+  if (stale) {
+    // 任務仍記著已刪除的模型：打開任務本身不算錯誤，等真的送出訊息才回報 404。
+    stats.stalePrewarms += 1;
+    stats.lastStalePrewarmModel = message.model.slice(0, 160);
+  } else {
+    const probe = { ...message };
+    delete probe.type;
+    const historyKey = historyKeyFor(probe, request.headers, connectionState?.connectionNamespace ?? null);
+    const previousId = typeof message.previous_response_id === "string" && message.previous_response_id
+      ? message.previous_response_id : null;
+    // 預熱本身若是接續，先在本機還原完整輸入；還原不了就不記，下一輪會要求完整重送。
+    const input = previousId
+      ? rebuildStatefulInput(historyKey, message.input, previousId)
+      : (message.input ?? []);
+    const history = input ? prepareHistory(historyKey, input, previousId) : null;
+    if (history) {
+      history.prewarm = true;
+      rememberHistoryEvent(history, { type: "response.completed", response: completed });
+    }
+    stats.localPrewarms += 1;
+  }
+  sendWebSocketJson(socket, { type: "response.created", sequence_number: 0, response });
+  sendWebSocketJson(socket, { type: "response.completed", sequence_number: 1, response: completed });
+  stats.websocketEvents += 2;
+}
+
 export async function handleWebSocketResponseInner(
   request,
   socket,
@@ -2737,6 +2818,18 @@ export async function handleWebSocketResponseInner(
   abortController,
   connectionState = null,
 ) {
+  const prewarm = isPrewarmRequest(message);
+  let route;
+  try {
+    route = chooseRoute(request.headers, message);
+  } catch (error) {
+    if (prewarm && error?.code === "custom_model_not_configured") {
+      answerPrewarmLocally(request, socket, message, connectionState, { stale: true });
+      return;
+    }
+    throw error;
+  }
+
   // 官方路由優先走上游 WebSocket；只有它支援連線內的 previous_response_id 接續。
   // 任何一步失敗都會回退到既有的 HTTP/SSE 路徑，且此時 Codex 尚未收到本輪事件。
   if (
@@ -2745,7 +2838,7 @@ export async function handleWebSocketResponseInner(
     !connectionState.upstreamDisabled &&
     !upstreamWebSocketInCooldown() &&
     message?.type === "response.create" &&
-    chooseRoute(request.headers, message) == null &&
+    route == null &&
     authDigest(request.headers)
   ) {
     const handled = await tryUpstreamWebSocketTurn(
@@ -2756,6 +2849,12 @@ export async function handleWebSocketResponseInner(
       connectionState,
     );
     if (handled) return;
+  }
+
+  // 官方上游 WebSocket 沒接手（自訂路由、已停用或失敗回退）時，預熱不能變成完整生成。
+  if (prewarm) {
+    answerPrewarmLocally(request, socket, message, connectionState);
+    return;
   }
 
   const body = { ...message, stream: true };

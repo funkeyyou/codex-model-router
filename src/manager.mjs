@@ -18,6 +18,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 export const TOKEN_HEADER = "x-router-manager-token";
+// 介面語言：auto 跟隨瀏覽器（都不符合時用英文）。管理頁每次啟動的連接埠不同，瀏覽器的
+// localStorage 跟著來源（含連接埠）走，記不住選擇，所以偏好由伺服器保存並在送出頁面時帶入。
+export const MANAGER_LANGUAGES = Object.freeze(["auto", "zh-Hant", "zh-Hans", "en"]);
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_JOB_OUTPUT = 512 * 1024;
 const KEEP_FINISHED_JOBS = 20;
@@ -291,7 +294,22 @@ export function pageWithNonce(html, nonce) {
   return String(html).replace(/<(script|style)(?=[\s>])/g, `<$1 nonce="${nonce}"`);
 }
 
-function sendPage(response, html, headOnly = false) {
+// 把保存的語言偏好寫進 <html data-language-preference>，頁面第一次繪製就用對的語言。
+export function pageWithLanguage(html, language) {
+  if (!MANAGER_LANGUAGES.includes(language)) return String(html);
+  return String(html).replace(/(<html\b[^>]*\sdata-language-preference=")[^"]*(")/, `$1${language}$2`);
+}
+
+function readLanguage(preferences) {
+  try {
+    const language = preferences?.read()?.language;
+    return MANAGER_LANGUAGES.includes(language) ? language : "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+function sendPage(response, html, headOnly = false, language = "auto") {
   const nonce = randomBytes(16).toString("base64");
   response.writeHead(200, {
     "content-type": "text/html; charset=utf-8",
@@ -311,7 +329,7 @@ function sendPage(response, html, headOnly = false) {
     "x-frame-options": "DENY",
     "cross-origin-opener-policy": "same-origin",
   });
-  response.end(headOnly ? undefined : pageWithNonce(html, nonce));
+  response.end(headOnly ? undefined : pageWithNonce(pageWithLanguage(html, language), nonce));
 }
 
 async function readJson(request) {
@@ -337,9 +355,10 @@ async function readJson(request) {
 
 // ops：state、version、errors、discover、providerDraft、queries（唯讀查詢，{ type: run }）
 // 與 jobs（會改設定的背景工作，{ type: { title, run } }）。
+// preferences：{ read(), write(patch) }，保存介面語言；沒提供時只用瀏覽器語言。
 // restartBlocked() 回傳字串時拒絕重新啟動管理頁，回傳 null 才呼叫 onRestart。
 export function createManagerServer({
-  html, token, version, ops, jobs, instanceId = createToken(),
+  html, token, version, ops, jobs, instanceId = createToken(), preferences = null,
   onActivity = () => {}, onShutdown = () => {}, onRestart = null, restartBlocked = () => null,
 }) {
   if (!html || !token || !ops || !jobs) throw new Error("createManagerServer 缺少必要參數。");
@@ -362,7 +381,7 @@ export function createManagerServer({
         sendJson(response, 405, { error: "不支援的方法。" });
         return;
       }
-      sendPage(response, html, method === "HEAD");
+      sendPage(response, html, method === "HEAD", readLanguage(preferences));
       return;
     }
     if (pathname === "/favicon.ico") {
@@ -405,6 +424,20 @@ export function createManagerServer({
     }
     if (route === "POST /api/ping") {
       sendJson(response, 200, { ok: true, version, instanceId, activeJob: activeSummary() });
+      return;
+    }
+    if (route === "POST /api/preferences") {
+      const language = body.language;
+      if (!MANAGER_LANGUAGES.includes(language)) {
+        sendJson(response, 400, { error: "不支援的介面語言。" });
+        return;
+      }
+      if (!preferences) {
+        sendJson(response, 200, { language, saved: false });
+        return;
+      }
+      const saved = await preferences.write({ language });
+      sendJson(response, 200, { language: readLanguage({ read: () => saved }), saved: true });
       return;
     }
     if (route === "POST /api/discover") {

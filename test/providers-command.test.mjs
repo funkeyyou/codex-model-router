@@ -157,19 +157,19 @@ test("新增供應商：重複的 Base URL 直接擋下；新網址查到模型�
   const added = await runInstaller(t, ["providers", "add"], state, [
     { marker: "兼容 OpenAI 的 Base URL", answer: `${upstream.origin}/p3` },
     { marker: "請輸入模型編號", answer: "1" },
-    { marker: "供應商名稱", answer: "Bad_Name" },
+    { marker: "供應商 ID（", answer: "Bad_Name" },
     { marker: "不能以連字號開頭或結尾", answer: "" },
     { marker: "是否繼續進行能力探測", answer: "n" },
   ]);
   assert.equal(added.code, 1, added.output);
-  assert.match(added.output, /供應商名稱（用於管理，僅為無前綴的模型補上名稱；Enter 使用預設） \[local\]/);
+  assert.match(added.output, /供應商 ID（用於管理與設定檔，並替無前綴的模型補上前綴；之後可另取顯示名稱；Enter 使用預設） \[local\]/);
   assert.match(added.output, /p3-model/);
   assert.match(added.output, /已在修改配置前取消/);
   assert.equal(added.unchanged, true);
   assert.deepEqual(added.backups, []);
 });
 
-test("所選模型已有前綴時跳過供應商名稱，管理名稱撞名則自動避開", async (t) => {
+test("所選模型已有前綴時跳過供應商 ID，ID 撞名則自動避開", async (t) => {
   const upstream = await fakeUpstream(t, { p3: ["ark/gpt-test", "plain-model"] });
   const state = installation(upstream, { providers: [
     providerAt(upstream.origin, "default", "p1"), providerAt(upstream.origin, "local", "p2"),
@@ -180,8 +180,8 @@ test("所選模型已有前綴時跳過供應商名稱，管理名稱撞名則�
     { marker: "是否繼續進行能力探測", answer: "n" },
   ]);
   assert.equal(result.code, 1, result.output);
-  assert.match(result.output, /管理名稱自動設為「local-2」/);
-  assert.doesNotMatch(result.output, /供應商名稱（/);
+  assert.match(result.output, /供應商 ID 自動設為「local-2」/);
+  assert.doesNotMatch(result.output, /供應商 ID（/);
   assert.match(result.output, /已在修改配置前取消/);
   assert.equal(result.unchanged, true);
   assert.deepEqual(result.backups, []);
@@ -214,4 +214,83 @@ test("移除供應商前列出它的模型；確認時回答否就不改任何�
   assert.match(result.output, /未進行任何修改/);
   assert.equal(result.unchanged, true);
   assert.deepEqual(result.backups, []);
+});
+
+test("修改供應商：先列出名稱、前綴與會改名的模型，確認時回答否就不改任何檔案", async (t) => {
+  const upstream = await fakeUpstream(t);
+  const state = installation(upstream, { providers: [
+    providerAt(upstream.origin, "default", "p1"), providerAt(upstream.origin, "backup", "p2"),
+  ] });
+  const result = await runInstaller(t, ["providers", "edit"], state, [
+    { marker: "要修改哪一家", answer: "2" },
+    { marker: "名稱（只用於顯示", answer: "備援站" },
+    { marker: "模型前綴（Enter 保留", answer: "bk/" },
+    { marker: "確認修改", answer: "n" },
+  ]);
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /名稱：backup → 備援站/);
+  assert.match(result.output, /模型前綴：預設規則 → bk\//);
+  assert.match(result.output, /backup\/backup-model → bk\/backup-model/);
+  assert.match(result.output, /未進行任何修改/);
+  assert.equal(result.unchanged, true);
+  assert.deepEqual(result.backups, []);
+
+  const invalid = await runInstaller(t, ["providers", "edit"], state, [
+    { marker: "要修改哪一家", answer: "backup" },
+    { marker: "名稱（只用於顯示", answer: "" },
+    { marker: "模型前綴（Enter 保留", answer: "-bad" },
+  ]);
+  assert.equal(invalid.code, 1, invalid.output);
+  assert.match(invalid.output, /前綴只能用/);
+  assert.equal(invalid.unchanged, true);
+});
+
+test("修改 Claude 訂閱只問模型前綴；沒有變更時直接結束", async (t) => {
+  const upstream = await fakeUpstream(t);
+  const state = installation(upstream, { providers: [providerAt(upstream.origin, "default", "p1")] });
+  const cliRoute = { pickerSlug: "custom/claude-cli-x", upstreamModel: "claude-x", displayName: "claude-cli/claude-x", providerId: "claude-cli",
+    transport: "claude-cli", translate: "anthropic", efforts: ["low"], contextWindow: 200000 };
+  for (const record of [state.settings, state.manifest]) {
+    record.routes = [...record.routes, cliRoute];
+    record.claudeCli = { binary: "/fixture/claude" };
+  }
+  state.catalog.models.push({ slug: cliRoute.pickerSlug, display_name: cliRoute.displayName, priority: 9 });
+  const result = await runInstaller(t, ["providers", "edit"], state, [
+    { marker: "要修改哪一家", answer: "2" },
+    { marker: "模型前綴（Enter 保留", answer: "cc" },
+    { marker: "確認修改", answer: "n" },
+  ]);
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /2\. Claude 訂閱（Claude CLI）— 1 個模型/);
+  assert.match(result.output, /Claude 訂閱的名稱目前不支援修改/);
+  assert.doesNotMatch(result.output, /名稱（只用於顯示/);
+  assert.match(result.output, /claude-cli\/claude-x → cc\/claude-x/);
+  assert.equal(result.unchanged, true);
+
+  const same = await runInstaller(t, ["providers", "edit"], state, [
+    { marker: "要修改哪一家", answer: "1" },
+    { marker: "名稱（只用於顯示", answer: "" },
+    { marker: "模型前綴（Enter 保留", answer: "" },
+  ]);
+  assert.equal(same.code, 0, same.output);
+  assert.match(same.output, /沒有任何變更/);
+  assert.equal(same.unchanged, true);
+});
+
+test("另外取的名稱顯示在選單與 status，選供應商時也能用名稱", async (t) => {
+  const upstream = await fakeUpstream(t);
+  const named = { ...providerAt(upstream.origin, "backup", "p2"), name: "Backup Relay", modelPrefix: "bk" };
+  const state = installation(upstream, { providers: [providerAt(upstream.origin, "default", "p1"), named] });
+  const menu = await runInstaller(t, ["providers"], state, [{ marker: "請選擇操作（Enter 返回）", answer: "" }]);
+  assert.match(menu.output, /2\. Backup Relay（ID backup，127\.0\.0\.1:\d+）— 1 個模型/);
+  assert.match(menu.output, /edit\s+修改供應商的名稱與模型前綴/);
+  const status = await runInstaller(t, ["status"], state);
+  assert.match(status.output, /2\. Backup Relay：http:\/\/127\.0\.0\.1:\d+\/p2\/v1，1 個模型/);
+  const add = await runInstaller(t, ["add"], state, [
+    { marker: "要替哪一家供應商添加模型", answer: "backup relay" },
+    { marker: "請輸入模型編號", answer: "p2-extra" },
+    { marker: "是否繼續進行能力探測", answer: "n" },
+  ]);
+  assert.match(add.output, /供應商：Backup Relay/);
+  assert.equal(add.unchanged, true);
 });

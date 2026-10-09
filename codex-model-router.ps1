@@ -160,7 +160,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.8";
+const INSTALLER_VERSION = "1.28.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1474,9 +1474,11 @@ export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeL
 // 既有對話選的模型不會因為升級而失效。其他供應商的路由帶 providerId，
 // 選擇器 ID 與顯示名稱都含供應商名稱，同一個模型在兩家都有時才不會撞在一起。
 export const DEFAULT_PROVIDER_ID = "default";
+// Claude 訂閱（Claude CLI）的路由也帶 providerId，但它不在 providers 陣列裡：沒有 Base URL 與 API Key。
+export const CLAUDE_CLI_PROVIDER_ID = "claude-cli";
 const LEGACY_PROVIDER_FIELDS = ["apiRoot", "baseUrl", "keychainService", "keychainAccount", "credentialPath"];
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
-const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official", "claude-cli"]);
+const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official", CLAUDE_CLI_PROVIDER_ID]);
 
 function providerRecord(source, id) {
   return {
@@ -1486,6 +1488,9 @@ function providerRecord(source, id) {
     keychainService: source.keychainService,
     keychainAccount: source.keychainAccount || "codex",
     credentialPath: source.credentialPath ?? null,
+    // 顯示名稱與模型前綴是 1.28.0 起的選填欄位；舊設定沒有，讀到無效值也一律當作沒設定。
+    ...(validProviderName(source.name) ? { name: validProviderName(source.name) } : {}),
+    ...(validModelPrefix(source.modelPrefix) ? { modelPrefix: validModelPrefix(source.modelPrefix) } : {}),
   };
 }
 
@@ -1525,11 +1530,219 @@ export function routeProviderId(route) {
 
 export function providerIdError(id, takenIds = []) {
   if (!PROVIDER_ID_PATTERN.test(id)) {
-    return "名稱只能用小寫英文、數字與連字號，1 到 24 個字元，不能以連字號開頭或結尾。";
+    return "ID 只能用小寫英文、數字與連字號，1 到 24 個字元，不能以連字號開頭或結尾。";
   }
   if (RESERVED_PROVIDER_IDS.has(id)) return `「${id}」是保留名稱，請換一個。`;
   if (takenIds.includes(id)) return `已經有叫「${id}」的供應商了。`;
   return null;
+}
+
+// --- 供應商的顯示名稱與模型前綴 -------------------------------------------------
+//
+// id 一旦建立就不改：選擇器 ID、路由的 providerId、生圖設定與既有對話都靠它對應，
+// 主要供應商的 id 還是舊版留下的 default。使用者看到的「名稱」另存在 name，
+// 只影響管理頁、終端選單與記錄的顯示。
+//
+// 模型前綴決定這家模型在選擇器裡的顯示名稱。沒設定時沿用預設規則：上游已有前綴
+// （例如 ark/gpt-6-sol）就用上游原名，否則補「供應商 id/」，主要供應商補 api/。
+// 設定之後一律顯示成「前綴/模型名」，上游自帶的前綴會被取代，不會疊成兩層。
+// 只有自動產生的顯示名稱會跟著前綴改；使用者手動改過的名稱保留。
+export const PROVIDER_NAME_MAX_LENGTH = 32;
+const MODEL_PREFIX_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,30}[A-Za-z0-9])?$/;
+
+function validProviderName(value) {
+  if (typeof value !== "string") return null;
+  const name = value.replace(/\s+/g, " ").trim();
+  return name && name.length <= PROVIDER_NAME_MAX_LENGTH && !/[\u0000-\u001f\u007f]/.test(name) ? name : null;
+}
+
+function validModelPrefix(value) {
+  return typeof value === "string" && MODEL_PREFIX_PATTERN.test(value) ? value : null;
+}
+
+// 空白、null 代表沿用預設規則；結尾的斜線會被去掉（使用者常照著畫面輸入「ark/」）。
+export function normalizeModelPrefix(value) {
+  if (value === undefined || value === null) return null;
+  const prefix = String(value).trim().replace(/\/+$/, "");
+  if (!prefix) return null;
+  if (!MODEL_PREFIX_PATTERN.test(prefix)) {
+    fail("前綴只能用英文字母、數字、點、底線與連字號，1 到 32 個字元，開頭與結尾必須是英文字母或數字。");
+  }
+  return prefix;
+}
+
+// 空白、null 代表不另取名稱，顯示供應商 id。
+export function normalizeProviderName(value) {
+  if (value === undefined || value === null) return null;
+  const name = String(value).replace(/\s+/g, " ").trim();
+  if (!name) return null;
+  if (name.length > PROVIDER_NAME_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(name)) {
+    fail(`供應商名稱最多 ${PROVIDER_NAME_MAX_LENGTH} 個字，且不能包含控制字元。`);
+  }
+  return name;
+}
+
+export function providerName(provider) {
+  return provider?.name || provider?.id || "";
+}
+
+export function modelPrefixFor(settings, providerId) {
+  if (providerId === CLAUDE_CLI_PROVIDER_ID) return validModelPrefix(settings?.claudeCli?.modelPrefix);
+  const provider = installedProviders(settings).find((item) => item.id === providerId);
+  return provider?.modelPrefix || null;
+}
+
+// 預設規則或指定前綴下的自動顯示名稱。
+export function autoModelDisplayName(route, prefix = null) {
+  const model = String(route?.upstreamModel || "");
+  if (prefix) return `${prefix}/${model.split("/").at(-1)}`;
+  if (model.includes("/")) return model;
+  const providerId = routeProviderId(route);
+  return `${providerId === DEFAULT_PROVIDER_ID ? "api" : providerId}/${model}`;
+}
+
+// 同一家的自動顯示名稱。取代上游前綴後，同一家若有兩個模型最後一段相同
+// （例如 ark/x 與 azure/x），改用「前綴/完整上游 ID」，名稱才不會撞在一起。
+export function autoModelDisplayNames(routes, prefix = null) {
+  const counts = new Map();
+  const base = (route) => String(route.upstreamModel || "").split("/").at(-1);
+  if (prefix) for (const route of routes) counts.set(base(route), (counts.get(base(route)) || 0) + 1);
+  return new Map(routes.map((route) => [route.pickerSlug, prefix && counts.get(base(route)) > 1
+    ? `${prefix}/${route.upstreamModel}`
+    : autoModelDisplayName(route, prefix)]));
+}
+
+// 這個名稱是不是自動產生的：預設規則、指定前綴下的兩種寫法，或上游原名。
+function isAutoDisplayName(name, route, prefix) {
+  return name === route.upstreamModel || name === autoModelDisplayName(route, null) ||
+    (Boolean(prefix) && (name === autoModelDisplayName(route, prefix) || name === `${prefix}/${route.upstreamModel}`));
+}
+
+// 新加入的路由套用供應商的前綴。只動自動產生的名稱，並與同一家既有的模型一起檢查重名。
+export function applyModelPrefix(newRoutes, prefix, existingRoutes = []) {
+  if (!prefix) return newRoutes;
+  const added = new Set(newRoutes.map((route) => route.pickerSlug));
+  const siblings = existingRoutes.filter((route) => !added.has(route.pickerSlug) &&
+    newRoutes.some((item) => routeProviderId(item) === routeProviderId(route) &&
+      (item.transport === "claude-cli") === (route.transport === "claude-cli")));
+  const names = autoModelDisplayNames([...siblings, ...newRoutes], prefix);
+  return newRoutes.map((route) => (route.displayName && !isAutoDisplayName(route.displayName, route, null)
+    ? route
+    : { ...route, displayName: names.get(route.pickerSlug) }));
+}
+
+function providerRoutes(routes, providerId) {
+  return routes.filter((route) => providerId === CLAUDE_CLI_PROVIDER_ID
+    ? route.transport === "claude-cli"
+    : route.transport !== "claude-cli" && routeProviderId(route) === providerId);
+}
+
+// 修改供應商的顯示名稱與模型前綴。只改名稱欄位、自動產生的模型顯示名稱與模型目錄裡對應的
+// display_name；id、選擇器 ID、上游 ID、憑證與路由能力一律不變，路由器轉發用不到這些欄位，
+// 所以不必重啟路由器。name／modelPrefix 為 undefined 表示不修改，空字串代表恢復預設。
+// Claude 訂閱只能改前綴，名稱固定。
+export function planEditProvider(manifest, settings, catalog, providerId, { name, modelPrefix } = {}) {
+  if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
+    fail("安裝設定或模型目錄不完整，無法修改供應商。");
+  }
+  const cli = providerId === CLAUDE_CLI_PROVIDER_ID;
+  const providers = installedProviders(settings, manifest);
+  const provider = cli ? null : providers.find((item) => item.id === providerId);
+  if (!cli && !provider) fail(`找不到供應商：${terminalSafeText(providerId, 40)}`);
+  const routes = providerRoutes(settings.routes, providerId);
+  if (cli && routes.length === 0) fail("尚未連接 Claude 訂閱，沒有可以修改的模型前綴。");
+
+  let nextName = cli ? null : provider.name || null;
+  if (name !== undefined) {
+    if (cli) {
+      if (name !== null && String(name).trim() !== "") fail("Claude 訂閱的名稱目前不支援修改。");
+    } else {
+      nextName = normalizeProviderName(name);
+      if (nextName === provider.id) nextName = null;
+      if (nextName) {
+        const folded = nextName.toLowerCase();
+        const clash = providers.find((item) => item.id !== provider.id &&
+          [item.id, item.name].some((value) => typeof value === "string" && value.toLowerCase() === folded));
+        if (clash) fail(`已經有叫「${nextName}」的供應商了。`);
+        if (RESERVED_PROVIDER_IDS.has(folded) && folded !== provider.id) fail(`「${nextName}」是保留名稱，請換一個。`);
+      }
+    }
+  }
+  const previousPrefix = cli ? validModelPrefix(settings.claudeCli?.modelPrefix) : provider.modelPrefix || null;
+  const nextPrefix = modelPrefix === undefined ? previousPrefix : normalizeModelPrefix(modelPrefix);
+
+  const entries = new Map(catalog.models.map((model) => [model.slug, model]));
+  const targets = autoModelDisplayNames(routes, nextPrefix);
+  const renames = [];
+  const kept = [];
+  for (const route of routes) {
+    const current = entries.get(route.pickerSlug)?.display_name || route.displayName || route.upstreamModel;
+    if (!isAutoDisplayName(current, route, previousPrefix)) {
+      kept.push({ slug: route.pickerSlug, displayName: current, upstreamModel: route.upstreamModel });
+      continue;
+    }
+    const target = targets.get(route.pickerSlug);
+    if (target !== current || route.displayName !== target) {
+      renames.push({ slug: route.pickerSlug, from: current, to: target, upstreamModel: route.upstreamModel });
+    }
+  }
+  const renamed = new Map(renames.map((item) => [item.slug, item.to]));
+  const rename = (route) => (renamed.has(route.pickerSlug) ? { ...route, displayName: renamed.get(route.pickerSlug) } : route);
+  const nextCatalog = renames.length === 0 ? catalog : {
+    ...catalog,
+    models: catalog.models.map((model) => (renamed.has(model.slug) ? { ...model, display_name: renamed.get(model.slug) } : model)),
+  };
+  // 同名不擋：使用者可能就是想這樣命名；交給畫面提醒。
+  const counts = new Map();
+  for (const model of nextCatalog.models) {
+    if (!String(model.slug).startsWith("custom/") || typeof model.display_name !== "string") continue;
+    counts.set(model.display_name, [...(counts.get(model.display_name) || []), model.slug]);
+  }
+  const conflicts = [...counts].filter(([value, slugs]) => slugs.length > 1 && slugs.some((slug) => renamed.has(slug)) && value)
+    .map(([value, slugs]) => ({ displayName: value, slugs }));
+
+  const withFields = (record) => {
+    const next = { ...record };
+    delete next.name;
+    delete next.modelPrefix;
+    if (nextName) next.name = nextName;
+    if (nextPrefix) next.modelPrefix = nextPrefix;
+    return next;
+  };
+  const routesOf = (record) => (Array.isArray(record.routes) ? record.routes.map(rename) : record.routes);
+  let nextSettings;
+  let nextManifest;
+  if (cli) {
+    const claudeCli = (record) => {
+      const next = { ...(record || {}) };
+      delete next.modelPrefix;
+      if (nextPrefix) next.modelPrefix = nextPrefix;
+      return next;
+    };
+    nextSettings = { ...settings, routes: routesOf(settings), claudeCli: claudeCli(settings.claudeCli) };
+    nextManifest = { ...manifest, routes: routesOf(manifest),
+      ...(manifest.claudeCli || settings.claudeCli ? { claudeCli: claudeCli(manifest.claudeCli || settings.claudeCli) } : {}) };
+  } else {
+    const nextProviders = providers.map((item) => (item.id === provider.id ? withFields(item) : item));
+    nextSettings = withProviders({ ...settings, routes: routesOf(settings) }, nextProviders);
+    nextManifest = manifestWithProviders({ ...manifest, routes: routesOf(manifest) }, nextProviders);
+  }
+  const providerChanged = nextName !== (cli ? null : provider.name || null) || nextPrefix !== previousPrefix;
+  return {
+    changed: providerChanged || renames.length > 0,
+    providerId,
+    name: nextName,
+    previousName: cli ? null : provider.name || null,
+    modelPrefix: nextPrefix,
+    previousModelPrefix: previousPrefix,
+    renames,
+    kept,
+    conflicts,
+    restartDesktop: renames.length > 0,
+    settings: nextSettings,
+    manifest: nextManifest,
+    catalog: nextCatalog,
+  };
 }
 
 // 從網址猜一個好記的名稱：api.openrouter.ai → openrouter、relay.example.com.cn → example。
@@ -1562,7 +1775,8 @@ function hostOf(url) {
 
 function providerLine(provider, routes = []) {
   const count = routes.filter((route) => routeProviderId(route) === provider.id).length;
-  return `${provider.id}（${hostOf(provider.baseUrl || provider.apiRoot)}）— ${count} 個模型`;
+  const id = provider.name ? `ID ${provider.id}，` : "";
+  return `${providerName(provider)}（${id}${hostOf(provider.baseUrl || provider.apiRoot)}）— ${count} 個模型`;
 }
 
 function printProviders(providers, routes = []) {
@@ -1585,7 +1799,10 @@ async function chooseProvider(providers, routes, question, { preferredId = null,
     allowCancel ? null : String(preferred + 1),
   )).trim().toLowerCase();
   if (allowCancel && (!answer || answer === "cancel")) return null;
-  const provider = /^\d+$/.test(answer) ? providers[Number(answer) - 1] : providers.find((item) => item.id === answer);
+  // 名稱可以是另外取的顯示名稱，也可以是供應商 id；不分大小寫。
+  const provider = /^\d+$/.test(answer)
+    ? providers[Number(answer) - 1]
+    : providers.find((item) => item.id === answer || item.name?.toLowerCase() === answer);
   if (!provider) fail(`找不到供應商：${answer}`);
   return provider;
 }
@@ -1931,13 +2148,15 @@ export function arrangeCustomModels(officialModels, customModels, routes, provid
 export function planAddModels(manifest, settings, catalog, templates, provider, newRoutes, discoveredModels,
   binary = codexBin) {
   const providers = installedProviders(settings, manifest);
-  if (!providers.some((item) => item.id === provider?.id)) fail(`找不到供應商：${provider?.id}`);
+  const current = providers.find((item) => item.id === provider?.id);
+  if (!current) fail(`找不到供應商：${provider?.id}`);
   if (!Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
     fail("安裝設定或模型目錄不完整，無法添加模型。");
   }
   if (newRoutes.some((route) => routeProviderId(route) !== provider.id)) fail("新模型與供應商不一致，配置未改動。");
   const existing = new Set(settings.routes.map((route) => route.pickerSlug));
-  const added = newRoutes.filter((route) => !existing.has(route.pickerSlug));
+  // 供應商設了模型前綴時，新模型的自動名稱跟著前綴走，與既有模型一致。
+  const added = applyModelPrefix(newRoutes.filter((route) => !existing.has(route.pickerSlug)), current.modelPrefix, settings.routes);
   if (added.length === 0) fail("所選模型都已配置，配置未改動。");
   const routes = [...settings.routes, ...added];
   const officialModels = applyForcedVisibility(
@@ -3075,7 +3294,7 @@ async function install() {
   );
   const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
   if (clash) {
-    fail(`這個 Base URL 已經是供應商「${clash.id}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
+    fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
   }
   const keychainService = keychainServiceFor(baseUrl);
 
@@ -3131,9 +3350,13 @@ async function install() {
       console.log(`  保留 ${model} 既有的推理強度：${restored.join(", ")}（本次為暫時性失敗）。`);
       keptEfforts.push(`${model}: ${restored.join(", ")}`);
     }
-    routes.push(withDefaultModelPrefix(route));
+    // 重新探測的既有模型沿用原本的顯示名稱：使用者可能手動改過名，或依前綴命名過。
+    const previousName = previousRoutes.get(model)?.displayName;
+    routes.push(withDefaultModelPrefix(previousName && kept !== "model" ? { ...route, displayName: previousName } : route));
   }
   if (routes.length === 0) fail("選中的模型均未通過 Responses API 探測。" );
+  // 新模型依主要供應商的模型前綴命名；沿用的名稱只有仍是預設規則產生的才會補上前綴。
+  routes.splice(0, routes.length, ...applyModelPrefix(routes, primary?.modelPrefix || null));
   if (keptModels.length > 0 || keptEfforts.length > 0) {
     console.log("\n本次探測遇到暫時性故障，以下項目沿用上次已驗證的設定：" );
     for (const model of keptModels) console.log(`  - ${model}（整個模型）`);
@@ -3159,6 +3382,9 @@ async function install() {
     keychainService,
     keychainAccount: "codex",
     credentialPath: isWindows ? credentialFileFor(keychainService) : null,
+    // 顯示名稱與模型前綴屬於這家供應商本身，重新配置 Base URL 或 Key 時保留。
+    ...(primary?.name ? { name: primary.name } : {}),
+    ...(primary?.modelPrefix ? { modelPrefix: primary.modelPrefix } : {}),
   }, ...otherProviders];
   // 主要供應商的項目依這次探測重建；其他供應商的沿用現有目錄裡那份。
   const allRoutes = [...routes, ...otherRoutes];
@@ -3375,7 +3601,7 @@ async function addModels() {
   const { baseUrl, keychainService } = provider;
   const providerRoutes = existingRoutes.filter((route) => routeProviderId(route) === provider.id);
   const port = Number(settings.port || manifest.port);
-  if (providers.length > 1) console.log(`\n供應商：${provider.id}`);
+  if (providers.length > 1) console.log(`\n供應商：${providerName(provider)}`);
   console.log(`Base URL：${baseUrl}`);
   console.log(`端口：${port}`);
   console.log(`已配置 ${providerRoutes.length} 個自訂模型：`);
@@ -3560,7 +3786,7 @@ export function planAddProvider(manifest, settings, catalog, templates, provider
   const problem = providerIdError(provider.id, providers.map((item) => item.id));
   if (problem) fail(problem);
   const clash = providers.find((item) => item.baseUrl === provider.baseUrl);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」。`);
   if (newRoutes.length === 0 || newRoutes.some((route) => routeProviderId(route) !== provider.id)) {
     fail("新模型與供應商不一致，配置未改動。");
   }
@@ -3770,23 +3996,26 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
     : parseTokenSetting(maxOutputTokens, { label: "最大輸出", min: MIN_OUTPUT_TOKENS, max: MAX_OUTPUT_TOKENS });
   if (output && output > contextWindow) fail("最大輸出不能超過上下文上限。");
   if (state.providers.some((provider) => provider.id === "claude-cli")) fail("既有供應商名稱與 Claude CLI 保留名稱衝突，請先更名。");
+  const prefix = validModelPrefix(state.settings.claudeCli?.modelPrefix);
   const unique = new Map(models.map((model) => [resolvedModels[model] || model, model]));
-  const newRoutes = [...unique].map(([resolved, requested]) => {
+  const newRoutes = applyModelPrefix([...unique].map(([resolved, requested]) => {
     const previous = state.settings.routes.find((route) => route.transport === "claude-cli"
       && (route.upstreamModel === resolved || route.upstreamModel === requested));
     const opusDefault = resolved === "claude-opus-5-5" ? Math.min(128000, contextWindow) : null;
     const outputLimit = output ?? previous?.maxOutputTokens ?? opusDefault ?? 32000;
     const defaultOutput = output ?? previous?.defaultMaxOutputTokens ?? (!previous ? opusDefault : null);
     if (previous && outputLimit > contextWindow) fail("既有最大輸出超過新的上下文上限，請一併調整輸出設定。");
+    // 重新設定時保留使用者手動取的名稱；自動名稱一律依目前的前綴重算。
+    const manualName = previous?.displayName && !isAutoDisplayName(previous.displayName, previous, prefix) ? previous.displayName : null;
     return {
       pickerSlug: previous?.pickerSlug || pickerSlug(resolved, "claude-cli"), upstreamModel: resolved,
       requestedModel: requested,
-      displayName: `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
+      displayName: manualName || `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
       transport: "claude-cli", translate: "anthropic", efforts: [...EFFORTS],
       contextWindow, maxOutputTokens: outputLimit,
       ...(defaultOutput ? { defaultMaxOutputTokens: defaultOutput } : {}),
     };
-  });
+  }), prefix, state.settings.routes);
   const replaced = new Set(newRoutes.map((route) => route.pickerSlug));
   const routes = [...state.settings.routes.filter((route) => !replaced.has(route.pickerSlug)), ...newRoutes];
   const official = state.catalog.models.filter((model) => !String(model.slug).startsWith("custom/"));
@@ -4035,8 +4264,14 @@ async function configureClaudeCli(subcommand = null) {
   // Re-read after login/probing; never overwrite intervening catalog refreshes.
   const plan = planClaudeCliModels(requireInstallation(), binary, passed, contextWindow, resolvedModels);
   const backup = await commitRouterChange("claude-cli", plan);
-  console.log(`已添加：${[...new Set(passed.map((model) => `claude-cli/${resolvedModels[model]}`))].join("、")}。請重開 Codex 後選擇模型。`);
+  console.log(`已添加：${claudeCliDisplayNames(plan, passed.map((model) => resolvedModels[model])).join("、")}。請重開 Codex 後選擇模型。`);
   console.log(`可從「刪除自訂模型」移除；不會登出 Claude。備份：${backup}`);
+}
+
+// 添加完成的提示用實際寫入的顯示名稱：設了前綴或手動改過名時，不是固定的 claude-cli/模型。
+function claudeCliDisplayNames(plan, upstreamIds) {
+  const routes = plan.settings.routes.filter((route) => route.transport === "claude-cli");
+  return [...new Set(upstreamIds)].map((id) => routes.find((route) => route.upstreamModel === id)?.displayName || `claude-cli/${id}`);
 }
 
 async function manageProviders(subcommand = null) {
@@ -4049,6 +4284,7 @@ async function manageProviders(subcommand = null) {
     });
     console.log("");
     console.log("  add     新增供應商，探測並添加它的模型");
+    console.log("  edit    修改供應商的名稱與模型前綴（不重新探測）");
     console.log("  remove  移除供應商與它的模型");
     console.log("  key     更換某一家的 API Key");
     action = (await ask("請選擇操作（Enter 返回）")).trim().toLowerCase();
@@ -4058,20 +4294,93 @@ async function manageProviders(subcommand = null) {
     return;
   }
   if (["add", "a", "new"].includes(action)) await addProvider();
+  else if (["edit", "e", "rename", "prefix"].includes(action)) await editProvider();
   else if (["remove", "r", "rm", "delete"].includes(action)) await removeProvider();
   else if (["key", "k", "api-key"].includes(action)) await replaceProviderKey();
   else fail(`無法識別的操作：${action}`);
 }
 
+// 列出名稱、前綴與會改名的模型；終端與網頁共用。
+function printProviderEdit(plan) {
+  const label = (value) => value || plan.providerId;
+  const prefix = (value) => (value ? `${value}/` : "預設規則");
+  if (plan.name !== plan.previousName) console.log(`名稱：${label(plan.previousName)} → ${label(plan.name)}`);
+  if (plan.modelPrefix !== plan.previousModelPrefix) {
+    console.log(`模型前綴：${prefix(plan.previousModelPrefix)} → ${prefix(plan.modelPrefix)}`);
+  }
+  if (plan.renames.length) {
+    console.log(`選擇器裡會改名的模型（${plan.renames.length} 個）：`);
+    for (const item of plan.renames) console.log(`  - ${item.from} → ${item.to}`);
+  }
+  if (plan.kept.length && plan.modelPrefix !== plan.previousModelPrefix) {
+    console.log("以下模型手動改過顯示名稱，保留不變：");
+    for (const item of plan.kept) console.log(`  - ${item.displayName}（${item.upstreamModel}）`);
+  }
+  if (plan.conflicts.length) {
+    console.log(`⚠️  改名後與其他模型同名：${plan.conflicts.map((item) => item.displayName).join("、")}`);
+  }
+}
+
+// 修改名稱與模型前綴：只改顯示用的欄位與模型目錄，不重新探測、不重啟路由器。
+async function editProvider() {
+  const { settings, providers } = requireInstallation();
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  printHeading("修改供應商名稱與模型前綴");
+  const cliCount = settings.routes.filter((route) => route.transport === "claude-cli").length;
+  const options = [
+    ...providers.map((provider) => ({ id: provider.id, provider, label: providerLine(provider, settings.routes) })),
+    ...(cliCount ? [{ id: CLAUDE_CLI_PROVIDER_ID, provider: null, label: `Claude 訂閱（Claude CLI）— ${cliCount} 個模型` }] : []),
+  ];
+  options.forEach((option, index) => console.log(`  ${index + 1}. ${option.label}`));
+  const answer = (await ask("要修改哪一家（編號或名稱；Enter／cancel 返回）")).trim().toLowerCase();
+  if (!answer || answer === "cancel") {
+    console.log("未進行任何修改。");
+    return;
+  }
+  const chosen = /^\d+$/.test(answer)
+    ? options[Number(answer) - 1]
+    : options.find((option) => option.id === answer || option.provider?.name?.toLowerCase() === answer);
+  if (!chosen) fail(`找不到供應商：${answer}`);
+  let name;
+  if (chosen.provider) {
+    const value = (await ask("名稱（只用於顯示；Enter 保留，輸入 - 改回顯示 ID）", providerName(chosen.provider))).trim();
+    name = value === "-" ? "" : value;
+  } else {
+    console.log("Claude 訂閱的名稱目前不支援修改，只能調整模型前綴。");
+  }
+  const currentPrefix = modelPrefixFor(settings, chosen.id);
+  console.log(currentPrefix
+    ? `目前的模型前綴：${currentPrefix}/`
+    : "目前沒有設定模型前綴：上游已有前綴的模型沿用原名，其他模型補上供應商 ID（主要供應商補 api/）。");
+  console.log("設定前綴後，這家模型一律顯示成「前綴/模型名」，上游自帶的前綴會被取代；手動改過名稱的模型不受影響。");
+  const prefixAnswer = (await ask("模型前綴（Enter 保留；輸入 auto 恢復預設規則）", currentPrefix || "auto")).trim();
+  const modelPrefix = /^auto$/i.test(prefixAnswer) ? "" : prefixAnswer;
+  const state = requireInstallation();
+  const plan = planEditProvider(state.manifest, state.settings, state.catalog, chosen.id, { name, modelPrefix });
+  if (!plan.changed) {
+    console.log("沒有任何變更。");
+    return;
+  }
+  console.log("");
+  printProviderEdit(plan);
+  if (!(await confirm("確認修改？", true))) {
+    console.log("未進行任何修改。");
+    return;
+  }
+  const backupDir = await commitCatalogChange("edit-provider", plan);
+  console.log(`已修改，不需要重新啟動路由器。備份：${backupDir}`);
+  if (plan.restartDesktop) console.log(`請完全退出並重新打開 ${desktopAppName}，選擇器才會顯示新的名稱。`);
+}
+
 async function askProviderId(baseUrl, takenIds) {
   const suggested = suggestProviderId(baseUrl, takenIds);
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const answer = (await ask("供應商名稱（用於管理，僅為無前綴的模型補上名稱；Enter 使用預設）", suggested)).trim().toLowerCase();
+    const answer = (await ask("供應商 ID（用於管理與設定檔，並替無前綴的模型補上前綴；之後可另取顯示名稱；Enter 使用預設）", suggested)).trim().toLowerCase();
     const problem = providerIdError(answer, takenIds);
     if (!problem) return answer;
     console.log(problem);
   }
-  fail("供應商名稱無效，未進行任何修改。");
+  fail("供應商 ID 無效，未進行任何修改。");
 }
 
 async function addProvider() {
@@ -4082,7 +4391,7 @@ async function addProvider() {
   console.log("每家供應商各自保存 API Key；已有前綴的模型保留原名，無前綴的模型才加供應商名稱。");
   const baseUrl = normalizeUrl(await ask("兼容 OpenAI 的 Base URL"));
   const clash = providers.find((provider) => provider.baseUrl === baseUrl);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」；要添加它的模型請用「添加自訂模型」。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要添加它的模型請用「添加自訂模型」。`);
   const keychainService = keychainServiceFor(baseUrl);
   const keyExisted = keychainHas(keychainService);
   if (!keyExisted) await storeApiKey(keychainService, baseUrl);
@@ -4099,7 +4408,7 @@ async function addProvider() {
     const takenIds = providers.map((provider) => provider.id);
     const prefixed = selectedModels.length > 0 && selectedModels.every((model) => model.includes("/"));
     const id = prefixed ? suggestProviderId(baseUrl, takenIds) : await askProviderId(baseUrl, takenIds);
-    if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商管理名稱自動設為「${id}」。`);
+    if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商 ID 自動設為「${id}」。`);
     console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
     if (!(await confirm("是否繼續進行能力探測？", true))) fail("已在修改配置前取消。");
     const outcomes = await probeModelsInParallel(selectedModels,
@@ -4155,23 +4464,23 @@ async function removeProvider() {
   const defaultModel = removedDefaultModel(userConfig.config, preview.removedRoutes.map((route) => route.pickerSlug));
   const imagegen = relayConfig();
   const imagegenAffected = Boolean(imagegen) && (imagegen.providerId ?? DEFAULT_PROVIDER_ID) === chosen.id;
-  console.log(`\n即將移除供應商「${chosen.id}」（${chosen.baseUrl}）與它的 ${preview.removedRoutes.length} 個模型：`);
+  console.log(`\n即將移除供應商「${providerName(chosen)}」（${chosen.baseUrl}）與它的 ${preview.removedRoutes.length} 個模型：`);
   for (const route of preview.removedRoutes) console.log(`  - ${route.displayName || route.upstreamModel}`);
-  if (providers[0].id === chosen.id) console.log(`移除後由「${preview.providers[0].id}」擔任主要供應商。`);
+  if (providers[0].id === chosen.id) console.log(`移除後由「${providerName(preview.providers[0])}」擔任主要供應商。`);
   if (defaultModel) console.log("這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
   if (imagegenAffected) console.log("中轉 API 生圖使用這家供應商，會一併停用；之後可從選單重新設定。");
   console.log("使用上述模型的既有任務需切換到其他模型後才能繼續。");
-  if (!(await confirm(`確認移除供應商「${chosen.id}」？`, false))) {
+  if (!(await confirm(`確認移除供應商「${providerName(chosen)}」？`, false))) {
     console.log("未進行任何修改。");
     return;
   }
   const { plan, backupDir } = await executeRemoveProvider(chosen.id, { expectedDefault: defaultModel });
 
   printHeading("移除完成");
-  console.log(`已移除供應商「${chosen.id}」與 ${plan.removedRoutes.length} 個模型，剩餘 ${plan.providers.length} 家供應商。`);
+  console.log(`已移除供應商「${providerName(chosen)}」與 ${plan.removedRoutes.length} 個模型，剩餘 ${plan.providers.length} 家供應商。`);
   if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
   console.log(`備份：${backupDir}`);
-  if (await confirm(`是否從${secretStoreLabel}中刪除「${chosen.id}」的 API Key？`, true)) {
+  if (await confirm(`是否從${secretStoreLabel}中刪除「${providerName(chosen)}」的 API Key？`, true)) {
     deleteApiKey(chosen.keychainService, chosen.keychainAccount || "codex");
   }
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
@@ -4218,7 +4527,7 @@ async function replaceProviderKey() {
     console.log("未進行任何修改。");
     return;
   }
-  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   await storeApiKey(provider.keychainService, provider.baseUrl);
   // 舊 Key 已被覆寫，驗證不通過也無從還原，只提醒使用者。
   try {
@@ -4899,7 +5208,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   const models = available.map((model) => model.id);
   const aliases = Object.fromEntries(available.map((model) => [model.id, model.upstreamModel]));
   const result = installRelayImageSkill({ models, aliases, apiMode: discovery.apiMode, providerId: provider.id });
-  console.log(`已啟用 $router-imagegen：${result.root}${providers.length > 1 ? `（供應商 ${provider.id}）` : ""}`);
+  console.log(`已啟用 $router-imagegen：${result.root}${providers.length > 1 ? `（供應商 ${providerName(provider)}）` : ""}`);
   if (result.backup) console.log(`備份：${result.backup}`);
   if (result.preserved.length) console.log(`保留手動修改的檔案：${result.preserved.join(", ")}`);
   console.log("請建立新任務使用 $router-imagegen；若尚未出現，重新啟動 Codex。所選模型已通過本次生圖測試。");
@@ -5016,7 +5325,7 @@ async function status() {
     console.log("供應商：");
     providers.forEach((provider, index) => {
       const count = routes.filter((route) => routeProviderId(route) === provider.id).length;
-      console.log(`  ${index + 1}. ${provider.id}${index === 0 ? "（主要）" : ""}：${provider.apiRoot}，${count} 個模型`);
+      console.log(`  ${index + 1}. ${providerName(provider)}${index === 0 ? "（主要）" : ""}：${provider.apiRoot}，${count} 個模型`);
     });
   }
   console.log(`路由器：http://127.0.0.1:${manifest.port}`);
@@ -5159,6 +5468,28 @@ const managerInstallerName = isWindows ? "codex-model-router.ps1" : "codex-model
 const managerInstallerPath = join(installRoot, managerInstallerName);
 const managerLockPath = join(installRoot, "manager.json");
 const managerHandoffPath = join(installRoot, "manager-handoff.json");
+// 管理頁的介面偏好（目前只有語言）。值由 manager.mjs 驗證；尚未安裝時只留在記憶體裡。
+const managerPreferencesPath = join(installRoot, "manager-preferences.json");
+let unsavedManagerPreferences = {};
+
+function managerPreferences() {
+  return {
+    read() {
+      try { return { ...JSON.parse(readFileSync(managerPreferencesPath, "utf8")), ...unsavedManagerPreferences }; }
+      catch { return { ...unsavedManagerPreferences }; }
+    },
+    write(patch) {
+      const next = { ...this.read(), ...patch };
+      if (existsSync(installRoot)) {
+        writeJsonAtomic(managerPreferencesPath, next);
+        unsavedManagerPreferences = {};
+      } else {
+        unsavedManagerPreferences = next;
+      }
+      return next;
+    },
+  };
+}
 const MANAGER_HANDLER_KEY = "desktop.custom_file_handlers.model_router_manager";
 const MANAGER_MCP_KEY = "mcp_servers.model_router_manager";
 const managerMcpPath = join(installRoot, "manager-entry.mjs");
@@ -5789,7 +6120,8 @@ async function managerState() {
     writeBlocked: managerWriteGuard(),
     router: { port, ...health },
     providers: providers.map((provider, index) => ({
-      id: provider.id, baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
+      id: provider.id, name: provider.name || null, modelPrefix: provider.modelPrefix || null,
+      baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
       modelCount: routes.filter((route) => routeProviderId(route) === provider.id).length,
       keyStored: env.CODEX_MODEL_ROUTER_TEST_API_KEY ? true : keychainHas(provider.keychainService),
     })),
@@ -5801,6 +6133,7 @@ async function managerState() {
     claudeCli: {
       binary: settings.claudeCli?.binary || null,
       routeCount: routes.filter((route) => route.transport === "claude-cli").length,
+      modelPrefix: validModelPrefix(settings.claudeCli?.modelPrefix),
     },
     desktop: { name: desktop?.name || desktopAppName, canRestart: Boolean(desktop) },
     paths: {
@@ -5940,7 +6273,7 @@ async function managerProviderDraft({ baseUrl, apiKey } = {}) {
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫 API Key。");
   const clash = providers.find((provider) => provider.baseUrl === normalized);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」；要添加它的模型請到「模型」頁新增。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要添加它的模型請到「模型」頁新增。`);
   const discovery = await discoverApiRoot(normalized, key);
   const now = Date.now();
   for (const [id, draft] of managerDrafts) {
@@ -5979,7 +6312,7 @@ async function managerAddModels({ providerId, models, contextWindow, maxOutputTo
   const provider = managerProvider(providers, String(providerId || ""));
   const selected = managerModelSelection(models, configuredUpstreams(settings, provider.id));
   const apiKey = readApiKey(provider.keychainService);
-  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("正在查詢模型清單…");
   const discovery = await discoverApiRoot(provider.baseUrl, apiKey);
   console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
@@ -6065,6 +6398,46 @@ async function managerEditModel({ slug, displayName, contextWindow, maxOutputTok
   return { changed: true, backupDir, restartDesktop: plan.restartDesktop };
 }
 
+// 網頁送來的名稱與前綴：undefined 不修改，null 或空字串恢復預設，其他型別一律拒絕。
+function providerEditFields({ name, modelPrefix } = {}) {
+  for (const value of [name, modelPrefix]) {
+    if (value !== undefined && value !== null && typeof value !== "string") fail("供應商名稱與前綴必須是文字。");
+  }
+  return { name, modelPrefix };
+}
+
+// 修改前的預覽：列出會改名、保留與同名的模型，不寫任何檔案。輸入無效時回傳原因，
+// 讓頁面一邊輸入一邊提示，而不是當成請求失敗。
+function managerProviderPreview({ providerId, ...fields } = {}) {
+  const { manifest, settings, catalog } = requireInstallation();
+  try {
+    const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
+    return {
+      ok: true, changed: plan.changed, name: plan.name, modelPrefix: plan.modelPrefix,
+      renames: plan.renames, kept: plan.kept, conflicts: plan.conflicts,
+    };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+async function managerEditProvider({ providerId, ...fields } = {}) {
+  assertManagerWritable();
+  const { manifest, settings, catalog } = requireInstallation();
+  const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
+  if (!plan.changed) {
+    console.log("沒有任何變更。");
+    return { changed: false };
+  }
+  printProviderEdit(plan);
+  console.log(plan.renames.length
+    ? "正在寫入供應商設定與模型目錄（不需要重新啟動路由器）…"
+    : "正在寫入供應商設定（不需要重新啟動路由器）…");
+  const backupDir = await commitCatalogChange("edit-provider", plan);
+  console.log(`已儲存。備份：${backupDir}`);
+  return { changed: true, renamed: plan.renames.length, backupDir, restartDesktop: plan.restartDesktop };
+}
+
 async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens } = {}) {
   assertManagerWritable();
   await withCodexLock(() => verifyLogin());
@@ -6074,14 +6447,14 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
   if (!draft || Date.now() - draft.createdAt > MANAGER_DRAFT_TTL_MS) fail("新增供應商的資料已過期，請重新查詢模型。");
   const { providers } = requireInstallation();
   const clash = providers.find((provider) => provider.baseUrl === draft.baseUrl);
-  if (clash) fail(`這個 Base URL 已經是供應商「${clash.id}」。`);
+  if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」。`);
   const selected = managerModelSelection(models);
   const takenIds = providers.map((provider) => provider.id);
   const prefixed = selected.every((model) => model.includes("/"));
   const id = prefixed ? suggestProviderId(draft.baseUrl, takenIds) : String(providerId || "").trim().toLowerCase();
   const problem = providerIdError(id, takenIds);
   if (problem) fail(problem);
-  if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商管理名稱自動設為「${id}」。`);
+  if (prefixed) console.log(`所選模型已有前綴，保留模型原名；供應商 ID 自動設為「${id}」。`);
   console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
   const outcomes = await probeModelsInParallel(selected,
     (model, log) => buildRouteForModel(draft.discovery, draft.apiKey, model, log, id));
@@ -6127,7 +6500,7 @@ async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
   const { providers } = requireInstallation();
   const provider = managerProvider(providers, String(providerId || ""));
   if (providers.length <= 1) fail("至少要保留一家供應商；要整個移除路由器請在終端選單使用「回退配置」。");
-  console.log(`正在移除供應商「${provider.id}」與它的模型，並重新啟動路由器…`);
+  console.log(`正在移除供應商「${providerName(provider)}」與它的模型，並重新啟動路由器…`);
   const { plan, defaultModel, imagegenAffected, backupDir } = await executeRemoveProvider(provider.id);
   let keyDeleted = false;
   const shared = providers.some((item) => item.id !== provider.id && item.keychainService === provider.keychainService);
@@ -6140,7 +6513,7 @@ async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
     }
   }
   if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
-  console.log(`已移除供應商「${provider.id}」與 ${plan.removedRoutes.length} 個模型。備份：${backupDir}`);
+  console.log(`已移除供應商「${providerName(provider)}」與 ${plan.removedRoutes.length} 個模型。備份：${backupDir}`);
   managerConfigHints(true);
   return {
     removed: plan.removedRoutes.map(summarizeRoute), defaultCleared: Boolean(defaultModel),
@@ -6155,7 +6528,7 @@ async function managerReplaceKey({ providerId, apiKey } = {}) {
   const provider = managerProvider(providers, String(providerId || ""));
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫新的 API Key。");
-  console.log(`正在用新 Key 查詢「${provider.id}」的模型清單…`);
+  console.log(`正在用新 Key 查詢「${providerName(provider)}」的模型清單…`);
   let status = null;
   let problem = null;
   try {
@@ -6300,7 +6673,7 @@ async function managerImagegenSetup({ providerId, models } = {}) {
   }
   const provider = providers.length === 1 && !providerId ? providers[0] : managerProvider(providers, String(providerId || ""));
   const current = relayConfig();
-  console.log(`供應商：${provider.id}（${provider.baseUrl}）`);
+  console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("偵測會實際生圖並依供應商計費；先測通用介面，全部未通過時自動改測 Ark 任務介面。");
   const outcome = await runRelayImagegenSetup({ provider, selected, current, settings, providers });
   if (!outcome.available.length) fail("沒找到可用模型，生圖設定沒有變更。");
@@ -6433,7 +6806,7 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = 
   console.log("\n測試完成，正在寫入設定並重新啟動路由器…");
   const backupDir = await commitRouterChange("claude-cli", plan);
   const added = [...new Set(tested.passed.map((model) => tested.resolvedModels[model]))];
-  console.log(`已添加：${added.map((id) => `claude-cli/${id}`).join("、")}`);
+  console.log(`已添加：${claudeCliDisplayNames(plan, added).join("、")}`);
   console.log(`上下文 ${defaults.contextWindow.toLocaleString("en-US")}，輸出 ${defaults.maxOutputTokens.toLocaleString("en-US")}（超過模型上限時 Claude CLI 會自動壓到上限）。`);
   console.log(`備份：${backupDir}`);
   return { added, failures: tested.failures, backupDir, restartDesktop: true };
@@ -6454,6 +6827,7 @@ function managerOperations() {
       imagegen: () => relayImagegenStatus(),
       "claude-cli": () => managerClaudeCliStatus(),
       "claude-cli-models": () => managerClaudeCliModels(),
+      "provider-preview": (params) => managerProviderPreview(params),
     },
     jobs: {
       "repair-models": job("同步與修復模型清單", repairModels),
@@ -6462,6 +6836,7 @@ function managerOperations() {
       "reorder-models": job("調整模型順序", managerReorderModels),
       "edit-model": job("修改模型", managerEditModel),
       "add-provider": job("新增供應商", managerAddProvider),
+      "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
       "replace-key": job("更換 API Key", managerReplaceKey),
       "restart-router": job("重新啟動路由器", managerRestartRouter),
@@ -6674,7 +7049,7 @@ async function runManager() {
   managerMode = true;
   let lastActivity = Date.now();
   const server = manager.createManagerServer({
-    html, token, version: INSTALLER_VERSION, instanceId, ops: managerOperations(), jobs,
+    html, token, version: INSTALLER_VERSION, instanceId, ops: managerOperations(), jobs, preferences: managerPreferences(),
     onActivity: () => { lastActivity = Date.now(); },
     onShutdown: () => finish("shutdown"),
     onRestart: () => finish("restart"),
@@ -6798,7 +7173,7 @@ export const MENU_ITEMS = [
   ["update", "更新到最新版本（保留現有配置）"],
   ["add", "添加自訂模型"],
   ["remove", "刪除自訂模型"],
-  ["providers", "管理供應商（新增／移除／更換 API Key）"],
+  ["providers", "管理供應商（新增／修改名稱與前綴／移除／更換 API Key）"],
   ["claude-cli", "連接 Claude 訂閱帳號（實驗性）"],
   ["hidden-models", "管理隱藏的官方模型"],
   ["context-1m", "設定全域上下文 100 萬"],
@@ -6822,7 +7197,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} remove
-  ${basename(scriptPath || "codex-model-router.command")} providers [add|remove|key]
+  ${basename(scriptPath || "codex-model-router.command")} providers [add|edit|remove|key]
   ${basename(scriptPath || "codex-model-router.command")} claude-cli [status|login]
   ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} context-1m
@@ -6840,8 +7215,9 @@ function help() {
 路由器安裝成功後可選擇啟用中轉 API 生圖；預設不啟用，之後可從選單第 ${menuNumber("imagegen")} 項添加。
 
 ui 在瀏覽器開啟本機網頁管理介面：查看狀態與最近錯誤、添加／刪除／排序模型、修改顯示名稱、
-上下文與輸出、管理供應商與 API Key、中轉 API 生圖、全域上下文、隱藏的官方模型與 Claude 訂閱（CLI），
-並可檢查新版本、一鍵更新後重新啟動。背後用的是與選單相同的流程（先備份、失敗還原）。
+上下文與輸出、管理供應商（名稱、模型前綴）與 API Key、中轉 API 生圖、全域上下文、隱藏的官方模型與
+Claude 訂閱（CLI），並可檢查新版本、一鍵更新後重新啟動。背後用的是與選單相同的流程（先備份、失敗還原）。
+介面支援繁體中文、簡體中文與英文，預設跟隨瀏覽器語言（都不符合時用英文），可在頁面左下角切換。
 網址含一次性存取權杖，只接受本機連線；背景執行，不需要保留終端視窗。
 從頁面結束或閒置 20 分鐘會自動退出；ui --foreground 可在終端顯示診斷。
 安裝與更新完成後會建立捷徑（macOS：~/Applications/Codex 模型路由器.command；
@@ -7672,7 +8048,9 @@ function rememberHistoryEvent(history, event) {
   }
   history.completed = true;
   historyCacheInfo();
-  const serialized = JSON.stringify({ input: history.input, output: history.output });
+  const serialized = JSON.stringify({
+    input: history.input, output: history.output, ...(history.prewarm ? { prewarm: true } : {}),
+  });
   // 用位元組計帳的不可變快照，避免共享物件被後續轉譯修改；超限不保存半份歷史。
   const bytes = Buffer.byteLength(serialized);
   if (bytes > maxHistoryBytes) return;
@@ -7700,12 +8078,27 @@ function rememberHistoryEvent(history, event) {
 
 function rebuildStatefulInput(key, incomingInput, previousId) {
   historyCacheInfo();
-  const snapshot = key ? threadHistories.get(key)?.get(previousId) : null;
+  const snapshot = findHistorySnapshot(key, previousId);
   const history = snapshot ? JSON.parse(snapshot.serialized) : null;
-  if (!history || history.input.length === 0) return null;
+  // 本機預熱的快照可以沒有輸入（只有指令與工具）；其他空快照一律視為遺失。
+  if (!history || (history.input.length === 0 && !history.prewarm)) return null;
   const incoming = typeof incomingInput === "string" ? [{ role: "user", content: incomingInput }]
     : Array.isArray(incomingInput) ? incomingInput : [];
   return [...history.input, ...history.output, ...incoming];
+}
+
+// 本機預熱的 id 是隨機且只回給發出預熱的那條連線；Codex 的預熱與下一輪若帶了不同的
+// 工作階段識別（client_metadata 與標頭），照 key 找不到時仍可憑這個唯一 id 找回。
+const PREWARM_ID_PREFIX = "resp_prewarm_";
+
+function findHistorySnapshot(key, previousId) {
+  const direct = key ? threadHistories.get(key)?.get(previousId) : null;
+  if (direct || typeof previousId !== "string" || !previousId.startsWith(PREWARM_ID_PREFIX)) return direct ?? null;
+  for (const responses of threadHistories.values()) {
+    const snapshot = responses.get(previousId);
+    if (snapshot) return snapshot;
+  }
+  return null;
 }
 
 // 從 Claude 轉譯路由切出去時，必須清掉轉譯層合成的內容，否則官方與其他供應商
@@ -7787,6 +8180,11 @@ const stats = {
   lastRequestBytesBeforeBudget: null,
   lastRequestBytesAfterBudget: null,
   websocketOnlyFieldsStripped: 0,
+  // Codex 開新任務或打開舊任務時送的 generate:false 預熱，由路由器本機回應的次數；
+  // stalePrewarms 是任務仍記著已刪除模型的預熱，只計數不記錯誤。
+  localPrewarms: 0,
+  stalePrewarms: 0,
+  lastStalePrewarmModel: null,
   queuedResponses: 0,
   responseInProgressRejects: 0,
   bridgeReasoningStripped: 0,
@@ -7919,6 +8317,8 @@ function contextProvider(context) {
   if (context.route !== "custom") return null;
   if ("provider" in context) return context.provider;
   const route = typeof context.model === "string" ? routeMap.get(context.model) : null;
+  // 未配置或已刪除的自訂模型不屬於任何供應商，不能記成主要供應商。
+  if (!route && typeof context.model === "string" && context.model.startsWith("custom/")) return null;
   if (route?.transport === "claude-cli") return null;
   return (route && providerById.get(route.providerId || DEFAULT_PROVIDER_ID)) || primaryProvider;
 }
@@ -8245,6 +8645,13 @@ function rememberedRoute(headers) {
   return null;
 }
 
+// 已刪除的自訂模型只剩選擇器 ID（custom/<名稱>-<8 碼雜湊>）可辨認；錯誤訊息用去掉雜湊的名稱。
+export function customModelLabel(slug) {
+  if (typeof slug !== "string") return "";
+  const label = slug.replace(/^custom\//, "").replace(/-[0-9a-f]{8}$/, "").slice(0, 80);
+  return label || slug.slice(0, 80);
+}
+
 function chooseRoute(headers, body) {
   if (typeof body?.model === "string" && routeMap.has(body.model)) {
     return routeMap.get(body.model);
@@ -8252,7 +8659,7 @@ function chooseRoute(headers, body) {
   if (typeof body?.model === "string" && body.model.startsWith("custom/")) {
     throw new RouterRequestError(
       404, "custom_model_not_configured",
-      "此自訂模型未配置或路由已遺失，請重新添加模型，並在新任務中選擇已配置的模型。",
+      `自訂模型「${customModelLabel(body.model)}」已從路由器移除或尚未配置。請在這個任務的模型選單改選現有模型再重送，不必開新任務；仍要使用它請重新添加。`,
       "routing",
     );
   }
@@ -9726,6 +10133,56 @@ async function tryUpstreamWebSocketTurn(
   return false;
 }
 
+// Codex 每次開新任務或打開舊任務，都會先用該任務記住的模型送一個 generate:false
+// 的預熱（startup prewarm）：官方後端只預先處理提示詞前綴、不生成內容，下一輪再以
+// 預熱回應的 id 增量接續。第三方上游與 HTTP 回退都沒有這種語意，而 generate 是
+// WebSocket 專用欄位、轉送前會被剝掉，結果每打開一個任務就多付一次完整生成。
+// 因此除了官方路由走得通上游 WebSocket 的情況，預熱一律由路由器本機回一個空的
+// 完成回應，並把預熱輸入記成歷史，讓下一輪的 previous_response_id 照常在本機重建。
+export function isPrewarmRequest(message) {
+  return message?.type === "response.create" && message.generate === false;
+}
+
+function answerPrewarmLocally(request, socket, message, connectionState, { stale = false } = {}) {
+  const createdAt = Math.floor(Date.now() / 1000);
+  const response = {
+    id: `${PREWARM_ID_PREFIX}${randomBytes(12).toString("hex")}`,
+    object: "response",
+    created_at: createdAt,
+    status: "in_progress",
+    model: typeof message?.model === "string" ? message.model : null,
+    error: null,
+    incomplete_details: null,
+    output: [],
+    usage: null,
+  };
+  const completed = { ...response, status: "completed", completed_at: createdAt };
+  if (stale) {
+    // 任務仍記著已刪除的模型：打開任務本身不算錯誤，等真的送出訊息才回報 404。
+    stats.stalePrewarms += 1;
+    stats.lastStalePrewarmModel = message.model.slice(0, 160);
+  } else {
+    const probe = { ...message };
+    delete probe.type;
+    const historyKey = historyKeyFor(probe, request.headers, connectionState?.connectionNamespace ?? null);
+    const previousId = typeof message.previous_response_id === "string" && message.previous_response_id
+      ? message.previous_response_id : null;
+    // 預熱本身若是接續，先在本機還原完整輸入；還原不了就不記，下一輪會要求完整重送。
+    const input = previousId
+      ? rebuildStatefulInput(historyKey, message.input, previousId)
+      : (message.input ?? []);
+    const history = input ? prepareHistory(historyKey, input, previousId) : null;
+    if (history) {
+      history.prewarm = true;
+      rememberHistoryEvent(history, { type: "response.completed", response: completed });
+    }
+    stats.localPrewarms += 1;
+  }
+  sendWebSocketJson(socket, { type: "response.created", sequence_number: 0, response });
+  sendWebSocketJson(socket, { type: "response.completed", sequence_number: 1, response: completed });
+  stats.websocketEvents += 2;
+}
+
 export async function handleWebSocketResponseInner(
   request,
   socket,
@@ -9734,6 +10191,18 @@ export async function handleWebSocketResponseInner(
   abortController,
   connectionState = null,
 ) {
+  const prewarm = isPrewarmRequest(message);
+  let route;
+  try {
+    route = chooseRoute(request.headers, message);
+  } catch (error) {
+    if (prewarm && error?.code === "custom_model_not_configured") {
+      answerPrewarmLocally(request, socket, message, connectionState, { stale: true });
+      return;
+    }
+    throw error;
+  }
+
   // 官方路由優先走上游 WebSocket；只有它支援連線內的 previous_response_id 接續。
   // 任何一步失敗都會回退到既有的 HTTP/SSE 路徑，且此時 Codex 尚未收到本輪事件。
   if (
@@ -9742,7 +10211,7 @@ export async function handleWebSocketResponseInner(
     !connectionState.upstreamDisabled &&
     !upstreamWebSocketInCooldown() &&
     message?.type === "response.create" &&
-    chooseRoute(request.headers, message) == null &&
+    route == null &&
     authDigest(request.headers)
   ) {
     const handled = await tryUpstreamWebSocketTurn(
@@ -9753,6 +10222,12 @@ export async function handleWebSocketResponseInner(
       connectionState,
     );
     if (handled) return;
+  }
+
+  // 官方上游 WebSocket 沒接手（自訂路由、已停用或失敗回退）時，預熱不能變成完整生成。
+  if (prewarm) {
+    answerPrewarmLocally(request, socket, message, connectionState);
+    return;
   }
 
   const body = { ...message, stream: true };
@@ -13568,6 +14043,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 export const TOKEN_HEADER = "x-router-manager-token";
+// 介面語言：auto 跟隨瀏覽器（都不符合時用英文）。管理頁每次啟動的連接埠不同，瀏覽器的
+// localStorage 跟著來源（含連接埠）走，記不住選擇，所以偏好由伺服器保存並在送出頁面時帶入。
+export const MANAGER_LANGUAGES = Object.freeze(["auto", "zh-Hant", "zh-Hans", "en"]);
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_JOB_OUTPUT = 512 * 1024;
 const KEEP_FINISHED_JOBS = 20;
@@ -13841,7 +14319,22 @@ export function pageWithNonce(html, nonce) {
   return String(html).replace(/<(script|style)(?=[\s>])/g, `<$1 nonce="${nonce}"`);
 }
 
-function sendPage(response, html, headOnly = false) {
+// 把保存的語言偏好寫進 <html data-language-preference>，頁面第一次繪製就用對的語言。
+export function pageWithLanguage(html, language) {
+  if (!MANAGER_LANGUAGES.includes(language)) return String(html);
+  return String(html).replace(/(<html\b[^>]*\sdata-language-preference=")[^"]*(")/, `$1${language}$2`);
+}
+
+function readLanguage(preferences) {
+  try {
+    const language = preferences?.read()?.language;
+    return MANAGER_LANGUAGES.includes(language) ? language : "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+function sendPage(response, html, headOnly = false, language = "auto") {
   const nonce = randomBytes(16).toString("base64");
   response.writeHead(200, {
     "content-type": "text/html; charset=utf-8",
@@ -13861,7 +14354,7 @@ function sendPage(response, html, headOnly = false) {
     "x-frame-options": "DENY",
     "cross-origin-opener-policy": "same-origin",
   });
-  response.end(headOnly ? undefined : pageWithNonce(html, nonce));
+  response.end(headOnly ? undefined : pageWithNonce(pageWithLanguage(html, language), nonce));
 }
 
 async function readJson(request) {
@@ -13887,9 +14380,10 @@ async function readJson(request) {
 
 // ops：state、version、errors、discover、providerDraft、queries（唯讀查詢，{ type: run }）
 // 與 jobs（會改設定的背景工作，{ type: { title, run } }）。
+// preferences：{ read(), write(patch) }，保存介面語言；沒提供時只用瀏覽器語言。
 // restartBlocked() 回傳字串時拒絕重新啟動管理頁，回傳 null 才呼叫 onRestart。
 export function createManagerServer({
-  html, token, version, ops, jobs, instanceId = createToken(),
+  html, token, version, ops, jobs, instanceId = createToken(), preferences = null,
   onActivity = () => {}, onShutdown = () => {}, onRestart = null, restartBlocked = () => null,
 }) {
   if (!html || !token || !ops || !jobs) throw new Error("createManagerServer 缺少必要參數。");
@@ -13912,7 +14406,7 @@ export function createManagerServer({
         sendJson(response, 405, { error: "不支援的方法。" });
         return;
       }
-      sendPage(response, html, method === "HEAD");
+      sendPage(response, html, method === "HEAD", readLanguage(preferences));
       return;
     }
     if (pathname === "/favicon.ico") {
@@ -13955,6 +14449,20 @@ export function createManagerServer({
     }
     if (route === "POST /api/ping") {
       sendJson(response, 200, { ok: true, version, instanceId, activeJob: activeSummary() });
+      return;
+    }
+    if (route === "POST /api/preferences") {
+      const language = body.language;
+      if (!MANAGER_LANGUAGES.includes(language)) {
+        sendJson(response, 400, { error: "不支援的介面語言。" });
+        return;
+      }
+      if (!preferences) {
+        sendJson(response, 200, { language, saved: false });
+        return;
+      }
+      const saved = await preferences.write({ language });
+      sendJson(response, 200, { language: readLanguage({ read: () => saved }), saved: true });
       return;
     }
     if (route === "POST /api/discover") {
@@ -14030,7 +14538,7 @@ export function createManagerServer({
 }
 __CODEX_MODEL_ROUTER_MANAGER_HTML__
 <!doctype html>
-<html lang="zh-Hant">
+<html lang="zh-Hant" data-language-preference="auto">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -14060,6 +14568,8 @@ __CODEX_MODEL_ROUTER_MANAGER_HTML__
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
+/* 簡體介面改用簡體字形的字型；英文介面仍保留中文字型，伺服器回傳的記錄可能是中文。 */
+:root:lang(zh-Hans) { --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif; }
 html, body { margin: 0; }
 body { background: var(--bg); color: var(--text); font: 14px/1.55 var(--sans); -webkit-font-smoothing: antialiased; }
 a { color: var(--accent); }
@@ -14087,6 +14597,9 @@ button { font: inherit; color: inherit; }
 .status-dot.bad { background: var(--danger); box-shadow: 0 0 0 3px rgba(244, 63, 94, .16); }
 .link-button { background: none; border: 0; padding: 0; color: var(--faint); cursor: pointer; text-align: left; font-size: 12.5px; }
 .link-button:hover { color: var(--text); }
+.language-picker { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.language-picker svg { width: 15px; height: 15px; flex: none; }
+.language-picker select { width: auto; flex: 1; min-width: 0; padding: 4px 8px; border-radius: 8px; font-size: 12.5px; background: #0d1528; }
 
 .main { flex: 1; min-width: 0; padding: 28px 34px 56px; max-width: 1280px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
@@ -14275,7 +14788,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
   .sidebar { width: auto; height: auto; position: static; border-right: 0; border-bottom: 1px solid var(--border); }
   .nav { flex-direction: row; overflow-x: auto; }
   .nav-count { display: none; }
-  .sidebar-footer { display: none; }
+  /* 窄版面只留語言選單：Codex 內建瀏覽器的側欄常常比這個寬度窄。 */
+  .sidebar-footer { border-top: 0; padding: 0 16px 12px; }
+  .sidebar-footer .router-status, .sidebar-footer .link-button { display: none; }
+  .language-picker select { flex: none; }
   .main { padding: 20px 16px 40px; }
   .kv { grid-template-columns: 1fr; gap: 2px 0; }
   .kv dd { margin-bottom: 8px; }
@@ -14309,14 +14825,15 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
         </svg>
       </div>
       <div>
-        <div class="brand-name">Codex 模型路由器</div>
+        <div class="brand-name" data-i18n="Codex 模型路由器">Codex 模型路由器</div>
         <button type="button" class="version-badge" id="version-badge" aria-haspopup="dialog" aria-expanded="false">v—</button>
       </div>
     </div>
     <nav class="nav" id="nav"></nav>
     <div class="sidebar-footer">
-      <div class="router-status" id="router-status"><span class="status-dot"></span><span>檢查中…</span></div>
-      <button type="button" class="link-button" id="shutdown-button">結束管理頁</button>
+      <div class="router-status" id="router-status"><span class="status-dot"></span><span data-i18n="檢查中…">檢查中…</span></div>
+      <label class="language-picker" id="language-picker"></label>
+      <button type="button" class="link-button" id="shutdown-button" data-i18n="結束管理頁">結束管理頁</button>
     </div>
   </aside>
   <main class="main" id="main">
@@ -14324,9 +14841,691 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
     <section id="view"></section>
   </main>
 </div>
-<div class="popover" id="version-popover" role="dialog" aria-label="版本資訊" hidden></div>
+<div class="popover" id="version-popover" role="dialog" aria-label="版本資訊" data-i18n-aria-label="版本資訊" hidden></div>
 <div id="modal-root"></div>
 <div class="toast-root" id="toast-root" aria-live="polite"></div>
+<!-- 介面翻譯：en 是完整字典；zh-Hans 由下方的繁簡轉換產生，hans 只放轉換結果不理想時的覆寫。
+     鍵就是畫面上的繁體中文原文，新增或修改文字時，test/manager-i18n.test.mjs 會檢查兩邊是否齊全。 -->
+<script type="application/json" id="i18n-data">
+{
+"en": {
+"{days} 天 {hours} 小時": "{days}d {hours}h",
+"{hours} 小時 {minutes} 分": "{hours}h {minutes}m",
+"{minutes} 分鐘": "{minutes} min",
+"不到 1 分鐘": "under 1 min",
+"供應商預設": "Provider default",
+"全部 5 檔": "All 5 levels",
+"Claude 訂閱": "Claude subscription",
+"{name}（{host}）": "{name} ({host})",
+"直接轉發 OpenAI Responses API": "Forwards the OpenAI Responses API directly",
+"Chat 轉譯": "Chat bridge",
+"上游只有 Chat Completions，由路由器在本機轉譯": "The upstream only supports Chat Completions; the router translates locally",
+"Claude 轉譯": "Claude bridge",
+"以 Anthropic Messages API 轉譯": "Translated through the Anthropic Messages API",
+"透過 Claude Code 登入的訂閱帳號（實驗性）": "Uses the subscription signed in to Claude Code (experimental)",
+"無法連線到管理程式，請重新開啟管理頁。": "Cannot reach the manager. Please reopen the manager page.",
+"管理頁已換新，正在重新整理。": "The manager was replaced. Reloading…",
+"模型": "Model",
+"供應商": "Provider",
+"設定": "Set",
+"有新版本": "Update available",
+"有新版本，點擊查看": "Update available. Click for details",
+"版本資訊": "Version info",
+"尚未安裝": "Not installed",
+"檢查中…": "Checking…",
+"路由器運作中 · :{port}": "Router running · :{port}",
+"路由器無法連線": "Router unreachable",
+"與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。": "Lost connection to the manager; retrying. If the manager has exited, reopen it from “自訂模型管理” in Codex or with the installer's ui command.",
+"設定已寫入。重新啟動 {app} 後，模型選擇器才會顯示這次的變更。": "Settings saved. Restart {app} to see the changes in the model picker.",
+"設定已寫入。請完全退出並重新打開 {app}，模型選擇器才會顯示這次的變更。": "Settings saved. Quit {app} completely and reopen it to see the changes in the model picker.",
+"立即重新啟動": "Restart now",
+"稍後再說": "Later",
+"關閉提示": "Dismiss",
+"桌面版": "the desktop app",
+"讀取中…": "Loading…",
+"這個 CODEX_HOME 還沒有安裝 Codex 模型路由器。": "Codex Model Router is not installed in this CODEX_HOME.",
+"請先在終端執行安裝器，選擇「安裝或重新配置」。": "Run the installer in a terminal first and choose “安裝或重新配置” (Install or reconfigure).",
+"路由器狀態、最近的錯誤與執行環境。": "Router status, recent errors, and environment.",
+"同步與修復模型清單": "Sync and repair model list",
+"重新啟動路由器": "Restart router",
+"重新啟動 {app}": "Restart {app}",
+"路由器": "Router",
+"運作中": "Running",
+"無法連線": "Unreachable",
+"v{version} · 連接埠 {port} · 已運作 {uptime}": "v{version} · port {port} · up {uptime}",
+"沒有回應": "No response",
+"請求": "Requests",
+"失敗 {failures} · 官方 {official} · 自訂 {custom}": "{failures} failed · {official} official · {custom} custom",
+"自訂模型": "Custom models",
+"官方模型 {count} 個": "{count} official models",
+"主要：{name}": "Primary: {name}",
+"全域預設模型已失效，請點擊「同步與修復模型清單」。": "The global default model is no longer valid. Click “Sync and repair model list”.",
+"重新整理": "Refresh",
+"重新整理錯誤紀錄": "Refresh error log",
+"最近的錯誤": "Recent errors",
+"記錄檔裡沒有錯誤紀錄。": "No errors in the log.",
+"模型清單同步": "Model list sync",
+"請求過大": "Request too large",
+"上游 WebSocket 冷卻": "Upstream WebSocket cooldown",
+"官方驗證寬限": "Official auth grace period",
+"錯誤": "Error",
+"供應商 {name}": "provider {name}",
+"時間": "Time",
+"類型": "Type",
+"內容": "Details",
+"診斷 ID": "Diagnostic ID",
+"未啟用": "Not enabled",
+"{models}（供應商 {provider}）": "{models} (provider {provider})",
+"版本": "Version",
+"管理頁 v{manager} · 已安裝 v{installed} · 路由器 {router}": "Manager v{manager} · installed v{installed} · router {router}",
+"未回應": "not responding",
+"路由器目錄": "Router directory",
+"記錄檔": "Log file",
+"背景服務": "Background service",
+"{name}（{kind}）": "{name} ({kind})",
+"全域預設模型": "Global default model",
+"未設定（使用官方預設）": "Not set (official default)",
+"全域上下文": "Global context",
+"{value} tokens（覆蓋各模型的設定）": "{value} tokens (overrides each model's setting)",
+"未設定（各模型自行決定）": "Not set (each model uses its own)",
+"中轉 API 生圖": "Relay API image generation",
+"管理頁捷徑": "Manager shortcut",
+"尚未建立（執行一次 update 會建立）": "Not created yet (running update once creates it)",
+"環境": "Environment",
+"Windows 排程工作": "Windows scheduled task",
+"Codex 選擇器裡的自訂模型，選擇器依這裡的順序顯示。": "Custom models in the Codex model picker, shown in this order.",
+"刪除所選（{count}）": "Delete selected ({count})",
+"刪除所選": "Delete selected",
+"新增模型": "Add models",
+"順序已調整，尚未儲存。": "Order changed but not saved.",
+"還原": "Revert",
+"儲存順序": "Save order",
+"拖曳左側把手或用箭頭調整順序。排序、改名與上下文只寫入模型目錄，不會重新啟動路由器；修改輸出會重新啟動路由器。": "Drag the handle on the left or use the arrows to reorder. Order, names, and context are written to the model catalog only and don't restart the router; changing output restarts the router.",
+"輸出只對 Claude 模型有效（送往 Claude 的 max_tokens，「/」後面是模型上限）；GPT 與 Chat 模型的輸出由上游決定。": "Output applies to Claude models only (max_tokens sent to Claude; the value after “/” is the model's limit). GPT and Chat models' output is decided upstream.",
+"已手動排序：之後新增的模型會排在最後。": "Manually ordered: models added later go to the end.",
+"全域 model_context_window = {value}，會覆蓋下表各模型的上下文設定。": "Global model_context_window = {value} overrides each model's context below.",
+"還沒有自訂模型。": "No custom models yet.",
+"全選": "Select all",
+"名稱": "Name",
+"介面": "Interface",
+"推理強度": "Reasoning effort",
+"上下文": "Context",
+"輸出": "Output",
+"{value} tokens（沿用官方模板，未實測）": "{value} tokens (from the official template, not measured)",
+"{value} tokens": "{value} tokens",
+"模板": "template",
+"上游預設": "Upstream default",
+"這個介面不送出輸出上限，由上游模型決定": "This interface doesn't send an output limit; the upstream model decides",
+"每次回覆最多 {value} tokens；模型上限 {cap}": "Up to {value} tokens per reply; model limit {cap}",
+"每次回覆最多 {value} tokens": "Up to {value} tokens per reply",
+"按住拖曳調整順序": "Drag to reorder",
+"選取 {name}": "Select {name}",
+"全域預設": "Global default",
+"目錄缺少": "Missing from catalog",
+"models.json 裡沒有這個模型，請執行 update 修復": "This model is missing from models.json. Run update to repair it",
+"選擇器 ID：{slug}": "Picker ID: {slug}",
+"上移": "Move up",
+"下移": "Move down",
+"修改名稱、上下文與輸出": "Edit name, context, and output",
+"修改": "Edit",
+"儲存模型順序": "Save model order",
+"每家供應商各自保存 API Key；主要供應商另外負責 Codex 內建的生圖請求。": "Each provider keeps its own API Key. The primary provider also handles Codex's built-in image generation requests.",
+"新增供應商": "Add provider",
+"主要": "Primary",
+"{count} 個模型": "{count} models",
+"修改名稱與模型前綴": "Edit name and model prefix",
+"模型前綴": "Model prefix",
+"API 根地址": "API root",
+"已加密儲存": "Stored encrypted",
+"已存於鑰匙圈": "Stored in Keychain",
+"找不到，請重新設定": "Missing. Please set it again",
+"添加模型": "Add models",
+"更換 API Key": "Replace API Key",
+"至少要保留一家供應商": "At least one provider must remain",
+"移除": "Remove",
+"自動：上游已有前綴時沿用，否則 {prefix}/": "Automatic: keeps the upstream prefix, otherwise {prefix}/",
+"自動：{prefix}/": "Automatic: {prefix}/",
+"留空＝自動（{prefix}/ 或上游原名）": "Empty = automatic ({prefix}/ or the upstream name)",
+"留空＝自動（{prefix}/）": "Empty = automatic ({prefix}/)",
+"儲存": "Save",
+"修改供應商：{name}": "Edit provider: {name}",
+"Claude 訂閱的名稱目前不支援修改。": "The Claude subscription's name can't be changed yet.",
+"只用於管理頁、終端選單與記錄的顯示。內部 ID「{id}」不變，既有對話、預設模型與 API Key 都不受影響；留空就顯示 ID。": "Only used for display in the manager, terminal menus, and logs. The internal ID “{id}” stays the same, so existing chats, the default model, and the API Key are unaffected. Leave empty to show the ID.",
+"選擇器裡這家的模型顯示成「前綴/模型名」，上游自帶的前綴（例如 ark/）會被取代，不會疊成兩層。留空使用自動規則：上游已有前綴時沿用原名，否則補「{prefix}/」。之後新增的模型也會套用。": "This provider's models appear in the picker as “prefix/model”. An upstream prefix (such as ark/) is replaced rather than doubled. Leave empty for the automatic rule: keep the upstream name if it already has a prefix, otherwise add “{prefix}/”. Models added later use it too.",
+"選擇器裡 Claude 訂閱的模型顯示成「前綴/模型名」；留空使用預設的「claude-cli/」。之後新增的模型也會套用。": "Claude subscription models appear in the picker as “prefix/model”. Leave empty for the default “claude-cli/”. Models added later use it too.",
+"只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。": "Only the settings and model catalog are written; nothing is re-probed and the router doesn't restart. If model names change, restart {app} to see them in the picker.",
+"取消": "Cancel",
+"前綴只能用英文字母、數字、點、底線與連字號，1～32 個字元，開頭與結尾必須是英文字母或數字。": "The prefix may contain only letters, digits, dots, underscores, and hyphens (1–32 characters), and must start and end with a letter or digit.",
+"名稱最多 {max} 個字。": "Names can be at most {max} characters.",
+"手動命名，保留": "Renamed manually, kept",
+"與其他模型同名": "Same name as another model",
+"選擇器裡的名稱": "Names in the model picker",
+"這家供應商目前沒有模型。": "This provider has no models yet.",
+"沒有任何變更。": "Nothing changed.",
+"重試": "Retry",
+"透過 Claude CLI 使用 Claude 訂閱帳號": "Use a Claude subscription through the Claude CLI",
+"實驗性": "Experimental",
+"重新檢查 Claude CLI": "Recheck Claude CLI",
+"修改模型前綴": "Edit model prefix",
+"使用 Claude Code 登入的訂閱帳號（Pro／Max），不需要 API Key；用量依帳號方案計算。": "Uses the Pro/Max subscription signed in to Claude Code. No API Key needed; usage counts against your plan.",
+"正在檢查 Claude CLI…": "Checking Claude CLI…",
+"可用": "Ready",
+"需要 {version} 以上": "Requires {version} or later",
+"已登入訂閱帳號": "Subscription signed in",
+"已登入，但不是訂閱帳號（{method}）": "Signed in, but not with a subscription ({method})",
+"已登入，但不是訂閱帳號": "Signed in, but not with a subscription",
+"尚未登入": "Not signed in",
+"程式": "Executable",
+"未安裝": "Not installed",
+"未知": "unknown",
+"登入": "Sign-in",
+"安裝 Claude CLI": "Install Claude CLI",
+"更新 Claude CLI": "Update Claude CLI",
+"登入 Claude": "Sign in to Claude",
+"更新 CLI": "Update CLI",
+"重新登入": "Sign in again",
+"移除 Claude 訂閱（CLI）": "Remove Claude subscription (CLI)",
+"會刪除它的 {count} 個模型：": "This deletes its {count} models:",
+"其中包含全域預設模型，移除後會一併清除這個預設，改用官方預設模型。": "This includes the global default model. Removing it also clears that default, so the official default model is used.",
+"不會登出 Claude，也不會解除安裝 Claude CLI；之後可以從「新增供應商」重新連接。刪除前會自動備份，接著重新啟動路由器。": "Claude stays signed in and the Claude CLI stays installed; you can reconnect later from “Add provider”. A backup is made first, then the router restarts.",
+"移除 Claude 訂閱": "Remove Claude subscription",
+"下載並安裝": "Download and install",
+"會從 {url} 下載 Anthropic 官方安裝程式並執行，Claude CLI 會安裝在你的使用者目錄。需要網路，可能要幾分鐘；安裝輸出會顯示在操作記錄裡。": "Downloads and runs Anthropic's official installer from {url}; the Claude CLI is installed in your user directory. Requires a network connection and may take a few minutes. Installer output appears in the operation log.",
+"安裝完成後，再按「登入 Claude」連接訂閱帳號。": "After installing, click “Sign in to Claude” to connect your subscription.",
+"更新": "Update",
+"會先備份目前的執行檔，再執行 claude update。目前版本：{version}；最低需求：{minimum}。": "Backs up the current executable, then runs claude update. Current version: {version}; minimum required: {minimum}.",
+"透過 Homebrew 或 WinGet 安裝的 CLI，請改用原本的套件管理器更新。": "If the CLI was installed with Homebrew or WinGet, update it with that package manager instead.",
+"重新登入 Claude": "Sign in to Claude again",
+"登入 Claude 訂閱帳號": "Sign in to a Claude subscription",
+"開始登入": "Start sign-in",
+"會在執行管理頁的終端機視窗啟動 Claude 官方登入流程（claude auth login），瀏覽器會開啟授權頁面；這項操作會等到授權完成，最多 5 分鐘。": "Starts Claude's official sign-in (claude auth login) in the terminal window running the manager; your browser opens the authorization page. This waits up to 5 minutes for authorization to finish.",
+"若瀏覽器沒有自動開啟，或畫面要求貼上代碼，請切到開啟管理頁的那個終端機視窗操作。路由器不經手、也不保存登入 token。": "If the browser doesn't open or you're asked to paste a code, switch to the terminal window that opened the manager. The router never handles or stores the sign-in token.",
+"已安裝 Claude CLI": "Claude CLI installed",
+"尚未安裝 Claude CLI": "Claude CLI not installed",
+"用 Anthropic 官方安裝程式安裝在你的使用者目錄，需要網路。": "Installs into your user directory with Anthropic's official installer. Requires a network connection.",
+"版本 {version}": "Version {version}",
+"版本需要 {version} 以上": "Requires version {version} or later",
+"版本 {version} 太舊": "Version {version} is too old",
+"無法確認 Claude CLI 版本": "Couldn't determine the Claude CLI version",
+"需要 {version} 以上；更新前會先備份目前的執行檔。": "Requires {version} or later. The current executable is backed up before updating.",
+"已登入 Claude 訂閱帳號": "Signed in to a Claude subscription",
+"尚未登入 Claude 訂閱帳號": "Not signed in to a Claude subscription",
+"目前登入的不是訂閱帳號（{method}）": "The signed-in account isn't a subscription ({method})",
+"目前登入的不是訂閱帳號": "The signed-in account isn't a subscription",
+"使用 Claude 官方登入流程，在瀏覽器完成授權；路由器不保存登入 token。": "Uses Claude's official sign-in; authorize in your browser. The router doesn't store the sign-in token.",
+"例如 claude-opus-5-5，可用逗號分隔": "e.g. claude-opus-5-5; separate with commas",
+"Claude CLI 無法探測上下文，直接使用這個值（最多 1,000,000）。": "The Claude CLI can't probe the context size, so this value is used as is (up to 1,000,000).",
+"以 CLAUDE_CODE_MAX_OUTPUT_TOKENS 傳給 Claude CLI；超過模型上限時，CLI 會自動壓到上限。": "Passed to the Claude CLI as CLAUDE_CODE_MAX_OUTPUT_TOKENS; the CLI caps it at the model's limit.",
+"透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算（實驗性）。": "Use Claude models with the Pro/Max subscription signed in to Claude Code. No API Key needed; usage counts against your plan (experimental).",
+"無法檢查 Claude CLI：{reason}": "Couldn't check the Claude CLI: {reason}",
+"添加模型前需要先完成以下準備：": "Complete these steps before adding models:",
+"Claude CLI {version}，已登入 Claude 訂閱帳號": "Claude CLI {version}, signed in to a Claude subscription",
+"正在讀取 Claude CLI 的模型清單（不會送出推理請求）…": "Reading the Claude CLI model list (no inference requests are sent)…",
+"清單來自 Claude CLI，未列出的模型可以直接輸入完整 ID；不保證每個模型都有可用額度。": "This list comes from the Claude CLI. Enter the full ID of any unlisted model. Usage availability isn't guaranteed for every model.",
+"CLI 沒有提供可辨識的清單，以下是內建候選，尚未驗證帳號權限。": "The CLI didn't provide a recognizable list. These are built-in candidates; account access hasn't been verified.",
+"既有設定，CLI 這次沒有列出": "Existing setting; not listed by the CLI this time",
+"讀取失敗：{reason}": "Couldn't load: {reason}",
+"{model}（CLI 別名，測試後確認完整版本）": "{model} (CLI alias; the full version is confirmed after testing)",
+"模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：{models}": "Model names must be opus, sonnet, haiku, fable, or a full claude-* name: {models}",
+"一次最多測試 10 個模型。": "You can test at most 10 models at a time.",
+"將用 Claude 訂閱帳號測試以下 {count} 個模型：": "These {count} models will be tested with your Claude subscription:",
+"每個模型會發送一次短測試並使用訂閱用量；只有通過的會添加，並固定使用回應中的完整模型版本。完成後會重新啟動路由器，進行中的對話會短暫重新連線。": "Each model gets one short test that uses your subscription. Only models that pass are added, pinned to the full model version in the response. The router then restarts, and active chats reconnect briefly.",
+"上一步": "Back",
+"開始測試並添加": "Test and add",
+"添加 Claude 訂閱模型": "Add Claude subscription models",
+"通用 Images API": "Standard Images API",
+"Ark 任務介面": "Ark task API",
+"用中轉供應商的圖片 API 生成或編輯圖片，適合免費帳號或內建生圖不可用的時候。Codex 裡以 $router-imagegen 技能使用，沿用路由器保存的憑證。": "Generate or edit images with a relay provider's image API, useful on free accounts or when built-in image generation isn't available. In Codex it's used through the $router-imagegen skill with the router's saved credentials.",
+"重新整理生圖狀態": "Refresh image generation status",
+"目前狀態": "Current status",
+"停用": "Disable",
+"狀態": "Status",
+"已啟用": "Enabled",
+"技能位置": "Skill location",
+"使用方式": "How to use",
+"在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。": "Type $router-imagegen in a new Codex task, or just ask for an image. With several models enabled, the AI picks one as needed.",
+"尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。": "Not enabled. Select models below and test them; models that pass are added to the $router-imagegen skill.",
+"用哪一家供應商生圖": "Provider for image generation",
+"重新偵測": "Test again",
+"偵測並啟用": "Test and enable",
+"多選時由 AI 依需求挑選：一般生圖與快速迭代偏好 Flare，精細改圖與保留原圖細節偏好 Sunburst；Image 2 給指定或相容需求使用。": "With several models selected, the AI chooses as needed: Flare for general generation and fast iteration, Sunburst for precise edits that keep source details, and Image 2 when specifically requested or for compatibility.",
+"偵測會實際生圖並依供應商計費：每個勾選的模型先用通用介面各生成一張低品質圖；全部失敗時，再用 Ark 任務介面各試一次。只有通過的模型會啟用，沒有通過時既有設定保持不變。": "Testing really generates images and is billed by the provider: each selected model first generates one low-quality image through the standard API; if all fail, each is tried once with the Ark task API. Only models that pass are enabled; otherwise the current setup is unchanged.",
+"重新偵測並套用": "Test again and apply",
+"最近一次偵測": "Last test",
+"結果": "Result",
+"通過": "Passed",
+"未通過": "Failed",
+"偵測並啟用中轉生圖": "Test and enable relay image generation",
+"開始偵測": "Start test",
+"將用「{provider}」實際生圖測試以下 {count} 個模型：": "These {count} models will be tested by generating images with “{provider}”:",
+"主要供應商": "the primary provider",
+"會依供應商計費：通用介面每個模型一張低品質圖，全部失敗時 Ark 介面再各一張。生成失敗不會自動重送。": "Billed by the provider: one low-quality image per model with the standard API, plus one more each with the Ark API if all fail. Failed generations aren't retried automatically.",
+"停用中轉 API 生圖": "Disable relay API image generation",
+"會把 $router-imagegen 技能封存到備份目錄，Codex 之後就不會再使用它；之後可以隨時重新偵測並啟用。": "The $router-imagegen skill is archived to the backup directory and Codex stops using it. You can test and enable it again at any time.",
+"停用中轉生圖": "Disable relay image generation",
+"影響所有模型的 Codex 設定。": "Codex settings that affect every model.",
+"重新整理全域上下文": "Refresh global context",
+"未設定": "Not set",
+"Codex 的 model_context_window 已設定，會覆蓋所有模型（官方與自訂）自己的上下文；Codex 用到約 95% 時會自動壓縮。": "Codex's model_context_window is set and overrides every model's own context (official and custom). Codex compacts automatically at about 95%.",
+"目前沒有全域設定，每個模型使用自己的上下文（模型頁可以個別修改）。": "No global setting; each model uses its own context (editable on the Models page).",
+"移除全域設定": "Remove global setting",
+"model_context_window（tokens）": "model_context_window (tokens)",
+"範圍 16,000～4,000,000，對所有模型生效。上游實際支援的上下文較小時，對話可能在自動壓縮前就被上游拒絕。": "Range 16,000–4,000,000; applies to all models. If the upstream supports less context, chats may be rejected before auto-compaction.",
+"修改前會自動備份；不需要重新啟動路由器，重新啟動 {app} 後生效。": "A backup is made first. No router restart needed; takes effect after restarting {app}.",
+"全域上下文必須是 16,000～4,000,000 之間的整數。": "Global context must be an integer between 16,000 and 4,000,000.",
+"設定全域上下文": "Set global context",
+"移除全域上下文": "Remove global context",
+"移除後每個模型改用自己的上下文：官方模型使用 Codex 內建值，自訂模型使用模型頁的設定。修改前會自動備份。": "Each model then uses its own context: official models use Codex's built-in values, custom models use the Models page settings. A backup is made first.",
+"隱藏的官方模型": "Hidden official models",
+"重新整理隱藏的官方模型": "Refresh hidden official models",
+"正在讀取 Codex 內建模型目錄…": "Reading Codex's built-in model catalog…",
+"Codex 內建目錄把下列模型標成隱藏，預設不會出現在選擇器。能不能用由帳號權限決定：強制顯示後若帳號沒有權限，選用時會失敗，取消勾選即可恢復。": "Codex's built-in catalog marks these models as hidden, so they don't appear in the picker by default. Whether they work depends on your account: if you force one to show without access, selecting it fails; uncheck it to undo.",
+"Codex 內建目錄目前沒有隱藏的官方模型。": "Codex's built-in catalog has no hidden official models right now.",
+"目前強制顯示": "Currently shown",
+"儲存會重新啟動路由器，並以 Codex 實際讀到的目錄驗證；失敗會自動還原。": "Saving restarts the router and verifies against the catalog Codex actually reads; failures are rolled back automatically.",
+"設定隱藏的官方模型": "Set hidden official models",
+"關閉": "Close",
+"確定": "OK",
+"刪除模型": "Delete models",
+"調整模型順序": "Reorder models",
+"修改模型": "Edit model",
+"修改供應商": "Edit provider",
+"移除供應商": "Remove provider",
+"重新啟動桌面版": "Restart desktop app",
+"更新路由器": "Update router",
+"套用新版本": "Apply new version",
+"進行中，請稍候…": "In progress, please wait…",
+"請稍候": "Please wait",
+"操作記錄由安裝器產生，目前以中文顯示。": "The operation log comes from the installer and is currently shown in Chinese.",
+"完成": "Done",
+"失敗": "Failed",
+"注意：{message}": "Note: {message}",
+"更新完成，正在以新版本重新啟動管理頁…": "Update finished. Restarting the manager with the new version…",
+"無法自動重新啟動管理頁：{reason}。請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。": "Couldn't restart the manager automatically: {reason}. Reopen it from “自訂模型管理” in Codex or with the installer's ui command.",
+"管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。": "The manager hasn't come back yet. Refresh, or reopen the “Codex 模型路由器” shortcut for diagnostics.",
+"清單沒有列出的模型 ID，可用逗號分隔": "Model IDs not in the list, separated by commas",
+"搜尋模型 ID": "Search model IDs",
+"搜尋模型": "Search models",
+"全選可用": "Select all available",
+"手動輸入模型 ID（選填）": "Enter model IDs manually (optional)",
+"沒有符合搜尋的模型。": "No models match your search.",
+"清單是空的；仍可在下方手動輸入模型 ID。": "The list is empty; you can still enter model IDs below.",
+"已添加，可重新設定": "Added; can be reconfigured",
+"已添加": "Added",
+"正在查詢模型清單…": "Fetching the model list…",
+"每個模型最多送出五次小型請求來確認可用的推理強度（Claude 模型另有幾次能力探測），可能依供應商計費。共 {count} 個模型；只有通過探測的才會加入。": "Each model gets up to five small requests to check supported reasoning efforts (Claude models get a few extra capability probes), which the provider may bill. {count} models in total; only those that pass are added.",
+"完成後會重新啟動路由器，進行中的對話會短暫重新連線。": " The router then restarts, and active chats reconnect briefly.",
+"目前設有全域 model_context_window = {value}，它會覆蓋各模型的上下文設定。": "A global model_context_window = {value} is set and overrides each model's context.",
+"例如 {value}": "e.g. {value}",
+"上下文上限（tokens）": "Context limit (tokens)",
+"最大輸出（tokens）": "Max output (tokens)",
+"{label}必須是 {min}～{max} 之間的整數。": "{label} must be an integer between {min} and {max}.",
+"上下文上限": "Context limit",
+"最大輸出不能超過這個模型的輸出上限 {cap}。": "Max output can't exceed this model's output limit of {cap}.",
+"最大輸出": "Max output",
+"最大輸出不能超過上下文上限。": "Max output can't exceed the context limit.",
+"GPT、Chat 模型探測不到上下文，直接使用這個值；Claude 模型探測到的上限較小時以上游為準。": "GPT and Chat models can't be probed for context, so this value is used as is. For Claude models, a smaller probed limit wins.",
+"只用於 Claude 模型（送往 Claude 的 max_tokens），上游回報的上限較小時以上游為準；GPT 與 Chat 模型的輸出由上游決定。": "Claude models only (max_tokens sent to Claude); a smaller limit reported upstream wins. GPT and Chat models' output is decided upstream.",
+"下一步": "Next",
+"Claude 訂閱（Claude CLI，實驗性）": "Claude subscription (Claude CLI, experimental)",
+"選擇供應商與要添加的模型。": "Choose a provider and the models to add.",
+"完成 Claude CLI 的準備後才能選擇模型": "Finish setting up the Claude CLI to choose models",
+"已選 {count} 個模型": "{count} models selected",
+"尚未選擇模型": "No models selected",
+"查詢失敗：{reason}": "Query failed: {reason}",
+"模型 ID 格式無效：{models}": "Invalid model IDs: {models}",
+"將向「{provider}」探測以下 {count} 個模型：": "These {count} models will be probed on “{provider}”:",
+"開始探測並添加": "Probe and add",
+"添加模型：{provider}": "Add models: {provider}",
+"刪除 {count} 個模型": "Delete {count} models",
+"刪除": "Delete",
+"以下模型會從 Codex 選擇器移除：": "These models will be removed from the Codex model picker:",
+"其中包含全域預設模型，刪除後會一併清除這個預設，改用官方預設模型。": "This includes the global default model. Deleting it also clears that default, so the official default model is used.",
+"使用這些模型的既有任務需切換到其他模型才能繼續。刪除前會自動備份，接著重新啟動路由器。": "Existing tasks using these models need to switch to another model to continue. A backup is made first, then the router restarts.",
+"範圍 16,000～{max}。Codex 用到約 95% 時會自動壓縮。": "Range 16,000–{max}. Codex compacts automatically at about 95%.",
+"每次回覆最多可輸出的 tokens，以 CLAUDE_CODE_MAX_OUTPUT_TOKENS 傳給 Claude CLI；超過模型上限時，CLI 會自動壓到上限。": "Maximum tokens per reply, passed to the Claude CLI as CLAUDE_CODE_MAX_OUTPUT_TOKENS; the CLI caps it at the model's limit.",
+"每次回覆最多可輸出的 tokens（送往 Claude 的 max_tokens）。": "Maximum tokens per reply (max_tokens sent to Claude). ",
+"模型上限 {cap}。": "Model limit: {cap}.",
+"上游沒有回報上限，設得比模型上限大時上游會拒絕。": "The upstream didn't report a limit; values above the model's limit are rejected upstream.",
+"沿用官方模板（未實測）": "From the official template (not measured)",
+"已設定（探測、新增時的預設值或手動修改）": "Configured (probed, default when added, or edited)",
+"上游模型": "Upstream model",
+"選擇器 ID": "Picker ID",
+"上下文來源": "Context source",
+"由上游決定：這個介面不送出輸出上限，因此不需要設定。": "Decided upstream: this interface doesn't send an output limit, so there's nothing to set.",
+"顯示名稱": "Display name",
+"只影響選擇器裡顯示的名稱；上游模型 ID 與選擇器 ID 不變。": "Only changes the name shown in the picker; the upstream model ID and picker ID stay the same.",
+"名稱與上下文不需要重新啟動路由器，重新啟動 {app} 後生效；修改輸出會重新啟動路由器，進行中的回應會短暫重新連線。": "Name and context don't need a router restart and take effect after restarting {app}. Changing output restarts the router, and active responses reconnect briefly.",
+"不重新探測、不重新啟動路由器；重新啟動 {app} 後生效。": "Nothing is re-probed and the router doesn't restart; takes effect after restarting {app}.",
+"顯示名稱不能是空白。": "The display name can't be empty.",
+"修改模型：{name}": "Edit model: {name}",
+"查詢模型": "Fetch models",
+"填入兼容 OpenAI 的 Base URL 與 API Key，先查詢它提供的模型清單（不會花費額度）。": "Enter an OpenAI-compatible Base URL and API Key to fetch its model list first (no usage is spent).",
+"Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "The key is only stored encrypted with Windows Data Protection (DPAPI). It's never written to settings files or shown on this page again.",
+"Key 只會存進 macOS 鑰匙圈，不會寫進設定檔，也不會再顯示在頁面上。": "The key is only stored in the macOS Keychain. It's never written to settings files or shown on this page again.",
+"供應商 ID": "Provider ID",
+"小寫英文、數字與連字號。用於管理與設定檔，並替沒有前綴的模型補上名稱（例如 ID/模型）；之後可以在供應商頁另取顯示名稱、修改模型前綴。": "Lowercase letters, digits, and hyphens. Used for management and settings files, and added to unprefixed model names (such as ID/model). You can set a display name and change the model prefix later on the Providers page.",
+"請填寫 Base URL 與 API Key。": "Enter the Base URL and API Key.",
+"選擇要新增的供應商類型。": "Choose the type of provider to add.",
+"OpenAI 相容 API": "OpenAI-compatible API",
+"中轉站、閘道或其他兼容 OpenAI 的服務，用 Base URL 與 API Key 連接；可添加 GPT、Claude 與只支援 Chat Completions 的模型。": "A relay, gateway, or other OpenAI-compatible service, connected with a Base URL and API Key. You can add GPT, Claude, and Chat Completions-only models.",
+"Claude 訂閱帳號（Claude CLI）": "Claude subscription (Claude CLI)",
+"透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算。": "Use Claude models with the Pro/Max subscription signed in to Claude Code. No API Key needed; usage counts against your plan.",
+"已連接 {count} 個模型，可以再添加。": " {count} models connected; you can add more.",
+"新增供應商：OpenAI 相容 API": "Add provider: OpenAI-compatible API",
+"新增供應商：Claude 訂閱帳號": "Add provider: Claude subscription",
+"完成上面的準備後才能選擇模型": "Finish the steps above to choose models",
+"新增供應商：{host}": "Add provider: {host}",
+"API 根地址：{url}": "API root: {url}",
+"ID 只能用小寫英文、數字與連字號，1～24 個字元，不能以連字號開頭或結尾。": "The ID may contain only lowercase letters, digits, and hyphens (1–24 characters), and can't start or end with a hyphen.",
+"「{name}」是保留名稱，請換一個。": "“{name}” is reserved. Choose another.",
+"已經有叫「{name}」的供應商了。": "A provider named “{name}” already exists.",
+"將新增供應商「{name}」，並探測以下 {count} 個模型：": "Provider “{name}” will be added and these {count} models probed:",
+"將新增供應商（所選模型已有前綴，ID 自動產生），並探測以下 {count} 個模型：": "A provider will be added (the selected models already have prefixes, so the ID is generated) and these {count} models probed:",
+"開始探測並新增": "Probe and add",
+"新的 API Key": "New API Key",
+"更換 API Key：{name}": "Replace API Key: {name}",
+"會先用新 Key 查詢模型清單：上游明確拒絕（401／403）時不會更換。路由器會自動改用新 Key，不需要重新啟動。": "The new key is checked by fetching the model list first; it isn't replaced if the upstream rejects it (401/403). The router picks up the new key automatically, with no restart.",
+"驗證並儲存": "Verify and save",
+"請填寫新的 API Key。": "Enter the new API Key.",
+"移除供應商「{name}」": "Remove provider “{name}”",
+"會一併移除它的 {count} 個模型：": "Its {count} models are removed too:",
+"移除後由「{name}」擔任主要供應商。": "“{name}” becomes the primary provider.",
+"其中包含全域預設模型，移除後會一併清除這個預設。": "This includes the global default model, which is cleared too.",
+"中轉 API 生圖使用這家供應商，會一併停用；之後可在生圖頁重新設定。": "Relay API image generation uses this provider and will be disabled; you can set it up again on the Images page.",
+"同時刪除這家的 API Key": "Also delete this provider's API Key",
+"移除前會自動備份，接著重新啟動路由器。": "A backup is made first, then the router restarts.",
+"移除供應商：{name}": "Remove provider: {name}",
+"重新啟動": "Restart",
+"進行中的回應會中斷，Codex 會自動重新連線並重試。通常不需要這麼做；路由器無回應或更新後版本沒換時再用。": "Active responses are interrupted; Codex reconnects and retries automatically. Usually unnecessary—use it when the router is unresponsive or still runs the old version after an update.",
+"會正常結束 {app} 再重新打開，讓模型選擇器載入最新設定。": "{app} quits normally and reopens so the model picker loads the latest settings.",
+"進行中的任務會被中斷；若 macOS 詢問是否允許控制「{app}」，請選擇允許。": "Running tasks are interrupted. If macOS asks whether to allow controlling “{app}”, choose Allow.",
+"重新檢查": "Check again",
+"重新檢查更新": "Check for updates again",
+"目前版本": "Current version",
+"正在檢查…": "Checking…",
+"有新版本 v{version}": "v{version} available",
+"已是最新版本": "Up to date",
+"比 GitHub 上的 v{version} 更新": "Newer than v{version} on GitHub",
+"無法確認最新版本": "Couldn't check the latest version",
+"檢查於 {time}": "Checked {time}",
+"路由器仍在執行 v{running}，請重新啟動路由器套用 v{installed}。": "The router is still running v{running}. Restart it to apply v{installed}.",
+"更新說明目前只有中文。": "Release notes are currently available in Chinese only.",
+"完成後重新啟動 {app}（會中斷進行中的任務）": "Restart {app} when done (interrupts running tasks)",
+"更新完成後請完全退出並重新打開 {app}。": "After updating, quit {app} completely and reopen it.",
+"更新並重新啟動": "Update and restart",
+"立即更新": "Update now",
+"這個管理頁是 v{manager}，比已安裝的 v{installed} 新。": "This manager is v{manager}, newer than the installed v{installed}.",
+"套用 v{version}": "Apply v{version}",
+"查看發佈": "View releases",
+"v{version}（{date}）": "v{version} ({date})",
+"v{version}（{date}）更新內容": "What's new in v{version} ({date})",
+"v{version} 更新內容": "What's new in v{version}",
+"更新到 v{version}": "Update to v{version}",
+"開始更新": "Start update",
+"會從 GitHub 下載 v{version} 的安裝器並核對 SHA256，再執行 update：": "Downloads the v{version} installer from GitHub, verifies its SHA256, then runs update:",
+"會以這個管理頁的安裝器執行 update：": "Runs update with this manager's installer:",
+"換掉路由器與轉譯層程式碼，保留所有模型、供應商與 API Key": "Replaces the router and bridge code, keeping all models, providers, and API Keys",
+"重新啟動路由器（進行中的回應會短暫重新連線）": "Restarts the router (active responses reconnect briefly)",
+"管理頁以新版本重新載入": "Reloads the manager with the new version",
+"最後重新啟動 {app}（會中斷進行中的任務）": "Finally restarts {app} (interrupts running tasks)",
+"更新前會自動備份，失敗時還原到原本的版本。": "A backup is made first; on failure, the previous version is restored.",
+"結束管理頁": "Quit manager",
+"結束": "Quit",
+"結束後這個分頁會失效；之後可從 Codex 的「自訂模型管理」、雙擊捷徑或執行安裝器的 ui 命令重新開啟。路由器本身不受影響。": "This tab stops working after quitting. Reopen the manager from “自訂模型管理” in Codex, the shortcut, or the installer's ui command. The router itself is unaffected.",
+"管理頁已結束": "Manager closed",
+"可以關閉這個分頁了。": "You can close this tab now.",
+"介面語言": "Interface language",
+"自動（{language}）": "Automatic ({language})",
+"無法儲存語言設定：{reason}": "Couldn't save the language setting: {reason}",
+"Codex 模型路由器": "Codex Model Router",
+"缺少存取權杖": "Missing access token",
+"請從 Codex 的「自訂模型管理」或終端機顯示的網址開啟管理頁，也可以重新執行安裝器的 ui 命令。": "Open the manager from “自訂模型管理” in Codex or the URL shown in the terminal, or run the installer's ui command again.",
+"存取權杖已失效": "Access token expired",
+"管理頁可能已重新啟動。請從 Codex 的「自訂模型管理」或終端機顯示的網址重新開啟，也可以重新執行安裝器的 ui 命令。": "The manager may have restarted. Reopen it from “自訂模型管理” in Codex or the URL shown in the terminal, or run the installer's ui command again.",
+"官方模型 {count} 個#one": "{count} official model",
+"{count} 個模型#one": "{count} model",
+"會刪除它的 {count} 個模型：#one": "This deletes its only model:",
+"將用 Claude 訂閱帳號測試以下 {count} 個模型：#one": "This model will be tested with your Claude subscription:",
+"將用「{provider}」實際生圖測試以下 {count} 個模型：#one": "This model will be tested by generating an image with “{provider}”:",
+"每個模型最多送出五次小型請求來確認可用的推理強度（Claude 模型另有幾次能力探測），可能依供應商計費。共 {count} 個模型；只有通過探測的才會加入。#one": "The model gets up to five small requests to check supported reasoning efforts (Claude models get a few extra capability probes), which the provider may bill. It's added only if it passes.",
+"已連接 {count} 個模型，可以再添加。#one": " {count} model connected; you can add more.",
+"已選 {count} 個模型#one": "{count} model selected",
+"將向「{provider}」探測以下 {count} 個模型：#one": "This model will be probed on “{provider}”:",
+"刪除 {count} 個模型#one": "Delete {count} model",
+"將新增供應商「{name}」，並探測以下 {count} 個模型：#one": "Provider “{name}” will be added and this model probed:",
+"將新增供應商（所選模型已有前綴，ID 自動產生），並探測以下 {count} 個模型：#one": "A provider will be added (the selected model already has a prefix, so the ID is generated) and this model probed:",
+"會一併移除它的 {count} 個模型：#one": "Its only model is removed too:"
+},
+"enSections": {
+"總覽": "Overview",
+"模型": "Models",
+"供應商": "Providers",
+"生圖": "Images",
+"設定": "Settings"
+},
+"enErrors": {
+"provider_not_configured": "The provider for this model isn't configured. Run the installer's update, or delete and re-add the model.",
+"unknown_provider": "The provider chosen for relay image generation no longer exists. Set up relay image generation again.",
+"router_request_too_large": "The request received by the local router is too large. Shrink attachments or split the work.",
+"unsupported_content_encoding": "Unsupported request content encoding.",
+"invalid_compressed_body": "Couldn't decompress the request body.",
+"chatgpt_auth_required": "ChatGPT sign-in is required.",
+"chatgpt_auth_rejected": "ChatGPT authentication was rejected. Check your sign-in status or account permissions.",
+"auth_probe_unavailable": "The ChatGPT authentication service is temporarily unavailable. Try again later.",
+"custom_model_not_configured": "This custom model was removed from the router or isn't configured. Switch this task to a configured model in the model picker and resend (no new task needed), or add the model again.",
+"router_history_unavailable": "The full history for previous_response_id wasn't found. Reconnect and resend the whole conversation.",
+"upstream_websocket_rejected": "The upstream WebSocket handshake failed.",
+"upstream_network_error": "Couldn't complete the upstream request. Check your network or try again later.",
+"upstream_timeout": "The upstream request timed out. Check your network or try again later.",
+"upstream_dns_error": "Couldn't resolve the upstream host name (DNS). Check your network, DNS, or Base URL.",
+"upstream_tls_error": "Upstream TLS/certificate verification failed. Check the server certificate, system clock, or proxy settings.",
+"upstream_connection_error": "The upstream connection failed or was interrupted. Check the upstream service, network, or proxy settings.",
+"upstream_auth_rejected": "The upstream rejected the request. Check the API Key and its permissions.",
+"upstream_rate_limited": "The upstream is rate limiting requests. Try again later.",
+"upstream_http_error": "The upstream service returned an HTTP error."
+},
+"enServer": [
+["^尚未安裝路由器，請先在終端執行「安裝或重新配置」。$", "The router isn't installed. Run the installer in a terminal and choose “安裝或重新配置” (Install or reconfigure)."],
+["^路由器已是 (.+)，這個管理頁仍是 (.+)；請關閉管理頁後重新開啟。$", "The router is already $1, but this manager is still $2. Close the manager and open it again."],
+["^這個管理頁是 (.+)，路由器仍是 (.+)；請先從左上角的版本選單套用新版本。$", "This manager is $1, but the router is still $2. Apply the new version from the version menu at the top left first."],
+["^未找到 Codex CLI，請先安裝 (.+) 或 Codex CLI。$", "Codex CLI wasn't found. Install $1 or the Codex CLI first."],
+["^未找到 Codex CLI。$", "Codex CLI wasn't found."],
+["^當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。$", "Codex Model Router isn't installed in this CODEX_HOME. Choose “安裝或重新配置” (Install or reconfigure) first."],
+["^尚未安裝路由器。$", "The router isn't installed."],
+["^「(.+)」正在進行中，請等它完成。$", "“$1” is in progress. Wait for it to finish."],
+["^還有操作正在進行，請等它完成。$", "Another operation is in progress. Wait for it to finish."],
+["^找不到這項操作，管理頁可能已重新啟動。$", "This operation wasn't found; the manager may have restarted."],
+["^存取權杖無效：請從終端機顯示的網址重新開啟管理頁。$", "Invalid access token. Reopen the manager from the URL shown in the terminal."],
+["^只接受以 127\\.0\\.0\\.1 或 localhost 開啟的管理頁。$", "The manager only accepts 127.0.0.1 or localhost."],
+["^拒絕來自其他網站的請求。$", "Requests from other sites are rejected."],
+["^不支援的介面語言。$", "Unsupported interface language."],
+["^無法連線到 GitHub 檢查更新，請稍後再試。$", "Couldn't reach GitHub to check for updates. Try again later."],
+["^上一代圖片模型，適合既有流程與相容需求。$", "Previous-generation image model, for existing workflows and compatibility."],
+["^偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。$", "Focused on editing precision, for detailed edits that keep the original's details."],
+["^偏重速度，適合一般生圖與快速迭代。$", "Focused on speed, for general generation and fast iteration."],
+["^沒找到可用模型，生圖設定沒有變更。$", "No usable model was found; image generation settings weren't changed."],
+["^中轉 API 生圖尚未啟用。$", "Relay API image generation isn't enabled."],
+["^請從 Image 2、Image 2\\.5 Sunburst、Image 2\\.5 Flare 中至少選擇一個模型。$", "Select at least one of Image 2, Image 2.5 Sunburst, and Image 2.5 Flare."],
+["^選中的模型均未通過探測，配置未改動。$", "None of the selected models passed probing; nothing was changed."],
+["^所選模型都已配置，配置未改動。$", "All selected models are already configured; nothing was changed."],
+["^沒有需要探測的新模型。$", "There are no new models to probe."],
+["^請至少選擇一個模型。$", "Select at least one model."],
+["^一次最多探測 40 個模型。$", "You can probe at most 40 models at a time."],
+["^一次最多測試 10 個模型。$", "You can test at most 10 models at a time."],
+["^模型 ID 格式無效：(.+)$", "Invalid model ID: $1"],
+["^找不到供應商：(.+)$", "Provider not found: $1"],
+["^所選模型不是已配置的自訂模型：(.+)$", "Not a configured custom model: $1"],
+["^沒有選擇要刪除的模型。$", "No models selected for deletion."],
+["^請填寫 API Key。$", "Enter an API Key."],
+["^請填寫新的 API Key。$", "Enter the new API Key."],
+["^這個 Base URL 已經是供應商「(.+?)」.*$", "This Base URL already belongs to provider “$1”."],
+["^新增供應商的資料已過期，請重新查詢模型。$", "The new provider draft expired. Fetch the models again."],
+["^上游拒絕這把 Key（HTTP (\\d+)），沒有更換。$", "The upstream rejected this key (HTTP $1); it wasn't replaced."],
+["^至少要保留一家供應商.*$", "At least one provider must remain. To remove the router entirely, use “回退配置” (Roll back) in the terminal menu."],
+["^排序清單與目前的自訂模型不一致，請重新整理頁面後再試。$", "The order no longer matches the current custom models. Refresh the page and try again."],
+["^前綴只能用英文字母、數字、點、底線與連字號，1 到 32 個字元，開頭與結尾必須是英文字母或數字。$", "The prefix may contain only letters, digits, dots, underscores, and hyphens (1–32 characters), and must start and end with a letter or digit."],
+["^供應商名稱最多 (\\d+) 個字，且不能包含控制字元。$", "Provider names can be at most $1 characters and can't contain control characters."],
+["^已經有叫「(.+)」的供應商了。$", "A provider named “$1” already exists."],
+["^「(.+)」是保留名稱，請換一個。$", "“$1” is reserved. Choose another."],
+["^Claude 訂閱的名稱目前不支援修改。$", "The Claude subscription's name can't be changed yet."],
+["^尚未連接 Claude 訂閱，沒有可以修改的模型前綴。$", "The Claude subscription isn't connected, so there's no model prefix to change."],
+["^供應商名稱與前綴必須是文字。$", "Provider names and prefixes must be text."],
+["^安裝設定或模型目錄不完整.*$", "The installation settings or model catalog are incomplete."],
+["^顯示名稱不能是空白。$", "The display name can't be empty."],
+["^(?:上下文上限)必須是 ([\\d,]+) 到 ([\\d,]+) 之間的整數。$", "The context limit must be an integer between $1 and $2."],
+["^(?:最大輸出)必須是 ([\\d,]+) 到 ([\\d,]+) 之間的整數。$", "Max output must be an integer between $1 and $2."],
+["^(?:全域上下文)必須是 ([\\d,]+) 到 ([\\d,]+) 之間的整數。$", "Global context must be an integer between $1 and $2."],
+["^最大輸出不能超過上下文上限。$", "Max output can't exceed the context limit."],
+["^尚未安裝 Claude CLI(?:，請先安裝)?。$", "Claude CLI isn't installed."],
+["^尚未安裝 Claude CLI，請先在供應商頁安裝。$", "Claude CLI isn't installed. Install it on the Providers page first."],
+["^尚未登入 Claude 訂閱帳號，請先按「登入 Claude」。$", "Not signed in to a Claude subscription. Click “Sign in to Claude” first."],
+["^沒有模型通過測試，路由配置未修改。$", "No model passed the test; routing wasn't changed."],
+["^已經安裝 Claude CLI；需要新版本請按「更新 CLI」。$", "Claude CLI is already installed. Click “Update CLI” for a newer version."],
+["^模型清單讀取失敗：(.+)$", "Couldn't read the model list: $1"],
+["^等待 Codex 模型清單同步失敗：(.+)$", "Waiting for the Codex model list to sync failed: $1"],
+["^無法讀取記錄檔：(.+)$", "Couldn't read the log file: $1"],
+["^外部程式執行逾時。$", "An external program timed out."],
+["^逾時$", "timed out"],
+["^無法連線$", "unreachable"],
+["^沒有可用的連接埠設定$", "no usable port setting"]
+],
+"hans": {
+"Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
+},
+"t2s": {
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲內兩冊冪凍別刪則剛剝劃動務區協卻參員問啟單嗎嘗嚴圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譯議護讀變讓負責費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難電靜響頁頂項順須預頭頻題額類顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储内两册幂冻别删则刚剥划动务区协却参员问启单吗尝严围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识译议护读变让负责费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难电静响页顶项顺须预头频题额类显风飘余驻验骤体么点齐",
+"phrases": {
+"程式碼": "代码",
+"原始碼": "源代码",
+"執行檔": "可执行文件",
+"程式": "程序",
+"程序": "进程",
+"預設": "默认",
+"執行": "运行",
+"網路": "网络",
+"連線": "连接",
+"伺服器憑證": "服务器证书",
+"憑證驗證": "证书验证",
+"伺服器": "服务器",
+"支援": "支持",
+"帳號": "账号",
+"帳戶": "账户",
+"視窗": "窗口",
+"選單": "菜单",
+"鑰匙圈": "钥匙串",
+"登入": "登录",
+"登出": "退出登录",
+"重新整理": "刷新",
+"捷徑": "快捷方式",
+"記錄檔": "日志文件",
+"偵測": "检测",
+"儲存": "保存",
+"設定檔": "配置文件",
+"設定": "设置",
+"檔案": "文件",
+"資料夾": "文件夹",
+"資料": "数据",
+"資訊": "信息",
+"訊息": "信息",
+"管理介面": "管理界面",
+"介面": "接口",
+"品質": "质量",
+"逾時": "超时",
+"快取": "缓存",
+"權杖": "令牌",
+"存取": "访问",
+"回應": "响应",
+"位址": "地址",
+"連接埠": "端口",
+"終端機": "终端",
+"指令": "命令",
+"命令列": "命令行",
+"自訂": "自定义",
+"金鑰": "密钥",
+"相容": "兼容",
+"搜尋": "搜索",
+"專案": "项目",
+"外掛": "插件",
+"使用者": "用户",
+"解除安裝": "卸载",
+"物件": "对象",
+"字串": "字符串",
+"字元": "字符",
+"函式": "函数",
+"閘道": "网关",
+"總覽": "概览",
+"分頁": "标签页",
+"背景工作": "后台任务",
+"背景": "后台",
+"清單": "列表",
+"螢幕": "屏幕",
+"記憶體": "内存",
+"網域": "域名",
+"憑證": "凭据",
+"回饋": "反馈",
+"擷取": "获取",
+"匯入": "导入",
+"匯出": "导出",
+"透過": "通过",
+"閒置": "空闲",
+"全域": "全局",
+"串流": "流式传输",
+"轉譯": "转换",
+"轉送": "转发",
+"本機": "本地",
+"互動": "交互",
+"運作": "运行",
+"封存": "归档",
+"紀錄": "记录",
+"套件管理器": "包管理器",
+"建立": "创建",
+"取得": "获取",
+"開啟": "打开",
+"文字": "文本",
+"項目": "项",
+"位元組": "字节",
+"最佳化": "优化",
+"線上": "在线",
+"遠端": "远程",
+"影片": "视频",
+"影像": "图像",
+"列印": "打印",
+"自訂模型管理": "自訂模型管理",
+"英文字母": "英文字母",
+"回覆": "回复",
+"反覆": "反复",
+"覆寫": "覆盖",
+"拖曳": "拖动",
+"內建": "内置",
+"選取": "选择",
+"介面語言": "界面语言",
+"排程工作": "计划任务",
+"套用": "应用",
+"載入": "加载",
+"畫面": "页面",
+"貼上": "粘贴",
+"連字號": "连字符",
+"底線": "下划线",
+"讀取中": "加载中",
+"重送": "重发",
+"選填": "可选",
+"既有": "现有",
+"取代": "替换",
+"辨識": "识别",
+"依序": "依次",
+"依賴": "依赖",
+"依然": "依然",
+"依舊": "依旧",
+"依據": "依据",
+"依": "按",
+"著": "着",
+"唯讀": "只读"
+}
+}
+}
+</script>
 <script>
 "use strict";
 
@@ -14342,6 +15541,105 @@ const TOKEN_LIMITS = { minContext: 16000, maxContext: 4000000, minOutput: 4096, 
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
 const RESERVED_PROVIDER_IDS = new Set(["default", "api", "custom", "official", "claude-cli"]);
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/;
+// 與安裝器的 normalizeModelPrefix 及 PROVIDER_NAME_MAX_LENGTH 相同；伺服器端會再驗證一次。
+const MODEL_PREFIX_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,30}[A-Za-z0-9])?$/;
+const PROVIDER_NAME_MAX_LENGTH = 32;
+
+// ---- 語言 ----------------------------------------------------------------------
+//
+// 畫面文字一律經過 t()：鍵是繁體中文原文，英文查字典，簡體由繁簡轉換產生（hans 可覆寫）。
+// 伺服器送來的記錄與錯誤（安裝器的輸出）經過 serverText()：簡體同樣轉換；英文只翻譯
+// enServer 列出的常見訊息，其餘保留原文。
+
+const I18N = JSON.parse(document.getElementById("i18n-data").textContent);
+const LANGUAGE_NAMES = { "zh-Hant": "繁體中文", "zh-Hans": "简体中文", en: "English" };
+const LANGUAGE_PREFERENCES = ["auto", "zh-Hant", "zh-Hans", "en"];
+const DATE_LOCALES = { "zh-Hant": "zh-TW", "zh-Hans": "zh-CN", en: "en-US" };
+
+// 瀏覽器語言標籤對應到支援的語言：zh-TW／HK／MO 與 Hant 用繁體，其他中文用簡體。
+function matchLanguage(tag) {
+  const value = String(tag || "").toLowerCase();
+  if (value === "zh" || value.startsWith("zh-")) {
+    if (/-hant(?:-|$)/.test(value)) return "zh-Hant";
+    if (/-hans(?:-|$)/.test(value)) return "zh-Hans";
+    return /^zh-(?:tw|hk|mo)(?:-|$)/.test(value) ? "zh-Hant" : "zh-Hans";
+  }
+  return value === "en" || value.startsWith("en-") ? "en" : null;
+}
+
+// 依瀏覽器的偏好順序找第一個支援的語言；都不符合時用英文。
+function browserLanguage() {
+  const tags = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
+  for (const tag of tags) {
+    const match = matchLanguage(tag);
+    if (match) return match;
+  }
+  return "en";
+}
+
+let languagePreference = LANGUAGE_PREFERENCES.includes(document.documentElement.dataset.languagePreference)
+  ? document.documentElement.dataset.languagePreference : "auto";
+let locale = languagePreference === "auto" ? browserLanguage() : languagePreference;
+
+const T2S = (() => {
+  const chars = new Map();
+  const to = Array.from(I18N.t2s.to);
+  Array.from(I18N.t2s.from).forEach((char, index) => chars.set(char, to[index]));
+  const phrases = new Map(Object.entries(I18N.t2s.phrases));
+  // 詞與單字放在同一個正規表示式，較長的詞優先；換過的詞不會再逐字轉換，
+  // 所以 Codex 介面上的專有名稱（例如「自訂模型管理」）可以原樣保留。
+  const keys = [...phrases.keys()].sort((left, right) => right.length - left.length)
+    .map((key) => key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const pattern = new RegExp([...keys, "[\\u3400-\\u9fff\\uf900-\\ufaff]"].join("|"), "g");
+  return { chars, phrases, pattern };
+})();
+
+// 繁轉簡：先換成大陸慣用詞（預設→默认、程式→程序），其餘逐字轉換。
+function toSimplified(text) {
+  return String(text).replace(T2S.pattern, (match) => (T2S.phrases.has(match) ? T2S.phrases.get(match) : T2S.chars.get(match) || match));
+}
+
+function fill(text, params) {
+  if (!params) return text;
+  return text.replace(/\{(\w+)\}/g, (match, name) => (Object.hasOwn(params, name) ? String(params[name]) : match));
+}
+
+function t(key, params) {
+  // 英文的單數：count 為 1 且字典有「鍵#one」時改用它（1 model、2 models）。
+  const singular = locale === "en" && params && Number(params.count) === 1 && Object.hasOwn(I18N.en, key + "#one");
+  const text = singular ? I18N.en[key + "#one"]
+    : locale === "en" ? (Object.hasOwn(I18N.en, key) ? I18N.en[key] : key)
+    : locale === "zh-Hans" ? (Object.hasOwn(I18N.hans, key) ? I18N.hans[key] : toSimplified(key))
+    : key;
+  return fill(text, params);
+}
+
+const EN_SERVER = I18N.enServer.map(([pattern, replacement]) => [new RegExp(pattern), replacement]);
+
+// 伺服器產生的單則訊息（錯誤、提示）。操作記錄整段只做繁簡轉換，見 logText()。
+function serverText(text) {
+  if (text == null || text === "") return text;
+  const value = String(text);
+  if (locale === "zh-Hans") return toSimplified(value);
+  if (locale === "en") {
+    for (const [pattern, replacement] of EN_SERVER) if (pattern.test(value)) return value.replace(pattern, replacement);
+  }
+  return value;
+}
+
+function logText(text) {
+  return locale === "zh-Hans" && text ? toSimplified(text) : text;
+}
+
+function joinList(items) {
+  return items.join(locale === "en" ? ", " : "、");
+}
+
+// 導覽、頁面標題與統計卡片：英文用複數或名詞形式（Providers、Models、Settings），
+// 與欄位標籤或按鈕（Provider、Model、Set）共用同一個中文鍵時分開翻譯。
+function sectionTitle(key) {
+  return locale === "en" && Object.hasOwn(I18N.enSections, key) ? I18N.enSections[key] : t(key);
+}
 
 const token = readToken();
 
@@ -14381,6 +15679,7 @@ const ICONS = {
   settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   chevronRight: '<path d="m9 6 6 6-6 6"/>',
   claude: '<path d="M12 3v5.5M12 15.5V21M3 12h5.5M15.5 12H21M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>',
+  globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.3 2.4 3.5 5.2 3.5 8.5s-1.2 6.1-3.5 8.5c-2.3-2.4-3.5-5.2-3.5-8.5S9.7 5.9 12 3.5Z"/>',
 };
 const GITHUB_PATH = "M12 .7C5.7.7.6 5.8.6 12.1c0 5 3.3 9.3 7.8 10.8.6.1.8-.2.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0c2.2-1.5 3.2-1.2 3.2-1.2.6 1.6.2 2.8.1 3.1.7.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6a11.4 11.4 0 0 0 7.8-10.8C23.4 5.8 18.3.7 12 .7Z";
 
@@ -14445,17 +15744,17 @@ function formatUptime(seconds) {
   const days = Math.floor(total / 86400);
   const hours = Math.floor((total % 86400) / 3600);
   const minutes = Math.floor((total % 3600) / 60);
-  if (days) return days + " 天 " + hours + " 小時";
-  if (hours) return hours + " 小時 " + minutes + " 分";
-  if (minutes) return minutes + " 分鐘";
-  return "不到 1 分鐘";
+  if (days) return t("{days} 天 {hours} 小時", { days, hours });
+  if (hours) return t("{hours} 小時 {minutes} 分", { hours, minutes });
+  if (minutes) return t("{minutes} 分鐘", { minutes });
+  return t("不到 1 分鐘");
 }
 
 function formatTime(value) {
   if (!value) return "—";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "—";
-  return date.toLocaleString("zh-TW", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  return date.toLocaleString(DATE_LOCALES[locale], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
 function hostOf(url) {
@@ -14463,24 +15762,34 @@ function hostOf(url) {
 }
 
 function effortText(efforts) {
-  if (!Array.isArray(efforts) || efforts.length === 0) return "供應商預設";
-  if (EFFORTS.every((effort) => efforts.includes(effort))) return "全部 5 檔";
-  return efforts.join("、");
+  if (!Array.isArray(efforts) || efforts.length === 0) return t("供應商預設");
+  if (EFFORTS.every((effort) => efforts.includes(effort))) return t("全部 5 檔");
+  return joinList(efforts);
 }
 
+// 供應商的顯示名稱：另外取過名稱就用名稱，否則用 id；Claude 訂閱的名稱固定。
 function providerLabel(id) {
-  return id === "claude-cli" ? "Claude 訂閱" : id;
+  if (id === "claude-cli") return t("Claude 訂閱");
+  const provider = state && (state.providers || []).find((item) => item.id === id);
+  return (provider && provider.name) || id;
 }
 
-const TRANSPORTS = {
-  responses: ["Responses", "cyan", "直接轉發 OpenAI Responses API"],
-  chat: ["Chat 轉譯", "amber", "上游只有 Chat Completions，由路由器在本機轉譯"],
-  anthropic: ["Claude 轉譯", "violet", "以 Anthropic Messages API 轉譯"],
-  "claude-cli": ["Claude CLI", "violet", "透過 Claude Code 登入的訂閱帳號（實驗性）"],
-};
+// 帶上 host 的供應商選項文字，下拉選單用。
+function providerOption(provider) {
+  return t("{name}（{host}）", { name: providerLabel(provider.id), host: hostOf(provider.baseUrl) });
+}
+
+function transports() {
+  return {
+    responses: ["Responses", "cyan", t("直接轉發 OpenAI Responses API")],
+    chat: [t("Chat 轉譯"), "amber", t("上游只有 Chat Completions，由路由器在本機轉譯")],
+    anthropic: [t("Claude 轉譯"), "violet", t("以 Anthropic Messages API 轉譯")],
+    "claude-cli": ["Claude CLI", "violet", t("透過 Claude Code 登入的訂閱帳號（實驗性）")],
+  };
+}
 
 function transportChip(transport) {
-  const [label, tone, description] = TRANSPORTS[transport] || [transport, "", ""];
+  const [label, tone, description] = transports()[transport] || [transport, "", ""];
   return h("span", { class: "chip " + tone, title: description }, label);
 }
 
@@ -14517,17 +15826,17 @@ async function api(path, options) {
     });
   } catch {
     setConnection(false);
-    throw new ApiError("無法連線到管理程式，請重新開啟管理頁。", 0);
+    throw new ApiError(t("無法連線到管理程式，請重新開啟管理頁。"), 0);
   }
   setConnection(true);
   let data = null;
   try { data = await response.json(); } catch { data = null; }
-  if (!response.ok) throw new ApiError((data && data.error) || ("HTTP " + response.status), response.status);
+  if (!response.ok) throw new ApiError((data && serverText(data.error)) || ("HTTP " + response.status), response.status);
   const instance = response.headers.get("x-router-manager-instance");
   if (instance && managerInstance && instance !== managerInstance) {
     restartingManager = true;
     location.reload();
-    throw new ApiError("管理頁已換新，正在重新整理。", 0);
+    throw new ApiError(t("管理頁已換新，正在重新整理。"), 0);
   }
   if (instance) managerInstance = instance;
   return data;
@@ -14593,11 +15902,11 @@ function writeBlocked() {
 // ---- 版面 --------------------------------------------------------------------
 
 const VIEWS = [
-  { id: "overview", label: "總覽", icon: "overview" },
-  { id: "models", label: "模型", icon: "models" },
-  { id: "providers", label: "供應商", icon: "providers" },
-  { id: "imagegen", label: "生圖", icon: "image" },
-  { id: "settings", label: "設定", icon: "settings" },
+  { id: "overview", label: () => sectionTitle("總覽"), icon: "overview" },
+  { id: "models", label: () => sectionTitle("模型"), icon: "models" },
+  { id: "providers", label: () => sectionTitle("供應商"), icon: "providers" },
+  { id: "imagegen", label: () => sectionTitle("生圖"), icon: "image" },
+  { id: "settings", label: () => sectionTitle("設定"), icon: "settings" },
 ];
 
 function render() {
@@ -14614,24 +15923,24 @@ function renderSidebar() {
       type: "button", class: "nav-item" + (view.id === currentView ? " active" : ""),
       "aria-current": view.id === currentView ? "page" : null,
       onclick: () => switchView(view.id),
-    }, icon(view.icon), view.label, count != null ? h("span", { class: "nav-count", text: String(count) }) : null);
+    }, icon(view.icon), view.label(), count != null ? h("span", { class: "nav-count", text: String(count) }) : null);
   }));
 
   const badge = document.getElementById("version-badge");
   const version = (versionInfo && versionInfo.installed) || (state && state.versions && (state.versions.installed || state.versions.manager));
   const hasUpdate = Boolean(versionInfo && (versionInfo.status === "update-available" || versionInfo.localNewer));
   // replaceChildren 會把 null 印成文字 "null"，可有可無的節點要先濾掉。
-  badge.replaceChildren(...["v" + (version || "—"), hasUpdate ? h("span", { class: "dot", title: "有新版本" }) : null].filter(Boolean));
+  badge.replaceChildren(...["v" + (version || "—"), hasUpdate ? h("span", { class: "dot", title: t("有新版本") }) : null].filter(Boolean));
   badge.classList.toggle("has-update", hasUpdate);
-  badge.title = hasUpdate ? "有新版本，點擊查看" : "版本資訊";
+  badge.title = hasUpdate ? t("有新版本，點擊查看") : t("版本資訊");
 
   const status = document.getElementById("router-status");
   if (!state || !state.installed) {
-    status.replaceChildren(h("span", { class: "status-dot" }), h("span", { text: state ? "尚未安裝" : "檢查中…" }));
+    status.replaceChildren(h("span", { class: "status-dot" }), h("span", { text: state ? t("尚未安裝") : t("檢查中…") }));
   } else if (state.router && state.router.ok) {
-    status.replaceChildren(h("span", { class: "status-dot ok" }), h("span", { text: "路由器運作中 · :" + state.router.port }));
+    status.replaceChildren(h("span", { class: "status-dot ok" }), h("span", { text: t("路由器運作中 · :{port}", { port: state.router.port }) }));
   } else {
-    status.replaceChildren(h("span", { class: "status-dot bad" }), h("span", { text: "路由器無法連線" }));
+    status.replaceChildren(h("span", { class: "status-dot bad" }), h("span", { text: t("路由器無法連線") }));
   }
 }
 
@@ -14653,30 +15962,34 @@ function renderBanners() {
   const host = document.getElementById("banners");
   const items = [];
   if (connectionLost && !restartingManager) {
-    items.push(banner("error", "alert", "與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。"));
+    items.push(banner("error", "alert", t("與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。")));
   }
-  if (state && state.writeBlocked) items.push(banner("warn", "alert", state.writeBlocked));
+  if (state && state.writeBlocked) items.push(banner("warn", "alert", serverText(state.writeBlocked)));
   if (pendingDesktopRestart && state && state.installed) {
     const canRestart = state.desktop && state.desktop.canRestart;
     items.push(banner("info", "info",
       canRestart
-        ? "設定已寫入。重新啟動 " + state.desktop.name + " 後，模型選擇器才會顯示這次的變更。"
-        : "設定已寫入。請完全退出並重新打開 " + ((state.desktop && state.desktop.name) || "桌面版") + "，模型選擇器才會顯示這次的變更。",
-      canRestart ? h("button", { type: "button", class: "button small", onclick: confirmRestartDesktop }, icon("restart"), "立即重新啟動") : null,
-      h("button", { type: "button", class: "icon-button", title: "稍後再說", "aria-label": "關閉提示", onclick: () => { pendingDesktopRestart = false; renderBanners(); } }, icon("close"))));
+        ? t("設定已寫入。重新啟動 {app} 後，模型選擇器才會顯示這次的變更。", { app: state.desktop.name })
+        : t("設定已寫入。請完全退出並重新打開 {app}，模型選擇器才會顯示這次的變更。", { app: desktopName() }),
+      canRestart ? h("button", { type: "button", class: "button small", onclick: confirmRestartDesktop }, icon("restart"), t("立即重新啟動")) : null,
+      h("button", { type: "button", class: "icon-button", title: t("稍後再說"), "aria-label": t("關閉提示"), onclick: () => { pendingDesktopRestart = false; renderBanners(); } }, icon("close"))));
   }
   host.replaceChildren(...items);
+}
+
+function desktopName() {
+  return (state && state.desktop && state.desktop.name) || t("桌面版");
 }
 
 function renderView() {
   const view = document.getElementById("view");
   if (!state) {
-    view.replaceChildren(h("div", { class: "empty" }, h("span", { class: "spinner" }), " 讀取中…"));
+    view.replaceChildren(h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("讀取中…")));
     return;
   }
   if (!state.installed) {
-    view.replaceChildren(pageHead("尚未安裝", "這個 CODEX_HOME 還沒有安裝 Codex 模型路由器。"),
-      h("div", { class: "panel" }, h("div", { class: "empty", text: "請先在終端執行安裝器，選擇「安裝或重新配置」。" })));
+    view.replaceChildren(pageHead(t("尚未安裝"), t("這個 CODEX_HOME 還沒有安裝 Codex 模型路由器。")),
+      h("div", { class: "panel" }, h("div", { class: "empty", text: t("請先在終端執行安裝器，選擇「安裝或重新配置」。") })));
     return;
   }
   if (currentView === "models") view.replaceChildren(...renderModels());
@@ -14706,58 +16019,67 @@ function renderOverview() {
   const stats = router.stats || {};
   const primary = (state.providers || []).find((provider) => provider.primary);
   const canRestart = state.desktop && state.desktop.canRestart;
-  const head = pageHead("總覽", "路由器狀態、最近的錯誤與執行環境。",
-    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked), onclick: () => runJob("repair-models", {}, { title: "同步與修復模型清單" }) }, icon("refresh"), "同步與修復模型清單"),
-    h("button", { type: "button", class: "button", onclick: confirmRestartRouter }, icon("restart"), "重新啟動路由器"),
-    canRestart ? h("button", { type: "button", class: "button", onclick: confirmRestartDesktop }, icon("power"), "重新啟動 " + state.desktop.name) : null);
+  const head = pageHead(sectionTitle("總覽"), t("路由器狀態、最近的錯誤與執行環境。"),
+    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked), onclick: () => runJob("repair-models", {}, { title: t("同步與修復模型清單") }) }, icon("refresh"), t("同步與修復模型清單")),
+    h("button", { type: "button", class: "button", onclick: confirmRestartRouter }, icon("restart"), t("重新啟動路由器")),
+    canRestart ? h("button", { type: "button", class: "button", onclick: confirmRestartDesktop }, icon("power"), t("重新啟動 {app}", { app: state.desktop.name })) : null);
 
   const cards = h("div", { class: "cards" },
-    card("路由器", router.ok ? "運作中" : "無法連線",
-      router.ok ? "v" + (router.version || "?") + " · 連接埠 " + router.port + " · 已運作 " + formatUptime(router.uptimeSeconds) : (router.error || "沒有回應"),
+    card(t("路由器"), router.ok ? t("運作中") : t("無法連線"),
+      router.ok ? t("v{version} · 連接埠 {port} · 已運作 {uptime}", { version: router.version || "?", port: router.port, uptime: formatUptime(router.uptimeSeconds) })
+        : (serverText(router.error) || t("沒有回應")),
       router.ok ? "ok" : "bad"),
-    card("請求", formatNumber(stats.requests ?? 0),
-      "失敗 " + formatNumber(stats.failures ?? 0) + " · 官方 " + formatNumber(stats.official ?? 0) + " · 自訂 " + formatNumber(stats.custom ?? 0)),
-    card("自訂模型", String((state.models || []).length), "官方模型 " + formatNumber(state.officialModelCount) + " 個"),
-    card("供應商", String((state.providers || []).length), primary ? "主要：" + primary.id : ""));
+    card(t("請求"), formatNumber(stats.requests ?? 0),
+      t("失敗 {failures} · 官方 {official} · 自訂 {custom}", {
+        failures: formatNumber(stats.failures ?? 0), official: formatNumber(stats.official ?? 0), custom: formatNumber(stats.custom ?? 0),
+      })),
+    card(t("自訂模型"), String((state.models || []).length), t("官方模型 {count} 個", { count: formatNumber(state.officialModelCount) })),
+    card(sectionTitle("供應商"), String((state.providers || []).length), primary ? t("主要：{name}", { name: providerLabel(primary.id) }) : ""));
 
   const invalidDefault = state.config && state.config.model && state.config.model.startsWith("custom/") &&
     !(state.models || []).some(model => model.slug === state.config.model);
-  return [head, ...(invalidDefault ? [banner("warn", "alert", "全域預設模型已失效，請點擊「同步與修復模型清單」。")] : []), cards, renderErrorsPanel(), renderEnvironmentPanel()];
+  return [head, ...(invalidDefault ? [banner("warn", "alert", t("全域預設模型已失效，請點擊「同步與修復模型清單」。"))] : []), cards, renderErrorsPanel(), renderEnvironmentPanel()];
+}
+
+// 路由器錯誤記錄的英文說明：記錄檔裡的訊息是中文，英文介面依錯誤代碼改用這裡的說明。
+function routerErrorMessage(entry) {
+  if (locale === "en" && entry.code && Object.hasOwn(I18N.enErrors, entry.code)) return I18N.enErrors[entry.code];
+  return serverText(entry.message);
 }
 
 function renderErrorsPanel() {
-  const refresh = h("button", { type: "button", class: "icon-button", title: "重新整理", "aria-label": "重新整理錯誤紀錄", onclick: () => refreshErrors() }, icon("refresh"));
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: "最近的錯誤" }), refresh));
+  const refresh = h("button", { type: "button", class: "icon-button", title: t("重新整理"), "aria-label": t("重新整理錯誤紀錄"), onclick: () => refreshErrors() }, icon("refresh"));
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("最近的錯誤") }), refresh));
   if (!errorsData) {
-    panel.append(h("div", { class: "empty" }, h("span", { class: "spinner" }), " 讀取中…"));
+    panel.append(h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("讀取中…")));
     return panel;
   }
   if (errorsData.error) {
-    panel.append(h("div", { class: "empty", text: errorsData.error }));
+    panel.append(h("div", { class: "empty", text: serverText(errorsData.error) }));
     return panel;
   }
   const entries = (errorsData.entries || []).slice(0, 30);
   if (entries.length === 0) {
-    panel.append(h("div", { class: "empty", text: "記錄檔裡沒有錯誤紀錄。" }));
+    panel.append(h("div", { class: "empty", text: t("記錄檔裡沒有錯誤紀錄。") }));
     return panel;
   }
   const kindLabels = {
-    "websocket-error": "WebSocket", "catalog-refresh-failed": "模型清單同步", "request-too-large": "請求過大",
-    "upstream-ws-cooldown": "上游 WebSocket 冷卻", "auth-probe-grace": "官方驗證寬限",
+    "websocket-error": "WebSocket", "catalog-refresh-failed": t("模型清單同步"), "request-too-large": t("請求過大"),
+    "upstream-ws-cooldown": t("上游 WebSocket 冷卻"), "auth-probe-grace": t("官方驗證寬限"),
   };
   const rows = entries.map((entry) => {
     const what = entry.kind === "error"
-      ? [entry.code ? h("span", { class: "chip rose mono", text: entry.status ? entry.status + " " + entry.code : entry.code }) : h("span", { class: "chip rose", text: "錯誤" })]
+      ? [entry.code ? h("span", { class: "chip rose mono", text: entry.status ? entry.status + " " + entry.code : entry.code }) : h("span", { class: "chip rose", text: t("錯誤") })]
       : [h("span", { class: "chip amber", text: kindLabels[entry.kind] || entry.kind })];
-    const where = [entry.model, entry.provider ? "供應商 " + entry.provider : null, entry.upstreamHost].filter(Boolean).join(" · ");
+    const where = [entry.model, entry.provider ? t("供應商 {name}", { name: providerLabel(entry.provider) }) : null, entry.upstreamHost].filter(Boolean).join(" · ");
     return h("tr", {},
       h("td", { class: "tight mono muted", text: formatTime(entry.at) }),
       h("td", { class: "tight" }, ...what),
-      h("td", {}, h("div", { text: entry.message || "—" }), where ? h("div", { class: "model-sub", text: where }) : null),
+      h("td", {}, h("div", { text: routerErrorMessage(entry) || "—" }), where ? h("div", { class: "model-sub", text: where }) : null),
       h("td", { class: "tight mono faint", text: entry.requestId || "" }));
   });
   panel.append(h("div", { class: "table-wrap" }, h("table", {},
-    h("thead", {}, h("tr", {}, h("th", { text: "時間" }), h("th", { text: "類型" }), h("th", { text: "內容" }), h("th", { text: "診斷 ID" }))),
+    h("thead", {}, h("tr", {}, h("th", { text: t("時間") }), h("th", { text: t("類型") }), h("th", { text: t("內容") }), h("th", { text: t("診斷 ID") }))),
     h("tbody", {}, rows))));
   return panel;
 }
@@ -14765,22 +16087,32 @@ function renderErrorsPanel() {
 function renderEnvironmentPanel() {
   const versions = state.versions || {};
   const config = state.config;
+  const loading = t("讀取中…");
+  const imagegen = !state.imagegen ? t("未啟用") : state.imagegen.error ? serverText(state.imagegen.error)
+    : t("{models}（供應商 {provider}）", { models: joinList(state.imagegen.models), provider: providerLabel(state.imagegen.providerId) });
   const items = [
-    ["版本", "管理頁 v" + versions.manager + " · 已安裝 v" + (versions.installed || "?") + " · 路由器 " + (versions.router ? "v" + versions.router : "未回應")],
-    ["CODEX_HOME", state.paths.codexHome],
-    ["路由器目錄", state.paths.installRoot],
-    ["記錄檔", state.paths.logPath],
-    ["背景服務", state.service.name + "（" + state.service.kind + "）"],
-    ["Node.js", state.paths.nodeBin || "—"],
-    ["Codex CLI", state.paths.codexBin || "—"],
-    ["全域預設模型", config ? (config.model || "未設定（使用官方預設）") : "讀取中…"],
-    ["全域上下文", config ? (config.modelContextWindow ? formatNumber(config.modelContextWindow) + " tokens（覆蓋各模型的設定）" : "未設定（各模型自行決定）") : "讀取中…"],
-    ["中轉 API 生圖", !state.imagegen ? "未啟用" : state.imagegen.error ? state.imagegen.error : state.imagegen.models.join("、") + "（供應商 " + state.imagegen.providerId + "）"],
-    ["管理頁捷徑", state.paths.shortcut || "尚未建立（執行一次 update 會建立）"],
+    [t("版本"), t("管理頁 v{manager} · 已安裝 v{installed} · 路由器 {router}", {
+      manager: versions.manager, installed: versions.installed || "?", router: versions.router ? "v" + versions.router : t("未回應"),
+    }), false],
+    ["CODEX_HOME", state.paths.codexHome, true],
+    [t("路由器目錄"), state.paths.installRoot, true],
+    [t("記錄檔"), state.paths.logPath, true],
+    [t("背景服務"), t("{name}（{kind}）", { name: state.service.name, kind: serviceKindText(state.service.kind) }), true],
+    ["Node.js", state.paths.nodeBin || "—", true],
+    ["Codex CLI", state.paths.codexBin || "—", true],
+    [t("全域預設模型"), config ? (config.model || t("未設定（使用官方預設）")) : loading, Boolean(config && config.model)],
+    [t("全域上下文"), config ? (config.modelContextWindow ? t("{value} tokens（覆蓋各模型的設定）", { value: formatNumber(config.modelContextWindow) }) : t("未設定（各模型自行決定）")) : loading, false],
+    [t("中轉 API 生圖"), imagegen, false],
+    [t("管理頁捷徑"), state.paths.shortcut || t("尚未建立（執行一次 update 會建立）"), Boolean(state.paths.shortcut)],
   ];
   return h("div", { class: "panel" },
-    h("div", { class: "panel-head" }, h("h2", { text: "環境" })),
-    h("div", { class: "panel-body" }, h("dl", { class: "kv" }, items.flatMap(([label, value]) => [h("dt", { text: label }), h("dd", { class: /[/\\]/.test(String(value)) && label !== "版本" ? "mono" : "", text: value })]))));
+    h("div", { class: "panel-head" }, h("h2", { text: t("環境") })),
+    h("div", { class: "panel-body" }, h("dl", { class: "kv" }, items.flatMap(([label, value, mono]) => [h("dt", { text: label }), h("dd", { class: mono ? "mono" : "", text: value })]))));
+}
+
+// 背景服務的種類由安裝器提供（LaunchAgent 或 Windows 排程工作）。
+function serviceKindText(kind) {
+  return kind === "Windows 排程工作" ? t("Windows 排程工作") : kind;
 }
 
 // ---- 模型 --------------------------------------------------------------------
@@ -14824,64 +16156,70 @@ function renderModels() {
   const blocked = writeBlocked();
   const models = orderedModels();
   const dirty = orderDirty();
-  const head = pageHead("模型", "Codex 選擇器裡的自訂模型，選擇器依這裡的順序顯示。",
+  const head = pageHead(sectionTitle("模型"), t("Codex 選擇器裡的自訂模型，選擇器依這裡的順序顯示。"),
     h("button", {
       type: "button", class: "button danger", disabled: blocked || selected.size === 0 || dirty,
       onclick: () => confirmRemoveModels([...selected]),
-    }, icon("trash"), selected.size ? "刪除所選（" + selected.size + "）" : "刪除所選"),
-    h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), "新增模型"));
+    }, icon("trash"), selected.size ? t("刪除所選（{count}）", { count: selected.size }) : t("刪除所選")),
+    h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")));
 
   const parts = [head];
   if (dirty) {
-    parts.push(banner("info", "info", "順序已調整，尚未儲存。",
-      h("button", { type: "button", class: "button small", onclick: () => { orderDraft = null; renderView(); } }, "還原"),
-      h("button", { type: "button", class: "button small primary", disabled: blocked, onclick: saveOrder }, "儲存順序")));
+    parts.push(banner("info", "info", t("順序已調整，尚未儲存。"),
+      h("button", { type: "button", class: "button small", onclick: () => { orderDraft = null; renderView(); } }, t("還原")),
+      h("button", { type: "button", class: "button small primary", disabled: blocked, onclick: saveOrder }, t("儲存順序"))));
   }
   const notes = [
-    h("div", { class: "note", text: "拖曳左側把手或用箭頭調整順序。排序、改名與上下文只寫入模型目錄，不會重新啟動路由器；修改輸出會重新啟動路由器。" }),
-    h("div", { class: "note", text: "輸出只對 Claude 模型有效（送往 Claude 的 max_tokens，「/」後面是模型上限）；GPT 與 Chat 模型的輸出由上游決定。" }),
+    h("div", { class: "note", text: t("拖曳左側把手或用箭頭調整順序。排序、改名與上下文只寫入模型目錄，不會重新啟動路由器；修改輸出會重新啟動路由器。") }),
+    h("div", { class: "note", text: t("輸出只對 Claude 模型有效（送往 Claude 的 max_tokens，「/」後面是模型上限）；GPT 與 Chat 模型的輸出由上游決定。") }),
   ];
-  if (state.customModelOrder === "manual") notes.push(h("div", { class: "note", text: "已手動排序：之後新增的模型會排在最後。" }));
+  if (state.customModelOrder === "manual") notes.push(h("div", { class: "note", text: t("已手動排序：之後新增的模型會排在最後。") }));
   if (state.config && state.config.modelContextWindow) {
-    notes.push(h("div", { class: "note warn", text: "全域 model_context_window = " + formatNumber(state.config.modelContextWindow) + "，會覆蓋下表各模型的上下文設定。" }));
+    notes.push(h("div", { class: "note warn", text: t("全域 model_context_window = {value}，會覆蓋下表各模型的上下文設定。", { value: formatNumber(state.config.modelContextWindow) }) }));
   }
   parts.push(h("div", { class: "notes" }, notes));
 
   if (models.length === 0) {
     parts.push(h("div", { class: "panel" }, h("div", { class: "empty" },
-      h("p", { text: "還沒有自訂模型。" }),
-      h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), "新增模型"))));
+      h("p", { text: t("還沒有自訂模型。") }),
+      h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")))));
     return parts;
   }
 
   const allChecked = models.every((model) => selected.has(model.slug));
   const headerBox = h("input", {
-    type: "checkbox", "aria-label": "全選", checked: allChecked && models.length > 0, disabled: blocked,
+    type: "checkbox", "aria-label": t("全選"), checked: allChecked && models.length > 0, disabled: blocked,
     onchange: (event) => { for (const model of models) event.target.checked ? selected.add(model.slug) : selected.delete(model.slug); renderView(); },
   });
   const rows = models.map((model, index) => modelRow(model, index, models.length, blocked));
   parts.push(h("div", { class: "panel" }, h("div", { class: "table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {},
       h("th", { class: "tight" }, headerBox), h("th", { class: "tight" }),
-      h("th", { text: "名稱" }), h("th", { class: "col-provider", text: "供應商" }), h("th", { class: "col-transport", text: "介面" }),
-      h("th", { class: "col-effort", text: "推理強度" }), h("th", { text: "上下文" }), h("th", { text: "輸出" }), h("th", { class: "tight" }))),
+      h("th", { text: t("名稱") }), h("th", { class: "col-provider", text: t("供應商") }), h("th", { class: "col-transport", text: t("介面") }),
+      h("th", { class: "col-effort", text: t("推理強度") }), h("th", { text: t("上下文") }), h("th", { text: t("輸出") }), h("th", { class: "tight" }))),
     h("tbody", {}, rows)))));
   return parts;
 }
 
 function contextCell(model) {
   const template = model.contextSource === "template";
-  return h("td", { class: "nowrap", title: model.contextWindow ? formatNumber(model.contextWindow) + " tokens" + (template ? "（沿用官方模板，未實測）" : "") : "" },
+  const title = !model.contextWindow ? ""
+    : template ? t("{value} tokens（沿用官方模板，未實測）", { value: formatNumber(model.contextWindow) })
+    : t("{value} tokens", { value: formatNumber(model.contextWindow) });
+  return h("td", { class: "nowrap", title },
     formatTokens(model.contextWindow),
-    template ? h("span", { class: "faint", text: " 模板" }) : null);
+    template ? h("span", { class: "faint", text: " " + t("模板") }) : null);
 }
 
 function outputCell(model) {
   if (!model.outputConfigurable) {
-    return h("td", { class: "nowrap faint", text: "上游預設", title: "這個介面不送出輸出上限，由上游模型決定" });
+    return h("td", { class: "nowrap faint", text: t("上游預設"), title: t("這個介面不送出輸出上限，由上游模型決定") });
   }
   const showCap = model.outputCap && model.outputCap > model.outputTokens;
-  return h("td", { class: "nowrap", title: "每次回覆最多 " + formatNumber(model.outputTokens) + " tokens" + (model.outputCap ? "；模型上限 " + formatNumber(model.outputCap) : "") },
+  const title = model.outputCap
+    ? t("每次回覆最多 {value} tokens；模型上限 {cap}", { value: formatNumber(model.outputTokens), cap: formatNumber(model.outputCap) })
+    : t("每次回覆最多 {value} tokens", { value: formatNumber(model.outputTokens) });
+  return h("td", { class: "nowrap", title },
     formatTokens(model.outputTokens),
     showCap ? h("span", { class: "faint", text: " / " + formatTokens(model.outputCap) }) : null);
 }
@@ -14889,19 +16227,19 @@ function outputCell(model) {
 function modelRow(model, index, count, blocked) {
   const isDefault = state.config && state.config.model === model.slug;
   const handle = h("span", {
-    class: "drag-handle" + (blocked ? " disabled" : ""), title: blocked ? null : "按住拖曳調整順序", "aria-hidden": "true",
+    class: "drag-handle" + (blocked ? " disabled" : ""), title: blocked ? null : t("按住拖曳調整順序"), "aria-hidden": "true",
   }, icon("grip"));
   const row = h("tr", { "data-slug": model.slug },
     h("td", { class: "tight" }, h("input", {
-      type: "checkbox", "aria-label": "選取 " + model.displayName, checked: selected.has(model.slug), disabled: blocked,
+      type: "checkbox", "aria-label": t("選取 {name}", { name: model.displayName }), checked: selected.has(model.slug), disabled: blocked,
       onchange: (event) => { event.target.checked ? selected.add(model.slug) : selected.delete(model.slug); renderView(); },
     })),
     h("td", { class: "tight" }, handle),
     h("td", {},
       h("div", { class: "model-name" }, h("span", { text: model.displayName }),
-        isDefault ? h("span", { class: "chip green", text: "全域預設" }) : null,
-        model.inCatalog ? null : h("span", { class: "chip rose", text: "目錄缺少", title: "models.json 裡沒有這個模型，請執行 update 修復" })),
-      h("div", { class: "model-sub", text: model.upstreamModel, title: "選擇器 ID：" + model.slug }),
+        isDefault ? h("span", { class: "chip green", text: t("全域預設") }) : null,
+        model.inCatalog ? null : h("span", { class: "chip rose", text: t("目錄缺少"), title: t("models.json 裡沒有這個模型，請執行 update 修復") })),
+      h("div", { class: "model-sub", text: model.upstreamModel, title: t("選擇器 ID：{slug}", { slug: model.slug }) }),
       h("div", { class: "model-meta" }, h("span", { class: "chip", text: providerLabel(model.providerId) }), transportChip(model.transport),
         h("span", { class: "faint", text: effortText(model.efforts) }))),
     h("td", { class: "col-provider" }, h("span", { class: "chip", text: providerLabel(model.providerId) })),
@@ -14910,9 +16248,9 @@ function modelRow(model, index, count, blocked) {
     contextCell(model),
     outputCell(model),
     h("td", { class: "tight" }, h("div", { class: "row-actions" },
-      h("button", { type: "button", class: "icon-button nudge", title: "上移", "aria-label": "上移", disabled: blocked || index === 0, onclick: () => nudgeModel(model.slug, -1) }, icon("up")),
-      h("button", { type: "button", class: "icon-button nudge", title: "下移", "aria-label": "下移", disabled: blocked || index === count - 1, onclick: () => nudgeModel(model.slug, 1) }, icon("down")),
-      h("button", { type: "button", class: "icon-button", title: "修改名稱、上下文與輸出", "aria-label": "修改", disabled: blocked, onclick: () => openEditModel(model) }, icon("edit")))));
+      h("button", { type: "button", class: "icon-button nudge", title: t("上移"), "aria-label": t("上移"), disabled: blocked || index === 0, onclick: () => nudgeModel(model.slug, -1) }, icon("up")),
+      h("button", { type: "button", class: "icon-button nudge", title: t("下移"), "aria-label": t("下移"), disabled: blocked || index === count - 1, onclick: () => nudgeModel(model.slug, 1) }, icon("down")),
+      h("button", { type: "button", class: "icon-button", title: t("修改名稱、上下文與輸出"), "aria-label": t("修改"), disabled: blocked, onclick: () => openEditModel(model) }, icon("edit")))));
   if (!blocked) attachDrag(handle, row, model.slug);
   return row;
 }
@@ -14962,7 +16300,7 @@ function attachDrag(handle, row, slug) {
 
 async function saveOrder() {
   const slugs = orderedModels().map((model) => model.slug);
-  const view = await runJob("reorder-models", { slugs }, { title: "儲存模型順序" });
+  const view = await runJob("reorder-models", { slugs }, { title: t("儲存模型順序") });
   if (view && view.status === "succeeded") orderDraft = null;
   renderView();
 }
@@ -14972,31 +16310,155 @@ async function saveOrder() {
 function renderProviders() {
   const blocked = writeBlocked();
   const providers = state.providers || [];
-  const head = pageHead("供應商", "每家供應商各自保存 API Key；主要供應商另外負責 Codex 內建的生圖請求。",
-    h("button", { type: "button", class: "button primary", disabled: blocked, onclick: openAddProvider }, icon("plus"), "新增供應商"));
+  const head = pageHead(sectionTitle("供應商"), t("每家供應商各自保存 API Key；主要供應商另外負責 Codex 內建的生圖請求。"),
+    h("button", { type: "button", class: "button primary", disabled: blocked, onclick: openAddProvider }, icon("plus"), t("新增供應商")));
   const cards = providers.map((provider) => h("div", { class: "provider-card" },
     h("div", { class: "head" },
-      h("span", { class: "title", text: provider.id }),
-      provider.primary ? h("span", { class: "chip cyan", text: "主要" }) : null,
-      h("span", { class: "chip", text: provider.modelCount + " 個模型" })),
+      h("span", { class: "title", text: providerLabel(provider.id) }),
+      provider.primary ? h("span", { class: "chip cyan", text: t("主要") }) : null,
+      h("span", { class: "chip", text: t("{count} 個模型", { count: provider.modelCount }) }),
+      h("span", { class: "spacer" }),
+      h("button", { type: "button", class: "button small", disabled: blocked, title: t("修改名稱與模型前綴"),
+        onclick: () => openEditProvider(provider.id) }, icon("edit"), t("修改"))),
     h("div", { class: "body" },
-      h("div", { class: "row" }, h("span", { text: "Base URL" }), h("span", { class: "mono", text: provider.baseUrl || "—" })),
-      h("div", { class: "row" }, h("span", { text: "API 根地址" }), h("span", { class: "mono", text: provider.apiRoot || "—" })),
-      h("div", { class: "row" }, h("span", { text: "API Key" }),
+      provider.name ? cardRow("ID", h("span", { class: "mono", text: provider.id })) : null,
+      cardRow(t("模型前綴"), prefixSummary(provider.id, provider.modelPrefix)),
+      cardRow("Base URL", h("span", { class: "mono", text: provider.baseUrl || "—" })),
+      cardRow(t("API 根地址"), h("span", { class: "mono", text: provider.apiRoot || "—" })),
+      cardRow("API Key",
         h("span", {}, provider.keyStored
-          ? h("span", { class: "chip green", text: state.platform === "win32" ? "已加密儲存" : "已存於鑰匙圈" })
-          : h("span", { class: "chip rose", text: "找不到，請重新設定" })))),
+          ? h("span", { class: "chip green", text: state.platform === "win32" ? t("已加密儲存") : t("已存於鑰匙圈") })
+          : h("span", { class: "chip rose", text: t("找不到，請重新設定") })))),
     h("div", { class: "foot" },
-      h("button", { type: "button", class: "button small", disabled: blocked, onclick: () => openAddModels(provider.id) }, icon("plus"), "添加模型"),
-      h("button", { type: "button", class: "button small", onclick: () => openReplaceKey(provider) }, icon("key"), "更換 API Key"),
+      h("button", { type: "button", class: "button small", disabled: blocked, onclick: () => openAddModels(provider.id) }, icon("plus"), t("添加模型")),
+      h("button", { type: "button", class: "button small", onclick: () => openReplaceKey(provider) }, icon("key"), t("更換 API Key")),
       h("button", {
         type: "button", class: "button small danger", disabled: blocked || providers.length <= 1,
-        title: providers.length <= 1 ? "至少要保留一家供應商" : null, onclick: () => confirmRemoveProvider(provider),
-      }, icon("trash"), "移除"))));
+        title: providers.length <= 1 ? t("至少要保留一家供應商") : null, onclick: () => confirmRemoveProvider(provider),
+      }, icon("trash"), t("移除")))));
   // Claude 訂閱有模型時才顯示卡片；還沒連接時，從「新增供應商」或「新增模型」選擇它。
   const cliModels = (state.models || []).filter((model) => model.transport === "claude-cli").length;
   if (cliModels) cards.push(claudeCliCard(blocked, cliModels));
   return [head, h("div", { class: "provider-grid" }, cards)];
+}
+
+// 沒設定前綴時的自動規則：上游已有前綴就用原名，否則補供應商 id（主要供應商補 api）。
+function autoPrefix(providerId) {
+  return providerId === "default" ? "api" : providerId;
+}
+
+function prefixSummary(providerId, prefix) {
+  if (prefix) return h("span", { class: "chip cyan mono", text: prefix + "/" });
+  // Claude 訂閱的模型 ID 沒有上游前綴，自動規則就是固定補 claude-cli/。
+  if (providerId === CLAUDE_CLI_ID) return h("span", { class: "muted", text: t("自動：{prefix}/", { prefix: autoPrefix(providerId) }) });
+  return h("span", { class: "muted", text: t("自動：上游已有前綴時沿用，否則 {prefix}/", { prefix: autoPrefix(providerId) }) });
+}
+
+// 修改供應商的名稱與模型前綴。名稱只用於顯示，內部 id 不變；前綴決定選擇器裡這家模型的
+// 顯示名稱，只改自動產生的名稱。一邊輸入一邊向安裝器要預覽，與實際寫入用同一套規則。
+function openEditProvider(providerId) {
+  const cli = providerId === CLAUDE_CLI_ID;
+  const provider = cli ? null : (state.providers || []).find((item) => item.id === providerId);
+  if (!cli && !provider) return;
+  const currentPrefix = cli ? (state.claudeCli && state.claudeCli.modelPrefix) || "" : provider.modelPrefix || "";
+  const currentName = cli ? t("Claude 訂閱") : provider.name || provider.id;
+  const name = h("input", { type: "text", value: currentName, maxlength: String(PROVIDER_NAME_MAX_LENGTH), disabled: cli, spellcheck: "false" });
+  const prefix = h("input", { type: "text", value: currentPrefix, maxlength: "40", spellcheck: "false", autocomplete: "off",
+    placeholder: cli ? t("留空＝自動（{prefix}/）", { prefix: autoPrefix(providerId) })
+      : t("留空＝自動（{prefix}/ 或上游原名）", { prefix: autoPrefix(providerId) }) });
+  const preview = h("div", { class: "stack" });
+  const saveButton = h("button", { type: "button", class: "button primary", text: t("儲存") });
+  const models = (state.models || []).filter((model) => (cli ? model.transport === "claude-cli" : model.transport !== "claude-cli" && model.providerId === providerId));
+  const modal = openModal({ title: t("修改供應商：{name}", { name: providerLabel(providerId) }), wide: true, body: [
+    h("label", { class: "field" }, h("span", { text: t("名稱") }), name,
+      h("span", { class: "hint", text: cli
+        ? t("Claude 訂閱的名稱目前不支援修改。")
+        : t("只用於管理頁、終端選單與記錄的顯示。內部 ID「{id}」不變，既有對話、預設模型與 API Key 都不受影響；留空就顯示 ID。", { id: providerId }) })),
+    h("label", { class: "field" }, h("span", { text: t("模型前綴") }), prefix,
+      h("span", { class: "hint", text: cli
+        ? t("選擇器裡 Claude 訂閱的模型顯示成「前綴/模型名」；留空使用預設的「claude-cli/」。之後新增的模型也會套用。")
+        : t("選擇器裡這家的模型顯示成「前綴/模型名」，上游自帶的前綴（例如 ark/）會被取代，不會疊成兩層。留空使用自動規則：上游已有前綴時沿用原名，否則補「{prefix}/」。之後新增的模型也會套用。", { prefix: autoPrefix(providerId) }) })),
+    preview,
+    paragraph(t("只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。", { app: desktopName() }), "note"),
+  ] });
+  modal.setFoot(h("span", { class: "grow" }),
+    h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }), saveButton);
+
+  let timer = null;
+  let request = 0;
+  const fields = () => ({ name: name.value, modelPrefix: prefix.value });
+  // 先在本機檢查格式，訊息才會跟著介面語言；重名之類需要完整設定的檢查交給安裝器。
+  const localProblem = () => {
+    const value = prefix.value.trim().replace(/\/+$/, "");
+    if (value && !MODEL_PREFIX_PATTERN.test(value)) return t("前綴只能用英文字母、數字、點、底線與連字號，1～32 個字元，開頭與結尾必須是英文字母或數字。");
+    if (!cli && name.value.replace(/\s+/g, " ").trim().length > PROVIDER_NAME_MAX_LENGTH) {
+      return t("名稱最多 {max} 個字。", { max: PROVIDER_NAME_MAX_LENGTH });
+    }
+    return null;
+  };
+  const showPreview = (data) => {
+    const renames = new Map((data.renames || []).map((item) => [item.slug, item]));
+    const kept = new Set((data.kept || []).map((item) => item.slug));
+    const conflicts = new Set((data.conflicts || []).flatMap((item) => item.slugs));
+    const rows = models.map((model) => {
+      const change = renames.get(model.slug);
+      return h("tr", {},
+        h("td", {}, h("div", { class: "model-name" },
+          change ? [h("span", { class: "faint", text: change.from }), h("span", { class: "faint", text: "→" }), h("span", { text: change.to })]
+            : h("span", { text: model.displayName }),
+          kept.has(model.slug) ? h("span", { class: "chip", text: t("手動命名，保留") }) : null,
+          conflicts.has(model.slug) ? h("span", { class: "chip amber", text: t("與其他模型同名") }) : null),
+          h("div", { class: "model-sub", text: model.upstreamModel })));
+    });
+    preview.replaceChildren(h("div", { class: "field" }, h("span", { class: "note", text: t("選擇器裡的名稱") }),
+      models.length
+        ? h("div", { class: "check-list" }, h("table", {}, h("tbody", {}, rows)))
+        : h("div", { class: "note", text: t("這家供應商目前沒有模型。") })));
+  };
+  const update = () => {
+    clearTimeout(timer);
+    const problem = localProblem();
+    if (problem) {
+      request += 1;
+      preview.replaceChildren(banner("error", "alert", problem));
+      saveButton.disabled = true;
+      return;
+    }
+    saveButton.disabled = true;
+    timer = setTimeout(async () => {
+      const current = ++request;
+      try {
+        const params = cli ? { providerId, modelPrefix: prefix.value } : { providerId, ...fields() };
+        const data = await api("/api/query", { method: "POST", body: { params, type: "provider-preview" } });
+        if (current !== request) return;
+        if (!data.ok) {
+          preview.replaceChildren(banner("error", "alert", serverText(data.error)));
+          return;
+        }
+        showPreview(data);
+        saveButton.disabled = false;
+      } catch (error) {
+        if (current === request) preview.replaceChildren(banner("error", "alert", error.message));
+      }
+    }, 250);
+  };
+  name.addEventListener("input", update);
+  prefix.addEventListener("input", update);
+  saveButton.onclick = () => {
+    if (localProblem()) return;
+    const nextName = name.value.replace(/\s+/g, " ").trim();
+    const nextPrefix = prefix.value.trim().replace(/\/+$/, "");
+    if ((cli || nextName === currentName || (!nextName && !provider.name)) && nextPrefix === currentPrefix) {
+      modal.close();
+      toast(t("沒有任何變更。"));
+      return;
+    }
+    modal.close();
+    runJob("edit-provider", cli ? { providerId, modelPrefix: nextPrefix } : { providerId, name: nextName, modelPrefix: nextPrefix },
+      { title: t("修改供應商：{name}", { name: cli ? t("Claude 訂閱") : nextName || providerId }) });
+  };
+  showPreview({ renames: [], kept: [], conflicts: [] });
+  update();
 }
 
 // ---- 唯讀查詢：各頁打開時才載入，背景工作完成後重新載入 -----------------------------
@@ -15042,13 +16504,13 @@ function invalidateQueries() {
 function queryPlaceholder(entry, type, text) {
   if (entry.error) {
     return h("div", { class: "empty" }, h("p", { text: entry.error }),
-      h("button", { type: "button", class: "button small", onclick: () => reloadQuery(type) }, "重試"));
+      h("button", { type: "button", class: "button small", onclick: () => reloadQuery(type) }, t("重試")));
   }
-  return h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + (text || "讀取中…"));
+  return h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + (text || t("讀取中…")));
 }
 
 function refreshButton(type, label) {
-  return h("button", { type: "button", class: "icon-button", title: "重新整理", "aria-label": label, onclick: () => reloadQuery(type) }, icon("refresh"));
+  return h("button", { type: "button", class: "icon-button", title: t("重新整理"), "aria-label": label, onclick: () => reloadQuery(type) }, icon("refresh"));
 }
 
 // ---- Claude 訂閱（CLI） --------------------------------------------------------
@@ -15065,41 +16527,47 @@ function claudeCliCard(blocked, count) {
   const entry = ensureQuery("claude-cli");
   const info = entry.data;
   const head = h("div", { class: "head" },
-    h("span", { class: "title", text: "Claude 訂閱", title: "透過 Claude CLI 使用 Claude 訂閱帳號" }), h("span", { class: "chip violet", text: "實驗性" }),
-    h("span", { class: "chip", text: count + " 個模型" }), h("span", { class: "spacer" }), refreshButton("claude-cli", "重新檢查 Claude CLI"));
-  const intro = h("div", { class: "note", text: "使用 Claude Code 登入的訂閱帳號（Pro／Max），不需要 API Key；用量依帳號方案計算。" });
+    h("span", { class: "title", text: t("Claude 訂閱"), title: t("透過 Claude CLI 使用 Claude 訂閱帳號") }), h("span", { class: "chip violet", text: t("實驗性") }),
+    h("span", { class: "chip", text: t("{count} 個模型", { count }) }), h("span", { class: "spacer" }), refreshButton("claude-cli", t("重新檢查 Claude CLI")),
+    h("button", { type: "button", class: "button small", disabled: blocked, title: t("修改模型前綴"),
+      onclick: () => openEditProvider(CLAUDE_CLI_ID) }, icon("edit"), t("修改")));
+  const intro = h("div", { class: "note", text: t("使用 Claude Code 登入的訂閱帳號（Pro／Max），不需要 API Key；用量依帳號方案計算。") });
+  const prefixRow = cardRow(t("模型前綴"), prefixSummary(CLAUDE_CLI_ID, state.claudeCli && state.claudeCli.modelPrefix));
   const button = (label, iconName, onclick, primary = false) =>
     h("button", { type: "button", class: "button small" + (primary ? " primary" : ""), onclick }, icon(iconName), label);
-  const addButton = h("button", { type: "button", class: "button small primary", disabled: blocked,
-    onclick: () => openAddModels(CLAUDE_CLI_ID) }, icon("plus"), "添加模型");
+  // 與其他供應商卡片一致用一般按鈕；藍色主按鈕只留給尚未完成、必須先處理的準備步驟。
+  const addButton = h("button", { type: "button", class: "button small", disabled: blocked,
+    onclick: () => openAddModels(CLAUDE_CLI_ID) }, icon("plus"), t("添加模型"));
   const removeButton = h("button", { type: "button", class: "button small danger", disabled: blocked, onclick: confirmRemoveClaudeCli },
-    icon("trash"), "移除");
+    icon("trash"), t("移除"));
   if (!info) {
     return h("div", { class: "provider-card" }, head, h("div", { class: "body" },
-      entry.error ? h("div", { class: "note warn", text: entry.error }) : h("div", { class: "note" }, h("span", { class: "spinner" }), " 正在檢查 Claude CLI…"),
-      intro), h("div", { class: "foot" }, addButton, removeButton));
+      entry.error ? h("div", { class: "note warn", text: entry.error }) : h("div", { class: "note" }, h("span", { class: "spinner" }), " " + t("正在檢查 Claude CLI…")),
+      prefixRow, intro), h("div", { class: "foot" }, addButton, removeButton));
   }
   const versionChip = info.upToDate
-    ? h("span", { class: "chip green", text: "可用" })
-    : h("span", { class: "chip amber", text: "需要 " + info.minimumVersion + " 以上" });
+    ? h("span", { class: "chip green", text: t("可用") })
+    : h("span", { class: "chip amber", text: t("需要 {version} 以上", { version: info.minimumVersion }) });
   const loginChip = !info.installed ? h("span", { class: "faint", text: "—" })
-    : info.subscription ? h("span", { class: "chip green", text: "已登入訂閱帳號" })
-    : info.loggedIn ? h("span", { class: "chip amber", text: "已登入，但不是訂閱帳號" + (info.authMethod ? "（" + info.authMethod + "）" : "") })
-    : h("span", { class: "chip rose", text: "尚未登入" });
+    : info.subscription ? h("span", { class: "chip green", text: t("已登入訂閱帳號") })
+    : info.loggedIn ? h("span", { class: "chip amber", text: info.authMethod
+      ? t("已登入，但不是訂閱帳號（{method}）", { method: info.authMethod }) : t("已登入，但不是訂閱帳號") })
+    : h("span", { class: "chip rose", text: t("尚未登入") });
   const body = h("div", { class: "body" },
-    cardRow("程式", info.installed ? h("span", { class: "mono", text: info.binary }) : h("span", { class: "chip rose", text: "未安裝" })),
-    info.installed ? cardRow("版本", h("span", { class: "mono", text: (info.version || "未知") + " " }), versionChip) : null,
-    cardRow("登入", loginChip),
-    info.authError ? h("div", { class: "note warn", text: info.authError }) : null,
+    cardRow(t("程式"), info.installed ? h("span", { class: "mono", text: info.binary }) : h("span", { class: "chip rose", text: t("未安裝") })),
+    info.installed ? cardRow(t("版本"), h("span", { class: "mono", text: (info.version || t("未知")) + " " }), versionChip) : null,
+    cardRow(t("登入"), loginChip),
+    prefixRow,
+    info.authError ? h("div", { class: "note warn", text: serverText(info.authError) }) : null,
     intro);
   const ready = info.installed && info.upToDate && info.subscription;
   const actions = [];
-  if (!info.installed) actions.push(button("安裝 Claude CLI", "plus", () => confirmClaudeCliInstall(info), true));
-  else if (!info.upToDate) actions.push(button("更新 Claude CLI", "arrowUp", () => confirmClaudeCliUpdate(info), true));
-  else if (!info.subscription) actions.push(button("登入 Claude", "key", () => confirmClaudeCliLogin(false), true));
+  if (!info.installed) actions.push(button(t("安裝 Claude CLI"), "plus", () => confirmClaudeCliInstall(info), true));
+  else if (!info.upToDate) actions.push(button(t("更新 Claude CLI"), "arrowUp", () => confirmClaudeCliUpdate(info), true));
+  else if (!info.subscription) actions.push(button(t("登入 Claude"), "key", () => confirmClaudeCliLogin(false), true));
   if (ready) actions.push(addButton);
-  if (info.installed && info.upToDate) actions.push(button("更新 CLI", "arrowUp", () => confirmClaudeCliUpdate(info)));
-  if (ready) actions.push(button("重新登入", "key", () => confirmClaudeCliLogin(true)));
+  if (info.installed && info.upToDate) actions.push(button(t("更新 CLI"), "arrowUp", () => confirmClaudeCliUpdate(info)));
+  if (ready) actions.push(button(t("重新登入"), "key", () => confirmClaudeCliLogin(true)));
   actions.push(removeButton);
   return h("div", { class: "provider-card" }, head, body, h("div", { class: "foot" }, actions));
 }
@@ -15110,52 +16578,52 @@ function confirmRemoveClaudeCli() {
   if (models.length === 0) return;
   const includesDefault = state.config && models.some((model) => model.slug === state.config.model);
   confirmDialog({
-    title: "移除 Claude 訂閱（CLI）",
+    title: t("移除 Claude 訂閱（CLI）"),
     danger: true,
-    confirmLabel: "移除",
+    confirmLabel: t("移除"),
     body: [
-      paragraph("會刪除它的 " + models.length + " 個模型："),
+      paragraph(t("會刪除它的 {count} 個模型：", { count: models.length })),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", { text: model.displayName }))),
-      includesDefault ? banner("warn", "alert", "其中包含全域預設模型，移除後會一併清除這個預設，改用官方預設模型。") : null,
-      paragraph("不會登出 Claude，也不會解除安裝 Claude CLI；之後可以從「新增供應商」重新連接。刪除前會自動備份，接著重新啟動路由器。", "note"),
+      includesDefault ? banner("warn", "alert", t("其中包含全域預設模型，移除後會一併清除這個預設，改用官方預設模型。")) : null,
+      paragraph(t("不會登出 Claude，也不會解除安裝 Claude CLI；之後可以從「新增供應商」重新連接。刪除前會自動備份，接著重新啟動路由器。"), "note"),
     ],
   }).then((ok) => {
-    if (ok) runJob("remove-models", { slugs: models.map((model) => model.slug) }, { title: "移除 Claude 訂閱" });
+    if (ok) runJob("remove-models", { slugs: models.map((model) => model.slug) }, { title: t("移除 Claude 訂閱") });
   });
 }
 
 // 以下三個確認框都回傳背景工作的結果（取消時為 null），呼叫端可以在完成後重新檢查狀態。
 function confirmClaudeCliInstall(info) {
   return confirmDialog({
-    title: "安裝 Claude CLI",
-    confirmLabel: "下載並安裝",
+    title: t("安裝 Claude CLI"),
+    confirmLabel: t("下載並安裝"),
     body: [
-      paragraph("會從 " + info.installerUrl + " 下載 Anthropic 官方安裝程式並執行，Claude CLI 會安裝在你的使用者目錄。需要網路，可能要幾分鐘；安裝輸出會顯示在操作記錄裡。"),
-      paragraph("安裝完成後，再按「登入 Claude」連接訂閱帳號。", "note"),
+      paragraph(t("會從 {url} 下載 Anthropic 官方安裝程式並執行，Claude CLI 會安裝在你的使用者目錄。需要網路，可能要幾分鐘；安裝輸出會顯示在操作記錄裡。", { url: info.installerUrl })),
+      paragraph(t("安裝完成後，再按「登入 Claude」連接訂閱帳號。"), "note"),
     ],
-  }).then((ok) => (ok ? runJob("claude-cli-install", {}, { title: "安裝 Claude CLI" }) : null));
+  }).then((ok) => (ok ? runJob("claude-cli-install", {}, { title: t("安裝 Claude CLI") }) : null));
 }
 
 function confirmClaudeCliUpdate(info) {
   return confirmDialog({
-    title: "更新 Claude CLI",
-    confirmLabel: "更新",
+    title: t("更新 Claude CLI"),
+    confirmLabel: t("更新"),
     body: [
-      paragraph("會先備份目前的執行檔，再執行 claude update。目前版本：" + (info.version || "未知") + "；最低需求：" + info.minimumVersion + "。"),
-      paragraph("透過 Homebrew 或 WinGet 安裝的 CLI，請改用原本的套件管理器更新。", "note"),
+      paragraph(t("會先備份目前的執行檔，再執行 claude update。目前版本：{version}；最低需求：{minimum}。", { version: info.version || t("未知"), minimum: info.minimumVersion })),
+      paragraph(t("透過 Homebrew 或 WinGet 安裝的 CLI，請改用原本的套件管理器更新。"), "note"),
     ],
-  }).then((ok) => (ok ? runJob("claude-cli-update", {}, { title: "更新 Claude CLI" }) : null));
+  }).then((ok) => (ok ? runJob("claude-cli-update", {}, { title: t("更新 Claude CLI") }) : null));
 }
 
 function confirmClaudeCliLogin(force) {
   return confirmDialog({
-    title: force ? "重新登入 Claude" : "登入 Claude 訂閱帳號",
-    confirmLabel: "開始登入",
+    title: force ? t("重新登入 Claude") : t("登入 Claude 訂閱帳號"),
+    confirmLabel: t("開始登入"),
     body: [
-      paragraph("會在執行管理頁的終端機視窗啟動 Claude 官方登入流程（claude auth login），瀏覽器會開啟授權頁面；這項操作會等到授權完成，最多 5 分鐘。"),
-      banner("info", "info", "若瀏覽器沒有自動開啟，或畫面要求貼上代碼，請切到開啟管理頁的那個終端機視窗操作。路由器不經手、也不保存登入 token。"),
+      paragraph(t("會在執行管理頁的終端機視窗啟動 Claude 官方登入流程（claude auth login），瀏覽器會開啟授權頁面；這項操作會等到授權完成，最多 5 分鐘。")),
+      banner("info", "info", t("若瀏覽器沒有自動開啟，或畫面要求貼上代碼，請切到開啟管理頁的那個終端機視窗操作。路由器不經手、也不保存登入 token。")),
     ],
-  }).then((ok) => (ok ? runJob("claude-cli-login", { force }, { title: force ? "重新登入 Claude" : "登入 Claude 訂閱帳號" }) : null));
+  }).then((ok) => (ok ? runJob("claude-cli-login", { force }, { title: force ? t("重新登入 Claude") : t("登入 Claude 訂閱帳號") }) : null));
 }
 
 // Claude CLI 的準備狀態：安裝、版本、訂閱登入。第一個沒通過的步驟附上處理按鈕，之後的步驟先灰掉。
@@ -15163,20 +16631,21 @@ function confirmClaudeCliLogin(force) {
 function claudeCliChecklist(info, act) {
   const steps = [
     info.installed
-      ? { ok: true, text: "已安裝 Claude CLI", detail: info.binary, mono: true }
-      : { ok: false, text: "尚未安裝 Claude CLI", detail: "用 Anthropic 官方安裝程式安裝在你的使用者目錄，需要網路。",
-        action: ["安裝 Claude CLI", () => confirmClaudeCliInstall(info)] },
+      ? { ok: true, text: t("已安裝 Claude CLI"), detail: info.binary, mono: true }
+      : { ok: false, text: t("尚未安裝 Claude CLI"), detail: t("用 Anthropic 官方安裝程式安裝在你的使用者目錄，需要網路。"),
+        action: [t("安裝 Claude CLI"), () => confirmClaudeCliInstall(info)] },
     info.upToDate
-      ? { ok: true, text: "版本 " + info.version, detail: "需要 " + info.minimumVersion + " 以上" }
-      : { ok: false, text: !info.installed ? "版本需要 " + info.minimumVersion + " 以上"
-          : info.version ? "版本 " + info.version + " 太舊" : "無法確認 Claude CLI 版本",
-        detail: "需要 " + info.minimumVersion + " 以上；更新前會先備份目前的執行檔。",
-        action: ["更新 Claude CLI", () => confirmClaudeCliUpdate(info)] },
+      ? { ok: true, text: t("版本 {version}", { version: info.version }), detail: t("需要 {version} 以上", { version: info.minimumVersion }) }
+      : { ok: false, text: !info.installed ? t("版本需要 {version} 以上", { version: info.minimumVersion })
+          : info.version ? t("版本 {version} 太舊", { version: info.version }) : t("無法確認 Claude CLI 版本"),
+        detail: t("需要 {version} 以上；更新前會先備份目前的執行檔。", { version: info.minimumVersion }),
+        action: [t("更新 Claude CLI"), () => confirmClaudeCliUpdate(info)] },
     info.subscription
-      ? { ok: true, text: "已登入 Claude 訂閱帳號" }
-      : { ok: false, text: info.loggedIn ? "目前登入的不是訂閱帳號" + (info.authMethod ? "（" + info.authMethod + "）" : "") : "尚未登入 Claude 訂閱帳號",
-        detail: info.authError || "使用 Claude 官方登入流程，在瀏覽器完成授權；路由器不保存登入 token。",
-        action: ["登入 Claude", () => confirmClaudeCliLogin(false)] },
+      ? { ok: true, text: t("已登入 Claude 訂閱帳號") }
+      : { ok: false, text: !info.loggedIn ? t("尚未登入 Claude 訂閱帳號")
+          : info.authMethod ? t("目前登入的不是訂閱帳號（{method}）", { method: info.authMethod }) : t("目前登入的不是訂閱帳號"),
+        detail: serverText(info.authError) || t("使用 Claude 官方登入流程，在瀏覽器完成授權；路由器不保存登入 token。"),
+        action: [t("登入 Claude"), () => confirmClaudeCliLogin(false)] },
   ];
   let failed = false;
   return h("div", { class: "checklist" }, steps.map((step, index) => {
@@ -15194,15 +16663,15 @@ function claudeCliChecklist(info, act) {
 // 已登入訂閱帳號，缺少的步驟可以直接在這裡處理；三項都通過才讀模型清單（讀清單不會送出推理請求）。
 function claudeCliChooser({ onChange }) {
   const picker = modelPicker({ onChange, allowConfigured: true, idPattern: CLAUDE_CLI_MODEL_PATTERN,
-    manualPlaceholder: "例如 claude-opus-5-5，可用逗號分隔" });
+    manualPlaceholder: t("例如 claude-opus-5-5，可用逗號分隔") });
   const limits = limitFields({
     context: 1000000, output: NEW_MODEL_DEFAULTS.maxOutputTokens, maxContext: 1000000,
-    contextHint: "Claude CLI 無法探測上下文，直接使用這個值（最多 1,000,000）。",
-    outputHint: "以 CLAUDE_CODE_MAX_OUTPUT_TOKENS 傳給 Claude CLI；超過模型上限時，CLI 會自動壓到上限。",
+    contextHint: t("Claude CLI 無法探測上下文，直接使用這個值（最多 1,000,000）。"),
+    outputHint: t("以 CLAUDE_CODE_MAX_OUTPUT_TOKENS 傳給 Claude CLI；超過模型上限時，CLI 會自動壓到上限。"),
   });
   const host = h("div", { class: "stack" });
   const element = h("div", { class: "stack" },
-    paragraph("透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算（實驗性）。", "muted"),
+    paragraph(t("透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算（實驗性）。"), "muted"),
     host);
   let phase = "idle";
   let request = 0;
@@ -15210,7 +16679,7 @@ function claudeCliChooser({ onChange }) {
   async function load() {
     const current = ++request;
     phase = "loading";
-    host.replaceChildren(h("div", { class: "empty" }, h("span", { class: "spinner" }), " 正在檢查 Claude CLI…"));
+    host.replaceChildren(h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("正在檢查 Claude CLI…")));
     onChange();
     let info;
     try {
@@ -15218,37 +16687,37 @@ function claudeCliChooser({ onChange }) {
     } catch (error) {
       if (current !== request) return;
       phase = "error";
-      host.replaceChildren(h("div", { class: "empty" }, h("p", { text: "無法檢查 Claude CLI：" + error.message }),
-        h("button", { type: "button", class: "button small", onclick: () => load() }, "重試")));
+      host.replaceChildren(h("div", { class: "empty" }, h("p", { text: t("無法檢查 Claude CLI：{reason}", { reason: error.message }) }),
+        h("button", { type: "button", class: "button small", onclick: () => load() }, t("重試"))));
       onChange();
       return;
     }
     if (current !== request) return;
     if (!(info.installed && info.upToDate && info.subscription)) {
       phase = "blocked";
-      host.replaceChildren(paragraph("添加模型前需要先完成以下準備：", "note"),
+      host.replaceChildren(paragraph(t("添加模型前需要先完成以下準備："), "note"),
         claudeCliChecklist(info, (run) => run().then((view) => { if (view) load(); })));
       onChange();
       return;
     }
     phase = "ready";
     const source = h("div", { class: "note" });
-    host.replaceChildren(h("div", { class: "result-ok" }, icon("check"), "Claude CLI " + info.version + "，已登入 Claude 訂閱帳號"),
+    host.replaceChildren(h("div", { class: "result-ok" }, icon("check"), t("Claude CLI {version}，已登入 Claude 訂閱帳號", { version: info.version })),
       source, picker.element);
-    picker.setLoading("正在讀取 Claude CLI 的模型清單（不會送出推理請求）…");
+    picker.setLoading(t("正在讀取 Claude CLI 的模型清單（不會送出推理請求）…"));
     onChange();
     try {
       const data = await api("/api/query", { method: "POST", body: { type: "claude-cli-models" } });
       if (current !== request) return;
       source.textContent = (data.fromCli
-        ? "清單來自 Claude CLI，未列出的模型可以直接輸入完整 ID；不保證每個模型都有可用額度。"
-        : "CLI 沒有提供可辨識的清單，以下是內建候選，尚未驗證帳號權限。") + (data.warning ? " " + data.warning : "");
+        ? t("清單來自 Claude CLI，未列出的模型可以直接輸入完整 ID；不保證每個模型都有可用額度。")
+        : t("CLI 沒有提供可辨識的清單，以下是內建候選，尚未驗證帳號權限。")) + (data.warning ? " " + serverText(data.warning) : "");
       picker.setModels(data.choices.map((choice) => ({
-        id: choice.id, label: choice.label, configured: choice.configured,
-        note: choice.source === "configured" ? "既有設定，CLI 這次沒有列出" : null,
+        id: choice.id, label: claudeChoiceLabel(choice), configured: choice.configured,
+        note: choice.source === "configured" ? t("既有設定，CLI 這次沒有列出") : null,
       })));
     } catch (error) {
-      if (current === request) picker.setError("讀取失敗：" + error.message);
+      if (current === request) picker.setError(t("讀取失敗：{reason}", { reason: error.message }));
     }
   }
   return {
@@ -15262,45 +16731,54 @@ function claudeCliChooser({ onChange }) {
   };
 }
 
+// 內建候選的說明由安裝器提供（中文）；CLI 自己列出的說明是英文，照原樣顯示。
+function claudeChoiceLabel(choice) {
+  if (choice.source !== "fallback") return choice.label;
+  const alias = { sonnet: "Sonnet", haiku: "Haiku", fable: "Fable" }[choice.id];
+  return alias ? t("{model}（CLI 別名，測試後確認完整版本）", { model: alias }) : choice.label;
+}
+
 // Claude 訂閱的確認步驟：列出要測試的模型與上下文、輸出設定，提醒會使用訂閱用量。
 function showClaudeCliConfirm(modal, chooser, back) {
   const invalid = chooser.invalidManual();
   if (invalid.length) {
-    toast("模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：" + invalid.join("、"), "error");
+    toast(t("模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：{models}", { models: joinList(invalid) }), "error");
     return;
   }
   const models = chooser.selection();
   if (models.length === 0) return;
   if (models.length > 10) {
-    toast("一次最多測試 10 個模型。", "error");
+    toast(t("一次最多測試 10 個模型。"), "error");
     return;
   }
   modal.setBody(
-    paragraph("將用 Claude 訂閱帳號測試以下 " + models.length + " 個模型："),
+    paragraph(t("將用 Claude 訂閱帳號測試以下 {count} 個模型：", { count: models.length })),
     h("ul", { class: "plain-list" }, models.map((model) => h("li", { class: "mono", text: model }))),
     chooser.limits.nodes,
     globalContextBanner(),
-    banner("warn", "alert", "每個模型會發送一次短測試並使用訂閱用量；只有通過的會添加，並固定使用回應中的完整模型版本。完成後會重新啟動路由器，進行中的對話會短暫重新連線。"));
+    banner("warn", "alert", t("每個模型會發送一次短測試並使用訂閱用量；只有通過的會添加，並固定使用回應中的完整模型版本。完成後會重新啟動路由器，進行中的對話會短暫重新連線。")));
   modal.setFoot(h("span", { class: "grow" }),
-    h("button", { type: "button", class: "button", text: "上一步", onclick: back }),
-    h("button", { type: "button", class: "button primary", text: "開始測試並添加", onclick: () => {
+    h("button", { type: "button", class: "button", text: t("上一步"), onclick: back }),
+    h("button", { type: "button", class: "button primary", text: t("開始測試並添加"), onclick: () => {
       const result = chooser.limits.read();
       if (result.error) { toast(result.error, "error"); return; }
       modal.close();
       runJob("claude-cli-add", { models, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens },
-        { title: "添加 Claude 訂閱模型" });
+        { title: t("添加 Claude 訂閱模型") });
     } }));
 }
 
 // ---- 生圖 ----------------------------------------------------------------------
 
-const API_MODE_LABELS = { images: "通用 Images API", "ark-task": "Ark 任務介面" };
+function apiModeLabel(mode) {
+  return { images: t("通用 Images API"), "ark-task": t("Ark 任務介面") }[mode] || mode;
+}
 
 function renderImagegen() {
   const blocked = writeBlocked();
   const entry = ensureQuery("imagegen");
-  const head = pageHead("中轉 API 生圖", "用中轉供應商的圖片 API 生成或編輯圖片，適合免費帳號或內建生圖不可用的時候。Codex 裡以 $router-imagegen 技能使用，沿用路由器保存的憑證。",
-    refreshButton("imagegen", "重新整理生圖狀態"));
+  const head = pageHead(t("中轉 API 生圖"), t("用中轉供應商的圖片 API 生成或編輯圖片，適合免費帳號或內建生圖不可用的時候。Codex 裡以 $router-imagegen 技能使用，沿用路由器保存的憑證。"),
+    refreshButton("imagegen", t("重新整理生圖狀態")));
   if (!entry.data) return [head, h("div", { class: "panel" }, queryPlaceholder(entry, "imagegen"))];
   const info = entry.data;
   const providers = state.providers || [];
@@ -15313,23 +16791,23 @@ function renderImagegen() {
   }
   const labels = new Map(info.choices.map((choice) => [choice.id, choice.label]));
   const parts = [head];
-  if (info.error) parts.push(banner("error", "alert", info.error));
+  if (info.error) parts.push(banner("error", "alert", serverText(info.error)));
 
-  const statusPanel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: "目前狀態" }),
-    info.enabled ? h("button", { type: "button", class: "button small danger", disabled: blocked, onclick: confirmDisableImagegen }, "停用") : null));
+  const statusPanel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("目前狀態") }),
+    info.enabled ? h("button", { type: "button", class: "button small danger", disabled: blocked, onclick: confirmDisableImagegen }, t("停用")) : null));
   if (info.enabled) {
     statusPanel.append(h("div", { class: "panel-body" }, h("dl", { class: "kv" },
-      h("dt", { text: "狀態" }), h("dd", {}, h("span", { class: "chip green", text: "已啟用" })),
-      h("dt", { text: "模型" }), h("dd", {}, info.models.map((model) => {
+      h("dt", { text: t("狀態") }), h("dd", {}, h("span", { class: "chip green", text: t("已啟用") })),
+      h("dt", { text: sectionTitle("模型") }), h("dd", {}, info.models.map((model) => {
         const upstream = info.upstreamModels[model];
         return h("div", {}, h("span", { text: labels.get(model) || model }), h("span", { class: "faint mono", text: "  " + (upstream || model) }));
       })),
-      h("dt", { text: "供應商" }), h("dd", { text: info.providerId || "—" }),
-      h("dt", { text: "介面" }), h("dd", { text: API_MODE_LABELS[info.apiMode] || info.apiMode || "—" }),
-      h("dt", { text: "技能位置" }), h("dd", { class: "mono", text: info.root }),
-      h("dt", { text: "使用方式" }), h("dd", { text: "在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。" }))));
+      h("dt", { text: t("供應商") }), h("dd", { text: info.providerId ? providerLabel(info.providerId) : "—" }),
+      h("dt", { text: t("介面") }), h("dd", { text: info.apiMode ? apiModeLabel(info.apiMode) : "—" }),
+      h("dt", { text: t("技能位置") }), h("dd", { class: "mono", text: info.root }),
+      h("dt", { text: t("使用方式") }), h("dd", { text: t("在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。") }))));
   } else {
-    statusPanel.append(h("div", { class: "panel-body" }, paragraph("尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。", "muted")));
+    statusPanel.append(h("div", { class: "panel-body" }, paragraph(t("尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。"), "muted")));
   }
   parts.push(statusPanel);
 
@@ -15342,34 +16820,34 @@ function renderImagegen() {
     });
     return h("label", { class: "check-row option-row" }, box, h("div", { class: "pick-text" },
       h("div", { class: "model-name" }, h("span", { text: choice.label }), h("span", { class: "faint mono", text: choice.id }),
-        info.enabled && info.models.includes(choice.id) ? h("span", { class: "chip green", text: "已啟用" }) : null),
-      h("div", { class: "note", text: choice.description })));
+        info.enabled && info.models.includes(choice.id) ? h("span", { class: "chip green", text: t("已啟用") }) : null),
+      h("div", { class: "note", text: serverText(choice.description) })));
   });
-  const providerField = providers.length > 1 ? h("label", { class: "field" }, h("span", { text: "用哪一家供應商生圖" }),
+  const providerField = providers.length > 1 ? h("label", { class: "field" }, h("span", { text: t("用哪一家供應商生圖") }),
     h("select", { disabled: blocked, onchange: (event) => { imagegenDraft.providerId = event.target.value; } },
-      providers.map((provider) => h("option", { value: provider.id, selected: provider.id === imagegenDraft.providerId, text: provider.id + "（" + hostOf(provider.baseUrl) + "）" })))) : null;
+      providers.map((provider) => h("option", { value: provider.id, selected: provider.id === imagegenDraft.providerId, text: providerOption(provider) })))) : null;
   parts.push(h("div", { class: "panel" },
-    h("div", { class: "panel-head" }, h("h2", { text: info.enabled ? "重新偵測" : "偵測並啟用" })),
+    h("div", { class: "panel-head" }, h("h2", { text: info.enabled ? t("重新偵測") : t("偵測並啟用") })),
     h("div", { class: "panel-body stack" },
-      paragraph("多選時由 AI 依需求挑選：一般生圖與快速迭代偏好 Flare，精細改圖與保留原圖細節偏好 Sunburst；Image 2 給指定或相容需求使用。", "muted"),
+      paragraph(t("多選時由 AI 依需求挑選：一般生圖與快速迭代偏好 Flare，精細改圖與保留原圖細節偏好 Sunburst；Image 2 給指定或相容需求使用。"), "muted"),
       h("div", { class: "check-list" }, options),
       providerField,
-      banner("warn", "alert", "偵測會實際生圖並依供應商計費：每個勾選的模型先用通用介面各生成一張低品質圖；全部失敗時，再用 Ark 任務介面各試一次。只有通過的模型會啟用，沒有通過時既有設定保持不變。"),
+      banner("warn", "alert", t("偵測會實際生圖並依供應商計費：每個勾選的模型先用通用介面各生成一張低品質圖；全部失敗時，再用 Ark 任務介面各試一次。只有通過的模型會啟用，沒有通過時既有設定保持不變。")),
       h("div", { class: "actions end" },
         h("button", { type: "button", class: "button primary", disabled: blocked || imagegenDraft.models.size === 0, onclick: () => confirmImagegenSetup(info) },
-          icon("image"), info.enabled ? "重新偵測並套用" : "偵測並啟用")))));
+          icon("image"), info.enabled ? t("重新偵測並套用") : t("偵測並啟用"))))));
 
   if (info.lastCheck && info.lastCheck.checks.length) {
     parts.push(h("div", { class: "panel" },
-      h("div", { class: "panel-head" }, h("h2", { text: "最近一次偵測" }), h("span", { class: "note", text: formatTime(info.lastCheck.checkedAt) })),
+      h("div", { class: "panel-head" }, h("h2", { text: t("最近一次偵測") }), h("span", { class: "note", text: formatTime(info.lastCheck.checkedAt) })),
       h("div", { class: "table-wrap" }, h("table", {},
-        h("thead", {}, h("tr", {}, h("th", { text: "介面" }), h("th", { text: "模型" }), h("th", { text: "結果" }))),
+        h("thead", {}, h("tr", {}, h("th", { text: t("介面") }), h("th", { text: t("模型") }), h("th", { text: t("結果") }))),
         h("tbody", {}, info.lastCheck.checks.map((check) => h("tr", {},
-          h("td", { class: "nowrap", text: API_MODE_LABELS[check.apiMode] || check.apiMode }),
+          h("td", { class: "nowrap", text: apiModeLabel(check.apiMode) }),
           h("td", { class: "mono", text: check.model }),
           h("td", {}, check.ok
-            ? h("span", { class: "result-ok" }, icon("check"), "通過")
-            : h("span", { class: "result-bad" }, icon("alert"), check.error || "未通過")))))))));
+            ? h("span", { class: "result-ok" }, icon("check"), t("通過"))
+            : h("span", { class: "result-bad" }, icon("alert"), serverText(check.error) || t("未通過"))))))))));
   }
   return parts;
 }
@@ -15378,25 +16856,25 @@ function confirmImagegenSetup(info) {
   const chosen = info.choices.filter((choice) => imagegenDraft.models.has(choice.id));
   const providerId = imagegenDraft.providerId;
   confirmDialog({
-    title: "偵測並啟用中轉生圖",
-    confirmLabel: "開始偵測",
+    title: t("偵測並啟用中轉生圖"),
+    confirmLabel: t("開始偵測"),
     body: [
-      paragraph("將用「" + (providerId || "主要供應商") + "」實際生圖測試以下 " + chosen.length + " 個模型："),
+      paragraph(t("將用「{provider}」實際生圖測試以下 {count} 個模型：", { provider: providerId ? providerLabel(providerId) : t("主要供應商"), count: chosen.length })),
       h("ul", { class: "plain-list" }, chosen.map((choice) => h("li", {}, choice.label, h("span", { class: "faint mono", text: "  " + choice.id })))),
-      banner("warn", "alert", "會依供應商計費：通用介面每個模型一張低品質圖，全部失敗時 Ark 介面再各一張。生成失敗不會自動重送。"),
+      banner("warn", "alert", t("會依供應商計費：通用介面每個模型一張低品質圖，全部失敗時 Ark 介面再各一張。生成失敗不會自動重送。")),
     ],
   }).then((ok) => {
-    if (ok) runJob("imagegen-setup", { providerId, models: chosen.map((choice) => choice.id) }, { title: "偵測並啟用中轉生圖" });
+    if (ok) runJob("imagegen-setup", { providerId, models: chosen.map((choice) => choice.id) }, { title: t("偵測並啟用中轉生圖") });
   });
 }
 
 function confirmDisableImagegen() {
   confirmDialog({
-    title: "停用中轉 API 生圖",
+    title: t("停用中轉 API 生圖"),
     danger: true,
-    confirmLabel: "停用",
-    body: paragraph("會把 $router-imagegen 技能封存到備份目錄，Codex 之後就不會再使用它；之後可以隨時重新偵測並啟用。"),
-  }).then((ok) => { if (ok) runJob("imagegen-disable", {}, { title: "停用中轉生圖" }); });
+    confirmLabel: t("停用"),
+    body: paragraph(t("會把 $router-imagegen 技能封存到備份目錄，Codex 之後就不會再使用它；之後可以隨時重新偵測並啟用。")),
+  }).then((ok) => { if (ok) runJob("imagegen-disable", {}, { title: t("停用中轉生圖") }); });
 }
 
 // ---- 設定：全域上下文、隱藏的官方模型 --------------------------------------------
@@ -15404,7 +16882,7 @@ function confirmDisableImagegen() {
 function renderSettings() {
   const blocked = writeBlocked();
   return [
-    pageHead("設定", "影響所有模型的 Codex 設定。"),
+    pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
   ];
@@ -15412,22 +16890,22 @@ function renderSettings() {
 
 function renderGlobalContextPanel(blocked) {
   const entry = ensureQuery("global-context");
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: "全域上下文" }),
-    refreshButton("global-context", "重新整理全域上下文")));
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("全域上下文") }),
+    refreshButton("global-context", t("重新整理全域上下文"))));
   if (!entry.data) {
     panel.append(queryPlaceholder(entry, "global-context"));
     return panel;
   }
   const value = entry.data.value;
   panel.append(h("div", { class: "panel-body setting-body" },
-    h("div", { class: "setting-value", text: value ? formatNumber(value) + " tokens" : "未設定" }),
+    h("div", { class: "setting-value", text: value ? t("{value} tokens", { value: formatNumber(value) }) : t("未設定") }),
     paragraph(value
-      ? "Codex 的 model_context_window 已設定，會覆蓋所有模型（官方與自訂）自己的上下文；Codex 用到約 95% 時會自動壓縮。"
-      : "目前沒有全域設定，每個模型使用自己的上下文（模型頁可以個別修改）。", "muted"),
+      ? t("Codex 的 model_context_window 已設定，會覆蓋所有模型（官方與自訂）自己的上下文；Codex 用到約 95% 時會自動壓縮。")
+      : t("目前沒有全域設定，每個模型使用自己的上下文（模型頁可以個別修改）。"), "muted"),
     h("div", { class: "note mono", text: entry.data.filePath || "" }),
     h("div", { class: "actions" },
-      h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openGlobalContext(value) }, icon("edit"), value ? "修改" : "設定"),
-      value ? h("button", { type: "button", class: "button danger", disabled: blocked, onclick: confirmClearGlobalContext }, "移除全域設定") : null)));
+      h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openGlobalContext(value) }, icon("edit"), value ? t("修改") : t("設定")),
+      value ? h("button", { type: "button", class: "button danger", disabled: blocked, onclick: confirmClearGlobalContext }, t("移除全域設定")) : null)));
   return panel;
 }
 
@@ -15436,41 +16914,40 @@ function openGlobalContext(current) {
     value: String(current || NEW_MODEL_DEFAULTS.contextWindow) });
   const presets = h("div", { class: "presets" }, [200000, 272000, 400000, 1000000].map((value) =>
     h("button", { type: "button", class: "button small", text: formatTokens(value), onclick: () => { input.value = String(value); } })));
-  const desktopName = (state.desktop && state.desktop.name) || "桌面版";
-  const modal = openModal({ title: "全域上下文", body: [
-    h("label", { class: "field" }, h("span", { text: "model_context_window（tokens）" }), input, presets,
-      h("span", { class: "hint", text: "範圍 16,000～4,000,000，對所有模型生效。上游實際支援的上下文較小時，對話可能在自動壓縮前就被上游拒絕。" })),
-    paragraph("修改前會自動備份；不需要重新啟動路由器，重新啟動 " + desktopName + " 後生效。", "note"),
+  const modal = openModal({ title: t("全域上下文"), body: [
+    h("label", { class: "field" }, h("span", { text: t("model_context_window（tokens）") }), input, presets,
+      h("span", { class: "hint", text: t("範圍 16,000～4,000,000，對所有模型生效。上游實際支援的上下文較小時，對話可能在自動壓縮前就被上游拒絕。") })),
+    paragraph(t("修改前會自動備份；不需要重新啟動路由器，重新啟動 {app} 後生效。", { app: desktopName() }), "note"),
   ] });
   modal.setFoot(h("span", { class: "grow" }),
-    h("button", { type: "button", class: "button", text: "取消", onclick: () => modal.close() }),
-    h("button", { type: "button", class: "button primary", text: "儲存", onclick: () => {
+    h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }),
+    h("button", { type: "button", class: "button primary", text: t("儲存"), onclick: () => {
       const value = Number(input.value.trim());
       if (!Number.isInteger(value) || value < TOKEN_LIMITS.minContext || value > TOKEN_LIMITS.maxContext) {
-        toast("全域上下文必須是 16,000～4,000,000 之間的整數。", "error");
+        toast(t("全域上下文必須是 16,000～4,000,000 之間的整數。"), "error");
         return;
       }
       modal.close();
-      if (value === current) { toast("沒有任何變更。"); return; }
-      runJob("set-global-context", { value }, { title: "設定全域上下文" });
+      if (value === current) { toast(t("沒有任何變更。")); return; }
+      runJob("set-global-context", { value }, { title: t("設定全域上下文") });
     } }));
 }
 
 function confirmClearGlobalContext() {
   confirmDialog({
-    title: "移除全域上下文",
+    title: t("移除全域上下文"),
     danger: true,
-    confirmLabel: "移除",
-    body: paragraph("移除後每個模型改用自己的上下文：官方模型使用 Codex 內建值，自訂模型使用模型頁的設定。修改前會自動備份。"),
-  }).then((ok) => { if (ok) runJob("set-global-context", { value: null }, { title: "移除全域上下文" }); });
+    confirmLabel: t("移除"),
+    body: paragraph(t("移除後每個模型改用自己的上下文：官方模型使用 Codex 內建值，自訂模型使用模型頁的設定。修改前會自動備份。")),
+  }).then((ok) => { if (ok) runJob("set-global-context", { value: null }, { title: t("移除全域上下文") }); });
 }
 
 function renderHiddenModelsPanel(blocked) {
   const entry = ensureQuery("hidden-models");
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: "隱藏的官方模型" }),
-    refreshButton("hidden-models", "重新整理隱藏的官方模型")));
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("隱藏的官方模型") }),
+    refreshButton("hidden-models", t("重新整理隱藏的官方模型"))));
   if (!entry.data) {
-    panel.append(queryPlaceholder(entry, "hidden-models", "正在讀取 Codex 內建模型目錄…"));
+    panel.append(queryPlaceholder(entry, "hidden-models", t("正在讀取 Codex 內建模型目錄…")));
     return panel;
   }
   const models = entry.data.models || [];
@@ -15478,9 +16955,9 @@ function renderHiddenModelsPanel(blocked) {
   if (!hiddenDraft) hiddenDraft = new Set(saved);
   const dirty = models.some((model) => hiddenDraft.has(model.slug) !== saved.has(model.slug));
   const body = h("div", { class: "panel-body stack" },
-    paragraph("Codex 內建目錄把下列模型標成隱藏，預設不會出現在選擇器。能不能用由帳號權限決定：強制顯示後若帳號沒有權限，選用時會失敗，取消勾選即可恢復。", "muted"));
+    paragraph(t("Codex 內建目錄把下列模型標成隱藏，預設不會出現在選擇器。能不能用由帳號權限決定：強制顯示後若帳號沒有權限，選用時會失敗，取消勾選即可恢復。"), "muted"));
   if (models.length === 0) {
-    body.append(h("div", { class: "empty", text: "Codex 內建目錄目前沒有隱藏的官方模型。" }));
+    body.append(h("div", { class: "empty", text: t("Codex 內建目錄目前沒有隱藏的官方模型。") }));
   } else {
     body.append(h("div", { class: "check-list" }, models.map((model) => {
       const box = h("input", { type: "checkbox", checked: hiddenDraft.has(model.slug), disabled: blocked });
@@ -15491,16 +16968,16 @@ function renderHiddenModelsPanel(blocked) {
       });
       return h("label", { class: "check-row option-row" }, box, h("div", { class: "pick-text" },
         h("div", { class: "model-name" }, h("span", { text: model.displayName }), h("span", { class: "faint mono", text: model.slug }),
-          saved.has(model.slug) ? h("span", { class: "chip green", text: "目前強制顯示" }) : null),
+          saved.has(model.slug) ? h("span", { class: "chip green", text: t("目前強制顯示") }) : null),
         model.description ? h("div", { class: "note", text: model.description }) : null));
     })));
     body.append(h("div", { class: "actions end" },
-      h("span", { class: "note", text: "儲存會重新啟動路由器，並以 Codex 實際讀到的目錄驗證；失敗會自動還原。" }),
-      dirty ? h("button", { type: "button", class: "button", onclick: () => { hiddenDraft = null; renderView(); } }, "還原") : null,
+      h("span", { class: "note", text: t("儲存會重新啟動路由器，並以 Codex 實際讀到的目錄驗證；失敗會自動還原。") }),
+      dirty ? h("button", { type: "button", class: "button", onclick: () => { hiddenDraft = null; renderView(); } }, t("還原")) : null,
       h("button", { type: "button", class: "button primary", disabled: blocked || !dirty, onclick: () => {
         runJob("set-hidden-models", { slugs: models.filter((model) => hiddenDraft.has(model.slug)).map((model) => model.slug) },
-          { title: "設定隱藏的官方模型" });
-      } }, "儲存")));
+          { title: t("設定隱藏的官方模型") });
+      } }, t("儲存"))));
   }
   panel.append(body);
   return panel;
@@ -15518,7 +16995,7 @@ function openModal(options) {
   const { title, wide, dismissable = true, onClose } = options;
   const body = h("div", { class: "modal-body" });
   const foot = h("div", { class: "modal-foot" });
-  const closeButton = h("button", { type: "button", class: "icon-button", "aria-label": "關閉", onclick: () => close() }, icon("close"));
+  const closeButton = h("button", { type: "button", class: "icon-button", "aria-label": t("關閉"), onclick: () => close() }, icon("close"));
   const titleNode = h("h3", { text: title });
   const modal = h("div", { class: "modal" + (wide ? " wide" : ""), role: "dialog", "aria-modal": "true" },
     h("div", { class: "modal-head" }, titleNode, closeButton), body, foot);
@@ -15554,7 +17031,7 @@ function openModal(options) {
   return handle;
 }
 
-function confirmDialog({ title, body, confirmLabel = "確定", danger = false, extra }) {
+function confirmDialog({ title, body, confirmLabel = t("確定"), danger = false, extra }) {
   return new Promise((resolve) => {
     let answered = false;
     const modal = openModal({
@@ -15563,13 +17040,27 @@ function confirmDialog({ title, body, confirmLabel = "確定", danger = false, e
       onClose: () => { if (!answered) resolve(false); },
     });
     modal.setFoot(
-      h("button", { type: "button", class: "button", text: "取消", onclick: () => modal.close() }),
+      h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }),
       h("button", { type: "button", class: "button " + (danger ? "danger" : "primary"), text: confirmLabel, onclick: () => { answered = true; modal.close(); resolve(true); } }));
   });
 }
 
 function paragraph(text, className) {
   return h("p", { class: className || null, text });
+}
+
+// 工作名稱依類型顯示；伺服器記錄的名稱是中文，交接後恢復記錄視窗時也用這裡的翻譯。
+function jobTitle(type, fallback) {
+  const titles = {
+    "repair-models": t("同步與修復模型清單"), "add-models": t("添加模型"), "remove-models": t("刪除模型"),
+    "reorder-models": t("調整模型順序"), "edit-model": t("修改模型"), "add-provider": t("新增供應商"),
+    "edit-provider": t("修改供應商"), "remove-provider": t("移除供應商"), "replace-key": t("更換 API Key"),
+    "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
+    "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
+    "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
+    "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
+  };
+  return titles[type] || serverText(fallback) || type;
 }
 
 // 背景工作：開一個記錄視窗輪詢輸出，結束後依結果提示重新啟動或重新整理。
@@ -15585,17 +17076,19 @@ async function runJob(type, params, { title } = {}) {
 }
 
 function watchJob(job, title) {
-  try { sessionStorage.setItem(JOB_KEY, JSON.stringify({ id: job.id, title: title || job.title })); } catch { /* 僅影響重新整理後的記錄視窗 */ }
+  try { sessionStorage.setItem(JOB_KEY, JSON.stringify({ id: job.id, type: job.type, title: title || job.title })); } catch { /* 僅影響重新整理後的記錄視窗 */ }
   return new Promise((resolve) => {
     const log = h("pre", { class: "log", "aria-live": "polite" });
-    const status = h("div", { class: "grow" }, h("span", { class: "spinner" }), "進行中，請稍候…");
-    const closeButton = h("button", { type: "button", class: "button", text: "請稍候", disabled: true });
-    const modal = openModal({ title: title || job.title, wide: true, dismissable: false, body: [log], foot: [status, closeButton] });
+    const status = h("div", { class: "grow" }, h("span", { class: "spinner" }), t("進行中，請稍候…"));
+    const closeButton = h("button", { type: "button", class: "button", text: t("請稍候"), disabled: true });
+    // 操作記錄是安裝器的終端輸出，目前只有中文；英文介面先說明，免得以為是顯示錯誤。
+    const logNote = locale === "en" ? paragraph(t("操作記錄由安裝器產生，目前以中文顯示。"), "note") : null;
+    const modal = openModal({ title: title || jobTitle(job.type, job.title), wide: true, dismissable: false, body: [logNote, log], foot: [status, closeButton] });
     let offset = 0;
     const append = (text) => {
       if (!text) return;
       const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
-      log.append(document.createTextNode(text));
+      log.append(document.createTextNode(logText(text)));
       if (atBottom) log.scrollTop = log.scrollHeight;
     };
     append(job.output);
@@ -15623,14 +17116,14 @@ function watchJob(job, title) {
     const finish = (view) => {
       const ok = view.status === "succeeded";
       status.replaceChildren(ok
-        ? h("span", { class: "result-ok" }, icon("check"), "完成")
-        : h("span", { class: "result-bad" }, icon("alert"), view.error || "失敗"));
+        ? h("span", { class: "result-ok" }, icon("check"), t("完成"))
+        : h("span", { class: "result-bad" }, icon("alert"), serverText(view.error) || t("失敗")));
       const result = view.result || {};
       if (ok && result.restartDesktop) pendingDesktopRestart = true;
       if (ok && result.desktopRestarted) pendingDesktopRestart = false;
-      if (result.desktopError || result.managerError) append("\n注意：" + (result.desktopError || result.managerError) + "\n");
+      if (result.desktopError || result.managerError) append("\n" + t("注意：{message}", { message: serverText(result.desktopError || result.managerError) }) + "\n");
       closeButton.disabled = false;
-      closeButton.textContent = "關閉";
+      closeButton.textContent = t("關閉");
       closeButton.className = "button" + (ok ? " primary" : "");
       modal.setDismissable(true);
       closeButton.onclick = () => modal.close();
@@ -15661,11 +17154,11 @@ async function restartManager({ alreadyRequested = false } = {}) {
   if (restartingManager) return;
   restartingManager = true;
   const previousInstance = managerInstance;
-  const { message } = showOverlay("更新完成，正在以新版本重新啟動管理頁…");
+  const { message } = showOverlay(t("更新完成，正在以新版本重新啟動管理頁…"));
   try {
     if (!alreadyRequested) await api("/api/restart", { method: "POST" });
   } catch (error) {
-    message.textContent = "無法自動重新啟動管理頁：" + error.message + "。請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。";
+    message.textContent = t("無法自動重新啟動管理頁：{reason}。請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。", { reason: error.message });
     return;
   }
   const started = Date.now();
@@ -15679,8 +17172,8 @@ async function restartManager({ alreadyRequested = false } = {}) {
       }
     } catch { /* 交接期間短暫無法連線，下次再試 */ }
     if (Date.now() - started > 120000) {
-      message.textContent = "管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。";
-      message.parentNode.append(h("button", { type: "button", class: "button", text: "重新整理", onclick: () => location.reload() }));
+      message.textContent = t("管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。");
+      message.parentNode.append(h("button", { type: "button", class: "button", text: t("重新整理"), onclick: () => location.reload() }));
       return;
     }
     setTimeout(tick, 1000);
@@ -15692,15 +17185,15 @@ async function restartManager({ alreadyRequested = false } = {}) {
 
 // allowConfigured：已添加的模型也能再選（Claude CLI 可重新設定）；idPattern：手動輸入的格式。
 function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_PATTERN,
-  manualPlaceholder = "清單沒有列出的模型 ID，可用逗號分隔" } = {}) {
+  manualPlaceholder = t("清單沒有列出的模型 ID，可用逗號分隔") } = {}) {
   let models = [];
   let filter = "";
   const chosen = new Set();
   const locked = (model) => model.configured && !allowConfigured;
   const list = h("div", { class: "check-list" });
-  const search = h("input", { type: "search", placeholder: "搜尋模型 ID", "aria-label": "搜尋模型", oninput: (event) => { filter = event.target.value.trim().toLowerCase(); draw(); } });
+  const search = h("input", { type: "search", placeholder: t("搜尋模型 ID"), "aria-label": t("搜尋模型"), oninput: (event) => { filter = event.target.value.trim().toLowerCase(); draw(); } });
   const matches = (model) => (model.id + " " + (model.label || "")).toLowerCase().includes(filter);
-  const toggleAll = h("button", { type: "button", class: "button small", text: "全選可用", onclick: () => {
+  const toggleAll = h("button", { type: "button", class: "button small", text: t("全選可用"), onclick: () => {
     const visible = models.filter((model) => !locked(model) && matches(model));
     const all = visible.every((model) => chosen.has(model.id));
     for (const model of visible) all ? chosen.delete(model.id) : chosen.add(model.id);
@@ -15711,7 +17204,7 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
   const element = h("div", { class: "field" },
     h("div", { class: "list-toolbar" }, search, toggleAll),
     list,
-    h("label", { class: "field" }, h("span", { text: "手動輸入模型 ID（選填）" }), manual));
+    h("label", { class: "field" }, h("span", { text: t("手動輸入模型 ID（選填）") }), manual));
   function draw(statusNode) {
     if (statusNode) {
       list.replaceChildren(statusNode);
@@ -15719,7 +17212,7 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
     }
     const visible = models.filter(matches);
     if (visible.length === 0) {
-      list.replaceChildren(h("div", { class: "empty", text: models.length ? "沒有符合搜尋的模型。" : "清單是空的；仍可在下方手動輸入模型 ID。" }));
+      list.replaceChildren(h("div", { class: "empty", text: models.length ? t("沒有符合搜尋的模型。") : t("清單是空的；仍可在下方手動輸入模型 ID。") }));
       return;
     }
     list.replaceChildren(...visible.map((model) => {
@@ -15728,14 +17221,14 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
       return h("label", { class: "check-row" + (locked(model) ? " disabled" : "") }, box,
         h("span", { class: "pick-text" }, h("span", { class: "mono", text: model.id }),
           model.label && model.label !== model.id ? h("span", { class: "faint", text: model.label }) : null),
-        model.configured ? h("span", { class: "chip", text: allowConfigured ? "已添加，可重新設定" : "已添加" }) : null,
+        model.configured ? h("span", { class: "chip", text: allowConfigured ? t("已添加，可重新設定") : t("已添加") }) : null,
         model.note ? h("span", { class: "chip amber", text: model.note }) : null,
-        !model.configured && model.anthropic ? h("span", { class: "chip violet", text: "Claude 轉譯" }) : null);
+        !model.configured && model.anthropic ? h("span", { class: "chip violet", text: t("Claude 轉譯") }) : null);
     }));
   }
   return {
     element,
-    setLoading(text) { draw(h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + (text || "正在查詢模型清單…"))); },
+    setLoading(text) { draw(h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + (text || t("正在查詢模型清單…")))); },
     setError(text) { draw(h("div", { class: "empty", text })); },
     setModels(next) { models = next || []; chosen.clear(); draw(); onChange(); },
     selection() {
@@ -15751,26 +17244,27 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
 
 function probeWarning(count, restartNote) {
   return banner("warn", "alert",
-    "每個模型最多送出五次小型請求來確認可用的推理強度（Claude 模型另有幾次能力探測），可能依供應商計費。共 " + count + " 個模型；只有通過探測的才會加入。" + (restartNote ? "完成後會重新啟動路由器，進行中的對話會短暫重新連線。" : ""));
+    t("每個模型最多送出五次小型請求來確認可用的推理強度（Claude 模型另有幾次能力探測），可能依供應商計費。共 {count} 個模型；只有通過探測的才會加入。", { count }) +
+      (restartNote ? t("完成後會重新啟動路由器，進行中的對話會短暫重新連線。") : ""));
 }
 
 function globalContextBanner() {
   return state.config && state.config.modelContextWindow
-    ? banner("warn", "alert", "目前設有全域 model_context_window = " + formatNumber(state.config.modelContextWindow) + "，它會覆蓋各模型的上下文設定。")
+    ? banner("warn", "alert", t("目前設有全域 model_context_window = {value}，它會覆蓋各模型的上下文設定。", { value: formatNumber(state.config.modelContextWindow) }))
     : null;
 }
 
 // 上下文與最大輸出的輸入欄，修改與新增共用。read() 驗證後回傳數字；欄位留空回傳 null。
 function limitFields({ context, output, maxContext = TOKEN_LIMITS.maxContext, outputCap = null, showOutput = true, contextHint, outputHint }) {
   const outputMax = outputCap || TOKEN_LIMITS.maxOutput;
-  const contextInput = h("input", { type: "number", min: String(TOKEN_LIMITS.minContext), max: String(maxContext), step: "1000", value: context ? String(context) : "", placeholder: "例如 1000000" });
-  const outputInput = h("input", { type: "number", min: String(TOKEN_LIMITS.minOutput), max: String(outputMax), step: "1000", value: output ? String(output) : "", placeholder: "例如 128000" });
+  const contextInput = h("input", { type: "number", min: String(TOKEN_LIMITS.minContext), max: String(maxContext), step: "1000", value: context ? String(context) : "", placeholder: t("例如 {value}", { value: 1000000 }) });
+  const outputInput = h("input", { type: "number", min: String(TOKEN_LIMITS.minOutput), max: String(outputMax), step: "1000", value: output ? String(output) : "", placeholder: t("例如 {value}", { value: 128000 }) });
   const presets = (input, values) => h("div", { class: "presets" }, values.map((value) =>
     h("button", { type: "button", class: "button small", text: formatTokens(value), onclick: () => { input.value = String(value); } })));
-  const contextField = h("label", { class: "field" }, h("span", { text: "上下文上限（tokens）" }), contextInput,
+  const contextField = h("label", { class: "field" }, h("span", { text: t("上下文上限（tokens）") }), contextInput,
     presets(contextInput, [128000, 200000, 272000, 400000, 1000000].filter((value) => value <= maxContext)),
     contextHint ? h("span", { class: "hint", text: contextHint }) : null);
-  const outputField = showOutput ? h("label", { class: "field" }, h("span", { text: "最大輸出（tokens）" }), outputInput,
+  const outputField = showOutput ? h("label", { class: "field" }, h("span", { text: t("最大輸出（tokens）") }), outputInput,
     presets(outputInput, [32000, 64000, 128000].filter((value) => value <= outputMax)),
     outputHint ? h("span", { class: "hint", text: outputHint }) : null) : null;
   const parse = (input, label, min, max) => {
@@ -15778,24 +17272,24 @@ function limitFields({ context, output, maxContext = TOKEN_LIMITS.maxContext, ou
     if (!raw) return { value: null };
     const value = Number(raw);
     if (!Number.isInteger(value) || value < min || value > max) {
-      return { error: label + "必須是 " + formatNumber(min) + "～" + formatNumber(max) + " 之間的整數。" };
+      return { error: t("{label}必須是 {min}～{max} 之間的整數。", { label, min: formatNumber(min), max: formatNumber(max) }) };
     }
     return { value };
   };
   return {
     nodes: [h("div", { class: "limit-grid" }, contextField, outputField)],
     read() {
-      const contextResult = parse(contextInput, "上下文上限", TOKEN_LIMITS.minContext, maxContext);
+      const contextResult = parse(contextInput, t("上下文上限"), TOKEN_LIMITS.minContext, maxContext);
       if (contextResult.error) return contextResult;
       if (!showOutput) return { contextWindow: contextResult.value, maxOutputTokens: null };
       if (outputCap && Number(outputInput.value) > outputCap) {
-        return { error: "最大輸出不能超過這個模型的輸出上限 " + formatNumber(outputCap) + "。" };
+        return { error: t("最大輸出不能超過這個模型的輸出上限 {cap}。", { cap: formatNumber(outputCap) }) };
       }
-      const outputResult = parse(outputInput, "最大輸出", TOKEN_LIMITS.minOutput, outputMax);
+      const outputResult = parse(outputInput, t("最大輸出"), TOKEN_LIMITS.minOutput, outputMax);
       if (outputResult.error) return outputResult;
       const contextLimit = contextResult.value ?? context;
       if (outputResult.value != null && contextLimit && outputResult.value > contextLimit) {
-        return { error: "最大輸出不能超過上下文上限。" };
+        return { error: t("最大輸出不能超過上下文上限。") };
       }
       return { contextWindow: contextResult.value, maxOutputTokens: outputResult.value };
     },
@@ -15807,8 +17301,8 @@ function newModelLimitFields() {
   return limitFields({
     context: NEW_MODEL_DEFAULTS.contextWindow,
     output: NEW_MODEL_DEFAULTS.maxOutputTokens,
-    contextHint: "GPT、Chat 模型探測不到上下文，直接使用這個值；Claude 模型探測到的上限較小時以上游為準。",
-    outputHint: "只用於 Claude 模型（送往 Claude 的 max_tokens），上游回報的上限較小時以上游為準；GPT 與 Chat 模型的輸出由上游決定。",
+    contextHint: t("GPT、Chat 模型探測不到上下文，直接使用這個值；Claude 模型探測到的上限較小時以上游為準。"),
+    outputHint: t("只用於 Claude 模型（送往 Claude 的 max_tokens），上游回報的上限較小時以上游為準；GPT 與 Chat 模型的輸出由上游決定。"),
   });
 }
 
@@ -15818,17 +17312,17 @@ function openAddModels(initialProviderId) {
   let requestId = 0;
   const isCli = () => providerId === CLAUDE_CLI_ID;
   const count = h("span", { class: "grow" });
-  const nextButton = h("button", { type: "button", class: "button primary", text: "下一步", disabled: true });
-  const cancelButton = h("button", { type: "button", class: "button", text: "取消" });
+  const nextButton = h("button", { type: "button", class: "button primary", text: t("下一步"), disabled: true });
+  const cancelButton = h("button", { type: "button", class: "button", text: t("取消") });
   const picker = modelPicker({ onChange: updateCount });
   const cli = claudeCliChooser({ onChange: updateCount });
-  const providerSelect = h("label", { class: "field" }, h("span", { text: "供應商" }),
+  const providerSelect = h("label", { class: "field" }, h("span", { text: t("供應商") }),
     h("select", { onchange: (event) => { providerId = event.target.value; showStepOne(); load(); } },
-      providers.map((provider) => h("option", { value: provider.id, selected: provider.id === providerId, text: provider.id + "（" + hostOf(provider.baseUrl) + "）" })),
-      h("option", { value: CLAUDE_CLI_ID, selected: isCli(), text: "Claude 訂閱（Claude CLI，實驗性）" })));
-  const intro = paragraph("選擇供應商與要添加的模型。", "muted");
+      providers.map((provider) => h("option", { value: provider.id, selected: provider.id === providerId, text: providerOption(provider) })),
+      h("option", { value: CLAUDE_CLI_ID, selected: isCli(), text: t("Claude 訂閱（Claude CLI，實驗性）") })));
+  const intro = paragraph(t("選擇供應商與要添加的模型。"), "muted");
   const limits = newModelLimitFields();
-  const modal = openModal({ title: "新增模型", wide: true, body: stepOneBody() });
+  const modal = openModal({ title: t("新增模型"), wide: true, body: stepOneBody() });
   cancelButton.onclick = () => modal.close();
   showStepOne();
   load();
@@ -15844,12 +17338,12 @@ function openAddModels(initialProviderId) {
   }
   function updateCount() {
     if (isCli() && !cli.ready()) {
-      count.textContent = "完成 Claude CLI 的準備後才能選擇模型";
+      count.textContent = t("完成 Claude CLI 的準備後才能選擇模型");
       nextButton.disabled = true;
       return;
     }
     const total = (isCli() ? cli : picker).selection().length;
-    count.textContent = total ? "已選 " + total + " 個模型" : "尚未選擇模型";
+    count.textContent = total ? t("已選 {count} 個模型", { count: total }) : t("尚未選擇模型");
     nextButton.disabled = total === 0;
   }
   async function load() {
@@ -15863,30 +17357,30 @@ function openAddModels(initialProviderId) {
       const data = await api("/api/discover", { method: "POST", body: { providerId } });
       if (current === requestId) picker.setModels(data.models);
     } catch (error) {
-      if (current === requestId) picker.setError("查詢失敗：" + error.message);
+      if (current === requestId) picker.setError(t("查詢失敗：{reason}", { reason: error.message }));
     }
   }
   function confirmStep() {
     const invalid = picker.invalidManual();
     if (invalid.length) {
-      toast("模型 ID 格式無效：" + invalid.join("、"), "error");
+      toast(t("模型 ID 格式無效：{models}", { models: joinList(invalid) }), "error");
       return;
     }
     const models = picker.selection();
     modal.setBody(
-      paragraph("將向「" + providerId + "」探測以下 " + models.length + " 個模型："),
+      paragraph(t("將向「{provider}」探測以下 {count} 個模型：", { provider: providerLabel(providerId), count: models.length })),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", { class: "mono", text: model }))),
       limits.nodes,
       globalContextBanner(),
       probeWarning(models.length, true));
     modal.setFoot(h("span", { class: "grow" }),
-      h("button", { type: "button", class: "button", text: "上一步", onclick: showStepOne }),
-      h("button", { type: "button", class: "button primary", text: "開始探測並添加", onclick: () => {
+      h("button", { type: "button", class: "button", text: t("上一步"), onclick: showStepOne }),
+      h("button", { type: "button", class: "button primary", text: t("開始探測並添加"), onclick: () => {
         const result = limits.read();
         if (result.error) { toast(result.error, "error"); return; }
         modal.close();
         runJob("add-models", { providerId, models, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens },
-          { title: "添加模型：" + providerId });
+          { title: t("添加模型：{provider}", { provider: providerLabel(providerId) }) });
       } }));
   }
 }
@@ -15896,18 +17390,18 @@ function confirmRemoveModels(slugs) {
   if (models.length === 0) return;
   const includesDefault = state.config && models.some((model) => model.slug === state.config.model);
   confirmDialog({
-    title: "刪除 " + models.length + " 個模型",
+    title: t("刪除 {count} 個模型", { count: models.length }),
     danger: true,
-    confirmLabel: "刪除",
+    confirmLabel: t("刪除"),
     body: [
-      paragraph("以下模型會從 Codex 選擇器移除："),
+      paragraph(t("以下模型會從 Codex 選擇器移除：")),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", {}, model.displayName, h("span", { class: "faint mono", text: "  " + model.upstreamModel })))),
-      includesDefault ? banner("warn", "alert", "其中包含全域預設模型，刪除後會一併清除這個預設，改用官方預設模型。") : null,
-      paragraph("使用這些模型的既有任務需切換到其他模型才能繼續。刪除前會自動備份，接著重新啟動路由器。", "note"),
+      includesDefault ? banner("warn", "alert", t("其中包含全域預設模型，刪除後會一併清除這個預設，改用官方預設模型。")) : null,
+      paragraph(t("使用這些模型的既有任務需切換到其他模型才能繼續。刪除前會自動備份，接著重新啟動路由器。"), "note"),
     ],
   }).then(async (ok) => {
     if (!ok) return;
-    const view = await runJob("remove-models", { slugs: models.map((model) => model.slug) }, { title: "刪除模型" });
+    const view = await runJob("remove-models", { slugs: models.map((model) => model.slug) }, { title: t("刪除模型") });
     if (view && view.status === "succeeded") selected.clear();
     renderView();
   });
@@ -15922,37 +17416,36 @@ function openEditModel(model) {
     maxContext,
     outputCap: model.outputCapFixed ? model.outputCap : null,
     showOutput: model.outputConfigurable,
-    contextHint: "範圍 16,000～" + formatNumber(maxContext) + "。Codex 用到約 95% 時會自動壓縮。",
+    contextHint: t("範圍 16,000～{max}。Codex 用到約 95% 時會自動壓縮。", { max: formatNumber(maxContext) }),
     outputHint: model.transport === "claude-cli"
-      ? "每次回覆最多可輸出的 tokens，以 CLAUDE_CODE_MAX_OUTPUT_TOKENS 傳給 Claude CLI；超過模型上限時，CLI 會自動壓到上限。"
-      : "每次回覆最多可輸出的 tokens（送往 Claude 的 max_tokens）。" +
-        (model.outputCap ? "模型上限 " + formatNumber(model.outputCap) + "。" : "上游沒有回報上限，設得比模型上限大時上游會拒絕。"),
+      ? t("每次回覆最多可輸出的 tokens，以 CLAUDE_CODE_MAX_OUTPUT_TOKENS 傳給 Claude CLI；超過模型上限時，CLI 會自動壓到上限。")
+      : t("每次回覆最多可輸出的 tokens（送往 Claude 的 max_tokens）。") +
+        (model.outputCap ? t("模型上限 {cap}。", { cap: formatNumber(model.outputCap) }) : t("上游沒有回報上限，設得比模型上限大時上游會拒絕。")),
   });
-  const contextSource = model.contextSource === "template" ? "沿用官方模板（未實測）" : "已設定（探測、新增時的預設值或手動修改）";
+  const contextSource = model.contextSource === "template" ? t("沿用官方模板（未實測）") : t("已設定（探測、新增時的預設值或手動修改）");
   const info = h("dl", { class: "kv" },
-    h("dt", { text: "上游模型" }), h("dd", { class: "mono", text: model.upstreamModel }),
-    h("dt", { text: "選擇器 ID" }), h("dd", { class: "mono", text: model.slug }),
-    h("dt", { text: "供應商" }), h("dd", { text: providerLabel(model.providerId) }),
-    h("dt", { text: "介面" }), h("dd", {}, transportChip(model.transport)),
-    h("dt", { text: "上下文來源" }), h("dd", { text: contextSource }),
-    model.outputConfigurable ? null : h("dt", { text: "輸出" }),
-    model.outputConfigurable ? null : h("dd", { text: "由上游決定：這個介面不送出輸出上限，因此不需要設定。" }));
-  const desktopName = (state.desktop && state.desktop.name) || "桌面版";
+    h("dt", { text: t("上游模型") }), h("dd", { class: "mono", text: model.upstreamModel }),
+    h("dt", { text: t("選擇器 ID") }), h("dd", { class: "mono", text: model.slug }),
+    h("dt", { text: t("供應商") }), h("dd", { text: providerLabel(model.providerId) }),
+    h("dt", { text: t("介面") }), h("dd", {}, transportChip(model.transport)),
+    h("dt", { text: t("上下文來源") }), h("dd", { text: contextSource }),
+    model.outputConfigurable ? null : h("dt", { text: t("輸出") }),
+    model.outputConfigurable ? null : h("dd", { text: t("由上游決定：這個介面不送出輸出上限，因此不需要設定。") }));
   const body = [
-    h("label", { class: "field" }, h("span", { text: "顯示名稱" }), name, h("span", { class: "hint", text: "只影響選擇器裡顯示的名稱；上游模型 ID 與選擇器 ID 不變。" })),
+    h("label", { class: "field" }, h("span", { text: t("顯示名稱") }), name, h("span", { class: "hint", text: t("只影響選擇器裡顯示的名稱；上游模型 ID 與選擇器 ID 不變。") })),
     limits.nodes,
     globalContextBanner(),
     info,
     paragraph(model.outputConfigurable
-      ? "名稱與上下文不需要重新啟動路由器，重新啟動 " + desktopName + " 後生效；修改輸出會重新啟動路由器，進行中的回應會短暫重新連線。"
-      : "不重新探測、不重新啟動路由器；重新啟動 " + desktopName + " 後生效。", "note"),
+      ? t("名稱與上下文不需要重新啟動路由器，重新啟動 {app} 後生效；修改輸出會重新啟動路由器，進行中的回應會短暫重新連線。", { app: desktopName() })
+      : t("不重新探測、不重新啟動路由器；重新啟動 {app} 後生效。", { app: desktopName() }), "note"),
   ];
-  const modal = openModal({ title: "修改模型", body });
+  const modal = openModal({ title: t("修改模型"), body });
   modal.setFoot(h("span", { class: "grow" }),
-    h("button", { type: "button", class: "button", text: "取消", onclick: () => modal.close() }),
-    h("button", { type: "button", class: "button primary", text: "儲存", onclick: () => {
+    h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }),
+    h("button", { type: "button", class: "button primary", text: t("儲存"), onclick: () => {
       const displayName = name.value.trim();
-      if (!displayName) { toast("顯示名稱不能是空白。", "error"); return; }
+      if (!displayName) { toast(t("顯示名稱不能是空白。"), "error"); return; }
       const result = limits.read();
       if (result.error) { toast(result.error, "error"); return; }
       // 只送出有變動的值：沒動過的上下文維持原本的來源，沒動過的輸出也不會重啟路由器。
@@ -15961,11 +17454,11 @@ function openEditModel(model) {
       if (result.maxOutputTokens != null && result.maxOutputTokens !== model.outputTokens) params.maxOutputTokens = result.maxOutputTokens;
       if (displayName === model.displayName && !("contextWindow" in params) && !("maxOutputTokens" in params)) {
         modal.close();
-        toast("沒有任何變更。");
+        toast(t("沒有任何變更。"));
         return;
       }
       modal.close();
-      runJob("edit-model", params, { title: "修改模型：" + displayName });
+      runJob("edit-model", params, { title: t("修改模型：{name}", { name: displayName }) });
     } }));
 }
 
@@ -15985,40 +17478,40 @@ function openAddProvider() {
   const baseUrl = h("input", { type: "url", placeholder: "https://api.example.com/v1", autocomplete: "off", spellcheck: "false" });
   const apiKey = h("input", { type: "password", placeholder: "sk-…", autocomplete: "new-password", spellcheck: "false" });
   const status = h("span", { class: "grow" });
-  const nextButton = h("button", { type: "button", class: "button primary", text: "查詢模型" });
-  const cancelButton = h("button", { type: "button", class: "button", text: "取消" });
+  const nextButton = h("button", { type: "button", class: "button primary", text: t("查詢模型") });
+  const cancelButton = h("button", { type: "button", class: "button", text: t("取消") });
   const stepOne = [
-    paragraph("填入兼容 OpenAI 的 Base URL 與 API Key，先查詢它提供的模型清單（不會花費額度）。", "muted"),
+    paragraph(t("填入兼容 OpenAI 的 Base URL 與 API Key，先查詢它提供的模型清單（不會花費額度）。"), "muted"),
     h("label", { class: "field" }, h("span", { text: "Base URL" }), baseUrl),
     h("label", { class: "field" }, h("span", { text: "API Key" }), apiKey,
       h("span", { class: "hint", text: state.platform === "win32"
-        ? "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。"
-        : "Key 只會存進 macOS 鑰匙圈，不會寫進設定檔，也不會再顯示在頁面上。" })),
+        ? t("Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。")
+        : t("Key 只會存進 macOS 鑰匙圈，不會寫進設定檔，也不會再顯示在頁面上。") })),
   ];
-  const backButton = h("button", { type: "button", class: "button", text: "上一步" });
-  const modal = openModal({ title: "新增供應商", wide: true });
+  const backButton = h("button", { type: "button", class: "button", text: t("上一步") });
+  const modal = openModal({ title: t("新增供應商"), wide: true });
   cancelButton.onclick = () => modal.close();
   backButton.onclick = () => showTypeChoice();
   let draft = null;
   const picker = modelPicker({ onChange: updateStepTwo });
   const providerName = h("input", { type: "text", maxlength: "24", spellcheck: "false", oninput: updateStepTwo });
-  const nameField = h("label", { class: "field" }, h("span", { text: "供應商名稱" }), providerName,
-    h("span", { class: "hint", text: "小寫英文、數字與連字號。只用於管理，並替沒有前綴的模型補上名稱（例如 名稱/模型）。" }));
+  const nameField = h("label", { class: "field" }, h("span", { text: t("供應商 ID") }), providerName,
+    h("span", { class: "hint", text: t("小寫英文、數字與連字號。用於管理與設定檔，並替沒有前綴的模型補上名稱（例如 ID/模型）；之後可以在供應商頁另取顯示名稱、修改模型前綴。") }));
   const count = h("span", { class: "grow" });
-  const addButton = h("button", { type: "button", class: "button primary", text: "下一步", disabled: true });
+  const addButton = h("button", { type: "button", class: "button primary", text: t("下一步"), disabled: true });
   const limits = newModelLimitFields();
   const cli = claudeCliChooser({ onChange: updateCli });
   const cliCount = h("span", { class: "grow" });
-  const cliNext = h("button", { type: "button", class: "button primary", text: "下一步", disabled: true });
+  const cliNext = h("button", { type: "button", class: "button primary", text: t("下一步"), disabled: true });
   cliNext.onclick = () => showClaudeCliConfirm(modal, cli, showClaudeCli);
 
   nextButton.onclick = async () => {
     if (!baseUrl.value.trim() || !apiKey.value.trim()) {
-      toast("請填寫 Base URL 與 API Key。", "error");
+      toast(t("請填寫 Base URL 與 API Key。"), "error");
       return;
     }
     nextButton.disabled = true;
-    status.replaceChildren(h("span", { class: "spinner" }), "正在查詢模型清單…");
+    status.replaceChildren(h("span", { class: "spinner" }), t("正在查詢模型清單…"));
     try {
       draft = await api("/api/provider-draft", { method: "POST", body: { baseUrl: baseUrl.value.trim(), apiKey: apiKey.value } });
       apiKey.value = "";
@@ -16033,27 +17526,27 @@ function openAddProvider() {
 
   function showTypeChoice() {
     const connected = (state.models || []).filter((model) => model.transport === "claude-cli").length;
-    modal.setTitle("新增供應商");
+    modal.setTitle(t("新增供應商"));
     modal.setBody(
-      paragraph("選擇要新增的供應商類型。", "muted"),
+      paragraph(t("選擇要新增的供應商類型。"), "muted"),
       h("div", { class: "type-choices" },
-        typeOption("providers", "OpenAI 相容 API", null,
-          "中轉站、閘道或其他兼容 OpenAI 的服務，用 Base URL 與 API Key 連接；可添加 GPT、Claude 與只支援 Chat Completions 的模型。",
+        typeOption("providers", t("OpenAI 相容 API"), null,
+          t("中轉站、閘道或其他兼容 OpenAI 的服務，用 Base URL 與 API Key 連接；可添加 GPT、Claude 與只支援 Chat Completions 的模型。"),
           showRelayForm),
-        typeOption("claude", "Claude 訂閱帳號（Claude CLI）", "實驗性",
-          "透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算。" +
-            (connected ? "已連接 " + connected + " 個模型，可以再添加。" : ""),
+        typeOption("claude", t("Claude 訂閱帳號（Claude CLI）"), t("實驗性"),
+          t("透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算。") +
+            (connected ? t("已連接 {count} 個模型，可以再添加。", { count: connected }) : ""),
           showClaudeCli)));
     modal.setFoot(h("span", { class: "grow" }), cancelButton);
   }
   function showRelayForm() {
-    modal.setTitle("新增供應商：OpenAI 相容 API");
+    modal.setTitle(t("新增供應商：OpenAI 相容 API"));
     modal.setBody(stepOne);
     modal.setFoot(status, backButton, nextButton);
     setTimeout(() => baseUrl.focus(), 30);
   }
   function showClaudeCli() {
-    modal.setTitle("新增供應商：Claude 訂閱帳號");
+    modal.setTitle(t("新增供應商：Claude 訂閱帳號"));
     modal.setBody(cli.element);
     modal.setFoot(cliCount, backButton, cliNext);
     cli.ensure();
@@ -16061,19 +17554,19 @@ function openAddProvider() {
   }
   function updateCli() {
     if (!cli.ready()) {
-      cliCount.textContent = "完成上面的準備後才能選擇模型";
+      cliCount.textContent = t("完成上面的準備後才能選擇模型");
       cliNext.disabled = true;
       return;
     }
     const total = cli.selection().length;
-    cliCount.textContent = total ? "已選 " + total + " 個模型" : "尚未選擇模型";
+    cliCount.textContent = total ? t("已選 {count} 個模型", { count: total }) : t("尚未選擇模型");
     cliNext.disabled = total === 0;
   }
   function showStepTwo() {
     providerName.value = draft.suggestedId || "";
-    modal.setTitle("新增供應商：" + hostOf(draft.baseUrl));
-    modal.setBody(paragraph("API 根地址：" + draft.apiRoot, "muted mono"), picker.element, nameField);
-    modal.setFoot(count, h("button", { type: "button", class: "button", text: "取消", onclick: () => modal.close() }), addButton);
+    modal.setTitle(t("新增供應商：{host}", { host: hostOf(draft.baseUrl) }));
+    modal.setBody(paragraph(t("API 根地址：{url}", { url: draft.apiRoot }), "muted mono"), picker.element, nameField);
+    modal.setFoot(count, h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }), addButton);
     picker.setModels(draft.models);
     addButton.onclick = confirmStep;
     updateStepTwo();
@@ -16085,9 +17578,11 @@ function openAddProvider() {
   function nameProblem() {
     if (!needsName()) return null;
     const value = providerName.value.trim().toLowerCase();
-    if (!PROVIDER_ID_PATTERN.test(value)) return "名稱只能用小寫英文、數字與連字號，1～24 個字元，不能以連字號開頭或結尾。";
-    if (RESERVED_PROVIDER_IDS.has(value)) return "「" + value + "」是保留名稱，請換一個。";
-    if ((state.providers || []).some((provider) => provider.id === value)) return "已經有叫「" + value + "」的供應商了。";
+    if (!PROVIDER_ID_PATTERN.test(value)) return t("ID 只能用小寫英文、數字與連字號，1～24 個字元，不能以連字號開頭或結尾。");
+    if (RESERVED_PROVIDER_IDS.has(value)) return t("「{name}」是保留名稱，請換一個。", { name: value });
+    if ((state.providers || []).some((provider) => provider.id === value || (provider.name || "").toLowerCase() === value)) {
+      return t("已經有叫「{name}」的供應商了。", { name: value });
+    }
     return null;
   }
   function updateStepTwo() {
@@ -16095,55 +17590,57 @@ function openAddProvider() {
     const total = picker.selection().length;
     nameField.hidden = !needsName();
     const problem = total ? nameProblem() : null;
-    count.textContent = problem || (total ? "已選 " + total + " 個模型" : "尚未選擇模型");
+    count.textContent = problem || (total ? t("已選 {count} 個模型", { count: total }) : t("尚未選擇模型"));
     count.className = "grow" + (problem ? " note warn" : "");
     addButton.disabled = total === 0 || Boolean(problem);
   }
   function confirmStep() {
     const invalid = picker.invalidManual();
     if (invalid.length) {
-      toast("模型 ID 格式無效：" + invalid.join("、"), "error");
+      toast(t("模型 ID 格式無效：{models}", { models: joinList(invalid) }), "error");
       return;
     }
     const models = picker.selection();
     const providerId = needsName() ? providerName.value.trim().toLowerCase() : null;
     modal.setBody(
-      paragraph("將新增供應商" + (providerId ? "「" + providerId + "」" : "（所選模型已有前綴，管理名稱自動產生）") + "，並探測以下 " + models.length + " 個模型："),
+      paragraph(providerId
+        ? t("將新增供應商「{name}」，並探測以下 {count} 個模型：", { name: providerId, count: models.length })
+        : t("將新增供應商（所選模型已有前綴，ID 自動產生），並探測以下 {count} 個模型：", { count: models.length })),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", { class: "mono", text: model }))),
       limits.nodes,
       globalContextBanner(),
       probeWarning(models.length, true));
     modal.setFoot(h("span", { class: "grow" }),
-      h("button", { type: "button", class: "button", text: "上一步", onclick: showStepTwo }),
-      h("button", { type: "button", class: "button primary", text: "開始探測並新增", onclick: () => {
+      h("button", { type: "button", class: "button", text: t("上一步"), onclick: showStepTwo }),
+      h("button", { type: "button", class: "button primary", text: t("開始探測並新增"), onclick: () => {
         const result = limits.read();
         if (result.error) { toast(result.error, "error"); return; }
         modal.close();
         runJob("add-provider", {
           draftId: draft.draftId, models, providerId, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens,
-        }, { title: "新增供應商" });
+        }, { title: t("新增供應商") });
       } }));
   }
 }
 
 function openReplaceKey(provider) {
-  const apiKey = h("input", { type: "password", placeholder: "新的 API Key", autocomplete: "new-password", spellcheck: "false" });
+  const apiKey = h("input", { type: "password", placeholder: t("新的 API Key"), autocomplete: "new-password", spellcheck: "false" });
   const modal = openModal({
-    title: "更換 API Key：" + provider.id,
+    title: t("更換 API Key：{name}", { name: providerLabel(provider.id) }),
     body: [
       h("dl", { class: "kv" }, h("dt", { text: "Base URL" }), h("dd", { class: "mono", text: provider.baseUrl || "—" })),
-      h("label", { class: "field" }, h("span", { text: "新的 API Key" }), apiKey),
-      paragraph("會先用新 Key 查詢模型清單：上游明確拒絕（401／403）時不會更換。路由器會自動改用新 Key，不需要重新啟動。", "note"),
+      h("label", { class: "field" }, h("span", { text: t("新的 API Key") }), apiKey),
+      paragraph(t("會先用新 Key 查詢模型清單：上游明確拒絕（401／403）時不會更換。路由器會自動改用新 Key，不需要重新啟動。"), "note"),
     ],
   });
   modal.setFoot(h("span", { class: "grow" }),
-    h("button", { type: "button", class: "button", text: "取消", onclick: () => modal.close() }),
-    h("button", { type: "button", class: "button primary", text: "驗證並儲存", onclick: () => {
+    h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }),
+    h("button", { type: "button", class: "button primary", text: t("驗證並儲存"), onclick: () => {
       const value = apiKey.value.trim();
-      if (!value) { toast("請填寫新的 API Key。", "error"); return; }
+      if (!value) { toast(t("請填寫新的 API Key。"), "error"); return; }
       apiKey.value = "";
       modal.close();
-      runJob("replace-key", { providerId: provider.id, apiKey: value }, { title: "更換 API Key：" + provider.id });
+      runJob("replace-key", { providerId: provider.id, apiKey: value }, { title: t("更換 API Key：{name}", { name: providerLabel(provider.id) }) });
     } }));
 }
 
@@ -16153,22 +17650,23 @@ function confirmRemoveProvider(provider) {
   const others = (state.providers || []).filter((item) => item.id !== provider.id);
   const imagegen = state.imagegen && !state.imagegen.error && state.imagegen.providerId === provider.id;
   const deleteKey = h("input", { type: "checkbox", checked: true });
+  const name = providerLabel(provider.id);
   confirmDialog({
-    title: "移除供應商「" + provider.id + "」",
+    title: t("移除供應商「{name}」", { name }),
     danger: true,
-    confirmLabel: "移除",
+    confirmLabel: t("移除"),
     body: [
-      paragraph(models.length ? "會一併移除它的 " + models.length + " 個模型：" : "這家供應商目前沒有模型。"),
+      paragraph(models.length ? t("會一併移除它的 {count} 個模型：", { count: models.length }) : t("這家供應商目前沒有模型。")),
       models.length ? h("ul", { class: "plain-list" }, models.map((model) => h("li", { text: model.displayName }))) : null,
-      provider.primary && others[0] ? banner("info", "info", "移除後由「" + others[0].id + "」擔任主要供應商。") : null,
-      includesDefault ? banner("warn", "alert", "其中包含全域預設模型，移除後會一併清除這個預設。") : null,
-      imagegen ? banner("warn", "alert", "中轉 API 生圖使用這家供應商，會一併停用；之後可在終端選單重新設定。") : null,
-      h("label", { class: "check-line" }, deleteKey, h("span", { text: "同時刪除這家的 API Key" })),
-      paragraph("移除前會自動備份，接著重新啟動路由器。", "note"),
+      provider.primary && others[0] ? banner("info", "info", t("移除後由「{name}」擔任主要供應商。", { name: providerLabel(others[0].id) })) : null,
+      includesDefault ? banner("warn", "alert", t("其中包含全域預設模型，移除後會一併清除這個預設。")) : null,
+      imagegen ? banner("warn", "alert", t("中轉 API 生圖使用這家供應商，會一併停用；之後可在生圖頁重新設定。")) : null,
+      h("label", { class: "check-line" }, deleteKey, h("span", { text: t("同時刪除這家的 API Key") })),
+      paragraph(t("移除前會自動備份，接著重新啟動路由器。"), "note"),
     ],
   }).then((ok) => {
     if (!ok) return;
-    runJob("remove-provider", { providerId: provider.id, deleteKey: deleteKey.checked }, { title: "移除供應商：" + provider.id });
+    runJob("remove-provider", { providerId: provider.id, deleteKey: deleteKey.checked }, { title: t("移除供應商：{name}", { name }) });
   });
 }
 
@@ -16176,25 +17674,25 @@ function confirmRemoveProvider(provider) {
 
 function confirmRestartRouter() {
   confirmDialog({
-    title: "重新啟動路由器",
-    confirmLabel: "重新啟動",
-    body: paragraph("進行中的回應會中斷，Codex 會自動重新連線並重試。通常不需要這麼做；路由器無回應或更新後版本沒換時再用。"),
-  }).then((ok) => { if (ok) runJob("restart-router", {}, { title: "重新啟動路由器" }); });
+    title: t("重新啟動路由器"),
+    confirmLabel: t("重新啟動"),
+    body: paragraph(t("進行中的回應會中斷，Codex 會自動重新連線並重試。通常不需要這麼做；路由器無回應或更新後版本沒換時再用。")),
+  }).then((ok) => { if (ok) runJob("restart-router", {}, { title: t("重新啟動路由器") }); });
 }
 
 function confirmRestartDesktop() {
-  const name = (state.desktop && state.desktop.name) || "桌面版";
+  const name = desktopName();
   confirmDialog({
-    title: "重新啟動 " + name,
-    confirmLabel: "重新啟動",
+    title: t("重新啟動 {app}", { app: name }),
+    confirmLabel: t("重新啟動"),
     danger: true,
     body: [
-      paragraph("會正常結束 " + name + " 再重新打開，讓模型選擇器載入最新設定。"),
-      banner("warn", "alert", "進行中的任務會被中斷；若 macOS 詢問是否允許控制「" + name + "」，請選擇允許。"),
+      paragraph(t("會正常結束 {app} 再重新打開，讓模型選擇器載入最新設定。", { app: name })),
+      banner("warn", "alert", t("進行中的任務會被中斷；若 macOS 詢問是否允許控制「{app}」，請選擇允許。", { app: name })),
     ],
   }).then(async (ok) => {
     if (!ok) return;
-    const view = await runJob("restart-desktop", {}, { title: "重新啟動 " + name });
+    const view = await runJob("restart-desktop", {}, { title: t("重新啟動 {app}", { app: name }) });
     if (view && view.status === "succeeded" && view.result && view.result.desktopRestarted) {
       pendingDesktopRestart = false;
       renderBanners();
@@ -16231,16 +17729,16 @@ function renderPopover() {
   const popover = document.getElementById("version-popover");
   if (!popoverOpen) return;
   const info = versionInfo;
-  const refreshButton = h("button", { type: "button", class: "icon-button", title: "重新檢查", "aria-label": "重新檢查更新" }, icon("refresh"));
+  const refreshButton = h("button", { type: "button", class: "icon-button", title: t("重新檢查"), "aria-label": t("重新檢查更新") }, icon("refresh"));
   refreshButton.onclick = async () => {
     refreshButton.classList.add("spin");
     refreshButton.disabled = true;
     await refreshVersion(true);
   };
-  const head = h("div", { class: "popover-head" }, h("span", { text: "目前版本" }), refreshButton);
+  const head = h("div", { class: "popover-head" }, h("span", { text: t("目前版本") }), refreshButton);
   const body = h("div", { class: "popover-body" });
   if (!info) {
-    body.append(h("div", { class: "status-line" }, h("span", { class: "spinner" }), " 正在檢查…"));
+    body.append(h("div", { class: "status-line" }, h("span", { class: "spinner" }), " " + t("正在檢查…")));
     popover.replaceChildren(head, body);
     return;
   }
@@ -16249,62 +17747,72 @@ function renderPopover() {
   const iconClass = update ? "update" : info.status === "unknown" ? "unknown" : "ok";
   const iconName = update ? "arrowUp" : info.status === "unknown" ? "question" : "check";
   body.append(h("div", { class: "big-version" }, "v" + version, h("span", { class: "status-icon " + iconClass }, icon(iconName))));
-  const statusText = update ? "有新版本 v" + info.latest
-    : info.status === "latest" ? "已是最新版本"
-    : info.status === "ahead" ? "比 GitHub 上的 v" + info.latest + " 更新"
-    : (info.error || "無法確認最新版本");
+  const statusText = update ? t("有新版本 v{version}", { version: info.latest })
+    : info.status === "latest" ? t("已是最新版本")
+    : info.status === "ahead" ? t("比 GitHub 上的 v{version} 更新", { version: info.latest })
+    : (serverText(info.error) || t("無法確認最新版本"));
   body.append(h("div", { class: "status-line", text: statusText }));
-  if (info.checkedAt) body.append(h("div", { class: "status-line faint", text: "檢查於 " + formatTime(info.checkedAt) }));
+  if (info.checkedAt) body.append(h("div", { class: "status-line faint", text: t("檢查於 {time}", { time: formatTime(info.checkedAt) }) }));
 
   const section = h("div", { class: "popover-section" });
   if (info.router && info.installed && info.router !== info.installed) {
-    section.append(banner("warn", "alert", "路由器仍在執行 v" + info.router + "，請重新啟動路由器套用 v" + info.installed + "。",
-      h("button", { type: "button", class: "button small", onclick: () => { togglePopover(false); confirmRestartRouter(); } }, "重新啟動")));
+    section.append(banner("warn", "alert", t("路由器仍在執行 v{running}，請重新啟動路由器套用 v{installed}。", { running: info.router, installed: info.installed }),
+      h("button", { type: "button", class: "button small", onclick: () => { togglePopover(false); confirmRestartRouter(); } }, t("重新啟動"))));
   }
   const releases = (info.releases || []).slice().reverse();
   if (releases.length) {
-    section.append(h("div", { class: "changes" }, releases.map((release) => [
-      h("h4", { text: "v" + release.version + (release.date ? "（" + release.date + "）" : "") + (update ? "" : " 更新內容") }),
-      h("ul", {}, release.changes.map((change) => h("li", { text: change }))),
-    ])));
+    section.append(h("div", { class: "changes" },
+      // 更新說明只有中文；英文介面先註明，簡體介面自動轉換。
+      locale === "en" ? h("p", { class: "note", text: t("更新說明目前只有中文。") }) : null,
+      releases.map((release) => [
+        h("h4", { text: releaseHeading(release, update) }),
+        h("ul", {}, release.changes.map((change) => h("li", { text: logText(change) }))),
+      ])));
   }
   if (update) {
     const restart = h("input", { type: "checkbox", checked: Boolean(info.canRestartDesktop), disabled: !info.canRestartDesktop });
     section.append(
       info.canRestartDesktop
-        ? h("label", { class: "check-line" }, restart, h("span", { text: "完成後重新啟動 " + info.desktopName + "（會中斷進行中的任務）" }))
-        : paragraph("更新完成後請完全退出並重新打開 " + info.desktopName + "。", "note"),
+        ? h("label", { class: "check-line" }, restart, h("span", { text: t("完成後重新啟動 {app}（會中斷進行中的任務）", { app: info.desktopName }) }))
+        : paragraph(t("更新完成後請完全退出並重新打開 {app}。", { app: info.desktopName }), "note"),
       h("button", { type: "button", class: "button primary", onclick: () => { togglePopover(false); confirmUpdate("update", info, restart.checked && info.canRestartDesktop); } },
-        icon("arrowUp"), info.canRestartDesktop ? "更新並重新啟動" : "立即更新"));
+        icon("arrowUp"), info.canRestartDesktop ? t("更新並重新啟動") : t("立即更新")));
   } else if (info.localNewer) {
     section.append(
-      paragraph("這個管理頁是 v" + info.manager + "，比已安裝的 v" + info.installed + " 新。", "note"),
-      h("button", { type: "button", class: "button primary", onclick: () => { togglePopover(false); confirmUpdate("apply-update", info, false); } }, icon("arrowUp"), "套用 v" + info.manager));
+      paragraph(t("這個管理頁是 v{manager}，比已安裝的 v{installed} 新。", { manager: info.manager, installed: info.installed }), "note"),
+      h("button", { type: "button", class: "button primary", onclick: () => { togglePopover(false); confirmUpdate("apply-update", info, false); } }, icon("arrowUp"), t("套用 v{version}", { version: info.manager })));
   }
   if (section.childNodes.length) body.append(section);
-  const link = h("a", { class: "popover-link", href: update || info.status === "latest" ? info.releaseUrl : info.releasesUrl, target: "_blank", rel: "noopener noreferrer" }, icon("github"), "查看發佈");
+  const link = h("a", { class: "popover-link", href: update || info.status === "latest" ? info.releaseUrl : info.releasesUrl, target: "_blank", rel: "noopener noreferrer" }, icon("github"), t("查看發佈"));
   body.append(link);
   popover.replaceChildren(head, body);
+}
+
+// 有新版本時列的是即將安裝的版本；已是最新時列的是目前版本的更新內容。
+function releaseHeading(release, upcoming) {
+  const params = { version: release.version, date: release.date };
+  if (release.date) return upcoming ? t("v{version}（{date}）", params) : t("v{version}（{date}）更新內容", params);
+  return upcoming ? "v" + release.version : t("v{version} 更新內容", params);
 }
 
 function confirmUpdate(type, info, restartDesktop) {
   const target = type === "update" ? info.latest : info.manager;
   confirmDialog({
-    title: "更新到 v" + target,
-    confirmLabel: restartDesktop ? "更新並重新啟動" : "開始更新",
+    title: t("更新到 v{version}", { version: target }),
+    confirmLabel: restartDesktop ? t("更新並重新啟動") : t("開始更新"),
     body: [
       paragraph(type === "update"
-        ? "會從 GitHub 下載 v" + target + " 的安裝器並核對 SHA256，再執行 update："
-        : "會以這個管理頁的安裝器執行 update："),
+        ? t("會從 GitHub 下載 v{version} 的安裝器並核對 SHA256，再執行 update：", { version: target })
+        : t("會以這個管理頁的安裝器執行 update：")),
       h("ul", { class: "plain-list" },
-        h("li", { text: "換掉路由器與轉譯層程式碼，保留所有模型、供應商與 API Key" }),
-        h("li", { text: "重新啟動路由器（進行中的回應會短暫重新連線）" }),
-        type === "update" ? h("li", { text: "管理頁以新版本重新載入" }) : null,
-        restartDesktop ? h("li", { text: "最後重新啟動 " + info.desktopName + "（會中斷進行中的任務）" }) : null),
-      paragraph("更新前會自動備份，失敗時還原到原本的版本。", "note"),
+        h("li", { text: t("換掉路由器與轉譯層程式碼，保留所有模型、供應商與 API Key") }),
+        h("li", { text: t("重新啟動路由器（進行中的回應會短暫重新連線）") }),
+        type === "update" ? h("li", { text: t("管理頁以新版本重新載入") }) : null,
+        restartDesktop ? h("li", { text: t("最後重新啟動 {app}（會中斷進行中的任務）", { app: info.desktopName }) }) : null),
+      paragraph(t("更新前會自動備份，失敗時還原到原本的版本。"), "note"),
     ],
   }).then((ok) => {
-    if (ok) runJob(type, { restartDesktop }, { title: "更新到 v" + target });
+    if (ok) runJob(type, { restartDesktop }, { title: t("更新到 v{version}", { version: target }) });
   });
 }
 
@@ -16312,9 +17820,9 @@ function confirmUpdate(type, info, restartDesktop) {
 
 function confirmShutdown() {
   confirmDialog({
-    title: "結束管理頁",
-    confirmLabel: "結束",
-    body: paragraph("結束後這個分頁會失效；之後雙擊捷徑或執行安裝器的 ui 命令即可重新開啟。路由器本身不受影響。"),
+    title: t("結束管理頁"),
+    confirmLabel: t("結束"),
+    body: paragraph(t("結束後這個分頁會失效；之後可從 Codex 的「自訂模型管理」、雙擊捷徑或執行安裝器的 ui 命令重新開啟。路由器本身不受影響。")),
   }).then(async (ok) => {
     if (!ok) return;
     try {
@@ -16324,7 +17832,7 @@ function confirmShutdown() {
       return;
     }
     restartingManager = true;
-    document.body.replaceChildren(h("div", { class: "fatal" }, h("h1", { text: "管理頁已結束" }), h("p", { text: "可以關閉這個分頁了。" })));
+    document.body.replaceChildren(h("div", { class: "fatal" }, h("h1", { text: t("管理頁已結束") }), h("p", { text: t("可以關閉這個分頁了。") })));
   });
 }
 
@@ -16334,9 +17842,42 @@ function showFatal(title, text) {
   document.body.replaceChildren(h("div", { class: "fatal" }, h("h1", { text: title }), h("p", { text })));
 }
 
+// ---- 介面語言 --------------------------------------------------------------------
+
+function renderLanguagePicker() {
+  const select = h("select", { "aria-label": t("介面語言"), title: t("介面語言"), onchange: (event) => setLanguage(event.target.value) },
+    h("option", { value: "auto", selected: languagePreference === "auto", text: t("自動（{language}）", { language: LANGUAGE_NAMES[browserLanguage()] }) }),
+    ["zh-Hant", "zh-Hans", "en"].map((id) => h("option", { value: id, selected: languagePreference === id, text: LANGUAGE_NAMES[id] })));
+  document.getElementById("language-picker").replaceChildren(icon("globe"), select);
+}
+
+// 切換後整頁依新語言重畫；偏好由管理程式保存，下次開啟（連接埠不同）也沿用。
+async function setLanguage(value) {
+  if (!LANGUAGE_PREFERENCES.includes(value)) return;
+  languagePreference = value;
+  locale = value === "auto" ? browserLanguage() : value;
+  applyLocale();
+  try {
+    await api("/api/preferences", { method: "POST", body: { language: value } });
+  } catch (error) {
+    toast(t("無法儲存語言設定：{reason}", { reason: error.message }), "error");
+  }
+}
+
+function applyLocale() {
+  document.documentElement.lang = locale;
+  document.title = t("Codex 模型路由器");
+  for (const node of document.querySelectorAll("[data-i18n]")) node.textContent = t(node.dataset.i18n);
+  for (const node of document.querySelectorAll("[data-i18n-aria-label]")) node.setAttribute("aria-label", t(node.dataset.i18nAriaLabel));
+  renderLanguagePicker();
+  render();
+  renderPopover();
+}
+
 async function start() {
+  applyLocale();
   if (!token) {
-    showFatal("缺少存取權杖", "請從終端機顯示的網址開啟管理頁，或重新執行安裝器的 ui 命令。");
+    showFatal(t("缺少存取權杖"), t("請從 Codex 的「自訂模型管理」或終端機顯示的網址開啟管理頁，也可以重新執行安裝器的 ui 命令。"));
     return;
   }
   document.getElementById("version-badge").addEventListener("click", (event) => { event.stopPropagation(); togglePopover(); });
@@ -16348,13 +17889,12 @@ async function start() {
   });
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && popoverOpen && modalCount === 0) togglePopover(false); });
   window.addEventListener("resize", () => { if (popoverOpen) positionPopover(); });
-  render();
   try {
     state = await api("/api/state");
   } catch (error) {
     if (error.status === 401) {
       try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* 忽略 */ }
-      showFatal("存取權杖已失效", "管理頁可能已重新啟動。請從終端機顯示的網址重新開啟，或重新執行安裝器的 ui 命令。");
+      showFatal(t("存取權杖已失效"), t("管理頁可能已重新啟動。請從 Codex 的「自訂模型管理」或終端機顯示的網址重新開啟，也可以重新執行安裝器的 ui 命令。"));
       return;
     }
     toast(error.message, "error");
@@ -16363,13 +17903,14 @@ async function start() {
   refreshVersion();
   refreshErrors();
   if (state && state.manager && state.manager.activeJob) {
-    watchJob({ id: state.manager.activeJob.id, title: state.manager.activeJob.title, output: "", offset: 0 }, state.manager.activeJob.title);
+    const active = state.manager.activeJob;
+    watchJob({ id: active.id, type: active.type, title: active.title, output: "", offset: 0 }, jobTitle(active.type, active.title));
   } else if (state) {
     try {
       const pending = JSON.parse(sessionStorage.getItem(JOB_KEY) || "null");
       if (pending && pending.id) {
         const view = await api("/api/jobs/" + encodeURIComponent(pending.id));
-        watchJob(view, pending.title);
+        watchJob(view, jobTitle(view.type, pending.title));
       }
     } catch { try { sessionStorage.removeItem(JOB_KEY); } catch { /* 忽略 */ } }
   }

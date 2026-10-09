@@ -413,6 +413,34 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.match(invalid.error, /上下文上限必須是/);
   assert.equal(readFileSync(catalogPath, "utf8"), before, "驗證失敗不能動到檔案");
 
+  // 供應商名稱與模型前綴：預覽不寫檔；修改只動設定與模型目錄，並經 Codex 實際的模型清單確認新名稱。
+  const previewOf = async (params) => (await ui.call("/api/query", { method: "POST", body: { type: "provider-preview", params } })).json;
+  const preview = await previewOf({ providerId: "default", name: "測試閘道", modelPrefix: "gw/" });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.deepEqual(preview.renames.map((item) => [item.slug, item.from, item.to]), [["custom/e2e-b", "api/e2e-b", "gw/e2e-b"]]);
+  assert.deepEqual(preview.kept.map((item) => [item.slug, item.displayName]), [["custom/e2e-a", "我的 A"]], "手動改過的名稱保留");
+  assert.equal(readFileSync(catalogPath, "utf8"), before, "預覽不寫檔");
+  const badPreview = await previewOf({ providerId: "default", modelPrefix: "-x" });
+  assert.equal(badPreview.ok, false);
+  assert.match(badPreview.error, /前綴只能用/);
+  const badType = await ui.runJob("edit-provider", { providerId: "default", name: 5 });
+  assert.equal(badType.status, "failed");
+  assert.match(badType.error, /必須是文字/);
+  const renamed = await ui.runJob("edit-provider", { providerId: "default", name: "測試閘道", modelPrefix: "gw/" });
+  assert.equal(renamed.status, "succeeded", renamed.output);
+  assert.deepEqual([renamed.result.renamed, renamed.result.restartDesktop], [1, true]);
+  assert.match(renamed.output, /api\/e2e-b → gw\/e2e-b/);
+  assert.match(renamed.output, /不需要重新啟動路由器/);
+  const renamedCatalog = JSON.parse(readFileSync(catalogPath, "utf8")).models;
+  assert.deepEqual(["custom/e2e-a", "custom/e2e-b"].map((slug) => renamedCatalog.find((model) => model.slug === slug).display_name), ["我的 A", "gw/e2e-b"]);
+  const renamedSettings = JSON.parse(readFileSync(join(runtime, "settings.json"), "utf8"));
+  assert.deepEqual(renamedSettings.providers.map((item) => [item.id, item.name, item.modelPrefix]), [["default", "測試閘道", "gw"]]);
+  assert.deepEqual(renamedSettings.routes.map((route) => [route.pickerSlug, route.displayName]), [["custom/e2e-a", "我的 A"], ["custom/e2e-b", "gw/e2e-b"]]);
+  assert.deepEqual((await ui.call("/api/state")).json.providers.map((item) => [item.id, item.name, item.modelPrefix]), [["default", "測試閘道", "gw"]]);
+  assert.ok(readdirSync(join(root, "backups", "model-router")).some((name) => name.startsWith("edit-provider-")));
+  const unchanged = await ui.runJob("edit-provider", { providerId: "default", name: "測試閘道", modelPrefix: "gw" });
+  assert.deepEqual([unchanged.status, unchanged.result.changed], ["succeeded", false]);
+
   // 全域上下文：經由真的 Codex 設定 API 寫入與移除，其他設定保留。
   const query = async (type) => (await ui.call("/api/query", { method: "POST", body: { type } })).json;
   const contextBefore = await query("global-context");
