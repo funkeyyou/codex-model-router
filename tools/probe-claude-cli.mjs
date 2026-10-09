@@ -29,7 +29,7 @@ const base = { model: "custom/claude-cli-probe", stream: true, reasoning: { effo
 };
 async function turn(body) {
   const translated = toAnthropicRequest(body, route);
-  const response = await fetchClaudeCli(translated.request, { binary, effort: "medium", timeoutMs: 60000 }, null,
+  const response = await fetchClaudeCli(translated.request, { binary, effort: "medium", timeoutMs: 60000, totalTimeoutMs: 60000 }, null,
     { onDiagnostic: process.env.CLAUDE_CLI_PROBE_TRACE ? (event) => console.log(JSON.stringify(event)) : undefined });
   assert.equal(response.ok, true, response.ok ? "" : await response.text());
   const events = [];

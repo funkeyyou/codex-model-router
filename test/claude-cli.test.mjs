@@ -61,7 +61,7 @@ test("Claude CLI model planning preserves API settings, adds isolated routes, su
   assert.deepEqual(plan.settings.providers, [provider]);
   assert.equal(plan.settings.routes.length, 2);
   assert.ok(plan.settings.routes.every((route) => route.transport === "claude-cli" && route.providerId === "claude-cli"));
-  assert.deepEqual(plan.settings.claudeCli, { binary, timeoutMs: 180000 });
+  assert.deepEqual(plan.settings.claudeCli, { binary, timeoutMs: 180000, totalTimeoutMs: 900000 });
   assert.equal(plan.catalog.models[1].display_name, "claude-cli/opus");
   assert.deepEqual(plan.settings.routes[0].efforts, ["low", "medium", "high", "xhigh", "max"]);
   assert.deepEqual(plan.catalog.models[1].supported_reasoning_levels.map((level) => level.effort),
@@ -69,6 +69,10 @@ test("Claude CLI model planning preserves API settings, adds isolated routes, su
   const update = installer.planUpdate(plan.manifest, plan.settings);
   assert.equal(update.ok, true);
   assert.deepEqual(update.settings.claudeCli, plan.settings.claudeCli);
+  const customTimeouts = { binary, timeoutMs: 240000, totalTimeoutMs: 1200000 };
+  const replanned = installer.planClaudeCliModels({ ...before,
+    settings: { ...before.settings, claudeCli: customTimeouts } }, binary, ["opus"]);
+  assert.deepEqual(replanned.settings.claudeCli, customTimeouts);
   const removal = installer.planRemoveModels(plan.manifest, plan.settings, plan.catalog, [plan.settings.routes[0].pickerSlug]);
   assert.equal(removal.settings.routes.length, 1);
   assert.deepEqual(removal.settings.providers, [provider]);

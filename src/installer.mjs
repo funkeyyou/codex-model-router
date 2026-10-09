@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.5";
+const INSTALLER_VERSION = "1.27.6";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3589,7 +3589,9 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
   const maxPriority = Math.max(0, ...retained.map((model) => Number(model.priority) || 0));
   const entries = newRoutes.map((route, index) => ({ ...customCatalogEntry(official, route, index),
     priority: maxPriority + index + 1, description: "實驗性 Claude CLI 訂閱路由；上下文為手動設定，非探測值。" }));
-  const claudeCli = { binary, timeoutMs: state.settings.claudeCli?.timeoutMs || 180000 };
+  const claudeCli = { ...state.settings.claudeCli, binary,
+    timeoutMs: state.settings.claudeCli?.timeoutMs || 180000,
+    totalTimeoutMs: state.settings.claudeCli?.totalTimeoutMs || 900000 };
   return { settings: { ...state.settings, version: INSTALLER_VERSION, codexBin, routes, claudeCli },
     manifest: { ...state.manifest, version: INSTALLER_VERSION, codexBin, routes, claudeCli },
     catalog: { ...state.catalog, models: [...retained, ...entries] } };
@@ -3730,7 +3732,8 @@ export async function testClaudeCliModels(transport, { binary, version, models, 
   const failures = {};
   const probe = async (model) => {
     const response = await transport.fetchClaudeCli({ model, max_tokens: 1024, system: "Reply briefly.",
-      messages: [{ role: "user", content: "Reply with OK only." }] }, { binary, effort: "medium", timeoutMs: 45000 });
+      messages: [{ role: "user", content: "Reply with OK only." }] },
+      { binary, effort: "medium", timeoutMs: 45000, totalTimeoutMs: 45000 });
     if (!response.ok) return { events: [], failure: (await response.json()).error || { message: "Claude CLI 無法使用。" } };
     const text = await response.text();
     const events = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));

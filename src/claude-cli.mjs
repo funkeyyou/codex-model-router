@@ -267,7 +267,8 @@ export function cliFailure(code, requiredVersion = null) {
   const messages = {
     authentication_failed: "Claude CLI 尚未登入或授權已過期，請從「連接 Claude 訂閱帳號」重新登入。",
     rate_limit: "Claude 訂閱用量已達上限，請等待重置或切換其他模型。",
-    timeout: "Claude CLI 等待逾時，請重試或檢查 Claude 登入與網路。",
+    timeout: "Claude CLI 持續沒有回傳串流內容，已達閒置逾時。",
+    total_timeout: "Claude CLI 已達本次生成的總時限，已停止此回合。",
     invalid_tool: "Claude CLI 傳回未註冊的工具，已停止此回合。",
     protocol: "Claude CLI 回應格式不相容或回應中斷，請檢查 CLI 版本。",
     unavailable: "無法啟動 Claude CLI，請重新設定 CLI 路徑。",
@@ -296,7 +297,12 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     signal?.throwIfAborted();
   }
   const directory = await mkdtemp(join(tmpdir(), "codex-claude-turn-"));
-  let mcp, child = null, timer, terminal = false, streamController;
+  // Keep timeoutMs compatible with existing installations, but measure silence
+  // rather than the full generation. Bound both timers to Node's supported range.
+  const timeoutValue = (value, fallback) => Number.isInteger(value) && value > 0 && value <= 2147483647 ? value : fallback;
+  const idleTimeoutMs = timeoutValue(configuration.timeoutMs, 180000);
+  const totalTimeoutMs = timeoutValue(configuration.totalTimeoutMs, 900000);
+  let mcp, child = null, idleTimer, totalTimer, terminal = false, streamController;
   let cleanupPromise;
   const processes = new Set();
   // Resolves after the process exits; escalates if it ignores the first signal.
@@ -306,7 +312,8 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     proc.kill();
   });
   const cleanup = () => cleanupPromise ||= (async () => {
-    clearTimeout(timer);
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
     signal?.removeEventListener("abort", abort);
     mcp?.close();
     await Promise.all([...processes].map(terminate));
@@ -321,6 +328,10 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     void cleanup().catch(() => process.stderr.write("model-router-claude-cli-cleanup-failed\n"));
   };
   const abort = () => finish("protocol");
+  const resetIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => finish("timeout"), idleTimeoutMs);
+  };
   try {
     const conversation = prepareCliConversation(request, directory,
       { cacheTtl: cliCacheMarkerEnabled() ? CLI_CACHE_TTL : null });
@@ -343,6 +354,7 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     const env = testEnv || { ...claudeCliEnvironment(), CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(request.max_tokens || 32000) };
     let started = false, stopReason = null, toolCount = 0, cacheRetried = false;
     const launch = (history) => {
+      resetIdleTimer();
       const args = [...baseArgs];
       if (history) args.push("--resume", history, "--fork-session");
       if (configuration.effort) args.push("--effort", configuration.effort);
@@ -418,6 +430,9 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
           if (event.type === "message_stop" && ["any", "tool"].includes(request.tool_choice?.type) && !toolCount) {
             finish("tool_choice"); return;
           }
+          // Only accepted model stream events are progress. CLI metadata,
+          // stderr, and partial JSON lines must not keep a stalled turn alive.
+          resetIdleTimer();
           send(event);
           if (event.type === "message_stop") finish();
         }
@@ -431,7 +446,8 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
         if (!terminal) launch(plainPath);
       } catch { finish("protocol"); }
     };
-    timer = setTimeout(() => finish("timeout"), configuration.timeoutMs || 180000);
+    // This deadline belongs to the Responses request, including cache fallback.
+    totalTimer = setTimeout(() => finish("total_timeout"), totalTimeoutMs);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     if (!terminal) launch(conversation.transcript ? historyPath : null);

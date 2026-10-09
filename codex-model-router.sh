@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.5";
+const INSTALLER_VERSION = "1.27.6";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3667,7 +3667,9 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
   const maxPriority = Math.max(0, ...retained.map((model) => Number(model.priority) || 0));
   const entries = newRoutes.map((route, index) => ({ ...customCatalogEntry(official, route, index),
     priority: maxPriority + index + 1, description: "實驗性 Claude CLI 訂閱路由；上下文為手動設定，非探測值。" }));
-  const claudeCli = { binary, timeoutMs: state.settings.claudeCli?.timeoutMs || 180000 };
+  const claudeCli = { ...state.settings.claudeCli, binary,
+    timeoutMs: state.settings.claudeCli?.timeoutMs || 180000,
+    totalTimeoutMs: state.settings.claudeCli?.totalTimeoutMs || 900000 };
   return { settings: { ...state.settings, version: INSTALLER_VERSION, codexBin, routes, claudeCli },
     manifest: { ...state.manifest, version: INSTALLER_VERSION, codexBin, routes, claudeCli },
     catalog: { ...state.catalog, models: [...retained, ...entries] } };
@@ -3808,7 +3810,8 @@ export async function testClaudeCliModels(transport, { binary, version, models, 
   const failures = {};
   const probe = async (model) => {
     const response = await transport.fetchClaudeCli({ model, max_tokens: 1024, system: "Reply briefly.",
-      messages: [{ role: "user", content: "Reply with OK only." }] }, { binary, effort: "medium", timeoutMs: 45000 });
+      messages: [{ role: "user", content: "Reply with OK only." }] },
+      { binary, effort: "medium", timeoutMs: 45000, totalTimeoutMs: 45000 });
     if (!response.ok) return { events: [], failure: (await response.json()).error || { message: "Claude CLI 無法使用。" } };
     const text = await response.text();
     const events = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
@@ -13141,7 +13144,8 @@ export function cliFailure(code, requiredVersion = null) {
   const messages = {
     authentication_failed: "Claude CLI 尚未登入或授權已過期，請從「連接 Claude 訂閱帳號」重新登入。",
     rate_limit: "Claude 訂閱用量已達上限，請等待重置或切換其他模型。",
-    timeout: "Claude CLI 等待逾時，請重試或檢查 Claude 登入與網路。",
+    timeout: "Claude CLI 持續沒有回傳串流內容，已達閒置逾時。",
+    total_timeout: "Claude CLI 已達本次生成的總時限，已停止此回合。",
     invalid_tool: "Claude CLI 傳回未註冊的工具，已停止此回合。",
     protocol: "Claude CLI 回應格式不相容或回應中斷，請檢查 CLI 版本。",
     unavailable: "無法啟動 Claude CLI，請重新設定 CLI 路徑。",
@@ -13170,7 +13174,12 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     signal?.throwIfAborted();
   }
   const directory = await mkdtemp(join(tmpdir(), "codex-claude-turn-"));
-  let mcp, child = null, timer, terminal = false, streamController;
+  // Keep timeoutMs compatible with existing installations, but measure silence
+  // rather than the full generation. Bound both timers to Node's supported range.
+  const timeoutValue = (value, fallback) => Number.isInteger(value) && value > 0 && value <= 2147483647 ? value : fallback;
+  const idleTimeoutMs = timeoutValue(configuration.timeoutMs, 180000);
+  const totalTimeoutMs = timeoutValue(configuration.totalTimeoutMs, 900000);
+  let mcp, child = null, idleTimer, totalTimer, terminal = false, streamController;
   let cleanupPromise;
   const processes = new Set();
   // Resolves after the process exits; escalates if it ignores the first signal.
@@ -13180,7 +13189,8 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     proc.kill();
   });
   const cleanup = () => cleanupPromise ||= (async () => {
-    clearTimeout(timer);
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
     signal?.removeEventListener("abort", abort);
     mcp?.close();
     await Promise.all([...processes].map(terminate));
@@ -13195,6 +13205,10 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     void cleanup().catch(() => process.stderr.write("model-router-claude-cli-cleanup-failed\n"));
   };
   const abort = () => finish("protocol");
+  const resetIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => finish("timeout"), idleTimeoutMs);
+  };
   try {
     const conversation = prepareCliConversation(request, directory,
       { cacheTtl: cliCacheMarkerEnabled() ? CLI_CACHE_TTL : null });
@@ -13217,6 +13231,7 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     const env = testEnv || { ...claudeCliEnvironment(), CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(request.max_tokens || 32000) };
     let started = false, stopReason = null, toolCount = 0, cacheRetried = false;
     const launch = (history) => {
+      resetIdleTimer();
       const args = [...baseArgs];
       if (history) args.push("--resume", history, "--fork-session");
       if (configuration.effort) args.push("--effort", configuration.effort);
@@ -13292,6 +13307,9 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
           if (event.type === "message_stop" && ["any", "tool"].includes(request.tool_choice?.type) && !toolCount) {
             finish("tool_choice"); return;
           }
+          // Only accepted model stream events are progress. CLI metadata,
+          // stderr, and partial JSON lines must not keep a stalled turn alive.
+          resetIdleTimer();
           send(event);
           if (event.type === "message_stop") finish();
         }
@@ -13305,7 +13323,8 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
         if (!terminal) launch(plainPath);
       } catch { finish("protocol"); }
     };
-    timer = setTimeout(() => finish("timeout"), configuration.timeoutMs || 180000);
+    // This deadline belongs to the Responses request, including cache fallback.
+    totalTimer = setTimeout(() => finish("total_timeout"), totalTimeoutMs);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     if (!terminal) launch(conversation.transcript ? historyPath : null);
