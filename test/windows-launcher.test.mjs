@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -53,6 +53,20 @@ test("Windows：wscript 以 JScript 執行守護迴圈，命令結束後會重�
 
 test("Windows：安裝前的 Windows Script Host 檢查在正常系統上通過", { skip: process.platform !== "win32" }, () => {
   assert.doesNotThrow(() => installer.assertScriptHostAvailable());
+});
+
+test("Windows 英文系統也能建立中文名稱的管理頁捷徑，並清理暫存捷徑", { skip: process.platform !== "win32" }, (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "router-shortcut-unicode-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
+  const shortcut = join(directory, "Codex 模型路由器.lnk");
+  const launcher = join(directory, "manager-open.js");
+  writeFileSync(launcher, "WScript.Quit(0);\r\n");
+  const script = installer.windowsShortcutScript({ shortcut, launcher, workingDirectory: directory });
+  execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { windowsHide: true, timeout: 20000 });
+  assert.equal(existsSync(shortcut), true);
+  const bytes = readFileSync(shortcut);
+  assert.equal(bytes.readUInt32LE(0), 0x4c, "有效的 Shell Link 標頭");
+  assert.deepEqual(readdirSync(directory).sort(), ["Codex 模型路由器.lnk", "manager-open.js"].sort(), "不能留下暫存捷徑");
 });
 
 test("Windows 管理頁啟動器：真實 WSH 傳遞中文路徑，PowerShell 視窗不可見且開啟後退出", {

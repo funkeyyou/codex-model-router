@@ -5055,13 +5055,21 @@ export function windowsShortcutScript({ shortcut, launcher, workingDirectory }) 
     "$ErrorActionPreference = 'Stop'",
     `$path = ${psQuote(shortcut)}`,
     "$null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path)",
+    // WSH 的 Save 在部分英文 Windows 上無法處理中文檔名。先寫 ASCII 名稱，再以
+    // PowerShell 的 Unicode 檔案操作移到真正的捷徑名稱，失敗不留下臨時捷徑。
+    "$temporary = Join-Path (Split-Path -Parent $path) ('codex-model-router-' + [Guid]::NewGuid().ToString('N') + '.lnk')",
+    "try {",
     "$shell = New-Object -ComObject WScript.Shell",
-    "$link = $shell.CreateShortcut($path)",
+    "$link = $shell.CreateShortcut($temporary)",
     "$link.TargetPath = Join-Path $env:SystemRoot 'System32\\wscript.exe'",
     `$link.Arguments = ${psQuote(argumentsText)}`,
     `$link.WorkingDirectory = ${psQuote(workingDirectory)}`,
     `$link.Description = ${psQuote("開啟 Codex 模型路由器的網頁管理介面")}`,
     "$link.Save()",
+    "Move-Item -LiteralPath $temporary -Destination $path -Force",
+    "} finally {",
+    "if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }",
+    "}",
   ].join("\n");
 }
 

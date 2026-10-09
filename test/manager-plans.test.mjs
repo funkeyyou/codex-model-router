@@ -163,7 +163,8 @@ test("Windows 捷徑以 GUI wscript 執行啟動器，路徑含空白、中文�
   });
   assert.ok(plain.includes("$link.Arguments = '//nologo //B //E:jscript \"C:\\Users\\me\\.codex\\model-router\\manager-open.js\"'"), plain);
   assert.ok(plain.includes("System32\\wscript.exe"));
-  assert.match(plain, /\$link\.Save\(\)$/);
+  assert.match(plain, /\$link\.Save\(\)/);
+  assert.match(plain, /Move-Item -LiteralPath \$temporary -Destination \$path -Force/);
   const custom = installer.windowsShortcutScript({
     shortcut: "C:\\x\\y.lnk", launcher: "D:\\王小明 O'Brien\\manager-open.js", workingDirectory: "D:\\O'Brien",
   });
