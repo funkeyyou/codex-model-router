@@ -173,9 +173,9 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
   writeFileSync(join(runtime, "settings.json"), JSON.stringify(settings));
   writeFileSync(join(runtime, "install.json"), JSON.stringify({ port, providers: settings.providers,
     routes: [{ ...routes[0], pickerSlug: "custom/legacy-demo" }, routes[1]] }));
-  await installer.codexRpc("config/batchWrite", { edits: [
+  await installer.retryConfigWrite(() => installer.codexRpc("config/batchWrite", { edits: [
     { keyPath: "model", value: "custom/legacy-demo", mergeStrategy: "replace" },
-  ], reloadUserConfig: false }, () => true, bin, root);
+  ], reloadUserConfig: false }, () => true, bin, root));
   async function runRepair() {
     const repair = spawn(process.execPath, [join(dir, "installer.mjs"), "repair-models"], {
       env: { ...env, CODEX_MODEL_ROUTER_CODEX_BIN: bin }, cwd: root, stdio: ["ignore", "pipe", "pipe"],
@@ -194,9 +194,9 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
   assert.match(output, /沒有發送模型推理請求/);
 
   // 同 ID 舊名稱不能通過；修復流程失敗必須還原原本的全域預設。
-  await installer.codexRpc("config/batchWrite", { edits: [
+  await installer.retryConfigWrite(() => installer.codexRpc("config/batchWrite", { edits: [
     { keyPath: "model", value: "custom/legacy-demo", mergeStrategy: "replace" },
-  ], reloadUserConfig: false }, () => true, bin, root);
+  ], reloadUserConfig: false }, () => true, bin, root));
   writeFileSync(catalogPath, JSON.stringify({ models: [...models, { ...ark, display_name: "api/demo" }, pri] }));
   const failed = await runRepair();
   assert.equal(failed.code, 1, failed.output);
