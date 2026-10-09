@@ -486,7 +486,7 @@ async function api(path, options) {
     });
   } catch {
     setConnection(false);
-    throw new ApiError("無法連線到管理程式。若終端視窗已關閉，請重新開啟管理頁。", 0);
+    throw new ApiError("無法連線到管理程式，請重新開啟管理頁。", 0);
   }
   setConnection(true);
   let data = null;
@@ -622,7 +622,7 @@ function renderBanners() {
   const host = document.getElementById("banners");
   const items = [];
   if (connectionLost && !restartingManager) {
-    items.push(banner("error", "alert", "與管理程式的連線中斷，正在重試。若終端視窗已關閉，請重新執行安裝器的 ui 命令。"));
+    items.push(banner("error", "alert", "與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。"));
   }
   if (state && state.writeBlocked) items.push(banner("warn", "alert", state.writeBlocked));
   if (pendingDesktopRestart && state && state.installed) {
@@ -1554,7 +1554,7 @@ function watchJob(job, title) {
   try { sessionStorage.setItem(JOB_KEY, JSON.stringify({ id: job.id, title: title || job.title })); } catch { /* 僅影響重新整理後的記錄視窗 */ }
   return new Promise((resolve) => {
     const log = h("pre", { class: "log", "aria-live": "polite" });
-    const status = h("div", { class: "grow" }, h("span", { class: "spinner" }), "進行中，請勿關閉終端視窗…");
+    const status = h("div", { class: "grow" }, h("span", { class: "spinner" }), "進行中，請稍候…");
     const closeButton = h("button", { type: "button", class: "button", text: "請稍候", disabled: true });
     const modal = openModal({ title: title || job.title, wide: true, dismissable: false, body: [log], foot: [status, closeButton] });
     let offset = 0;
@@ -1631,7 +1631,7 @@ async function restartManager({ alreadyRequested = false } = {}) {
   try {
     if (!alreadyRequested) await api("/api/restart", { method: "POST" });
   } catch (error) {
-    message.textContent = "無法自動重新啟動管理頁：" + error.message + "。請回到終端視窗，重新執行安裝器的 ui 命令。";
+    message.textContent = "無法自動重新啟動管理頁：" + error.message + "。請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。";
     return;
   }
   const started = Date.now();

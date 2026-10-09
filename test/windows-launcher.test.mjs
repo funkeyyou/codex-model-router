@@ -6,7 +6,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -52,4 +53,30 @@ test("Windows：wscript 以 JScript 執行守護迴圈，命令結束後會重�
 
 test("Windows：安裝前的 Windows Script Host 檢查在正常系統上通過", { skip: process.platform !== "win32" }, () => {
   assert.doesNotThrow(() => installer.assertScriptHostAvailable());
+});
+
+test("Windows 管理頁啟動器：真實 WSH 傳遞中文路徑，PowerShell 視窗不可見且開啟後退出", {
+  skip: process.platform !== "win32", timeout: 45000,
+}, async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "router manager O'Brien 中文 "));
+  t.after(() => rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
+  const ps1 = join(directory, "codex-model-router.ps1");
+  const launcher = join(directory, "manager-open.js");
+  const marker = join(directory, "結果.json");
+  const ps = `param([string]$Action)
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class RouterWindowTest { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); }'
+$result = @{ action = $Action; home = $env:CODEX_HOME; visible = [RouterWindowTest]::IsWindowVisible([RouterWindowTest]::GetConsoleWindow()) }
+[IO.File]::WriteAllText($env:ROUTER_TEST_RESULT, ($result | ConvertTo-Json))
+exit 17
+`;
+  writeFileSync(ps1, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(ps, "utf16le")]));
+  const script = installer.windowsManagerLauncher({ installer: ps1, launchEnv: { CODEX_HOME: directory, ROUTER_TEST_RESULT: marker } });
+  writeFileSync(launcher, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(script, "utf16le")]));
+  const child = spawn(join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe"),
+    ["//nologo", "//B", "//E:jscript", launcher, "ignored.txt"], { stdio: "ignore", windowsHide: true });
+  t.after(() => { if (child.exitCode == null) execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 17, existsSync(marker) ? readFileSync(marker, "utf8") : "WSH 未完成啟動");
+  const result = JSON.parse(readFileSync(marker, "utf8"));
+  assert.deepEqual(result, { action: "ui", home: directory, visible: false });
 });

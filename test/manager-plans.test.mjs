@@ -8,6 +8,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer, managerPage } = await loadPayloads();
@@ -149,26 +150,24 @@ test("macOS 捷徑以 bash 執行安裝器副本的 ui，路徑含空白與引�
   assert.match(text, /^#!\/bin\/bash\n/);
   writeFileSync(shortcut, text);
   chmodSync(shortcut, 0o755);
-  const result = spawnSync(shortcut, [], { env: { ...process.env, OUT: output }, encoding: "utf8" });
+  const result = spawnSync(shortcut, ["ignored file $(bad).txt", "--help"], { env: { ...process.env, OUT: output }, encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readFileSync(output, "utf8"), "ui|" + tricky + "|" + join(root, "r'r"));
   assert.doesNotMatch(installer.managerCommandFile({ installer: "/a.sh" }), /export/, "預設位置不寫環境變數");
 });
 
-test("Windows 捷徑腳本：預設用 -File，有自訂 CODEX_HOME 時改用 -Command 並正確跳脫", () => {
+test("Windows 捷徑以 GUI wscript 執行啟動器，路徑含空白、中文與單引號也安全", () => {
   const plain = installer.windowsShortcutScript({
-    shortcut: "C:\\Users\\me\\Start\\Codex 模型路由器.lnk", installer: "C:\\Users\\me\\.codex\\model-router\\codex-model-router.ps1",
+    shortcut: "C:\\Users\\me\\Start\\Codex 模型路由器.lnk", launcher: "C:\\Users\\me\\.codex\\model-router\\manager-open.js",
     workingDirectory: "C:\\Users\\me\\.codex\\model-router",
   });
-  assert.ok(plain.includes("$link.Arguments = '-NoProfile -ExecutionPolicy Bypass -File \"C:\\Users\\me\\.codex\\model-router\\codex-model-router.ps1\" ui'"), plain);
-  assert.ok(plain.includes("System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+  assert.ok(plain.includes("$link.Arguments = '//nologo //B //E:jscript \"C:\\Users\\me\\.codex\\model-router\\manager-open.js\"'"), plain);
+  assert.ok(plain.includes("System32\\wscript.exe"));
   assert.match(plain, /\$link\.Save\(\)$/);
   const custom = installer.windowsShortcutScript({
-    shortcut: "C:\\x\\y.lnk", installer: "D:\\O'Brien\\codex-model-router.ps1", workingDirectory: "D:\\O'Brien",
-    launchEnv: { CODEX_HOME: "D:\\O'Brien\\.codex" },
+    shortcut: "C:\\x\\y.lnk", launcher: "D:\\王小明 O'Brien\\manager-open.js", workingDirectory: "D:\\O'Brien",
   });
-  // 外層是 PowerShell 單引號字串（' 變 ''），內層 -Command 的單引號再跳脫一次。
-  const expected = "$link.Arguments = '-NoProfile -ExecutionPolicy Bypass -Command \"$env:CODEX_HOME=''D:\\O''''Brien\\.codex''; & ''D:\\O''''Brien\\codex-model-router.ps1'' ui\"'";
+  const expected = "$link.Arguments = '//nologo //B //E:jscript \"D:\\王小明 O''Brien\\manager-open.js\"'";
   assert.ok(custom.includes(expected), custom);
   assert.ok(custom.includes("$link.WorkingDirectory = 'D:\\O''Brien'"));
   const pwsh = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command",
@@ -176,6 +175,44 @@ test("Windows 捷徑腳本：預設用 -File，有自訂 CODEX_HOME 時改用 -C
   { input: plain + "\n" + custom, encoding: "utf8" });
   if (pwsh.error) return; // 沒有 pwsh 時只做字串檢查
   assert.equal(pwsh.status, 0, pwsh.stdout + pwsh.stderr);
+});
+
+test("Windows 啟動器隱藏 PowerShell，只傳 ui，並用子程序環境傳遞自訂安裝位置", () => {
+  const calls = [];
+  const values = {};
+  const installed = "D:\\王小明 O'Brien $(bad)\\codex-model-router.ps1";
+  const home = "D:\\home\u2028folder\u2029name";
+  const shell = { Environment: () => ({ Item: (key) => values[key] }),
+    ExpandEnvironmentStrings: value => value.replace("%SystemRoot%", "C:\\Windows"),
+    Run: (...args) => { calls.push(args); return 17; } };
+  // WSH 的 Environment.Item 是可寫 COM 屬性；以 Proxy 模擬，驗證實際傳出去的值。
+  shell.Environment = () => new Proxy({}, { set(target, key, value) { values[key] = value; return true; } });
+  let script = installer.windowsManagerLauncher({ installer: installed, launchEnv: { CODEX_HOME: home } });
+  assert.ok(!script.includes("\u2028") && !script.includes("\u2029"));
+  // COM 屬性賦值語法在 JScript 有效，Node 不支援；只轉換這個屬性存取，其他原樣執行。
+  script = script.replace(/processEnv\.Item\(("[^"]+")\) = /g, "processEnv[$1] = ");
+  let result;
+  runInNewContext(script, { ActiveXObject: function () { return shell; }, WScript: { Quit: code => { result = code; } } });
+  assert.deepEqual(calls[0], ['"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + installed + '" ui', 0, true]);
+  assert.equal(values.CODEX_HOME, home);
+  assert.equal(result, 17);
+});
+
+test("Codex MCP 入口沿用指定 Node 與安裝位置；回退保留使用者修改及其他伺服器", () => {
+  const key = "mcp_servers.model_router_manager";
+  const entry = installer.managerMcpConfig({ node: "/my node/node", entry: "/my home/manager-entry.mjs" });
+  assert.deepEqual(entry, { command: "/my node/node", args: ["/my home/manager-entry.mjs"], startup_timeout_sec: 10 });
+  const config = { mcp_servers: { model_router_manager: structuredClone(entry), other: { command: "keep" } } };
+  assert.deepEqual(installer.managerMcpRollbackEdit(config, { installed: entry, previous: null }), { keyPath: key, value: null });
+  assert.deepEqual(installer.managerMcpRollbackEdit(config, { installed: entry, previous: { command: "Previous" } }), { keyPath: key, value: { command: "Previous" } });
+  config.mcp_servers.model_router_manager.args.push("manual");
+  assert.equal(installer.managerMcpRollbackEdit(config, { installed: entry }), null, "使用者修改後不覆蓋");
+  assert.deepEqual(config.mcp_servers.other, { command: "keep" });
+  const legacy = { command: "/bin/bash", args: ["manager-open.sh"] };
+  const legacyConfig = { desktop: { custom_file_handlers: { model_router_manager: legacy, keep: { label: "Keep" } } } };
+  assert.deepEqual(installer.managerHandlerRollbackEdit(legacyConfig, { installed: legacy, previous: null }),
+    { keyPath: "desktop.custom_file_handlers.model_router_manager", value: null });
+  assert.equal(installer.managerHandlerRollbackEdit(legacyConfig, { installed: { command: "other" } }), null);
 });
 
 test("從 Codex 執行檔路徑找出桌面版的 App bundle", () => {
@@ -225,6 +262,8 @@ test("內嵌的網頁管理介面在 .sh 與 .ps1 中一致，Claude CLI 段不�
   assert.equal(page, managerPage);
   assert.equal(installer.loadManagerPage(powershellPath), page);
   assert.equal(installer.loadManagerSource(powershellPath), installer.loadManagerSource(shellPath));
+  assert.equal(installer.loadManagerEntrySource(powershellPath), installer.loadManagerEntrySource(shellPath));
+  assert.doesNotMatch(page, /export async function serveManagerEntry/);
   assert.match(installer.loadManagerSource(shellPath), /export function createManagerServer/);
   const claudeCli = installer.loadClaudeCliSource(shellPath);
   assert.doesNotMatch(claudeCli, /createManagerServer|<!doctype html>/i);

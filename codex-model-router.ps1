@@ -158,8 +158,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.4";
+const INSTALLER_VERSION = "1.27.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -551,8 +552,18 @@ export function loadManagerPage(sourcePath = scriptPath) {
   const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
   const marker = "\n__CODEX_MODEL_ROUTER_MANAGER_HTML__\n";
   const start = source.indexOf(marker);
-  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__");
+  const entryStart = source.indexOf("\n__CODEX_MODEL_ROUTER_MANAGER_ENTRY_JS__");
+  const end = entryStart < 0 ? source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__") : entryStart;
   if (start < 0 || end <= start) fail("安裝器中缺少網頁管理介面頁面。");
+  return source.slice(start + marker.length, end) + "\n";
+}
+
+export function loadManagerEntrySource(sourcePath = scriptPath) {
+  const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_MANAGER_ENTRY_JS__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_EMBEDDED__");
+  if (start < 0 || end <= start) fail("安裝器中缺少 Codex 管理頁入口程式。");
   return source.slice(start + marker.length, end) + "\n";
 }
 
@@ -3194,6 +3205,8 @@ async function install() {
       configVersionAfterInstall: writeResult.version || null,
       codexBin,
       nodeBin,
+      ...(existingManifest?.managerFileHandler ? { managerFileHandler: existingManifest.managerFileHandler } : {}),
+      ...(existingManifest?.managerMcpEntry ? { managerMcpEntry: existingManifest.managerMcpEntry } : {}),
     }, providers);
     await waitForPickerModels(allRoutes);
     writeJsonAtomic(manifestPath, manifest);
@@ -3266,7 +3279,7 @@ async function install() {
   console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
   console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
   console.log(`回退命令：${basename(scriptPath)} rollback`);
-  printManagerLauncher(installManagerLauncher());
+  printManagerLauncher(await installManagerLauncher());
   await offerInstalledRelayImagegen();
 }
 
@@ -4360,7 +4373,7 @@ async function update() {
   try { refreshRelayImagegen(); } catch (error) {
     console.error(`路由器已更新，中轉生圖技能保持原狀：${error.message}`);
   }
-  printManagerLauncher(installManagerLauncher());
+  printManagerLauncher(await installManagerLauncher());
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
@@ -4966,7 +4979,20 @@ async function rollback() {
   console.log(`完整配置備份：${manifest.configBackup}`);
   if (!(await confirm("是否繼續？", true))) return;
 
-  await writeConfigEdits(rollbackEdits(manifest.previousConfig));
+  const edits = rollbackEdits(manifest.previousConfig);
+  if (manifest.managerFileHandler) {
+    const user = await readUserConfig();
+    const entryEdit = managerHandlerRollbackEdit(user.config, manifest.managerFileHandler);
+    if (entryEdit) edits.push(entryEdit);
+    else console.log("自訂模型管理的開啟方式已被修改，保留目前的設定。");
+  }
+  if (manifest.managerMcpEntry) {
+    const user = await readUserConfig();
+    const entryEdit = managerMcpRollbackEdit(user.config, manifest.managerMcpEntry);
+    if (entryEdit) edits.push(entryEdit);
+    else console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
+  }
+  await writeConfigEdits(edits);
   stopService();
   removeServiceRegistration();
 
@@ -5000,8 +5026,8 @@ async function rollback() {
 // --- 網頁管理介面 -------------------------------------------------------------
 //
 // ui 命令在本機開一個臨時網頁，背後呼叫的是與終端選單相同的函式：備份、寫入、重啟、
-// 健康檢查與 Codex 模型清單驗證，失敗一律還原。網頁伺服器只在這個命令執行期間存在，
-// 關閉終端視窗、按 Ctrl+C 或閒置太久就結束；常駐的路由器本身不提供任何網頁。
+// 健康檢查與 Codex 模型清單驗證，失敗一律還原。一般啟動會交給獨立背景程序，
+// 從頁面結束或閒置太久就結束；--foreground 可保留終端診斷，路由器本身不提供任何網頁。
 
 const MANAGER_REPO_URL = "https://github.com/funkeyyou/codex-model-router";
 const MANAGER_RELEASES_PAGE = `${MANAGER_REPO_URL}/releases`;
@@ -5014,6 +5040,12 @@ const managerInstallerName = isWindows ? "codex-model-router.ps1" : "codex-model
 const managerInstallerPath = join(installRoot, managerInstallerName);
 const managerLockPath = join(installRoot, "manager.json");
 const managerHandoffPath = join(installRoot, "manager-handoff.json");
+const MANAGER_HANDLER_KEY = "desktop.custom_file_handlers.model_router_manager";
+const MANAGER_MCP_KEY = "mcp_servers.model_router_manager";
+const managerMcpPath = join(installRoot, "manager-entry.mjs");
+const managerLauncherPath = join(installRoot, isWindows ? "manager-open.js" : "manager-open.sh");
+const managerIconPath = join(installRoot, "manager-icon.svg");
+const MANAGER_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#111d35"/><path d="M14 22h14l10 20h12M14 42h14l10-20h12m-6-6 6 6-6 6m0 8 6 6-6 6" fill="none" stroke="#63b5fa" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>\n';
 // 記錄檔裡跟故障有關的前綴；ready、log-truncated 之類的例行訊息不顯示。
 const MANAGER_LOG_KINDS = new Set([
   "error", "websocket-error", "catalog-refresh-failed", "request-too-large", "upstream-ws-cooldown", "auth-probe-grace",
@@ -5055,20 +5087,31 @@ export function managerCommandFile({ installer, launchEnv = {} }) {
   ].join("\n");
 }
 
-// 開始功能表捷徑：以 PowerShell 5.1 執行安裝器副本的 ui 命令，主控台視窗即管理頁的記錄。
-export function windowsShortcutScript({ shortcut, installer, workingDirectory, launchEnv = {} }) {
-  const literal = (value) => `'${String(value).replaceAll("'", "''")}'`;
-  const assignments = Object.entries(launchEnv).map(([name, value]) => `$env:${name}=${literal(value)}`);
-  const argumentsText = assignments.length
-    ? `-NoProfile -ExecutionPolicy Bypass -Command "${[...assignments, `& ${literal(installer)} ui`].join("; ")}"`
-    : `-NoProfile -ExecutionPolicy Bypass -File "${installer}" ui`;
+// GUI 子系統的 wscript 啟動短期 PowerShell bootstrap，兩者都不顯示主控台。
+// ui 完成背景交接後即返回；檔案輸入參數刻意忽略，開管理頁不會把來源檔案當成命令。
+export function windowsManagerLauncher({ installer, launchEnv = {} }) {
+  const literal = value => JSON.stringify(String(value)).replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");
+  return [
+    'var shell = new ActiveXObject("WScript.Shell");',
+    'var processEnv = shell.Environment("PROCESS");',
+    ...Object.entries(launchEnv).map(([name, value]) => `processEnv.Item(${literal(name)}) = ${literal(value)};`),
+    'var powershell = shell.ExpandEnvironmentStrings("%SystemRoot%\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe");',
+    `var command = '"' + powershell + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + ${literal(`"${installer}" ui`)};`,
+    "var result = shell.Run(command, 0, true);",
+    "WScript.Quit(result);",
+    "",
+  ].join("\r\n");
+}
+
+export function windowsShortcutScript({ shortcut, launcher, workingDirectory }) {
+  const argumentsText = `//nologo //B //E:jscript "${launcher}"`;
   return [
     "$ErrorActionPreference = 'Stop'",
     `$path = ${psQuote(shortcut)}`,
     "$null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path)",
     "$shell = New-Object -ComObject WScript.Shell",
     "$link = $shell.CreateShortcut($path)",
-    "$link.TargetPath = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'",
+    "$link.TargetPath = Join-Path $env:SystemRoot 'System32\\wscript.exe'",
     `$link.Arguments = ${psQuote(argumentsText)}`,
     `$link.WorkingDirectory = ${psQuote(workingDirectory)}`,
     `$link.Description = ${psQuote("開啟 Codex 模型路由器的網頁管理介面")}`,
@@ -5078,7 +5121,7 @@ export function windowsShortcutScript({ shortcut, installer, workingDirectory, l
 
 // 安裝與更新成功後放一份安裝器到路由器目錄，並建立雙擊即可開啟管理頁的捷徑。
 // 失敗只提醒，不影響路由器本身。測試模式沒指定捷徑目錄時不碰使用者的應用程式資料夾。
-function installManagerLauncher() {
+async function installManagerLauncher() {
   try {
     if (scriptPath && existsSync(scriptPath) && resolve(scriptPath) !== resolve(managerInstallerPath)) {
       // 先寫暫存檔再改名：正在執行舊副本的 bash 握著舊檔，不會讀到寫到一半的內容。
@@ -5090,20 +5133,34 @@ function installManagerLauncher() {
   } catch (error) {
     return { ok: false, message: `無法放置網頁管理介面用的安裝器副本（${error.message}）` };
   }
-  if (testMode && !env.CODEX_MODEL_ROUTER_SHORTCUT_DIR) return { ok: true, shortcut: null };
+  const launchEnv = managerLaunchEnv();
+  try {
+    writeFileSync(managerLauncherPath, isWindows
+      ? utf16leWithBom(windowsManagerLauncher({ installer: managerInstallerPath, launchEnv }))
+      : managerCommandFile({ installer: managerInstallerPath, launchEnv }), { mode: isWindows ? 0o600 : 0o700 });
+    chmodSync(managerLauncherPath, isWindows ? 0o600 : 0o700);
+    writeFileSync(managerIconPath, MANAGER_ICON, { mode: 0o600 });
+    writeFileSync(managerMcpPath, loadManagerEntrySource() + "\nawait serveManagerEntry(" + JSON.stringify({
+      version: INSTALLER_VERSION, installer: managerInstallerPath,
+      launchEnv: { CODEX_HOME: codexHome, CODEX_MODEL_ROUTER_HOME: installRoot },
+    }) + ");\n", { mode: 0o600 });
+  } catch (error) {
+    return { ok: false, message: `無法建立管理頁啟動器（${error.message}）` };
+  }
+  const desktop = testMode && env.CODEX_MODEL_ROUTER_TEST_MANAGER_ENTRY !== "1" ? null : await installManagerMcpEntry();
+  if (testMode && !env.CODEX_MODEL_ROUTER_SHORTCUT_DIR) return { ok: true, shortcut: null, desktop };
   const shortcut = managerShortcutPath();
   try {
-    const launchEnv = managerLaunchEnv();
     if (isWindows) {
-      powershell(windowsShortcutScript({ shortcut, installer: managerInstallerPath, workingDirectory: installRoot, launchEnv }));
+      powershell(windowsShortcutScript({ shortcut, launcher: managerLauncherPath, workingDirectory: installRoot }));
     } else {
       mkdirSync(dirname(shortcut), { recursive: true });
       writeFileSync(shortcut, managerCommandFile({ installer: managerInstallerPath, launchEnv }), { mode: 0o755 });
       chmodSync(shortcut, 0o755);
     }
-    return { ok: true, shortcut };
+    return { ok: true, shortcut, desktop };
   } catch (error) {
-    return { ok: false, message: `無法建立網頁管理介面的捷徑（${error.message}）` };
+    return { ok: false, desktop, message: `無法建立網頁管理介面的捷徑（${error.message}）` };
   }
 }
 
@@ -5111,6 +5168,65 @@ function printManagerLauncher(result) {
   if (result.ok && result.shortcut) console.log(`網頁管理介面：雙擊「${result.shortcut}」開啟。`);
   else if (result.ok) console.log(`網頁管理介面：執行 ${managerInstallerName} ui 開啟。`);
   else console.log(`注意：${result.message}；仍可執行安裝器的 ui 命令開啟網頁管理介面。`);
+  if (result.desktop?.ok) console.log("Codex 介面入口：重新開啟 Codex 後，點擊介面中的「自訂模型管理」（依版本顯示在頂部或側邊欄）。");
+  else if (result.desktop) console.log(`Codex 介面入口未加入：${result.desktop.message}`);
+}
+
+export function managerMcpConfig({ node = nodeBin || process.execPath, entry = managerMcpPath, revision = null } = {}) {
+  return { command: node, args: [entry, ...(revision ? ["--revision", revision] : [])], startup_timeout_sec: 10 };
+}
+
+const sameHandler = (left, right) => isDeepStrictEqual(left ?? null, right ?? null);
+
+// 只撤回仍由本工具管理的這一個項目，不碰使用者後來修改的啟動器或偏好的編輯器。
+export function managerHandlerRollbackEdit(config, record) {
+  if (!record?.installed || !sameHandler(deepGet(config, MANAGER_HANDLER_KEY).value, record.installed)) return null;
+  return { keyPath: MANAGER_HANDLER_KEY, value: record.previous ?? null };
+}
+
+export function managerMcpRollbackEdit(config, record) {
+  if (!record?.installed || !sameHandler(deepGet(config, MANAGER_MCP_KEY).value, record.installed)) return null;
+  return { keyPath: MANAGER_MCP_KEY, value: record.previous ?? null };
+}
+
+async function installManagerMcpEntry() {
+  try {
+    const user = await readUserConfig();
+    const manifest = readManifest();
+    if (!manifest) fail("請先安裝 Codex 模型路由器。");
+    // 入口程式改變時，MCP 設定的識別也改變，客戶端不能繼續使用先前的連線快取。
+    const revision = createHash("sha256").update(loadManagerEntrySource()).digest("hex").slice(0, 12);
+    const installed = managerMcpConfig({ revision });
+    const current = deepGet(user.config, MANAGER_MCP_KEY).value;
+    const previous = manifest.managerMcpEntry;
+    if (current != null && !sameHandler(current, previous?.installed)) {
+      return { ok: false, message: "model_router_manager 名稱已有其他 MCP 設定，已保留原設定。" };
+    }
+    const legacyEdit = managerHandlerRollbackEdit(user.config, manifest.managerFileHandler);
+    if (sameHandler(current, installed) && previous && !legacyEdit) return { ok: true };
+    configBackup(user.filePath);
+    // 先記錄恢復資料，途中中斷時仍能用 rollback 還原這一個設定項。
+    const updatedManifest = { ...manifest, managerMcpEntry: { key: MANAGER_MCP_KEY, installed,
+      previous: previous ? previous.previous : current } };
+    writeJsonAtomic(manifestPath, updatedManifest);
+    await writeConfigEdits([{ keyPath: MANAGER_MCP_KEY, value: installed }, ...(legacyEdit ? [legacyEdit] : [])]);
+    const verified = await readUserConfig();
+    if (!sameHandler(deepGet(verified.config, MANAGER_MCP_KEY).value, installed)) fail("Codex MCP 入口未成功寫入。");
+    if (legacyEdit) {
+      delete updatedManifest.managerFileHandler;
+      writeJsonAtomic(manifestPath, updatedManifest);
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, message: error.message };
+  }
+}
+
+async function setupManagerEntry() {
+  if (!readManifest()) fail("請先安裝 Codex 模型路由器。");
+  const result = await installManagerLauncher();
+  printManagerLauncher(result);
+  if (!result.ok || result.desktop?.ok === false) fail("管理頁入口未完整安裝，請依上方訊息處理。");
 }
 
 function archiveManagerShortcut(archiveDir) {
@@ -6301,6 +6417,89 @@ function closeManagerServer(server) {
   });
 }
 
+// 一般開啟只負責啟動／重用背景程序，再打開網址，完成即退出。
+// 管理程序直接用同一份 Node 負載啟動，不留下 PowerShell / cmd / 終端依附。
+async function openManager() {
+  if (!readManifest()) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先安裝。");
+  // 兩次快速點擊也只能建立一個背景管理頁；啟動者意外退出後，下次會移除它的鎖。
+  const path = join(installRoot, "manager-starting.json");
+  const owner = { pid: process.pid, id: randomUUID() };
+  const deadline = Date.now() + 45000;
+  let acquired = false;
+  while (Date.now() < deadline && !acquired) {
+    try {
+      const fd = openSync(path, "wx", 0o600);
+      try { writeFileSync(fd, JSON.stringify(owner)); acquired = true; } finally { closeSync(fd); }
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      try {
+        let previous;
+        try { previous = JSON.parse(readFileSync(path, "utf8")); } catch {}
+        let stale = !previous?.pid && Date.now() - statSync(path).mtimeMs > 5000;
+        if (Number.isInteger(previous?.pid) && previous.pid > 0) {
+          try { process.kill(previous.pid, 0); } catch (error) { stale = error.code === "ESRCH"; }
+        }
+        if (stale) rmSync(path, { force: true });
+      } catch (error) { if (error.code !== "ENOENT") throw error; }
+      await delay(100);
+    }
+  }
+  if (!acquired) fail("另一個管理頁啟動程序尚未完成，請稍後再試。");
+  try { return await openManagerOnce(); } finally {
+    try { if (JSON.parse(readFileSync(path, "utf8")).id === owner.id) rmSync(path, { force: true }); } catch {}
+  }
+}
+
+async function openManagerOnce() {
+  const existing = readManagerLock();
+  const openPage = env.CODEX_MODEL_ROUTER_UI_NO_OPEN !== "1";
+  if (existing && await managerAlive(existing)) {
+    const url = managerUrl(existing.port, existing.token);
+    console.log(`網頁管理介面已經在執行（${existing.version || "版本未知"}）。`);
+    console.log(`網址：${url}`);
+    if (openPage && openBrowser(url)) console.log("已在瀏覽器開啟。");
+    return;
+  }
+  const manager = await importManagerModule();
+  const token = manager.createToken();
+  const entry = join(installRoot, `manager-entry-${randomUUID()}.mjs`);
+  const source = readFileSync(scriptPath, "utf8").replaceAll("\r\n", "\n");
+  const start = source.indexOf("\n__CODEX_MODEL_ROUTER_INSTALLER_JS__\n");
+  const end = source.indexOf("\n__CODEX_MODEL_ROUTER_ROUTER_JS__\n");
+  if (start < 0 || end <= start) fail("安裝器缺少管理頁啟動程式。");
+  writeFileSync(entry, source.slice(start + "\n__CODEX_MODEL_ROUTER_INSTALLER_JS__\n".length, end) + "\n", { mode: 0o600 });
+  const childEnv = { ...managerBackgroundEnvironment(env), CODEX_HOME: codexHome, CODEX_MODEL_ROUTER_HOME: installRoot,
+    CODEX_MODEL_ROUTER_SCRIPT_PATH: scriptPath, CODEX_MODEL_ROUTER_NODE_BIN: process.execPath,
+    CODEX_MODEL_ROUTER_UI_TOKEN: token, CODEX_MODEL_ROUTER_UI_NO_OPEN: "1", CODEX_MODEL_ROUTER_UI_BACKGROUND: "1" };
+  const args = [entry, "ui", "--foreground"];
+  const preferredPort = argOption("--port");
+  if (preferredPort) args.push("--port", preferredPort);
+  let worker;
+  try {
+    worker = await startManagerBackgroundTask({ kind: "manager", command: process.execPath, args,
+      environment: childEnv, cleanupPaths: [entry] });
+  } catch (error) {
+    rmSync(entry, { force: true });
+    throw error;
+  }
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const state = readManagerWorkerStatus(worker.statusPath);
+    if (state?.status === "failed") fail(state.error);
+    const lock = readManagerLock();
+    if (lock?.token === token && await managerAlive(lock)) {
+      const url = managerUrl(lock.port, token);
+      console.log(`網址：${url}`);
+      console.log("管理頁已在背景啟動；可從頁面結束，閒置 20 分鐘自動結束。");
+      if (openPage && openBrowser(url)) console.log("已在瀏覽器開啟。");
+      rmSync(worker.statusPath, { force: true });
+      return;
+    }
+    await delay(100);
+  }
+  fail(`管理頁未能啟動，請查看 ${worker.logPath}。`);
+}
+
 async function runManager() {
   if (!readManifest()) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
   const inheritedToken = env.CODEX_MODEL_ROUTER_UI_TOKEN || null;
@@ -6377,7 +6576,8 @@ async function runManager() {
   printHeading("網頁管理介面");
   console.log(`網址：${url}`);
   console.log("網址含這次的存取權杖，請勿分享；閒置 20 分鐘會自動結束。");
-  if (inheritedToken) console.log("管理頁已由獨立程序接手，瀏覽器分頁會自動重新整理；可從頁面選擇結束管理頁。");
+  if (env.CODEX_MODEL_ROUTER_UI_BACKGROUND === "1") console.log("管理頁已在背景啟動，可從頁面選擇結束管理頁。");
+  else if (inheritedToken) console.log("管理頁已由獨立程序接手，瀏覽器分頁會自動重新整理；可從頁面選擇結束管理頁。");
   else console.log("關閉這個終端視窗或按 Ctrl+C 即結束管理頁。");
   if (restoredJob) {
     rmSync(managerHandoffPath, { force: true });
@@ -6433,8 +6633,8 @@ async function restartIntoInstalledManager(port, token) {
   childEnv.CODEX_MODEL_ROUTER_UI_TOKEN = token;
   childEnv.CODEX_MODEL_ROUTER_UI_NO_OPEN = "1";
   const [command, args] = isWindows
-    ? ["powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", managerInstallerPath, "ui", "--port", String(port)]]
-    : ["/bin/bash", [managerInstallerPath, "ui", "--port", String(port)]];
+    ? ["powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", managerInstallerPath, "ui", "--foreground", "--port", String(port)]]
+    : ["/bin/bash", [managerInstallerPath, "ui", "--foreground", "--port", String(port)]];
   const worker = await startManagerBackgroundTask({ kind: "manager", command, args, environment: childEnv });
   const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
@@ -6490,6 +6690,7 @@ function help() {
 用法：
   ${basename(scriptPath || "codex-model-router.command")} install
   ${basename(scriptPath || "codex-model-router.command")} ui
+  ${basename(scriptPath || "codex-model-router.command")} ui-setup
   ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} remove
@@ -6513,9 +6714,11 @@ function help() {
 ui 在瀏覽器開啟本機網頁管理介面：查看狀態與最近錯誤、添加／刪除／排序模型、修改顯示名稱、
 上下文與輸出、管理供應商與 API Key、中轉 API 生圖、全域上下文、隱藏的官方模型與 Claude 訂閱（CLI），
 並可檢查新版本、一鍵更新後重新啟動。背後用的是與選單相同的流程（先備份、失敗還原）。
-網址含一次性存取權杖，只接受本機連線；關閉終端視窗即結束。
+網址含一次性存取權杖，只接受本機連線；背景執行，不需要保留終端視窗。
+從頁面結束或閒置 20 分鐘會自動退出；ui --foreground 可在終端顯示診斷。
 安裝與更新完成後會建立捷徑（macOS：~/Applications/Codex 模型路由器.command；
-Windows：開始功能表），雙擊即可開啟。
+Windows：開始功能表），雙擊即可開啟。重新開啟支援 MCP Apps 的 Codex 後，也可點擊介面中的
+「自訂模型管理」直接開啟（依版本顯示在頂部或側邊欄）。ui-setup 可單獨修復入口，不重啟路由器。
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
 沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
@@ -6622,7 +6825,12 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       await printVersionSummary();
     }
     const action = requestedAction || (await chooseAction());
-    if (action === "ui" || action === "web" || action === "manager") await runManager();
+    if (action === "ui" || action === "web" || action === "manager") {
+      // 1.27.3／1.27.4 的更新交接只有傳權杖、沒有 --foreground，仍須沿用原網址與權杖。
+      if (process.argv.includes("--foreground") || env.CODEX_MODEL_ROUTER_UI_TOKEN) await runManager();
+      else await openManager();
+    }
+    else if (action === "ui-setup") await setupManagerEntry();
     else if (action === "claude-cli") await configureClaudeCli(requestedAction ? process.argv[3] : null);
     else if (action === "context-1m") await configureMillionTokenContext();
     else if (action === "imagegen" || action === "relay-imagegen") await configureRelayImagegen();
@@ -13278,6 +13486,7 @@ export async function runBackgroundTask(specPath) {
     // 結果留給管理頁讀取；程式與含存取權杖的啟動參數在工作結束後立即刪除。
     rmSync(specPath, { force: true });
     rmSync(spec.workerPath, { force: true });
+    for (const file of spec.cleanupPaths || []) rmSync(file, { force: true });
     if (spec.kind === "manager" && process.exitCode !== 1) rmSync(spec.statusPath, { force: true });
     if (spec.launchLabel) spawnSync("/bin/launchctl", ["remove", spec.launchLabel], { stdio: "ignore", timeout: 5000 });
   }
@@ -14119,7 +14328,7 @@ async function api(path, options) {
     });
   } catch {
     setConnection(false);
-    throw new ApiError("無法連線到管理程式。若終端視窗已關閉，請重新開啟管理頁。", 0);
+    throw new ApiError("無法連線到管理程式，請重新開啟管理頁。", 0);
   }
   setConnection(true);
   let data = null;
@@ -14255,7 +14464,7 @@ function renderBanners() {
   const host = document.getElementById("banners");
   const items = [];
   if (connectionLost && !restartingManager) {
-    items.push(banner("error", "alert", "與管理程式的連線中斷，正在重試。若終端視窗已關閉，請重新執行安裝器的 ui 命令。"));
+    items.push(banner("error", "alert", "與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。"));
   }
   if (state && state.writeBlocked) items.push(banner("warn", "alert", state.writeBlocked));
   if (pendingDesktopRestart && state && state.installed) {
@@ -15187,7 +15396,7 @@ function watchJob(job, title) {
   try { sessionStorage.setItem(JOB_KEY, JSON.stringify({ id: job.id, title: title || job.title })); } catch { /* 僅影響重新整理後的記錄視窗 */ }
   return new Promise((resolve) => {
     const log = h("pre", { class: "log", "aria-live": "polite" });
-    const status = h("div", { class: "grow" }, h("span", { class: "spinner" }), "進行中，請勿關閉終端視窗…");
+    const status = h("div", { class: "grow" }, h("span", { class: "spinner" }), "進行中，請稍候…");
     const closeButton = h("button", { type: "button", class: "button", text: "請稍候", disabled: true });
     const modal = openModal({ title: title || job.title, wide: true, dismissable: false, body: [log], foot: [status, closeButton] });
     let offset = 0;
@@ -15264,7 +15473,7 @@ async function restartManager({ alreadyRequested = false } = {}) {
   try {
     if (!alreadyRequested) await api("/api/restart", { method: "POST" });
   } catch (error) {
-    message.textContent = "無法自動重新啟動管理頁：" + error.message + "。請回到終端視窗，重新執行安裝器的 ui 命令。";
+    message.textContent = "無法自動重新啟動管理頁：" + error.message + "。請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。";
     return;
   }
   const started = Date.now();
@@ -15986,5 +16195,194 @@ start();
 </script>
 </body>
 </html>
+__CODEX_MODEL_ROUTER_MANAGER_ENTRY_JS__
+// Codex 的本機 MCP App 入口。只開啟已安裝的管理頁，不提供設定檔或憑證讀寫工具。
+// 不依賴 npm 套件：安裝器把這段模組及啟動參數放到路由器目錄，Codex 以 stdio 載入。
+import { createInterface } from "node:readline";
+import { execFile } from "node:child_process";
+import { win32 } from "node:path";
+import { createHash } from "node:crypto";
+
+export const MANAGER_ENTRY_URI = "ui://model-router/manager";
+export const MANAGER_ENTRY_NAME = "open_model_manager";
+
+export function managerEntryTool({ uri = managerEntryResourceUri() } = {}) {
+  return {
+    name: MANAGER_ENTRY_NAME, title: "自訂模型管理",
+    description: "開啟此電腦的 Codex 模型路由器管理頁。",
+    inputSchema: { type: "object", properties: { reopen: { type: "boolean", description: "再次開啟管理頁。" } }, additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    _meta: {
+      ui: { resourceUri: uri },
+      "openai/ui": { entrypoints: [{ type: "global" }] },
+      // 支援此項的桌面版會同時提供頂部入口；其他 MCP Apps 客戶端沿用全域側邊欄。
+      "openai/globalHeader": true,
+      "openai/widgetAccessible": true,
+    },
+  };
+}
+
+// MCP Apps 的 ui/initialize 與 tools/call 透過 parent.postMessage 傳送，管理頁本身仍在
+// 原本的瀏覽器中開啟，不放寬 HTTP 管理頁的 CSP、Origin 或存取權杖檢查。
+export const MANAGER_ENTRY_HTML = String.raw`<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>自訂模型管理</title><style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif;color:#edf2ff;background:#0c1222}
+body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:440px;padding:40px;text-align:center}
+.icon{font-size:36px;color:#63b5fa}h1{font-size:24px;margin:18px 0 12px}p{line-height:1.7;color:#aab6cf}
+button{font:inherit;padding:12px 24px;border:0;border-radius:10px;background:#4d8cef;color:white;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}.error{color:#f5a4a4}
+</style></head><body><main><div class="icon" aria-hidden="true">⇄</div><h1>自訂模型管理</h1>
+<p id="status" role="status">正在開啟本機管理頁…</p><button id="open" type="button" disabled>開啟管理頁</button>
+<p>在管理頁中新增模型、管理供應商、調整上下文及檢查更新。</p></main><script>
+(() => {
+  const status = document.getElementById("status");
+  const button = document.getElementById("open");
+  const pending = new Map();
+  let nextId = 1, opened = false, ready = false, opening = false, visible = null, resumePending = false;
+  const notify = (method, params) => parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error("Codex 未回應，請重新開啟此入口。")); }, 65000);
+    pending.set(id, { resolve, reject, timer });
+    parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+  });
+  const showOpened = () => { opened = true; status.textContent = "管理頁已在瀏覽器開啟。"; status.className = ""; };
+  window.addEventListener("message", (event) => {
+    if (event.source !== parent || event.data?.jsonrpc !== "2.0") return;
+    const message = event.data;
+    if (message.method === "ui/notifications/tool-result" && message.params?.structuredContent?.opened === true) showOpened();
+    if (message.method && message.id != null) {
+      parent.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*");
+      return;
+    }
+    const call = pending.get(message.id);
+    if (!call) return;
+    clearTimeout(call.timer); pending.delete(message.id);
+    if (message.error) call.reject(new Error(message.error.message || "無法開啟管理頁。"));
+    else call.resolve(message.result);
+  });
+  async function open(reopen = false) {
+    if (!ready || opening) return;
+    opening = true;
+    button.disabled = true; status.className = ""; status.textContent = "正在開啟本機管理頁…";
+    try {
+      const result = await request("tools/call", { name: "open_model_manager", arguments: reopen ? { reopen: true } : {} });
+      if (result?.isError) throw new Error(result.content?.find(item => item.type === "text")?.text || "無法開啟管理頁。");
+      if (result?.structuredContent?.opened !== true) throw new Error("管理頁未能開啟，請重新嘗試。");
+      showOpened();
+    } catch (error) { status.textContent = error.message; status.className = "error"; }
+    finally {
+      opening = false; button.disabled = false;
+      if (resumePending && visible === true) { resumePending = false; void open(true); }
+    }
+  }
+  // Codex 會保留全域 App 的 iframe；切到其他頁面再切回時不一定重新載入文件。
+  // 只觀察入口自身重新顯示，不能監聽應用程式 focus，否則從瀏覽器回來會反覆跳走。
+  if (typeof IntersectionObserver === "function") {
+    const observer = new IntersectionObserver(entries => {
+      const shown = entries.some(item => item.isIntersecting && item.intersectionRatio > 0);
+      const resumed = visible === false && shown;
+      visible = shown;
+      if (resumed && ready) {
+        if (opening) resumePending = true;
+        else void open(true);
+      }
+    });
+    observer.observe(document.documentElement);
+  }
+  window.addEventListener("pageshow", event => { if (event.persisted && ready) void open(true); });
+  button.addEventListener("click", () => { if (ready) void open(true); else void connect(); });
+  async function connect() {
+    button.disabled = true; status.className = ""; status.textContent = "正在連接本機入口…";
+    try {
+      await request("ui/initialize", { appInfo: { name: "codex-model-router", version: "1.0.0" }, appCapabilities: {}, protocolVersion: "2026-01-26" });
+      ready = true; notify("ui/notifications/initialized", {}); button.disabled = false;
+      if (!opened && visible !== false) await open();
+    } catch (error) { status.textContent = error.message; status.className = "error"; button.disabled = false; }
+  }
+  void connect();
+})();
+</script></body></html>
+`;
+
+// HTML 內容改變即使用不同的資源 URI，避免 Codex 沿用驗證版或舊版入口的畫面快取。
+export function managerEntryResourceUri(version = "current") {
+  const revision = createHash("sha256").update(MANAGER_ENTRY_HTML).digest("hex").slice(0, 12);
+  return `${MANAGER_ENTRY_URI}/${encodeURIComponent(version)}/${revision}`;
+}
+
+export function managerEntryLaunchPlan({ installer, launchEnv = {}, platform = process.platform, environment = process.env }) {
+  if (typeof installer !== "string" || !installer) throw new Error("缺少已安裝的管理頁啟動程式。");
+  const env = { ...environment, ...launchEnv, CODEX_MODEL_ROUTER_UI_NO_OPEN: "0" };
+  for (const key of ["CODEX_MODEL_ROUTER_IMPORT_ONLY", "CODEX_MODEL_ROUTER_UI_TOKEN", "CODEX_MODEL_ROUTER_UI_BACKGROUND"]) delete env[key];
+  return platform === "win32"
+    ? { command: win32.join(env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", installer, "ui"], env }
+    : { command: "/bin/bash", args: [installer, "ui"], env };
+}
+
+function runLauncher(plan) {
+  return new Promise((resolve, reject) => {
+    execFile(plan.command, plan.args, { env: plan.env, windowsHide: true, timeout: 60000, maxBuffer: 256 * 1024 }, (error) => {
+      if (error) reject(new Error("管理頁啟動失敗，請執行安裝器的 ui 命令查看診斷。"));
+      else resolve();
+    });
+  });
+}
+
+export function createManagerEntryHandler({ version, installer, launchEnv, run = runLauncher, now = Date.now }) {
+  let lastOpened = null;
+  const resourceUri = managerEntryResourceUri(version);
+  return async function handle(message) {
+    const result = (value) => ({ jsonrpc: "2.0", id: message.id, result: value });
+    const error = (code, text) => ({ jsonrpc: "2.0", id: message?.id ?? null, error: { code, message: text } });
+    if (!message || message.jsonrpc !== "2.0" || typeof message.method !== "string") return error(-32600, "Invalid Request");
+    if (message.id == null) return null;
+    switch (message.method) {
+      case "initialize":
+        return result({ protocolVersion: message.params?.protocolVersion || "2025-06-18", capabilities: { tools: {}, resources: {} },
+          serverInfo: { name: "codex-model-router", title: "自訂模型管理", version } });
+      case "ping": return result({});
+      case "tools/list": return result({ tools: [managerEntryTool({ uri: resourceUri })] });
+      case "resources/list": return result({ resources: [{ uri: resourceUri, name: "自訂模型管理", mimeType: "text/html;profile=mcp-app" }] });
+      case "resources/templates/list": return result({ resourceTemplates: [] });
+      case "resources/read":
+        if (![resourceUri, MANAGER_ENTRY_URI].includes(message.params?.uri)) return error(-32002, "Resource not found");
+        return result({ contents: [{ uri: message.params.uri, mimeType: "text/html;profile=mcp-app", text: MANAGER_ENTRY_HTML,
+          _meta: { ui: { csp: { connectDomains: [], resourceDomains: [] } },
+            "openai/ui": { availableDisplayModes: ["inline", "fullscreen", "pip"], preferredDisplayMode: "fullscreen" } } }] });
+      case "tools/call": {
+        if (message.params?.name !== MANAGER_ENTRY_NAME) return error(-32602, "Unknown tool");
+        const args = message.params.arguments ?? {};
+        if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).some(key => key !== "reopen")
+          || (Object.hasOwn(args, "reopen") && typeof args.reopen !== "boolean")) return error(-32602, "此入口不接受額外參數。");
+        try {
+          if (args.reopen === true || lastOpened == null || now() - lastOpened > 2000) {
+            await run(managerEntryLaunchPlan({ installer, launchEnv }));
+            lastOpened = now();
+          }
+          return result({ content: [{ type: "text", text: "管理頁已在瀏覽器開啟。" }], structuredContent: { opened: true } });
+        } catch (cause) {
+          return result({ isError: true, content: [{ type: "text", text: cause.message }], structuredContent: { opened: false } });
+        }
+      }
+      default: return error(-32601, "Method not found");
+    }
+  };
+}
+
+export async function serveManagerEntry(options, { input = process.stdin, output = process.stdout } = {}) {
+  const handle = createManagerEntryHandler(options);
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  for await (const line of lines) {
+    let response;
+    try {
+      if (Buffer.byteLength(line) > 64 * 1024) throw new Error("Request too large");
+      response = await handle(JSON.parse(line));
+    } catch { response = { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }; }
+    if (response) output.write(JSON.stringify(response) + "\n");
+  }
+}
 __CODEX_MODEL_ROUTER_EMBEDDED__
 #>

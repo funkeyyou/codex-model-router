@@ -120,7 +120,11 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 安裝或更新完成後，安裝器會在路由器目錄放一份安裝器副本，並建立「Codex 模型路由器」捷徑（macOS 在 `~/Applications`，Windows 在開始功能表），之後雙擊即可開啟，不必再找當初下載的安裝器。
 
-將這個倉庫作為 Codex 專案開啟時，頂部 Actions 也會提供「自訂模型管理」入口；點擊會執行已安裝路由器的 `ui` 命令，直接開啟管理頁。設定在 [`.codex/environments/environment.toml`](.codex/environments/environment.toml)，依 macOS／Windows 選擇對應命令，並沿用 `CODEX_MODEL_ROUTER_HOME` 或 `CODEX_HOME`；請先安裝路由工具。這個入口按專案提供，不會加入原生模型選單或切換模型。若未顯示，重新開啟該專案；要在其他專案使用，可合併設定檔中的 `[[actions]]` 項目，保留原有的 setup 與其他動作。
+從 1.27.5 起，安裝或更新會自動加入 Codex 的「自訂模型管理」全域入口。重新開啟 Codex 後，點擊入口即可在瀏覽器開啟本機管理頁，不需要下載倉庫或設定專案 Actions。入口使用官方支援的 [MCP Apps 全域擴充](https://developers.openai.com/plugins/build/extensions#sidebar-apps)，需要支援 MCP Apps 的桌面版本；不同版本會顯示在頂部或側邊欄。開啟入口不需要模型推理或消耗中轉額度。若只想重新註冊入口，可執行 `ui-setup`，不重啟路由器。
+
+這個本機 MCP 只提供「開啟管理頁」工具，不暴露設定讀寫或 API Key。管理操作仍在原有的本機網頁中完成。安裝器只管理自己的 `mcp_servers.model_router_manager` 項目；同名項目已被使用者設定時會保留並提示，其他 MCP 伺服器不受影響。回退會移除仍由本工具管理的入口。
+
+Git 專案也可選用倉庫提供的 [Actions 設定](.codex/environments/environment.toml)。Actions 受 Codex 專案環境支援範圍限制，不作為通用入口。
 
 - **總覽**：路由器狀態、請求統計、最近的錯誤與診斷 ID、執行環境。
 - **模型**：拖曳排序，修改顯示名稱、上下文與輸出，勾選刪除。新增模型時可選中轉供應商或 Claude 訂閱；預設上下文 1,000,000、輸出 128,000，上游回報的上限較小時以上游為準。
@@ -131,7 +135,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 背後沿用選單的流程：寫入前備份，失敗自動還原；會產生費用或使用訂閱額度的探測、生圖偵測與 Claude 測試，都會先列出內容再確認。排序、改名與修改上下文只寫入模型目錄，不重啟路由器；修改輸出、添加或刪除模型會重啟路由器。輸出上限只對 Claude 模型有效（送往 Claude 的 `max_tokens`，或 Claude CLI 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`），GPT 與 Chat Completions 模型不送這個值，由上游決定。
 
-管理頁只監聽 `127.0.0.1`，網址附帶這次的存取權杖（請勿分享），並檢查 Host 與 Origin、只接受 JSON 請求、啟用 CSP。API Key 只寫入鑰匙圈或 DPAPI，不會回傳到頁面。一般啟動時關閉終端視窗即結束；一鍵更新或重啟桌面版後由獨立程序接手，請按「結束管理頁」關閉，或閒置 20 分鐘後自動結束。常駐的路由器本身不提供網頁。首次安裝與回退仍在終端執行。
+管理頁只監聽 `127.0.0.1`，網址附帶這次的存取權杖（請勿分享），並檢查 Host 與 Origin、只接受 JSON 請求、啟用 CSP。API Key 只寫入鑰匙圈或 DPAPI，不會回傳到頁面。1.27.5 起預設在背景執行，開啟命令完成即退出；Windows 的 Codex 入口與開始功能表捷徑不會留下 CMD／PowerShell 視窗。重複開啟沿用同一個管理頁，請按「結束管理頁」關閉，或閒置 20 分鐘後自動結束；`ui --foreground` 可保留終端診斷模式。常駐的路由器本身不提供網頁。首次安裝與回退仍在終端執行。
 
 ## 升級
 

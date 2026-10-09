@@ -19,8 +19,9 @@ import { fileURLToPath } from "node:url";
 import { codexBin } from "./helpers/codex-bin.mjs";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
-const { dir: payloadDir } = await loadPayloads();
+const { dir: payloadDir, installer } = await loadPayloads();
 const shellPath = fileURLToPath(new URL("../codex-model-router.sh", import.meta.url));
+const powershellPath = fileURLToPath(new URL("../codex-model-router.ps1", import.meta.url));
 const releases = JSON.parse(readFileSync(new URL("../releases.json", import.meta.url), "utf8"));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 逾時用的計時器要 unref：比賽贏的一方先結束時，它不能讓測試檔多掛著等它跑完。
@@ -112,7 +113,7 @@ function windowsProcesses() {
 function baseEnv(root, runtime, extra = {}) {
   const env = {
     ...process.env, CODEX_HOME: root, CODEX_MODEL_ROUTER_HOME: runtime,
-    CODEX_MODEL_ROUTER_SCRIPT_PATH: shellPath, CODEX_MODEL_ROUTER_NODE_BIN: process.execPath,
+    CODEX_MODEL_ROUTER_SCRIPT_PATH: process.platform === "win32" ? powershellPath : shellPath, CODEX_MODEL_ROUTER_NODE_BIN: process.execPath,
     CODEX_MODEL_ROUTER_CODEX_BIN: process.execPath, CODEX_MODEL_ROUTER_TEST_MODE: "1",
     CODEX_MODEL_ROUTER_TEST_API_KEY: "fixture-key", CODEX_MODEL_ROUTER_RELEASES_JSON: JSON.stringify(releases),
     CODEX_MODEL_ROUTER_UI_NO_OPEN: "1", CODEX_MODEL_ROUTER_SHORTCUT_DIR: join(root, "shortcuts"),
@@ -123,8 +124,8 @@ function baseEnv(root, runtime, extra = {}) {
   return env;
 }
 
-async function startManager(defer, env) {
-  const child = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "ui"], { env, stdio: ["ignore", "pipe", "pipe"] });
+async function startManager(defer, env, { foreground = true } = {}) {
+  const child = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "ui", ...(foreground ? ["--foreground"] : [])], { env, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   const exited = once(child, "exit");
   defer(() => stopChild(child));
@@ -162,8 +163,142 @@ async function startManager(defer, env) {
   };
   // 結束時最多等 20 秒；逾時回傳 "timeout"，讓斷言失敗而不是卡住。
   const waitExit = () => Promise.race([exited, timeoutAfter(20000, ["timeout"])]);
+  if (!foreground) defer(async () => {
+    try { await call("/api/shutdown", { method: "POST" }); } catch {}
+    for (let attempt = 0; attempt < 200 && readdirSync(env.CODEX_MODEL_ROUTER_HOME).some((name) => /^manager-(worker|entry)-.*\.(mjs|json)$/.test(name)); attempt += 1) await delay(50);
+  });
   return { child, waitExit, port, token, call, runJob, output: () => output, url: match[1] };
 }
+
+test("背景管理頁：啟動命令退出後仍可存取，重複開啟沿用同一程序，結束後清理短期檔案", { timeout: 60000 }, async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-background-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  mkdirSync(runtime);
+  writeFileSync(join(runtime, "install.json"), JSON.stringify({ version: releases.latest, port: 9, routes: [] }));
+  const env = baseEnv(root, runtime);
+  // 本機額外驗收可測真實 launchd 背景啟動，仍只操作測試目錄，不呼叫模型或重啟桌面版。
+  if (process.platform === "darwin" && process.env.CODEX_MODEL_ROUTER_TEST_DESKTOP_RESTART === "1") env.CODEX_MODEL_ROUTER_TEST_MODE = "0";
+  const [ui, concurrent] = await Promise.all([
+    startManager(defer, env, { foreground: false }), startManager(defer, env, { foreground: false }),
+  ]);
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
+  assert.equal((await concurrent.waitExit())[0], 0, concurrent.output());
+  assert.equal(concurrent.url, ui.url, "同時開啟也只建立一個管理頁");
+  assert.match(ui.output() + concurrent.output(), /管理頁已在背景啟動/);
+  const lockPath = join(runtime, "manager.json");
+  const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+  assert.notEqual(lock.pid, ui.child.pid, "管理頁不可依附在開啟命令內");
+  assert.equal((await ui.call("/api/ping", { method: "POST" })).status, 200);
+  const again = await startManager(defer, env, { foreground: false });
+  assert.equal((await again.waitExit())[0], 0, again.output());
+  assert.equal(again.url, ui.url);
+  assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).pid, lock.pid);
+  const page = await fetch("http://127.0.0.1:" + ui.port + "/");
+  assert.match(page.headers.get("content-security-policy"), /default-src 'none'/);
+  assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
+  for (let attempt = 0; attempt < 200 && (existsSync(lockPath) || readdirSync(runtime).some((name) => /^manager-(worker|entry)-/.test(name))); attempt += 1) await delay(50);
+  assert.equal(existsSync(lockPath), false);
+  assert.equal(existsSync(join(runtime, "manager-starting.json")), false);
+  assert.deepEqual(readdirSync(runtime).filter((name) => /^manager-(worker|entry)-/.test(name)), []);
+});
+
+test("舊版更新交接只傳權杖、不帶 --foreground 時，仍沿用權杖而不再啟動另一個管理頁", { timeout: 30000 }, async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-legacy-handoff-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  mkdirSync(runtime);
+  writeFileSync(join(runtime, "install.json"), JSON.stringify({ version: releases.latest, port: 9, routes: [] }));
+  const environment = baseEnv(root, runtime);
+  environment.CODEX_MODEL_ROUTER_UI_TOKEN = "legacy-handoff-fixture-token";
+  const ui = await startManager(defer, environment, { foreground: false });
+  assert.equal(ui.token, environment.CODEX_MODEL_ROUTER_UI_TOKEN);
+  assert.equal(JSON.parse(readFileSync(join(runtime, "manager.json"), "utf8")).pid, ui.child.pid);
+  assert.equal((await ui.call("/api/ping", { method: "POST" })).status, 200);
+  assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
+  assert.match(ui.output(), /由獨立程序接手/);
+});
+
+test("Codex 全域入口：真實 config RPC 註冊並保留其他設定，重裝冪等，同名衝突不覆蓋", {
+  skip: !codexBin && "需要 Codex CLI", timeout: 120000,
+}, async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-entry-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  mkdirSync(runtime);
+  const configPath = join(root, "config.toml");
+  writeFileSync(configPath, 'model = "gpt-6-sol"\n[desktop]\npreferred_editor = "custom:keep"\n[desktop.custom_file_handlers.keep]\nlabel = "Keep"\ncommand = "other-app"\nicon = "keep.svg"\n[mcp_servers.keep]\ncommand = "other-server"\nenabled = false\n');
+  writeFileSync(join(runtime, "install.json"), JSON.stringify({ version: releases.latest, port: 9, routes: [] }));
+  const environment = baseEnv(root, runtime, { CODEX_MODEL_ROUTER_CODEX_BIN: codexBin, CODEX_MODEL_ROUTER_TEST_MANAGER_ENTRY: "1" });
+  const runSetup = async () => {
+    const child = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "ui-setup"], { env: environment, stdio: ["ignore", "pipe", "pipe"] });
+    defer(() => stopChild(child));
+    let output = "";
+    child.stdout.on("data", data => { output += data; });
+    child.stderr.on("data", data => { output += data; });
+    const [code] = await Promise.race([once(child, "exit"), timeoutAfter(30000, ["timeout"])]);
+    return { code, output };
+  };
+  const readConfig = async () => (await installer.codexRpc("config/read", { includeLayers: true, cwd: null }, () => true, codexBin, root)).layers.find(layer => layer.name.type === "user").config;
+  const original = await readConfig();
+  const first = await runSetup();
+  assert.equal(first.code, 0, first.output);
+  assert.match(first.output, /Codex 介面入口/);
+  const config = await readConfig();
+  assert.equal(config.model, original.model);
+  assert.equal(config.desktop.preferred_editor, original.desktop.preferred_editor);
+  assert.deepEqual(config.desktop.custom_file_handlers.keep, original.desktop.custom_file_handlers.keep);
+  assert.deepEqual(config.mcp_servers.keep, original.mcp_servers.keep);
+  const managed = config.mcp_servers.model_router_manager;
+  const launcher = join(runtime, "manager-entry.mjs");
+  assert.equal(managed.command, process.execPath);
+  assert.ok(managed.args.includes(launcher));
+  assert.equal(existsSync(launcher), true);
+  const inventory = await installer.codexRpc("mcpServerStatus/list", {},
+    result => result.data?.some(server => server.name === "model_router_manager" && Object.keys(server.tools || {}).length), codexBin, root);
+  const tool = inventory.data.find(server => server.name === "model_router_manager").tools.open_model_manager;
+  assert.equal(tool.title, "自訂模型管理");
+  assert.deepEqual(tool._meta["openai/ui"].entrypoints, [{ type: "global" }]);
+  const beforeRepeat = readFileSync(configPath, "utf8");
+  const second = await runSetup();
+  assert.equal(second.code, 0, second.output);
+  assert.equal(readFileSync(configPath, "utf8"), beforeRepeat, "重裝不重寫已相同的設定");
+  // 本機早期版本曾註冊檔案右鍵入口，只移除仍由路由器擁有的那個項目。
+  const legacy = { label: "自訂模型管理", command: "/bin/bash", args: ["old-manager-open.sh"], icon: "old-icon.svg" };
+  await installer.codexRpc("config/batchWrite", { edits: [{ keyPath: "desktop.custom_file_handlers.model_router_manager", value: legacy, mergeStrategy: "replace" }], reloadUserConfig: false }, () => true, codexBin, root);
+  const oldManifest = JSON.parse(readFileSync(join(runtime, "install.json"), "utf8"));
+  oldManifest.managerFileHandler = { installed: legacy, previous: null };
+  writeFileSync(join(runtime, "install.json"), JSON.stringify(oldManifest));
+  const migration = await runSetup();
+  assert.equal(migration.code, 0, migration.output);
+  assert.equal((await readConfig()).desktop.custom_file_handlers.model_router_manager, undefined);
+  assert.equal(JSON.parse(readFileSync(join(runtime, "install.json"), "utf8")).managerFileHandler, undefined);
+  assert.deepEqual((await readConfig()).desktop.custom_file_handlers.keep, original.desktop.custom_file_handlers.keep);
+  const record = JSON.parse(readFileSync(join(runtime, "install.json"), "utf8")).managerMcpEntry;
+  assert.equal(record.previous, null);
+  const keyPath = "mcp_servers.model_router_manager";
+  const writeEntry = (value) => installer.codexRpc("config/batchWrite", { edits: [{ keyPath, value, mergeStrategy: "replace" }], reloadUserConfig: false }, () => true, codexBin, root);
+  const changed = { ...managed, args: [...managed.args, "manual"] };
+  await writeEntry(changed);
+  const conflict = await runSetup();
+  assert.equal(conflict.code, 1, conflict.output);
+  assert.match(conflict.output, /已保留原設定/);
+  assert.deepEqual((await readConfig()).mcp_servers.model_router_manager, changed);
+  assert.equal(installer.managerMcpRollbackEdit(await readConfig(), record), null);
+  await writeEntry(managed);
+  const rollback = installer.managerMcpRollbackEdit(await readConfig(), record);
+  assert.equal(rollback.keyPath, keyPath);
+  await writeEntry(rollback.value);
+  const reverted = await readConfig();
+  assert.equal(reverted.mcp_servers?.model_router_manager, undefined);
+  assert.deepEqual(reverted.desktop.custom_file_handlers.keep, original.desktop.custom_file_handlers.keep);
+  assert.equal(reverted.desktop.preferred_editor, original.desktop.preferred_editor);
+  assert.deepEqual(reverted.mcp_servers.keep, original.mcp_servers.keep);
+});
 
 test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清單仍完整", { skip: !codexBin && "需要 Codex CLI", timeout: 120000 }, async (t) => {
   const defer = cleanupStack(t);

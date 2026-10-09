@@ -122,7 +122,11 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 安装或更新完成后，安装器会在路由器目录放一份安装器副本，并建立「Codex 模型路由器」快捷方式（macOS 在 `~/Applications`，Windows 在开始菜单），之后双击即可打开，不必再找当初下载的安装器。
 
-将这个仓库作为 Codex 项目打开时，顶部 Actions 也会提供「自定义模型管理」入口（按钮显示「自訂模型管理」）；点击会执行已安装路由器的 `ui` 命令，直接打开管理页。配置在 [`.codex/environments/environment.toml`](.codex/environments/environment.toml)，按 macOS／Windows 选择对应命令，并沿用 `CODEX_MODEL_ROUTER_HOME` 或 `CODEX_HOME`；请先安装路由工具。这个入口按项目提供，不会加入原生模型菜单或切换模型。若未显示，重新打开该项目；要在其他项目使用，可合并配置文件中的 `[[actions]]` 项目，保留原有的 setup 和其他动作。
+从 1.27.5 起，安装或更新会自动加入 Codex 的「自訂模型管理」全局入口。重新打开 Codex 后，点击入口即可在浏览器打开本机管理页，不需要下载仓库或配置项目 Actions。入口使用官方支持的 [MCP Apps 全局扩展](https://developers.openai.com/plugins/build/extensions#sidebar-apps)，需要支持 MCP Apps 的桌面版本；不同版本会显示在顶部或侧边栏。打开入口不需要模型推理或消耗中转额度。若只想重新注册入口，可运行 `ui-setup`，不重启路由器。
+
+这个本机 MCP 只提供「打开管理页」工具，不暴露配置读写或 API Key。管理操作仍在原有的本机网页中完成。安装器只管理自己的 `mcp_servers.model_router_manager` 项目；同名项目已被用户配置时会保留并提示，其他 MCP 服务器不受影响。回退会移除仍由本工具管理的入口。
+
+Git 项目也可选用仓库提供的 [Actions 配置](.codex/environments/environment.toml)。Actions 受 Codex 项目环境支持范围限制，不作为通用入口。
 
 - **总览**：路由器状态、请求统计、最近的错误与诊断 ID、执行环境。
 - **模型**：拖曳排序，修改显示名称、上下文与输出，勾选删除。新增模型时可选中转供应商或 Claude 订阅；默认上下文 1,000,000、输出 128,000，上游回报的上限较小时以上游为准。
@@ -133,7 +137,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 背后沿用菜单的流程：写入前备份，失败自动还原；会产生费用或使用订阅额度的探测、生图检测与 Claude 测试，都会先列出内容再确认。排序、改名与修改上下文只写入模型目录，不重启路由器；修改输出、添加或删除模型会重启路由器。输出上限只对 Claude 模型有效（送往 Claude 的 `max_tokens`，或 Claude CLI 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`），GPT 与 Chat Completions 模型不送这个值，由上游决定。
 
-管理页只监听 `127.0.0.1`，网址附带本次的访问令牌（请勿分享），并检查 Host 与 Origin、只接受 JSON 请求、启用 CSP。API Key 只写入钥匙圈或 DPAPI，不会回传到页面。一般启动时关闭终端窗口即结束；一键更新或重启桌面版后由独立程序接手，请点击「结束管理页」关闭，或闲置 20 分钟后自动结束。常驻的路由器本身不提供网页。首次安装与回退仍在终端执行。界面文字目前为繁体中文。
+管理页只监听 `127.0.0.1`，网址附带本次的访问令牌（请勿分享），并检查 Host 与 Origin、只接受 JSON 请求、启用 CSP。API Key 只写入钥匙圈或 DPAPI，不会回传到页面。1.27.5 起默认在后台运行，打开命令完成即退出；Windows 的 Codex 入口和开始菜单快捷方式不会留下 CMD／PowerShell 窗口。重复打开复用同一个管理页，请点击「结束管理页」关闭，或闲置 20 分钟后自动结束；`ui --foreground` 可保留终端诊断模式。常驻的路由器本身不提供网页。首次安装与回退仍在终端执行。界面文字目前为繁体中文。
 
 ## 升级
 

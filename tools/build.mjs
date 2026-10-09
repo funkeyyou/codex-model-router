@@ -4,7 +4,7 @@
 //   node tools/build.mjs           # 寫入 .sh 與 .ps1
 //   node tools/build.mjs --check   # 只比對，有落差就以非零狀態結束
 //
-// src/ 是唯一真實來源：七段 JavaScript 各自是一般的 .mjs 檔，可以直接用編輯器、
+// src/ 是唯一真實來源：八段 JavaScript 各自是一般的 .mjs 檔，可以直接用編輯器、
 // ESLint 與 node --check 處理；網頁管理介面另有一段 HTML。兩支安裝器只是把同一份文字包進不同的外殼——
 // .sh 放在 bash heredoc 裡，.ps1 放在 PowerShell 的 <# #> 註解區塊裡——
 // 讓使用者一樣只要下載單一檔案。
@@ -37,6 +37,7 @@ export const SECTIONS = [
   // 網頁管理介面：伺服器端模組與頁面。安裝器執行 ui 命令時才取出來用，不會寫進路由器目錄。
   { marker: "__CODEX_MODEL_ROUTER_MANAGER_JS__", file: "manager.mjs" },
   { marker: "__CODEX_MODEL_ROUTER_MANAGER_HTML__", file: "manager.html" },
+  { marker: "__CODEX_MODEL_ROUTER_MANAGER_ENTRY_JS__", file: "manager-entry.mjs" },
 ];
 const ALL_MARKERS = [...SECTIONS.map((section) => section.marker), END_MARKER];
 

@@ -125,6 +125,7 @@ export async function runBackgroundTask(specPath) {
     // 結果留給管理頁讀取；程式與含存取權杖的啟動參數在工作結束後立即刪除。
     rmSync(specPath, { force: true });
     rmSync(spec.workerPath, { force: true });
+    for (const file of spec.cleanupPaths || []) rmSync(file, { force: true });
     if (spec.kind === "manager" && process.exitCode !== 1) rmSync(spec.statusPath, { force: true });
     if (spec.launchLabel) spawnSync("/bin/launchctl", ["remove", spec.launchLabel], { stdio: "ignore", timeout: 5000 });
   }

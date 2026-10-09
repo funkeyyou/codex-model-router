@@ -20,9 +20,10 @@ const MARKERS = {
   imagegen: ["__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", "__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__"],
   "claude-cli": ["__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__", "__CODEX_MODEL_ROUTER_MANAGER_JS__"],
   manager: ["__CODEX_MODEL_ROUTER_MANAGER_JS__", "__CODEX_MODEL_ROUTER_MANAGER_HTML__"],
+  "manager-entry": ["__CODEX_MODEL_ROUTER_MANAGER_ENTRY_JS__", "__CODEX_MODEL_ROUTER_EMBEDDED__"],
 };
 // 網頁管理介面的頁面不是模組，另外存成 manager.html。
-const PAGE_MARKERS = ["__CODEX_MODEL_ROUTER_MANAGER_HTML__", "__CODEX_MODEL_ROUTER_EMBEDDED__"];
+const PAGE_MARKERS = ["__CODEX_MODEL_ROUTER_MANAGER_HTML__", "__CODEX_MODEL_ROUTER_MANAGER_ENTRY_JS__"];
 
 // 與安裝器的 awk 同樣的切法：起始標記的下一行起，到結束標記的前一行為止。
 function slice(text, [begin, end]) {
@@ -92,6 +93,7 @@ export async function loadPayloads() {
     chat: await load("chat-bridge"),
     imagegen: await load("imagegen"),
     manager: await load("manager"),
+    managerEntry: await load("manager-entry"),
     managerPage: readFileSync(join(dir, "manager.html"), "utf8"),
   };
   return cached;
