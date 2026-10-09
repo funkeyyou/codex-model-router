@@ -4,6 +4,8 @@
 
 **在 Codex Desktop 使用 Claude 与第三方模型，同时保留官方 GPT 模型。**
 
+模型菜单仍显示旧名称或已删除的模型？从 1.27.8 起，可在网页管理页总览点击「同步與修復模型清單」，或运行 `bash codex-model-router.sh repair-models`（Windows：`powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 repair-models`）。这会备份并清除可重建的模型列表缓存，校验名称、可见性及默认模型，不发送模型推理请求。只有旧路由能证明同一供应商、同一上游模型的唯一对应时才迁移默认 ID，否则清除失效默认。完成后重新展开模型菜单；界面仍未刷新时，请完全退出桌面版再打开（macOS 用 ⌘Q，关闭窗口不等于退出）。已有任务保存的模型选择需要手动重选。
+
 Use Claude and OpenAI-compatible models in Codex Desktop alongside official GPT models.
 Local multi-provider routing for macOS and Windows.
 

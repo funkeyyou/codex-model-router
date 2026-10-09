@@ -374,6 +374,11 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.deepEqual(state.json.models.map((model) => [model.outputConfigurable, model.outputTokens]), [[false, null], [false, null]],
     "Responses 路由的輸出由上游決定");
 
+  const repair = await ui.runJob("repair-models", {});
+  assert.equal(repair.status, "succeeded", repair.output);
+  assert.equal(repair.result.repaired, true);
+  assert.match(repair.output, /沒有發送模型推理請求/);
+
   // 重複開啟：沿用正在執行的管理頁，不另開第二個。
   const again = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "ui"], { env, stdio: ["ignore", "pipe", "pipe"] });
   defer(() => stopChild(again));

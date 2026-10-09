@@ -12,7 +12,7 @@ import { loadPayloads } from "./helpers/payloads.mjs";
 import { codexBin } from "./helpers/codex-bin.mjs";
 
 const bin = codexBin;
-test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型", { skip: !bin, timeout: 30000 }, async t => {
+test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型", { skip: !bin, timeout: 90000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), "router-catalog-e2e-"));
   const runtime = join(root, "model-router");
   mkdirSync(runtime);
@@ -56,7 +56,7 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
     service.stderr.on("data", d => { if (d.toString().includes("model-router-ready:")) { clearTimeout(timer); resolve(); } });
     service.once("error", reject);
   });
-  async function picker(expected, migrate = false) {
+  async function picker(expected, migrate = false, afterFirst = null) {
     const app = spawn(bin, ["app-server"], { env, cwd: root, stdio: ["pipe", "pipe", "ignore"] });
     const exited = once(app, "exit");
     const send = m => app.stdin.write(JSON.stringify(m) + "\n");
@@ -87,7 +87,13 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
                   ? expected.every((slug, index) => ids.includes(slug) &&
                     (index === 0 || ids.indexOf(expected[index - 1]) < ids.indexOf(slug)))
                   : ids.includes(expected);
-                if (found) { clearTimeout(timer); resolve(ids); }
+                if (found && afterFirst) {
+                  const next = afterFirst();
+                  afterFirst = null;
+                  expected = next;
+                  send({ id: 2, method: "model/list", params: { includeHidden: true } });
+                }
+                else if (found) { clearTimeout(timer); resolve(ids); }
                 else setTimeout(() => send({ id: 2, method: "model/list", params: { includeHidden: true } }), 50);
               }
             }
@@ -147,4 +153,54 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
     response => installer.hasExpectedModels(response, [custom.slug], [claude.slug]), bin, root);
   assert.ok(afterRemoval.data.some(model => model.id === custom.slug));
   assert.ok(afterRemoval.data.every(model => model.id !== claude.slug));
+
+  // Issue #8：同一 app-server 已讀取舊 api 清單，替換為兩家供應商後使快取失效。
+  const ark = entry("custom/ark-demo"); ark.display_name = "ark/demo";
+  const pri = entry("custom/pri-demo"); pri.display_name = "pri/demo";
+  const refreshed = await picker(custom.slug, false, () => {
+    writeFileSync(catalogPath, JSON.stringify({ models: [...models, ark, pri] }));
+    installer.invalidatePickerCache(root);
+    return [ark.slug, pri.slug];
+  });
+  assert.ok(!refreshed.includes(custom.slug));
+
+  // 實際執行無推理的修復命令：旧預設有同供應商、同上游的唯一現行 ID。
+  const routes = [ark, pri].map(model => ({ pickerSlug: model.slug,
+    providerId: model === ark ? "ark" : "pri", upstreamModel: "demo", displayName: model.display_name }));
+  const settings = JSON.parse(readFileSync(join(runtime, "settings.json"), "utf8"));
+  settings.routes = routes;
+  settings.providers = ["ark", "pri"].map(id => ({ id, baseUrl: "https://unused.example", apiRoot: "https://unused.example/v1" }));
+  writeFileSync(join(runtime, "settings.json"), JSON.stringify(settings));
+  writeFileSync(join(runtime, "install.json"), JSON.stringify({ port, providers: settings.providers,
+    routes: [{ ...routes[0], pickerSlug: "custom/legacy-demo" }, routes[1]] }));
+  await installer.codexRpc("config/batchWrite", { edits: [
+    { keyPath: "model", value: "custom/legacy-demo", mergeStrategy: "replace" },
+  ], reloadUserConfig: false }, () => true, bin, root);
+  async function runRepair() {
+    const repair = spawn(process.execPath, [join(dir, "installer.mjs"), "repair-models"], {
+      env: { ...env, CODEX_MODEL_ROUTER_CODEX_BIN: bin }, cwd: root, stdio: ["ignore", "pipe", "pipe"],
+    });
+    t.after(() => repair.kill());
+    let output = "";
+    repair.stdout.on("data", chunk => { output += chunk; });
+    repair.stderr.on("data", chunk => { output += chunk; });
+    const [code] = await once(repair, "exit");
+    return { code, output };
+  }
+  const { code, output } = await runRepair();
+  assert.equal(code, 0, output);
+  const repaired = await installer.codexRpc("config/read", { includeLayers: true, cwd: null }, () => true, bin, root);
+  assert.equal(repaired.layers.find(layer => layer.name?.type === "user").config.model, ark.slug);
+  assert.match(output, /沒有發送模型推理請求/);
+
+  // 同 ID 舊名稱不能通過；修復流程失敗必須還原原本的全域預設。
+  await installer.codexRpc("config/batchWrite", { edits: [
+    { keyPath: "model", value: "custom/legacy-demo", mergeStrategy: "replace" },
+  ], reloadUserConfig: false }, () => true, bin, root);
+  writeFileSync(catalogPath, JSON.stringify({ models: [...models, { ...ark, display_name: "api/demo" }, pri] }));
+  const failed = await runRepair();
+  assert.equal(failed.code, 1, failed.output);
+  assert.match(failed.output, /等待 Codex 模型清單同步失敗/);
+  const restored = await installer.codexRpc("config/read", { includeLayers: true, cwd: null }, () => true, bin, root);
+  assert.equal(restored.layers.find(layer => layer.name?.type === "user").config.model, "custom/legacy-demo");
 });

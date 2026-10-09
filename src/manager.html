@@ -676,6 +676,7 @@ function renderOverview() {
   const primary = (state.providers || []).find((provider) => provider.primary);
   const canRestart = state.desktop && state.desktop.canRestart;
   const head = pageHead("總覽", "路由器狀態、最近的錯誤與執行環境。",
+    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked), onclick: () => runJob("repair-models", {}, { title: "同步與修復模型清單" }) }, icon("refresh"), "同步與修復模型清單"),
     h("button", { type: "button", class: "button", onclick: confirmRestartRouter }, icon("restart"), "重新啟動路由器"),
     canRestart ? h("button", { type: "button", class: "button", onclick: confirmRestartDesktop }, icon("power"), "重新啟動 " + state.desktop.name) : null);
 
@@ -688,7 +689,9 @@ function renderOverview() {
     card("自訂模型", String((state.models || []).length), "官方模型 " + formatNumber(state.officialModelCount) + " 個"),
     card("供應商", String((state.providers || []).length), primary ? "主要：" + primary.id : ""));
 
-  return [head, cards, renderErrorsPanel(), renderEnvironmentPanel()];
+  const invalidDefault = state.config && state.config.model && state.config.model.startsWith("custom/") &&
+    !(state.models || []).some(model => model.slug === state.config.model);
+  return [head, ...(invalidDefault ? [banner("warn", "alert", "全域預設模型已失效，請點擊「同步與修復模型清單」。")] : []), cards, renderErrorsPanel(), renderEnvironmentPanel()];
 }
 
 function renderErrorsPanel() {

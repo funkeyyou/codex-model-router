@@ -4,6 +4,8 @@
 
 **Use Claude and OpenAI-compatible models in Codex Desktop alongside official GPT models.**
 
+If the picker shows stale names or removed models, v1.27.8 adds **Sync and repair model list** in the web manager overview (`同步與修復模型清單`), or run `bash codex-model-router.sh repair-models` (Windows: `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 repair-models`). It backs up and invalidates the rebuildable model cache, checks names and visibility, and repairs invalid custom defaults without inference requests. Migration requires an unambiguous old route with the same provider and upstream model; otherwise the invalid default is cleared. Reopen the picker afterward. If the UI remains stale, fully quit and reopen Desktop (⌘Q on macOS). Existing tasks may still need their saved model selection changed manually.
+
 A local LLM proxy and multi-provider model router for Codex Desktop / ChatGPT Desktop on macOS and Windows. Connect custom Base URLs and third-party APIs using OpenAI Responses API, Anthropic Messages API or OpenAI-compatible Chat Completions. Experimental Claude Code CLI subscription routing is also available.
 
 ## Claude Code subscription routing (experimental)

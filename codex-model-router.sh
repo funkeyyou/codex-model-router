@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.27.7";
+const INSTALLER_VERSION = "1.27.8";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -185,6 +185,7 @@ let releaseCatalogLoadedAt = 0;
 // 網頁管理介面執行期間沒有人在終端回答問題；任何流程若走到提問，直接當成程式錯誤，
 // 不能讓背景工作卡在等待 stdin。
 let managerMode = false;
+let pickerSyncCompleted = false;
 
 function fail(message) {
   throw new Error(message);
@@ -2243,16 +2244,78 @@ async function codexRpcOnce(method, params, acceptResult, binary, home) {
 }
 
 export function hasExpectedModels(result, expected, absent = []) {
-  const models = new Set((result?.data || []).map(m => m.id));
-  return expected.every(slug => models.has(slug)) && absent.every(slug => !models.has(slug));
+  const models = new Map((result?.data || []).map(m => [m.id, m]));
+  return expected.every(item => {
+    if (typeof item === "string") return models.has(item);
+    const model = models.get(item.pickerSlug);
+    return model && model.hidden === false && model.displayName === item.displayName;
+  }) && absent.every(slug => !models.has(slug));
 }
 
-async function waitForPickerModels(routes, absent = []) {
-  const expected = routes.map(r => r.pickerSlug);
+// 不猜測前綴或跨供應商配對；只有舊路由能證明同一供應商、同一上游時才遷移。
+export function planDefaultModelRepair(config, routes, previousRoutes = []) {
+  const current = config?.model;
+  if (typeof current !== "string" || !current.startsWith("custom/") ||
+      routes.some(route => route.pickerSlug === current)) return null;
+  const previous = previousRoutes.filter(route => route.pickerSlug === current);
+  const matches = previous.length === 1 ? routes.filter(route =>
+    routeProviderId(route) === routeProviderId(previous[0]) &&
+    route.upstreamModel === previous[0].upstreamModel &&
+    (route.transport || "api") === (previous[0].transport || "api")) : [];
+  return { previous: current, value: matches.length === 1 ? matches[0].pickerSlug : null };
+}
+
+// 讓 Codex 自行依登入身分及版本重建快取，不寫入或仿造其私人快取格式。
+// 僅處理這一個可重建檔案，保留備份；不觸碰登入憑證或聊天紀錄。
+export function invalidatePickerCache(home = codexHome, backupDir = null) {
+  const path = join(home, "models_cache.json");
+  if (!existsSync(path)) return false;
+  if (backupDir) copyIfExists(path, join(backupDir, "models_cache.json"));
+  rmSync(path, { force: true });
+  return true;
+}
+
+function invalidatePickerCacheAfterFailure() {
+  try { invalidatePickerCache(); }
+  catch (error) { console.error(`清單快取清理失敗，還原後請重開桌面版：${error.message}`); }
+}
+
+async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
+  const expected = routes.map(withDefaultModelPrefix);
+  const user = await readUserConfig();
+  const repair = planDefaultModelRepair(user.config, routes, previousRoutes);
+  const backupDir = join(backupsRoot, `picker-sync-${timestamp()}`);
+  ensureDirectory(backupDir);
+  if (repair) configBackup(user.filePath);
+  let attempted = false;
   try {
-    return await codexRpc("model/list", { includeHidden: true },
-      result => hasExpectedModels(result, expected, absent));
+    if (repair) {
+      attempted = true;
+      await writeConfigEdits([{ keyPath: "model", value: repair.value }]);
+      const verified = await readUserConfig();
+      if ((verified.config.model ?? null) !== repair.value) fail("全域預設模型修復驗證失敗。");
+    }
+    invalidatePickerCache(codexHome, backupDir);
+    const allowed = new Set(routes.map(route => route.pickerSlug));
+    const result = await codexRpc("model/list", { includeHidden: true },
+      result => hasExpectedModels(result, expected, absent) &&
+        !result.data.some(model => model.id.startsWith("custom/") && !allowed.has(model.id)));
+    const verifiedDefault = (await readUserConfig()).config.model;
+    if (typeof verifiedDefault === "string" && verifiedDefault.startsWith("custom/") && !allowed.has(verifiedDefault)) {
+      fail("全域預設模型在同步期間已變更為無效的模型，請重試。");
+    }
+    if (repair) console.log(repair.value
+      ? `已修復全域預設模型：${repair.previous} → ${repair.value}`
+      : `已清除失效的全域預設模型：${repair.previous}，改用官方預設模型。`);
+    pickerSyncCompleted = true;
+    return result;
   } catch (error) {
+    if (attempted) {
+      try { await writeConfigEdits([{ keyPath: "model", value: repair.previous }]); }
+      catch (restoreError) { console.error(`預設模型還原失敗：${restoreError.message}`); }
+    }
+    // 外層會還原路由設定；不讓此次清單留在 Codex 快取中。
+    invalidatePickerCacheAfterFailure();
     throw new Error(`等待 Codex 模型清單同步失敗：${error.message}`);
   }
 }
@@ -3154,9 +3217,12 @@ async function install() {
       ...(existingManifest?.managerFileHandler ? { managerFileHandler: existingManifest.managerFileHandler } : {}),
       ...(existingManifest?.managerMcpEntry ? { managerMcpEntry: existingManifest.managerMcpEntry } : {}),
     }, providers);
-    await waitForPickerModels(allRoutes);
     writeJsonAtomic(manifestPath, manifest);
+    await waitForPickerModels(allRoutes,
+      existingRoutes.map(route => route.pickerSlug).filter(slug => !allRoutes.some(route => route.pickerSlug === slug)),
+      existingRoutes);
   } catch (error) {
+    invalidatePickerCacheAfterFailure();
     if (configChanged && !existingManifest) {
       try {
         await writeConfigEdits(rollbackEdits(previousConfig));
@@ -3515,6 +3581,7 @@ function requireInstallation() {
 // apply／restore 用來一併處理 config.toml 之類的附帶修改。
 async function commitRouterChange(label, { settings, manifest, catalog, absent = [], configFile = null,
   apply = null, restore = null }) {
+  const previousRoutes = readSettingsIfExists().routes || [];
   const port = Number(settings.port ?? manifest.port);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) fail("現有安裝沒有可用的連接埠設定。");
   const backupDir = join(backupsRoot, `${label}-${timestamp()}`);
@@ -3545,7 +3612,7 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
       applied = true;
       await apply();
     }
-    await waitForPickerModels(settings.routes, absent);
+    await waitForPickerModels(settings.routes, absent, previousRoutes);
   } catch (error) {
     console.error("\n修改失敗，正在還原之前的配置...");
     const failures = [];
@@ -3559,6 +3626,7 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
     if (applied && restore) {
       try { await restore(); } catch (restoreError) { failures.push(restoreError.message); }
     }
+    invalidatePickerCacheAfterFailure();
     try {
       restartServiceInPlace();
       await waitForHealth(port);
@@ -3596,6 +3664,7 @@ async function commitCatalogChange(label, { settings, manifest, catalog }) {
       } catch (restoreError) { failures.push(`${name}：${restoreError.message}`); }
     }
     console.error(failures.length ? `還原未完成：${failures.join("；")}。備份：${backupDir}` : "已還原到修改前的配置。");
+    invalidatePickerCacheAfterFailure();
     throw error;
   }
   return backupDir;
@@ -4284,6 +4353,9 @@ async function update() {
       const verified = await readUserConfig();
       if (verified.config.model_catalog_json != null) fail("固定模型目錄設定未成功移除。");
     }
+    if (!previousCatalogPath || migrateCatalog) {
+      await waitForPickerModels(plan.routes, [], manifest.routes || []);
+    }
   } catch (error) {
     console.error("\n更新失敗，正在還原更新前的檔案...");
     if (catalogConfigAttempted) {
@@ -4296,6 +4368,7 @@ async function update() {
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
     copyIfExists(join(backupDir, "install.json"), manifestPath);
     if (namesChanged) copyIfExists(join(backupDir, "models.json"), catalogPath);
+    invalidatePickerCacheAfterFailure();
     for (const path of serviceArchivePaths()) {
       copyIfExists(join(backupDir, basename(path)), path);
     }
@@ -4406,6 +4479,8 @@ async function executeHiddenModels(requested, { bundledCatalog = loadBundledCata
     restartServiceInPlace();
     health = await waitForHealth(port);
 
+    invalidatePickerCache(codexHome, backupDir);
+
     const modelCheck = shell(codexBin, ["debug", "models"], {
       env: { ...env, CODEX_HOME: codexHome },
     });
@@ -4434,6 +4509,7 @@ async function executeHiddenModels(requested, { bundledCatalog = loadBundledCata
     console.error("\n隱藏模型設定失敗，正在還原之前的目錄...");
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
     copyIfExists(join(backupDir, "models.json"), catalogPath);
+    invalidatePickerCacheAfterFailure();
     try {
       restartServiceInPlace();
       await waitForHealth(port);
@@ -4847,6 +4923,28 @@ export async function configureMillionTokenContext() {
   console.log(`請完全退出並重新打開 ${desktopAppName}，再建立新任務。`);
 }
 
+async function repairModels() {
+  if (managerMode) assertManagerWritable();
+  const { settings, manifest } = requireInstallation();
+  if (!codexBin) fail("未找到 Codex CLI。");
+  const config = (await readUserConfig()).config;
+  const targetPort = Number(settings.port ?? manifest.port);
+  const targetUrls = [`http://127.0.0.1:${targetPort}/v1`, `http://localhost:${targetPort}/v1`];
+  if ((config.model_provider && config.model_provider !== "openai") ||
+      !targetUrls.includes(String(config.openai_base_url || "").replace(/\/$/, ""))) {
+    fail("Codex 目前沒有指向這個路由器，請先確認供應商與 Base URL 設定；未改動配置。");
+  }
+  if (config.model_catalog_json && !isManagedCatalogPath(config.model_catalog_json, catalogPath)) {
+    fail("目前使用自行指定的 model_catalog_json，請先確認該目錄設定；未改動配置。");
+  }
+  await waitForHealth(settings.port ?? manifest.port);
+  await waitForPickerModels(settings.routes, [], manifest.routes || []);
+  if (managerMode) await managerConfigHints(true);
+  console.log("已同步並驗證模型 ID、名稱、可見性與全域預設模型。請關閉後重新展開模型選單；若仍未刷新，請完全退出桌面版再開啟。");
+  console.log("本次只讀取模型清單，沒有發送模型推理請求。");
+  return { repaired: true, restartDesktop: true };
+}
+
 async function status() {
   const manifest = readManifest();
   if (!manifest) {
@@ -4909,6 +5007,12 @@ async function status() {
     console.log(`健康狀態：不可用（${error.message}）`);
   }
   console.log("模型：");
+  if (codexBin) {
+    try {
+      const repair = planDefaultModelRepair((await readUserConfig()).config, routes);
+      if (repair) console.log("注意：全域預設模型已失效，請執行 repair-models 修復。");
+    } catch (error) { console.log(`無法檢查全域預設模型：${error.message}`); }
+  }
   if (routes.length === 0) console.log("  （目前沒有自訂模型，官方模型仍可使用）");
   for (const route of routes) {
     console.log(`  - ${route.displayName} -> ${route.upstreamModel}`);
@@ -4934,6 +5038,12 @@ async function rollback() {
   if (!(await confirm("是否繼續？", true))) return;
 
   const edits = rollbackEdits(manifest.previousConfig);
+  const userBeforeRollback = await readUserConfig();
+  // 只清除本工具擁有的路由引用；不影響其他供應商碰巧使用 custom/ 的模型。
+  if ((manifest.routes || []).some(route => route.pickerSlug === userBeforeRollback.config.model)) {
+    configBackup(userBeforeRollback.filePath);
+    edits.push({ keyPath: "model", value: null });
+  }
   if (manifest.managerFileHandler) {
     const user = await readUserConfig();
     const entryEdit = managerHandlerRollbackEdit(user.config, manifest.managerFileHandler);
@@ -4947,6 +5057,7 @@ async function rollback() {
     else console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
   }
   await writeConfigEdits(edits);
+  invalidatePickerCache();
   stopService();
   removeServiceRegistration();
 
@@ -6291,6 +6402,7 @@ function managerOperations() {
       "claude-cli-models": () => managerClaudeCliModels(),
     },
     jobs: {
+      "repair-models": job("同步與修復模型清單", repairModels),
       "add-models": job("添加模型", managerAddModels),
       "remove-models": job("刪除模型", managerRemoveModels),
       "reorder-models": job("調整模型順序", managerReorderModels),
@@ -6699,6 +6811,9 @@ providers 用於同時使用多家中轉供應商：add 新增一家（各自保
 API Key。第一家是主要供應商，install 重新配置的是它，Codex 內建的 image_gen 也送它。
 add 有多家時會先問要替哪一家添加模型。
 
+repair-models 同步與修復模型清單：重抓 Codex 快取，檢查名稱、可見性及失效預設模型。
+不發送模型推理請求；也可在網頁管理頁的總覽執行。
+
 hidden-models 用於單獨管理 Codex 內建目錄裡被標成隱藏的官方模型：
 只更新 forceListedModels 與模型目錄，保留自訂模型，不需要 Base URL 或 API Key。
 
@@ -6743,6 +6858,7 @@ async function chooseAction() {
     "hidden-models": "hidden-models",
     "unhide-models": "hidden-models",
     status: "status",
+    "repair-models": "repair-models",
     rollback: "rollback",
     uninstall: "rollback",
     imagegen: "imagegen",
@@ -6793,6 +6909,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       else await openManager();
     }
     else if (action === "ui-setup") await setupManagerEntry();
+    else if (action === "repair-models") await repairModels();
     else if (action === "claude-cli") await configureClaudeCli(requestedAction ? process.argv[3] : null);
     else if (action === "context-1m") await configureMillionTokenContext();
     else if (action === "imagegen" || action === "relay-imagegen") await configureRelayImagegen();
@@ -6813,6 +6930,11 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     else if (action === "exit") console.log("未進行任何修改。" );
     else if (action === "help" || action === "--help" || action === "-h") help();
     else fail(`無法識別的命令：${action}`);
+    if (pickerSyncCompleted && input.isTTY && !assumeYes && !managerMode && desktopApp()) {
+      if (await confirm("要現在重新啟動桌面版以刷新選單嗎？進行中的任務可能會中斷", false)) {
+        await restartDesktopAfter({});
+      }
+    }
   } catch (error) {
     console.error(`\n錯誤：${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
@@ -14531,6 +14653,7 @@ function renderOverview() {
   const primary = (state.providers || []).find((provider) => provider.primary);
   const canRestart = state.desktop && state.desktop.canRestart;
   const head = pageHead("總覽", "路由器狀態、最近的錯誤與執行環境。",
+    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked), onclick: () => runJob("repair-models", {}, { title: "同步與修復模型清單" }) }, icon("refresh"), "同步與修復模型清單"),
     h("button", { type: "button", class: "button", onclick: confirmRestartRouter }, icon("restart"), "重新啟動路由器"),
     canRestart ? h("button", { type: "button", class: "button", onclick: confirmRestartDesktop }, icon("power"), "重新啟動 " + state.desktop.name) : null);
 
@@ -14543,7 +14666,9 @@ function renderOverview() {
     card("自訂模型", String((state.models || []).length), "官方模型 " + formatNumber(state.officialModelCount) + " 個"),
     card("供應商", String((state.providers || []).length), primary ? "主要：" + primary.id : ""));
 
-  return [head, cards, renderErrorsPanel(), renderEnvironmentPanel()];
+  const invalidDefault = state.config && state.config.model && state.config.model.startsWith("custom/") &&
+    !(state.models || []).some(model => model.slug === state.config.model);
+  return [head, ...(invalidDefault ? [banner("warn", "alert", "全域預設模型已失效，請點擊「同步與修復模型清單」。")] : []), cards, renderErrorsPanel(), renderEnvironmentPanel()];
 }
 
 function renderErrorsPanel() {
