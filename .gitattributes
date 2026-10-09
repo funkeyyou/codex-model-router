@@ -4,3 +4,8 @@
 *.ps1  text eol=lf
 *.mjs  text eol=lf
 *.md   text eol=lf
+# 管理頁、更新說明與測試資料同樣固定 LF：Windows 簽出成 CRLF 時，繁轉簡字表的掃描
+# 會找不到管理頁的翻譯資料區塊。
+*.html text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf

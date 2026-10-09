@@ -22,18 +22,19 @@ const CJK = /[\u3400-\u9fff\uf900-\ufaff]/u;
 const DATA_BLOCK = /(<script type="application\/json" id="i18n-data">\n)([\s\S]*?)(\n<\/script>)/;
 
 // 需要涵蓋的文字：所有原始碼與更新說明；管理頁本身扣掉翻譯資料（裡面本來就有簡體字）。
+// Windows 簽出可能把換行轉成 CRLF，比對前一律先換回 LF，否則找不到翻譯資料區塊。
 export function sourceCharacters(root = repoRoot) {
   const texts = [];
   for (const name of readdirSync(join(root, "src")).sort()) {
-    const text = readFileSync(join(root, "src", name), "utf8");
+    const text = readFileSync(join(root, "src", name), "utf8").replaceAll("\r\n", "\n");
     texts.push(name === "manager.html" ? text.replace(DATA_BLOCK, "$1$3") : text);
   }
-  texts.push(readFileSync(join(root, "releases.json"), "utf8"));
+  texts.push(readFileSync(join(root, "releases.json"), "utf8").replaceAll("\r\n", "\n"));
   return [...new Set([...texts.join("")].filter((char) => CJK.test(char)))].sort();
 }
 
 export function readPageData(page = readFileSync(pagePath, "utf8")) {
-  const match = DATA_BLOCK.exec(page);
+  const match = DATA_BLOCK.exec(page.replaceAll("\r\n", "\n"));
   if (!match) throw new Error("src/manager.html 缺少 i18n-data 區塊");
   return JSON.parse(match[2]);
 }
@@ -58,7 +59,8 @@ function main() {
   const page = readFileSync(pagePath, "utf8");
   const data = readPageData(page);
   const nextPage = page.replace(/^"from": ".*",$/m, '"from": ' + JSON.stringify(from) + ",").replace(/^"to": ".*",$/m, '"to": ' + JSON.stringify(to) + ",");
-  const stale = data.t2s.from !== from || data.t2s.to !== to || readFileSync(identityPath, "utf8") !== identity + "\n";
+  const stale = data.t2s.from !== from || data.t2s.to !== to
+    || readFileSync(identityPath, "utf8").replaceAll("\r\n", "\n") !== identity + "\n";
   if (check) {
     console.log(stale ? "繁轉簡字表需要更新：執行 node tools/i18n-t2s.mjs" : "繁轉簡字表已是最新");
     process.exitCode = stale ? 1 : 0;
@@ -70,4 +72,3 @@ function main() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
-

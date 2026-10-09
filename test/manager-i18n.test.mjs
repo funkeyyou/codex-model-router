@@ -6,7 +6,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadPayloads } from "./helpers/payloads.mjs";
 import { readPageData, sourceCharacters } from "../tools/i18n-t2s.mjs";
 
@@ -109,6 +111,23 @@ test("繁轉簡字表涵蓋原始碼與更新說明用到的每個字（新增�
     "有新的中文字沒有涵蓋：執行 node tools/i18n-t2s.mjs 重新產生字表");
   for (const [phrase, simplified] of Object.entries(data.t2s.phrases)) {
     assert.ok(phrase && simplified, phrase);
+  }
+});
+
+test("Windows 簽出成 CRLF 時，字表掃描仍排除管理頁的翻譯資料", () => {
+  const root = mkdtempSync(join(tmpdir(), "router-t2s-crlf-"));
+  try {
+    mkdirSync(join(root, "src"));
+    const srcDir = new URL("../src/", import.meta.url);
+    for (const name of readdirSync(srcDir)) {
+      writeFileSync(join(root, "src", name), readFileSync(new URL(name, srcDir), "utf8").replaceAll("\n", "\r\n"));
+    }
+    const releases = readFileSync(new URL("../releases.json", import.meta.url), "utf8");
+    writeFileSync(join(root, "releases.json"), releases.replaceAll("\n", "\r\n"));
+    assert.deepEqual(sourceCharacters(root), sourceCharacters());
+    assert.deepEqual(readPageData(readFileSync(join(root, "src", "manager.html"), "utf8")).t2s, data.t2s);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
