@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.3";
+const INSTALLER_VERSION = "1.29.4";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -944,6 +944,17 @@ export function normalizeOwner(owner) {
   return value || "unknown";
 }
 
+// 官方 Anthropic API 以 x-api-key 認證，且每個請求都必須帶 anthropic-version；
+// 中轉站沿用 Bearer。Claude 原生 /messages 測試一律補上 anthropic-version，對中轉站無害。
+export function upstreamAuthHeaders(url, apiKey, anthropicNative = false) {
+  let official = false;
+  try { official = new URL(url).hostname.toLowerCase() === "api.anthropic.com"; } catch {}
+  return {
+    ...(official ? { "x-api-key": apiKey } : { authorization: `Bearer ${apiKey}` }),
+    ...(official || anthropicNative ? { "anthropic-version": "2023-06-01" } : {}),
+  };
+}
+
 // 供應商欄位沒有統一名稱，各家自架閘道用的鍵不一樣。
 function ownerOf(item) {
   return normalizeOwner(item?.owned_by ?? item?.owner ?? item?.provider ?? item?.vendor);
@@ -984,7 +995,7 @@ async function discoverApiRoot(baseUrl, apiKey) {
     const modelsUrl = `${apiRoot.replace(/\/$/, "")}/models`;
     try {
       const response = await fetchWithTimeout(modelsUrl, {
-        headers: { authorization: `Bearer ${apiKey}` },
+        headers: upstreamAuthHeaders(modelsUrl, apiKey),
       });
       const text = await response.text();
       if (!response.ok) {
@@ -1165,7 +1176,7 @@ async function probeAnthropicContextWindow(apiRoot, apiKey, model) {
       `${apiRoot.replace(/\/$/, "")}/messages`,
       {
         method: "POST",
-        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        headers: { ...upstreamAuthHeaders(apiRoot, apiKey, true), "content-type": "application/json" },
         body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: "user", content: filler }] }),
       },
       180000,
@@ -1184,7 +1195,7 @@ async function probeAnthropicMaxOutput(apiRoot, apiKey, model) {
       `${apiRoot.replace(/\/$/, "")}/messages`,
       {
         method: "POST",
-        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        headers: { ...upstreamAuthHeaders(apiRoot, apiKey, true), "content-type": "application/json" },
         body: JSON.stringify({ model, max_tokens: 9999999, messages: [{ role: "user", content: "hi" }] }),
       },
       60000,
@@ -1205,7 +1216,7 @@ async function probeAnthropicParam(apiRoot, apiKey, model, extra) {
       `${apiRoot.replace(/\/$/, "")}/messages`,
       {
         method: "POST",
-        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        headers: { ...upstreamAuthHeaders(apiRoot, apiKey, true), "content-type": "application/json" },
         body: JSON.stringify({
           model, max_tokens: 16,
           messages: [{ role: "user", content: "Reply with exactly OK." }],
@@ -1234,7 +1245,7 @@ async function probeAnthropicModel(apiRoot, apiKey, model) {
       `${apiRoot.replace(/\/$/, "")}/messages`,
       {
         method: "POST",
-        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        headers: { ...upstreamAuthHeaders(apiRoot, apiKey, true), "content-type": "application/json" },
         body: JSON.stringify({
           model, max_tokens: 16, stream: true,
           messages: [{ role: "user", content: "Reply with exactly OK." }],
@@ -4512,7 +4523,7 @@ async function replaceProviderKey() {
   try {
     const apiKey = readApiKey(provider.keychainService);
     const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-      headers: { authorization: `Bearer ${apiKey}` },
+      headers: upstreamAuthHeaders(provider.apiRoot, apiKey),
     }, 15000);
     await response.arrayBuffer();
     console.log(response.ok
@@ -6525,7 +6536,7 @@ async function managerReplaceKey({ providerId, apiKey } = {}) {
   let problem = null;
   try {
     const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-      headers: { authorization: `Bearer ${key}` },
+      headers: upstreamAuthHeaders(provider.apiRoot, key),
     }, 15000);
     await response.arrayBuffer();
     status = response.status;
@@ -8490,8 +8501,19 @@ function buildOfficialHeaders(requestHeaders) {
   return headers;
 }
 
-function buildCustomHeaders(requestHeaders, apiKey) {
-  const headers = new Headers({ authorization: `Bearer ${apiKey}` });
+// 官方 Anthropic API 以 x-api-key 認證，且每個請求都必須帶 anthropic-version；
+// 中轉站沿用 Bearer。所有 /messages 請求補上 anthropic-version，對中轉站無害。
+export const ANTHROPIC_VERSION = "2023-06-01";
+export function isOfficialAnthropic(target) {
+  try { return new URL(target).hostname.toLowerCase() === "api.anthropic.com"; } catch { return false; }
+}
+
+export function buildCustomHeaders(requestHeaders, apiKey, target = null) {
+  const official = target != null && isOfficialAnthropic(target);
+  const headers = new Headers(official ? { "x-api-key": apiKey } : { authorization: `Bearer ${apiKey}` });
+  if (official || (target != null && /\/messages$/.test(new URL(target).pathname))) {
+    headers.set("anthropic-version", ANTHROPIC_VERSION);
+  }
   for (const [name, value] of Object.entries(requestHeaders)) {
     if (!customForwardHeaders.has(name.toLowerCase()) || value == null) continue;
     appendHeader(headers, name, value);
@@ -8772,7 +8794,7 @@ async function fetchCustom(provider, target, headers, body, signal) {
   let apiKey = await getApiKey(provider, false);
   let upstream = await fetch(target, {
     method: "POST",
-    headers: buildCustomHeaders(headers, apiKey),
+    headers: buildCustomHeaders(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
@@ -8782,7 +8804,7 @@ async function fetchCustom(provider, target, headers, body, signal) {
   apiKey = await getApiKey(provider, true);
   return fetch(target, {
     method: "POST",
-    headers: buildCustomHeaders(headers, apiKey),
+    headers: buildCustomHeaders(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,

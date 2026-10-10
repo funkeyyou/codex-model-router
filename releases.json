@@ -1,6 +1,13 @@
 {
-  "latest": "1.29.3",
+  "latest": "1.29.4",
   "releases": [
+    {
+      "version": "1.29.4",
+      "date": "2026-10-10",
+      "changes": [
+        "支援以官方 Anthropic API（https://api.anthropic.com）為供應商添加 Claude 模型。以前列出模型、添加前測試與實際對話都只用 Bearer 送 Key、且沒有 anthropic-version，官方一律拒絕，第一步列出模型就失敗。現在送往 api.anthropic.com 時改用 x-api-key 與 anthropic-version，Key 不會以 Bearer 送出；中轉站仍用 Bearer，所有 Claude 原生 /messages 請求補上 anthropic-version。"
+      ]
+    },
     {
       "version": "1.29.3",
       "date": "2026-10-10",

@@ -85,6 +85,8 @@ On Windows, replace `bash codex-model-router.sh` with `powershell -ExecutionPoli
 
 Models that already have a prefix, such as `ark/model-name`, keep that name when newly added. Provider-specific internal IDs keep different providers' credentials separate even if their model display names match.
 
+Since v1.29.4, you can add Claude models with the official `https://api.anthropic.com` Base URL: requests to it authenticate with `x-api-key` and `anthropic-version` and never send the key as Bearer. Relays keep Bearer authentication, and native Claude `/messages` requests always include `anthropic-version`.
+
 ## Update and rollback
 
 Download the latest installer with the [install command](../README.en.md#install), then select the update option (menu item 3), or run:

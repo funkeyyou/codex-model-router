@@ -477,6 +477,7 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   故障不會被誤報為需要重新登入，也不會快取成驗證成功。
 - **自動偵測上下文上限**——Anthropic 模型透過供應商的驗證錯誤精確取得（該探測不計費），
   其餘沿用官方同名模板；找不到時明確警告，不會靜默填入錯誤的預設值。
+- **官方 Anthropic API**——1.29.4 起可直接以 `https://api.anthropic.com` 為 Base URL 添加 Claude 模型：送往官方時改用 `x-api-key` 與 `anthropic-version` 認證，Key 不會以 Bearer 送出；中轉站仍用 Bearer，Claude 原生 `/messages` 請求一律補上 `anthropic-version`。
 - **自動判斷是否需要轉譯**——優先依 `/v1/models` 的 `owned_by`；部分自架閘道完全不回
   這個欄位（例如直接回 Anthropic 格式的 `{id, type, display_name}`），此時改用模型名推斷，
   再以原生 `/messages` 驗證。推斷錯誤是安全的：探測不通會回退到通用 Responses 路由並提示。

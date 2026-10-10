@@ -1122,8 +1122,19 @@ function buildOfficialHeaders(requestHeaders) {
   return headers;
 }
 
-function buildCustomHeaders(requestHeaders, apiKey) {
-  const headers = new Headers({ authorization: `Bearer ${apiKey}` });
+// 官方 Anthropic API 以 x-api-key 認證，且每個請求都必須帶 anthropic-version；
+// 中轉站沿用 Bearer。所有 /messages 請求補上 anthropic-version，對中轉站無害。
+export const ANTHROPIC_VERSION = "2023-06-01";
+export function isOfficialAnthropic(target) {
+  try { return new URL(target).hostname.toLowerCase() === "api.anthropic.com"; } catch { return false; }
+}
+
+export function buildCustomHeaders(requestHeaders, apiKey, target = null) {
+  const official = target != null && isOfficialAnthropic(target);
+  const headers = new Headers(official ? { "x-api-key": apiKey } : { authorization: `Bearer ${apiKey}` });
+  if (official || (target != null && /\/messages$/.test(new URL(target).pathname))) {
+    headers.set("anthropic-version", ANTHROPIC_VERSION);
+  }
   for (const [name, value] of Object.entries(requestHeaders)) {
     if (!customForwardHeaders.has(name.toLowerCase()) || value == null) continue;
     appendHeader(headers, name, value);
@@ -1404,7 +1415,7 @@ async function fetchCustom(provider, target, headers, body, signal) {
   let apiKey = await getApiKey(provider, false);
   let upstream = await fetch(target, {
     method: "POST",
-    headers: buildCustomHeaders(headers, apiKey),
+    headers: buildCustomHeaders(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
@@ -1414,7 +1425,7 @@ async function fetchCustom(provider, target, headers, body, signal) {
   apiKey = await getApiKey(provider, true);
   return fetch(target, {
     method: "POST",
-    headers: buildCustomHeaders(headers, apiKey),
+    headers: buildCustomHeaders(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
