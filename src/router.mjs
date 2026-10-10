@@ -843,6 +843,9 @@ const stats = {
   claudeCompactionFailures: 0,
   // Claude CLI 拒收路由器加的歷史快取斷點、改以無斷點重送的次數；應為 0。
   claudeCliCacheFallbacks: 0,
+  claudeCliFastRequests: 0,
+  lastClaudeCliFastState: null,
+  lastClaudeCliFastDisabledReason: null,
   chatTranslatedRequests: 0,
   chatToolOutputsMerged: 0,
   chatLateToolOutputs: 0,
@@ -1510,9 +1513,15 @@ export async function fetchModelUpstream(
         const { fetchClaudeCli } = await import("./claude-cli.mjs");
         const translated = await fetchClaudeCli(budget.request, {
           ...settings.claudeCli, effort: outboundBodyObject?.reasoning?.effort,
+          fast: outboundBodyObject?.service_tier === "priority",
         }, signal, {
-          onDiagnostic: (event) => { if (event?.type === "cache_marker_fallback") stats.claudeCliCacheFallbacks += 1; },
+          onDiagnostic: (event) => {
+            if (event?.type === "cache_marker_fallback") stats.claudeCliCacheFallbacks += 1;
+            if (event?.fastState) stats.lastClaudeCliFastState = event.fastState;
+            if (event?.fastState) stats.lastClaudeCliFastDisabledReason = event.fastDisabledReason || null;
+          },
         });
+        if (outboundBodyObject?.service_tier === "priority") stats.claudeCliFastRequests += 1;
         stats.lastCustomStatus = translated.status;
         stats.lastProvider = "claude-cli";
         return translated;

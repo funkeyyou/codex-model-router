@@ -160,7 +160,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.28.0";
+const INSTALLER_VERSION = "1.29.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2089,6 +2089,35 @@ export function mergeAddedModels(officialModels, current, routes, newRoutes) {
   });
 }
 
+// Claude CLI 的 Opus 可用 Claude Code 快速模式；是否真的可用（使用點數、帳號設定、
+// 模型版本）由 CLI 判斷，不可用時 CLI 會改用一般速度。其他自訂模型不支援。
+export function customSpeedTiers(route) {
+  const fast = route?.transport === "claude-cli" && /opus/i.test(route.upstreamModel || "");
+  return {
+    additional_speed_tiers: fast ? ["fast"] : [],
+    service_tiers: fast
+      ? [{ id: "priority", name: "Fast", description: "Claude 快速模式：輸出更快，改扣使用點數（usage credits）" }]
+      : [],
+  };
+}
+
+// 更新時把既有自訂項目的速度等級改成依路由計算的結果；沒有變動就回傳原物件。
+export function refreshCustomSpeedTiers(catalog, routes) {
+  if (!Array.isArray(catalog?.models)) return catalog;
+  const bySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
+  let changed = false;
+  const models = catalog.models.map((model) => {
+    const route = bySlug.get(model.slug);
+    if (!route) return model;
+    const tiers = customSpeedTiers(route);
+    if (JSON.stringify(model.additional_speed_tiers ?? []) === JSON.stringify(tiers.additional_speed_tiers)
+      && JSON.stringify(model.service_tiers ?? []) === JSON.stringify(tiers.service_tiers)) return model;
+    changed = true;
+    return { ...model, ...tiers };
+  });
+  return changed ? { ...catalog, models } : catalog;
+}
+
 export function orderCustomModelsByDiscovery(officialModels, customModels, routes, discoveredModels) {
   const upstreamBySlug = new Map(routes.map(route => [route.pickerSlug, route.upstreamModel]));
   const rank = new Map(discoveredModels.map((model, index) => [model, index]));
@@ -2377,8 +2406,7 @@ export function customCatalogEntry(officialModels, route, index) {
     1;
   entry.visibility = "list";
   entry.supported_in_api = true;
-  entry.additional_speed_tiers = [];
-  entry.service_tiers = [];
+  Object.assign(entry, customSpeedTiers(route));
   entry.availability_nux = null;
   entry.upgrade = null;
   entry.supports_search_tool = false;
@@ -4629,7 +4657,7 @@ async function update() {
     fail(UPDATE_FAILURES[plan.reason] || "無法更新現有安裝。");
   }
   const currentCatalog = existsSync(catalogPath) ? JSON.parse(readFileSync(catalogPath, "utf8")) : null;
-  const updatedCatalog = prefixCatalogDisplayNames(currentCatalog, plan.routes);
+  const updatedCatalog = refreshCustomSpeedTiers(prefixCatalogDisplayNames(currentCatalog, plan.routes), plan.routes);
   const namesChanged = updatedCatalog !== currentCatalog;
   // 只遷移本工具管理的固定目錄，不移除使用者自行指定的其他目錄。
   if (!codexBin) fail("此次更新需要 Codex CLI 讀取及遷移舊版模型目錄設定，請先確認 Codex 已安裝。");
@@ -8216,6 +8244,9 @@ const stats = {
   claudeCompactionFailures: 0,
   // Claude CLI 拒收路由器加的歷史快取斷點、改以無斷點重送的次數；應為 0。
   claudeCliCacheFallbacks: 0,
+  claudeCliFastRequests: 0,
+  lastClaudeCliFastState: null,
+  lastClaudeCliFastDisabledReason: null,
   chatTranslatedRequests: 0,
   chatToolOutputsMerged: 0,
   chatLateToolOutputs: 0,
@@ -8883,9 +8914,15 @@ export async function fetchModelUpstream(
         const { fetchClaudeCli } = await import("./claude-cli.mjs");
         const translated = await fetchClaudeCli(budget.request, {
           ...settings.claudeCli, effort: outboundBodyObject?.reasoning?.effort,
+          fast: outboundBodyObject?.service_tier === "priority",
         }, signal, {
-          onDiagnostic: (event) => { if (event?.type === "cache_marker_fallback") stats.claudeCliCacheFallbacks += 1; },
+          onDiagnostic: (event) => {
+            if (event?.type === "cache_marker_fallback") stats.claudeCliCacheFallbacks += 1;
+            if (event?.fastState) stats.lastClaudeCliFastState = event.fastState;
+            if (event?.fastState) stats.lastClaudeCliFastDisabledReason = event.fastDisabledReason || null;
+          },
         });
+        if (outboundBodyObject?.service_tier === "priority") stats.claudeCliFastRequests += 1;
         stats.lastCustomStatus = translated.status;
         stats.lastProvider = "claude-cli";
         return translated;
@@ -13617,7 +13654,12 @@ export function claudeCliEnvironment(source = process.env) {
     ENABLE_TOOL_SEARCH: "false" };
 }
 
-const isolationArgs = ["--setting-sources", "", "--settings", '{"disableAllHooks":true}'];
+const isolationSettings = { disableAllHooks: true };
+const isolationArgs = ["--setting-sources", "", "--settings", JSON.stringify(isolationSettings)];
+// 無頭模式（Agent SDK）預設不開快速模式，必須由 --settings 明確 opt in。
+export function cliSettingsArgs({ fast = false } = {}) {
+  return ["--setting-sources", "", "--settings", JSON.stringify(fast ? { ...isolationSettings, fastMode: true } : isolationSettings)];
+}
 
 // SDK initialize exposes ModelInfo[] without sending a user/model turn.
 // Return only models, never the account metadata also present in this response.
@@ -13911,7 +13953,7 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     const baseArgs = ["-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json",
       "--include-partial-messages", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
       "--mcp-config", join(directory, "mcp.json"), "--disable-slash-commands", "--no-chrome",
-      "--permission-mode", "dontAsk", "--max-turns", "1", ...isolationArgs,
+      "--permission-mode", "dontAsk", "--max-turns", "1", ...cliSettingsArgs({ fast: configuration.fast === true }),
       // Claude 5 系列預設不回傳思考文字（display: omitted）。要求摘要後 Codex 才能顯示
       // 思考過程；計費不變。這個參數不在 --help 中，2.1.231 起可用，且只附加在
       // adaptive／enabled 思考設定上，不會與關閉思考同時送出。
@@ -13948,6 +13990,8 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
           onDiagnostic?.({ type: record.type, event: record.event?.type, stop: record.event?.delta?.stop_reason,
             block: record.event?.content_block?.type, error: record.error, subtype: record.subtype,
             model: record.event?.message?.model, assistantStop: record.message?.stop_reason,
+            ...(typeof record.fast_mode_state === "string" ? { fastState: record.fast_mode_state,
+              fastDisabledReason: typeof record.fast_mode_disabled_reason === "string" ? record.fast_mode_disabled_reason : null } : {}),
             ...(record.message?.stop_reason === "refusal" ? { refusal: record.message.content?.filter((block) => block.type === "text")
               .map((block) => block.text).join("\n").slice(0, 1000) } : {}) });
           if (record.type === "assistant" && record.error) {

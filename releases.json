@@ -1,6 +1,13 @@
 {
-  "latest": "1.28.0",
+  "latest": "1.29.0",
   "releases": [
+    {
+      "version": "1.29.0",
+      "date": "2026-10-10",
+      "changes": [
+        "Claude 訂閱的 Opus 模型新增 Fast（快速模式）：在 Codex 選單開啟後，路由器讓該次 Claude CLI 請求使用 Claude Code 的 fast mode，輸出更快，但改扣 Claude 帳號的使用點數（usage credits）。帳號未開點數、方案或模型不支援時，CLI 自動改用一般速度；/healthz 新增 claudeCliFastRequests、lastClaudeCliFastState 與 lastClaudeCliFastDisabledReason。更新時既有 Opus 項目會補上 Fast，保留手動設定；Sonnet、Haiku 與其他自訂模型不顯示。"
+      ]
+    },
     {
       "version": "1.28.0",
       "date": "2026-10-09",

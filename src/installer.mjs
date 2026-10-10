@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.28.0";
+const INSTALLER_VERSION = "1.29.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1957,6 +1957,35 @@ export function mergeAddedModels(officialModels, current, routes, newRoutes) {
   });
 }
 
+// Claude CLI 的 Opus 可用 Claude Code 快速模式；是否真的可用（使用點數、帳號設定、
+// 模型版本）由 CLI 判斷，不可用時 CLI 會改用一般速度。其他自訂模型不支援。
+export function customSpeedTiers(route) {
+  const fast = route?.transport === "claude-cli" && /opus/i.test(route.upstreamModel || "");
+  return {
+    additional_speed_tiers: fast ? ["fast"] : [],
+    service_tiers: fast
+      ? [{ id: "priority", name: "Fast", description: "Claude 快速模式：輸出更快，改扣使用點數（usage credits）" }]
+      : [],
+  };
+}
+
+// 更新時把既有自訂項目的速度等級改成依路由計算的結果；沒有變動就回傳原物件。
+export function refreshCustomSpeedTiers(catalog, routes) {
+  if (!Array.isArray(catalog?.models)) return catalog;
+  const bySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
+  let changed = false;
+  const models = catalog.models.map((model) => {
+    const route = bySlug.get(model.slug);
+    if (!route) return model;
+    const tiers = customSpeedTiers(route);
+    if (JSON.stringify(model.additional_speed_tiers ?? []) === JSON.stringify(tiers.additional_speed_tiers)
+      && JSON.stringify(model.service_tiers ?? []) === JSON.stringify(tiers.service_tiers)) return model;
+    changed = true;
+    return { ...model, ...tiers };
+  });
+  return changed ? { ...catalog, models } : catalog;
+}
+
 export function orderCustomModelsByDiscovery(officialModels, customModels, routes, discoveredModels) {
   const upstreamBySlug = new Map(routes.map(route => [route.pickerSlug, route.upstreamModel]));
   const rank = new Map(discoveredModels.map((model, index) => [model, index]));
@@ -2245,8 +2274,7 @@ export function customCatalogEntry(officialModels, route, index) {
     1;
   entry.visibility = "list";
   entry.supported_in_api = true;
-  entry.additional_speed_tiers = [];
-  entry.service_tiers = [];
+  Object.assign(entry, customSpeedTiers(route));
   entry.availability_nux = null;
   entry.upgrade = null;
   entry.supports_search_tool = false;
@@ -4497,7 +4525,7 @@ async function update() {
     fail(UPDATE_FAILURES[plan.reason] || "無法更新現有安裝。");
   }
   const currentCatalog = existsSync(catalogPath) ? JSON.parse(readFileSync(catalogPath, "utf8")) : null;
-  const updatedCatalog = prefixCatalogDisplayNames(currentCatalog, plan.routes);
+  const updatedCatalog = refreshCustomSpeedTiers(prefixCatalogDisplayNames(currentCatalog, plan.routes), plan.routes);
   const namesChanged = updatedCatalog !== currentCatalog;
   // 只遷移本工具管理的固定目錄，不移除使用者自行指定的其他目錄。
   if (!codexBin) fail("此次更新需要 Codex CLI 讀取及遷移舊版模型目錄設定，請先確認 Codex 已安裝。");

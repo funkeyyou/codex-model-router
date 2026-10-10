@@ -304,6 +304,8 @@ DeepSeek、通義千問、GLM、Kimi、Gemini 的 OpenAI 相容介面、Ollama�
 
 1.26.5 起改善訂閱路由的提示快取：重播歷史的結尾加上一個 1 小時快取斷點，CLI 自己的快取也固定為 1 小時，下一輪可直接讀取上一輪的歷史。本機以假 API 模擬 4 輪、10 次請求，快取命中率從約 37% 提高到約 85%；實際用量仍依對話內容與 Anthropic 計算方式而定。同版本起 Codex 工具說明完整送出，不再被 CLI 在 2,048 字元處截斷。
 
+1.29.0 起，Claude 訂閱的 Opus 模型在 Codex 選單提供 Fast（快速模式）開關，對應 Claude Code 的 fast mode：輸出更快，但改扣 Claude 帳號的使用點數（usage credits），不使用訂閱方案額度。帳號未開使用點數、方案不支援或模型不支援時，CLI 會自動改用一般速度；可從 `/healthz` 的 `claudeCliFastRequests`、`lastClaudeCliFastState`（`on` 表示實際生效）與 `lastClaudeCliFastDisabledReason` 確認。Sonnet、Haiku 與其他自訂模型不顯示 Fast；同一任務中途切換可能讓提示快取重新建立一次。
+
 ## 中轉 API 生圖（可選）
 
 安裝時同意啟用，或事後選擇選單第 10 項／執行 `imagegen`／在網頁管理介面的「生圖」頁，即可添加獨立的 `$router-imagegen` 技能。

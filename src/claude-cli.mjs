@@ -49,7 +49,12 @@ export function claudeCliEnvironment(source = process.env) {
     ENABLE_TOOL_SEARCH: "false" };
 }
 
-const isolationArgs = ["--setting-sources", "", "--settings", '{"disableAllHooks":true}'];
+const isolationSettings = { disableAllHooks: true };
+const isolationArgs = ["--setting-sources", "", "--settings", JSON.stringify(isolationSettings)];
+// 無頭模式（Agent SDK）預設不開快速模式，必須由 --settings 明確 opt in。
+export function cliSettingsArgs({ fast = false } = {}) {
+  return ["--setting-sources", "", "--settings", JSON.stringify(fast ? { ...isolationSettings, fastMode: true } : isolationSettings)];
+}
 
 // SDK initialize exposes ModelInfo[] without sending a user/model turn.
 // Return only models, never the account metadata also present in this response.
@@ -343,7 +348,7 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     const baseArgs = ["-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json",
       "--include-partial-messages", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
       "--mcp-config", join(directory, "mcp.json"), "--disable-slash-commands", "--no-chrome",
-      "--permission-mode", "dontAsk", "--max-turns", "1", ...isolationArgs,
+      "--permission-mode", "dontAsk", "--max-turns", "1", ...cliSettingsArgs({ fast: configuration.fast === true }),
       // Claude 5 系列預設不回傳思考文字（display: omitted）。要求摘要後 Codex 才能顯示
       // 思考過程；計費不變。這個參數不在 --help 中，2.1.231 起可用，且只附加在
       // adaptive／enabled 思考設定上，不會與關閉思考同時送出。
@@ -380,6 +385,8 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
           onDiagnostic?.({ type: record.type, event: record.event?.type, stop: record.event?.delta?.stop_reason,
             block: record.event?.content_block?.type, error: record.error, subtype: record.subtype,
             model: record.event?.message?.model, assistantStop: record.message?.stop_reason,
+            ...(typeof record.fast_mode_state === "string" ? { fastState: record.fast_mode_state,
+              fastDisabledReason: typeof record.fast_mode_disabled_reason === "string" ? record.fast_mode_disabled_reason : null } : {}),
             ...(record.message?.stop_reason === "refusal" ? { refusal: record.message.content?.filter((block) => block.type === "text")
               .map((block) => block.text).join("\n").slice(0, 1000) } : {}) });
           if (record.type === "assistant" && record.error) {
