@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.2";
+const INSTALLER_VERSION = "1.29.3";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2805,16 +2805,21 @@ function taskXmlDocument() {
 }
 
 // schtasks /End 只結束 wscript，它用 Run 起的 node 會留下來佔著埠，必須另外收掉。
-// 只認我們自己會起的三種行程名：命令列裡剛好帶到安裝路徑的外殼（例如正在跑安裝器
-// 的 powershell.exe）不能被波及。
+// 只認路由器服務本身：執行 router-launcher.js 的 wscript，以及執行 router.mjs 的
+// cmd 外殼與 node。不能用「命令列含安裝目錄」來比對：管理頁、它的背景程序與 Codex 的
+// 管理入口也放在安裝目錄裡，被一起結束時，正在重啟路由器的管理頁會跟著死掉，
+// 路由器就停在已停止、沒人重新啟動的狀態。
 function killRouterProcesses() {
   powershell(
     [
       "$ErrorActionPreference = 'SilentlyContinue'",
-      `$root = ${psQuote(installRoot)}`,
-      "$names = @('node.exe', 'wscript.exe', 'cmd.exe')",
+      `$router = ${psQuote(routerPath)}`,
+      `$launcher = ${psQuote(launcherPath)}`,
+      "function Has($text, $value) { $text.IndexOf($value, [StringComparison]::OrdinalIgnoreCase) -ge 0 }",
       "Get-CimInstance Win32_Process |",
-      `  Where-Object { $names -contains $_.Name -and $_.ProcessId -ne ${process.pid} -and $_.CommandLine -and $_.CommandLine.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |`,
+      `  Where-Object { $_.ProcessId -ne ${process.pid} -and $_.CommandLine -and (`,
+      "    ($_.Name -eq 'wscript.exe' -and (Has $_.CommandLine $launcher)) -or",
+      "    (($_.Name -eq 'node.exe' -or $_.Name -eq 'cmd.exe') -and (Has $_.CommandLine $router))) } |",
       "  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
     ].join("\n"),
     { allowFailure: true },
