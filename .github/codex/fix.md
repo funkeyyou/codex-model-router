@@ -23,7 +23,10 @@ set resolved=false and explain what remains uncertain. Use the issue's language;
 use Traditional Chinese for Chinese replies. The workflow will add the PR link.
 
 Repository-specific guidance for codex-model-router:
-- Read README.md, README.zh-TW.md, package.json, and the applicable .codex guidance.
+- Read README.zh-TW.md for the overview, then the detailed docs it links to:
+  docs/guide.zh-TW.md (behavior and settings), docs/troubleshooting.zh-TW.md
+  (known failures and health-check fields), and docs/development.zh-TW.md (build,
+  test, and release rules). Also read package.json and the applicable .codex guidance.
 - Canonical application source is in src/. The root codex-model-router.sh and
   codex-model-router.ps1 are generated installers; do not hand-edit them.
 - After changing src/, rebuild with npm run build, then run npm run check.
