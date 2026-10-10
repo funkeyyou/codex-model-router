@@ -269,7 +269,8 @@ test("Codex 全域入口：真實 config RPC 註冊並保留其他設定，重�
   assert.equal(readFileSync(configPath, "utf8"), beforeRepeat, "重裝不重寫已相同的設定");
   // 本機早期版本曾註冊檔案右鍵入口，只移除仍由路由器擁有的那個項目。
   const legacy = { label: "自訂模型管理", command: "/bin/bash", args: ["old-manager-open.sh"], icon: "old-icon.svg" };
-  await installer.codexRpc("config/batchWrite", { edits: [{ keyPath: "desktop.custom_file_handlers.model_router_manager", value: legacy, mergeStrategy: "replace" }], reloadUserConfig: false }, () => true, codexBin, root);
+  // Windows 上 Codex 寫 config.toml 偶爾會撞到檔案仍被佔用（failed to persist），與正式流程一樣重試。
+  await installer.retryConfigWrite(() => installer.codexRpc("config/batchWrite", { edits: [{ keyPath: "desktop.custom_file_handlers.model_router_manager", value: legacy, mergeStrategy: "replace" }], reloadUserConfig: false }, () => true, codexBin, root));
   const oldManifest = JSON.parse(readFileSync(join(runtime, "install.json"), "utf8"));
   oldManifest.managerFileHandler = { installed: legacy, previous: null };
   writeFileSync(join(runtime, "install.json"), JSON.stringify(oldManifest));
@@ -281,7 +282,7 @@ test("Codex 全域入口：真實 config RPC 註冊並保留其他設定，重�
   const record = JSON.parse(readFileSync(join(runtime, "install.json"), "utf8")).managerMcpEntry;
   assert.equal(record.previous, null);
   const keyPath = "mcp_servers.model_router_manager";
-  const writeEntry = (value) => installer.codexRpc("config/batchWrite", { edits: [{ keyPath, value, mergeStrategy: "replace" }], reloadUserConfig: false }, () => true, codexBin, root);
+  const writeEntry = (value) => installer.retryConfigWrite(() => installer.codexRpc("config/batchWrite", { edits: [{ keyPath, value, mergeStrategy: "replace" }], reloadUserConfig: false }, () => true, codexBin, root));
   const changed = { ...managed, args: [...managed.args, "manual"] };
   await writeEntry(changed);
   const conflict = await runSetup();
