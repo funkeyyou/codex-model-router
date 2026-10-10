@@ -226,7 +226,7 @@ jobs:
       - name: Create Summer Shark installation token
         id: bot-token
         if: env.CODEX_APP_ID != '' && env.HAS_APP_KEY == 'true'
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.CODEX_APP_ID }}
           private-key: ${{ secrets.CODEX_APP_PRIVATE_KEY }}
