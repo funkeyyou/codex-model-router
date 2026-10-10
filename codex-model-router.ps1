@@ -175,7 +175,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.1";
+const INSTALLER_VERSION = "1.29.2";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5987,7 +5987,18 @@ function runDownloadedUpdate(path) {
     child.stdout.on("data", (chunk) => process.stdout.write(chunk));
     child.stderr.on("data", (chunk) => process.stderr.write(chunk));
     child.once("error", rejectPromise);
-    child.once("close", (code) => resolvePromise(code));
+    let settled = false;
+    const done = (code) => {
+      if (settled) return;
+      settled = true;
+      child.stdout.destroy();
+      child.stderr.destroy();
+      resolvePromise(code);
+    };
+    child.once("close", done);
+    // Windows 上新版安裝器啟動的長駐程序會繼承這條輸出管線，close 要等它們全部結束才觸發，
+    // 管理頁就一直停在「更新中」。以 exit 為準，留一秒收完剩餘輸出。
+    child.once("exit", (code) => setTimeout(() => done(code), 1000));
   });
 }
 
