@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.4";
+const INSTALLER_VERSION = "1.29.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3202,7 +3202,7 @@ async function install() {
   const defaultBaseUrl = primary?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
   const baseUrl = normalizeUrl(
     env.CODEX_MODEL_ROUTER_BASE_URL ||
-      (await ask("兼容 OpenAI 的 Base URL", defaultBaseUrl)),
+      (await ask("Base URL（OpenAI 相容服務或官方 Anthropic API）", defaultBaseUrl)),
   );
   const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
   if (clash) {
@@ -4301,7 +4301,7 @@ async function addProvider() {
   verifyLogin();
   printHeading("新增供應商");
   console.log("每家供應商各自保存 API Key；已有前綴的模型保留原名，無前綴的模型才加供應商名稱。");
-  const baseUrl = normalizeUrl(await ask("兼容 OpenAI 的 Base URL"));
+  const baseUrl = normalizeUrl(await ask("Base URL（OpenAI 相容服務或官方 Anthropic API）"));
   const clash = providers.find((provider) => provider.baseUrl === baseUrl);
   if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要添加它的模型請用「添加自訂模型」。`);
   const keychainService = keychainServiceFor(baseUrl);
@@ -7135,7 +7135,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} rollback
 
 安裝時會詢問：
-  1. 兼容 OpenAI 的 Base URL
+  1. Base URL（OpenAI 相容服務或官方 Anthropic API）
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
 探測時 /responses 不通的模型會改探 /chat/completions（DeepSeek、通義千問、Ollama 等），

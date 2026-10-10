@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.4";
+const INSTALLER_VERSION = "1.29.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3280,7 +3280,7 @@ async function install() {
   const defaultBaseUrl = primary?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
   const baseUrl = normalizeUrl(
     env.CODEX_MODEL_ROUTER_BASE_URL ||
-      (await ask("兼容 OpenAI 的 Base URL", defaultBaseUrl)),
+      (await ask("Base URL（OpenAI 相容服務或官方 Anthropic API）", defaultBaseUrl)),
   );
   const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
   if (clash) {
@@ -4379,7 +4379,7 @@ async function addProvider() {
   verifyLogin();
   printHeading("新增供應商");
   console.log("每家供應商各自保存 API Key；已有前綴的模型保留原名，無前綴的模型才加供應商名稱。");
-  const baseUrl = normalizeUrl(await ask("兼容 OpenAI 的 Base URL"));
+  const baseUrl = normalizeUrl(await ask("Base URL（OpenAI 相容服務或官方 Anthropic API）"));
   const clash = providers.find((provider) => provider.baseUrl === baseUrl);
   if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要添加它的模型請用「添加自訂模型」。`);
   const keychainService = keychainServiceFor(baseUrl);
@@ -7213,7 +7213,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} rollback
 
 安裝時會詢問：
-  1. 兼容 OpenAI 的 Base URL
+  1. Base URL（OpenAI 相容服務或官方 Anthropic API）
   2. API Key（保存在${secretStoreLabel}）
   3. 要添加的模型
 探測時 /responses 不通的模型會改探 /chat/completions（DeepSeek、通義千問、Ollama 等），
@@ -15233,19 +15233,19 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "顯示名稱不能是空白。": "The display name can't be empty.",
 "修改模型：{name}": "Edit model: {name}",
 "查詢模型": "Fetch models",
-"填入兼容 OpenAI 的 Base URL 與 API Key，先查詢它提供的模型清單（不會花費額度）。": "Enter an OpenAI-compatible Base URL and API Key to fetch its model list first (no usage is spent).",
+"填入 Base URL 與 API Key（OpenAI 相容服務或官方 Anthropic API），先查詢它提供的模型清單（不會花費額度）。": "Enter a Base URL and API key (an OpenAI-compatible service or the official Anthropic API) to fetch its model list first (no usage is spent).",
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "The key is only stored encrypted with Windows Data Protection (DPAPI). It's never written to settings files or shown on this page again.",
 "Key 只會存進 macOS 鑰匙圈，不會寫進設定檔，也不會再顯示在頁面上。": "The key is only stored in the macOS Keychain. It's never written to settings files or shown on this page again.",
 "供應商 ID": "Provider ID",
 "小寫英文、數字與連字號。用於管理與設定檔，並替沒有前綴的模型補上名稱（例如 ID/模型）；之後可以在供應商頁另取顯示名稱、修改模型前綴。": "Lowercase letters, digits, and hyphens. Used for management and settings files, and added to unprefixed model names (such as ID/model). You can set a display name and change the model prefix later on the Providers page.",
 "請填寫 Base URL 與 API Key。": "Enter the Base URL and API Key.",
 "選擇要新增的供應商類型。": "Choose the type of provider to add.",
-"OpenAI 相容 API": "OpenAI-compatible API",
-"中轉站、閘道或其他兼容 OpenAI 的服務，用 Base URL 與 API Key 連接；可添加 GPT、Claude 與只支援 Chat Completions 的模型。": "A relay, gateway, or other OpenAI-compatible service, connected with a Base URL and API Key. You can add GPT, Claude, and Chat Completions-only models.",
+"API Key 連接": "API key provider",
+"用 Base URL 與 API Key 連接中轉站、閘道、OpenAI 相容服務，或官方 Anthropic API（https://api.anthropic.com）；可添加 GPT、Claude 與只支援 Chat Completions 的模型。": "Connect a relay, gateway, OpenAI-compatible service, or the official Anthropic API (https://api.anthropic.com) with a Base URL and API key. You can add GPT, Claude, and Chat Completions-only models.",
 "Claude 訂閱帳號（Claude CLI）": "Claude subscription (Claude CLI)",
 "透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算。": "Use Claude models with the Pro/Max subscription signed in to Claude Code. No API Key needed; usage counts against your plan.",
 "已連接 {count} 個模型，可以再添加。": " {count} models connected; you can add more.",
-"新增供應商：OpenAI 相容 API": "Add provider: OpenAI-compatible API",
+"新增供應商：API Key 連接": "Add provider: API key provider",
 "新增供應商：Claude 訂閱帳號": "Add provider: Claude subscription",
 "完成上面的準備後才能選擇模型": "Finish the steps above to choose models",
 "新增供應商：{host}": "Add provider: {host}",
@@ -17514,7 +17514,7 @@ function openAddProvider() {
   const nextButton = h("button", { type: "button", class: "button primary", text: t("查詢模型") });
   const cancelButton = h("button", { type: "button", class: "button", text: t("取消") });
   const stepOne = [
-    paragraph(t("填入兼容 OpenAI 的 Base URL 與 API Key，先查詢它提供的模型清單（不會花費額度）。"), "muted"),
+    paragraph(t("填入 Base URL 與 API Key（OpenAI 相容服務或官方 Anthropic API），先查詢它提供的模型清單（不會花費額度）。"), "muted"),
     h("label", { class: "field" }, h("span", { text: "Base URL" }), baseUrl),
     h("label", { class: "field" }, h("span", { text: "API Key" }), apiKey,
       h("span", { class: "hint", text: state.platform === "win32"
@@ -17563,8 +17563,8 @@ function openAddProvider() {
     modal.setBody(
       paragraph(t("選擇要新增的供應商類型。"), "muted"),
       h("div", { class: "type-choices" },
-        typeOption("providers", t("OpenAI 相容 API"), null,
-          t("中轉站、閘道或其他兼容 OpenAI 的服務，用 Base URL 與 API Key 連接；可添加 GPT、Claude 與只支援 Chat Completions 的模型。"),
+        typeOption("providers", t("API Key 連接"), null,
+          t("用 Base URL 與 API Key 連接中轉站、閘道、OpenAI 相容服務，或官方 Anthropic API（https://api.anthropic.com）；可添加 GPT、Claude 與只支援 Chat Completions 的模型。"),
           showRelayForm),
         typeOption("claude", t("Claude 訂閱帳號（Claude CLI）"), t("實驗性"),
           t("透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算。") +
@@ -17573,7 +17573,7 @@ function openAddProvider() {
     modal.setFoot(h("span", { class: "grow" }), cancelButton);
   }
   function showRelayForm() {
-    modal.setTitle(t("新增供應商：OpenAI 相容 API"));
+    modal.setTitle(t("新增供應商：API Key 連接"));
     modal.setBody(stepOne);
     modal.setFoot(status, backButton, nextButton);
     setTimeout(() => baseUrl.focus(), 30);

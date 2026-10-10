@@ -1,6 +1,13 @@
 {
-  "latest": "1.29.4",
+  "latest": "1.29.5",
   "releases": [
+    {
+      "version": "1.29.5",
+      "date": "2026-10-10",
+      "changes": [
+        "新增供應商的「OpenAI 相容 API」改名為「API Key 連接」，說明寫明可連接中轉站、閘道、OpenAI 相容服務或官方 Anthropic API（https://api.anthropic.com）；終端重新配置與 providers add 的 Base URL 提示同步改為「Base URL（OpenAI 相容服務或官方 Anthropic API）」。只改文字，行為不變。"
+      ]
+    },
     {
       "version": "1.29.4",
       "date": "2026-10-10",

@@ -148,14 +148,14 @@ test("新增供應商：重複的 Base URL 直接擋下；新網址查到模型�
   const upstream = await fakeUpstream(t);
   const state = installation(upstream, { providers: [providerAt(upstream.origin, "default", "p1")] });
   const duplicate = await runInstaller(t, ["providers", "add"], state, [
-    { marker: "兼容 OpenAI 的 Base URL", answer: `${upstream.origin}/p1` },
+    { marker: "Base URL（OpenAI 相容服務或官方 Anthropic API）", answer: `${upstream.origin}/p1` },
   ]);
   assert.equal(duplicate.code, 1, duplicate.output);
   assert.match(duplicate.output, /已經是供應商「default」/);
   assert.equal(duplicate.unchanged, true);
 
   const added = await runInstaller(t, ["providers", "add"], state, [
-    { marker: "兼容 OpenAI 的 Base URL", answer: `${upstream.origin}/p3` },
+    { marker: "Base URL（OpenAI 相容服務或官方 Anthropic API）", answer: `${upstream.origin}/p3` },
     { marker: "請輸入模型編號", answer: "1" },
     { marker: "供應商 ID（", answer: "Bad_Name" },
     { marker: "不能以連字號開頭或結尾", answer: "" },
@@ -175,7 +175,7 @@ test("所選模型已有前綴時跳過供應商 ID，ID 撞名則自動避開",
     providerAt(upstream.origin, "default", "p1"), providerAt(upstream.origin, "local", "p2"),
   ] });
   const result = await runInstaller(t, ["providers", "add"], state, [
-    { marker: "兼容 OpenAI 的 Base URL", answer: `${upstream.origin}/p3` },
+    { marker: "Base URL（OpenAI 相容服務或官方 Anthropic API）", answer: `${upstream.origin}/p3` },
     { marker: "請輸入模型編號", answer: "ark/gpt-test" },
     { marker: "是否繼續進行能力探測", answer: "n" },
   ]);
