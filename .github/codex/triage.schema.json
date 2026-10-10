@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "category": {"type": "string", "enum": ["bug", "needs_info", "question", "feature", "not_reproduced"]},
+    "auto_fix": {"type": "boolean"},
+    "summary": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "string"}},
+    "reply": {"type": "string"}
+  },
+  "required": ["category", "auto_fix", "summary", "evidence", "reply"],
+  "additionalProperties": false
+}

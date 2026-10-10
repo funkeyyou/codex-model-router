@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "resolved": {"type": "boolean"},
+    "summary": {"type": "string"},
+    "validation": {"type": "string"},
+    "reply": {"type": "string"}
+  },
+  "required": ["resolved", "summary", "validation", "reply"],
+  "additionalProperties": false
+}
