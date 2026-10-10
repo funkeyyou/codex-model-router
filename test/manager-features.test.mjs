@@ -17,6 +17,13 @@ test("背景管理程序不保存繼承來的 API Key、登入 token 或舊安�
     CODEX_HOME: "/fixture/codex", CODEX_MODEL_ROUTER_NODE_BIN: "/fixture/node" });
 });
 
+test("背景管理程序保留 Windows PowerShell 執行 node.exe 所需的 PATHEXT 等基本變數", () => {
+  const kept = installer.managerBackgroundEnvironment({ PATH: "C:\\fixture", PATHEXT: ".COM;.EXE",
+    ComSpec: "C:\\Windows\\system32\\cmd.exe", SystemDrive: "C:", ProgramFiles: "C:\\Program Files" });
+  assert.deepEqual(kept, { PATH: "C:\\fixture", PATHEXT: ".COM;.EXE", ComSpec: "C:\\Windows\\system32\\cmd.exe",
+    SystemDrive: "C:", ProgramFiles: "C:\\Program Files" });
+});
+
 test("全域上下文：空值代表移除，其他必須是 16,000～4,000,000 的整數", () => {
   for (const value of [undefined, null, ""]) assert.equal(installer.normalizeGlobalContextWindow(value), null);
   assert.equal(installer.normalizeGlobalContextWindow(1000000), 1000000);

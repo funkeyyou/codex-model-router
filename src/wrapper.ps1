@@ -14,6 +14,13 @@ $ErrorActionPreference = 'Stop'
 $MinimumNodeVersion = [Version] '22.15.0'
 $commandArguments = @($args)
 
+# 由管理頁等背景程序啟動時，環境變數可能只剩白名單。Windows PowerShell 5.1
+# 沒有 PATHEXT 就不把 node.exe 當成可執行檔，會誤判「未找到 Node.js」。
+# 注意 PowerShell 啟動時會自行補上 .CPL，所以缺失時看到的是 ".CPL" 而不是空值。
+if (";$env:PATHEXT;" -notmatch ';\.EXE;') {
+  $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC' + $(if ($env:PATHEXT) { ";$env:PATHEXT" } else { '' })
+}
+
 function Get-NodeVersion {
   param([string] $Path)
   try {
@@ -92,7 +99,21 @@ if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath -PathType Leaf
   exit 1
 }
 
-$nodeBin = Find-NodeBinary
+# 主控台代碼頁不是 65001（例如 936）時，管理頁以 UTF-8 讀取輸出，中文會變亂碼；
+# 所以在第一則可能的錯誤訊息之前就切成 UTF-8，結束時再還原。
+$previousOutputEncoding = [Console]::OutputEncoding
+$previousInputEncoding = [Console]::InputEncoding
+try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+try { [Console]::InputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+
+try {
+  $nodeBin = Find-NodeBinary
+} catch {
+  [Console]::Error.WriteLine("錯誤：$($_.Exception.Message)")
+  try { [Console]::OutputEncoding = $previousOutputEncoding } catch { }
+  try { [Console]::InputEncoding = $previousInputEncoding } catch { }
+  exit 1
+}
 $content = [IO.File]::ReadAllText($scriptPath).Replace("`r`n", "`n")
 $installerSource = Get-EmbeddedSection -Content $content `
   -StartMarker '__CODEX_MODEL_ROUTER_INSTALLER_JS__' `
@@ -103,14 +124,8 @@ $null = New-Item -ItemType Directory -Path $tempDir
 $installerPath = Join-Path $tempDir 'installer.mjs'
 [IO.File]::WriteAllText($installerPath, $installerSource, (New-Object Text.UTF8Encoding $false))
 
-$previousOutputEncoding = [Console]::OutputEncoding
-$previousInputEncoding = [Console]::InputEncoding
 $exitCode = 0
 try {
-  # Node 一律以 UTF-8 輸出；主控台代碼頁不是 65001 時中文會變亂碼。
-  try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
-  try { [Console]::InputEncoding = New-Object Text.UTF8Encoding $false } catch { }
-
   $env:CODEX_MODEL_ROUTER_SCRIPT_PATH = $scriptPath
   $env:CODEX_MODEL_ROUTER_NODE_BIN = $nodeBin
 

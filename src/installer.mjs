@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.0";
+const INSTALLER_VERSION = "1.29.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5830,6 +5830,8 @@ function runDownloadedUpdate(path) {
   for (const name of ["CODEX_MODEL_ROUTER_SCRIPT_PATH", "CODEX_MODEL_ROUTER_UI_TOKEN", "CODEX_MODEL_ROUTER_UI_NO_OPEN"]) {
     delete childEnv[name];
   }
+  // 本行程正在用的 Node 已確定可用；交給新版安裝器優先使用，不必再靠 PATH 找。
+  childEnv.CODEX_MODEL_ROUTER_NODE_BIN = process.execPath;
   const [command, args] = isWindows
     ? ["powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path, "update"]]
     : ["/bin/bash", [path, "update"]];
@@ -7053,6 +7055,9 @@ async function restartIntoInstalledManager(port, token) {
 export function managerBackgroundEnvironment(environment) {
   const names = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PATH", "Path",
     "SystemRoot", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL", "USER", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+    // Windows PowerShell 5.1 靠 PATHEXT 判斷 node.exe 能否執行；其餘是 Windows 程式常用的基本路徑。
+    "PATHEXT", "ComSpec", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData",
+    "PSModulePath", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
     "NODE_USE_ENV_PROXY", "NODE_EXTRA_CA_CERTS", "CODEX_HOME", "CODEX_MODEL_ROUTER_HOME", "CODEX_MODEL_ROUTER_NODE_BIN",
     "CODEX_MODEL_ROUTER_CODEX_BIN", "CODEX_MODEL_ROUTER_CLAUDE_BIN", "CODEX_MODEL_ROUTER_CREDENTIALS_DIR", "CODEX_MODEL_ROUTER_DESKTOP_APP",

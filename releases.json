@@ -1,6 +1,13 @@
 {
-  "latest": "1.29.0",
+  "latest": "1.29.1",
   "releases": [
+    {
+      "version": "1.29.1",
+      "date": "2026-10-10",
+      "changes": [
+        "修正 Windows 從網頁管理介面更新時報「未找到 Node.js」且訊息變亂碼。管理頁的背景程序只保留白名單環境變數，沒有保留 PATHEXT；Windows PowerShell 5.1 少了它就無法執行 node.exe，所有 Node 候選都被判定無效。現在背景環境補回 PATHEXT 等 Windows 基本變數，更新時直接把管理頁正在用的 Node 交給新版安裝器；安裝器本身在 PATHEXT 缺少 .EXE 時也會自行補上，所以從舊版管理頁更新到這一版同樣能成功。安裝器改在偵測 Node 之前就切到 UTF-8 輸出，系統代碼頁為 936 等非 UTF-8 時，錯誤訊息不再變成亂碼。"
+      ]
+    },
     {
       "version": "1.29.0",
       "date": "2026-10-10",

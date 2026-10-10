@@ -14,6 +14,13 @@ $ErrorActionPreference = 'Stop'
 $MinimumNodeVersion = [Version] '22.15.0'
 $commandArguments = @($args)
 
+# 由管理頁等背景程序啟動時，環境變數可能只剩白名單。Windows PowerShell 5.1
+# 沒有 PATHEXT 就不把 node.exe 當成可執行檔，會誤判「未找到 Node.js」。
+# 注意 PowerShell 啟動時會自行補上 .CPL，所以缺失時看到的是 ".CPL" 而不是空值。
+if (";$env:PATHEXT;" -notmatch ';\.EXE;') {
+  $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC' + $(if ($env:PATHEXT) { ";$env:PATHEXT" } else { '' })
+}
+
 function Get-NodeVersion {
   param([string] $Path)
   try {
@@ -92,7 +99,21 @@ if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath -PathType Leaf
   exit 1
 }
 
-$nodeBin = Find-NodeBinary
+# 主控台代碼頁不是 65001（例如 936）時，管理頁以 UTF-8 讀取輸出，中文會變亂碼；
+# 所以在第一則可能的錯誤訊息之前就切成 UTF-8，結束時再還原。
+$previousOutputEncoding = [Console]::OutputEncoding
+$previousInputEncoding = [Console]::InputEncoding
+try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+try { [Console]::InputEncoding = New-Object Text.UTF8Encoding $false } catch { }
+
+try {
+  $nodeBin = Find-NodeBinary
+} catch {
+  [Console]::Error.WriteLine("錯誤：$($_.Exception.Message)")
+  try { [Console]::OutputEncoding = $previousOutputEncoding } catch { }
+  try { [Console]::InputEncoding = $previousInputEncoding } catch { }
+  exit 1
+}
 $content = [IO.File]::ReadAllText($scriptPath).Replace("`r`n", "`n")
 $installerSource = Get-EmbeddedSection -Content $content `
   -StartMarker '__CODEX_MODEL_ROUTER_INSTALLER_JS__' `
@@ -103,14 +124,8 @@ $null = New-Item -ItemType Directory -Path $tempDir
 $installerPath = Join-Path $tempDir 'installer.mjs'
 [IO.File]::WriteAllText($installerPath, $installerSource, (New-Object Text.UTF8Encoding $false))
 
-$previousOutputEncoding = [Console]::OutputEncoding
-$previousInputEncoding = [Console]::InputEncoding
 $exitCode = 0
 try {
-  # Node 一律以 UTF-8 輸出；主控台代碼頁不是 65001 時中文會變亂碼。
-  try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch { }
-  try { [Console]::InputEncoding = New-Object Text.UTF8Encoding $false } catch { }
-
   $env:CODEX_MODEL_ROUTER_SCRIPT_PATH = $scriptPath
   $env:CODEX_MODEL_ROUTER_NODE_BIN = $nodeBin
 
@@ -160,7 +175,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.0";
+const INSTALLER_VERSION = "1.29.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5962,6 +5977,8 @@ function runDownloadedUpdate(path) {
   for (const name of ["CODEX_MODEL_ROUTER_SCRIPT_PATH", "CODEX_MODEL_ROUTER_UI_TOKEN", "CODEX_MODEL_ROUTER_UI_NO_OPEN"]) {
     delete childEnv[name];
   }
+  // 本行程正在用的 Node 已確定可用；交給新版安裝器優先使用，不必再靠 PATH 找。
+  childEnv.CODEX_MODEL_ROUTER_NODE_BIN = process.execPath;
   const [command, args] = isWindows
     ? ["powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path, "update"]]
     : ["/bin/bash", [path, "update"]];
@@ -7185,6 +7202,9 @@ async function restartIntoInstalledManager(port, token) {
 export function managerBackgroundEnvironment(environment) {
   const names = ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PATH", "Path",
     "SystemRoot", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL", "USER", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+    // Windows PowerShell 5.1 靠 PATHEXT 判斷 node.exe 能否執行；其餘是 Windows 程式常用的基本路徑。
+    "PATHEXT", "ComSpec", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData",
+    "PSModulePath", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
     "NODE_USE_ENV_PROXY", "NODE_EXTRA_CA_CERTS", "CODEX_HOME", "CODEX_MODEL_ROUTER_HOME", "CODEX_MODEL_ROUTER_NODE_BIN",
     "CODEX_MODEL_ROUTER_CODEX_BIN", "CODEX_MODEL_ROUTER_CLAUDE_BIN", "CODEX_MODEL_ROUTER_CREDENTIALS_DIR", "CODEX_MODEL_ROUTER_DESKTOP_APP",
