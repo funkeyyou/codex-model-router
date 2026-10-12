@@ -49,7 +49,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 - 「Codex 模型路由器」快捷方式（Windows 在开始菜单，macOS 在 `~/Applications`）
 - 运行 `ui` 命令
 
-<img src="docs/images/codex-manager-entry.png" alt="Codex 侧边栏「更多」菜单中的模型管理入口（截图为繁体界面）" width="300">
+<img src="docs/images/codex-manager-entry-zh-Hans.png" alt="Codex 侧边栏「更多」菜单中的自定义模型管理入口" width="300">
 
 <img src="docs/images/manager-models-zh-Hans.png" alt="网页管理页的模型列表：调整顺序、上下文、输出与推理强度">
 

@@ -49,13 +49,13 @@ Most tasks can be done in the web manager. Open it from any of:
 - the "Codex 模型路由器" shortcut (Start menu on Windows, `~/Applications` on macOS)
 - the `ui` command
 
-<img src="docs/images/codex-manager-entry.png" alt="The manager entry in the Codex sidebar More menu (shown here in Traditional Chinese)" width="300">
+<img src="docs/images/codex-manager-entry-en.png" alt="The Custom Model Manager entry in the Codex sidebar More menu" width="300">
 
 <img src="docs/images/manager-models-en.png" alt="Web manager models page: order, context, output and reasoning effort">
 
 <img src="docs/images/manager-providers-en.png" alt="Web manager providers page: API Key providers and Claude subscription">
 
-*Provider names and URLs in the screenshots are replaced or blurred. The Codex entry is shown in Traditional Chinese; it reads "Custom Model Manager" in English.*
+*Provider names and URLs in the screenshots are replaced or blurred.*
 
 You can also run commands from the folder containing the installer: `bash codex-model-router.sh <command>` on macOS, or `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 <command>` on Windows. Run it without a command to get the menu.
 
