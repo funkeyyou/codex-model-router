@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { loadPayloads, loadRouterWith } from "./helpers/payloads.mjs";
 
 const { imagegen, installer } = await loadPayloads();
-const all = imagegen.IMAGE_MODELS;
+const all = imagegen.GPT_IMAGE_MODELS;
 const ark = imagegen.ARK_IMAGE_PATH;
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
 const candidates = all.slice(1).map((id) => ({ id, upstreamModel: "ark/" + id }));

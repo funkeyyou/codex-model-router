@@ -124,8 +124,8 @@ function baseEnv(root, runtime, extra = {}) {
   return env;
 }
 
-async function startManager(defer, env, { foreground = true } = {}) {
-  const child = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "ui", ...(foreground ? ["--foreground"] : [])], { env, stdio: ["ignore", "pipe", "pipe"] });
+async function startManager(defer, env, { foreground = true, args = ["ui"] } = {}) {
+  const child = spawn(process.execPath, [join(payloadDir, "installer.mjs"), ...args, ...(foreground ? ["--foreground"] : [])], { env, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   const exited = once(child, "exit");
   defer(() => stopChild(child));
@@ -202,6 +202,54 @@ test("背景管理頁：啟動命令退出後仍可存取，重複開啟沿用�
   assert.equal(existsSync(lockPath), false);
   assert.equal(existsSync(join(runtime, "manager-starting.json")), false);
   assert.deepEqual(readdirSync(runtime).filter((name) => /^manager-(worker|entry)-/.test(name)), []);
+});
+
+test("不帶指令執行：先只裝管理頁再開啟，網頁可查詢模型、送出首次設定，回退只移除管理頁", { timeout: 60000 }, async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-first-run-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  const upstream = http.createServer((request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ data: [{ id: "gpt-first" }, { id: "claude-first" }] }));
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  defer(() => { upstream.closeAllConnections(); upstream.close(); });
+  const ui = await startManager(defer, baseEnv(root, runtime), { foreground: false, args: [] });
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
+  assert.match(ui.output(), /安裝網頁管理頁/);
+  assert.match(ui.output(), /menu/, "提示終端選單的備用方式");
+  assert.equal(JSON.parse(readFileSync(join(runtime, "manager-install.json"), "utf8")).version, releases.latest);
+  assert.equal(existsSync(join(root, "shortcuts")), true, "管理頁捷徑已建立");
+  const state = (await ui.call("/api/state")).json;
+  assert.equal(state.installed, false);
+  assert.equal(state.managerOnly, true);
+  assert.equal(state.versions.installed, releases.latest);
+  assert.equal(state.setupBlocked, null);
+  assert.ok(state.providerPresets.length > 0, "首次設定也能選常用供應商");
+  assert.deepEqual([state.providers, state.models], [[], []]);
+  const draft = await ui.call("/api/provider-draft", { method: "POST",
+    body: { baseUrl: "http://127.0.0.1:" + upstream.address().port + "/v1", apiKey: "first-run-key" } });
+  assert.equal(draft.status, 200, JSON.stringify(draft.json));
+  assert.deepEqual(draft.json.models.map((model) => model.id).sort(), ["claude-first", "gpt-first"]);
+  assert.doesNotMatch(JSON.stringify(draft.json), /first-run-key/, "Key 不回傳給網頁");
+  const expired = await ui.runJob("install", { draftId: "missing", models: ["gpt-first"] });
+  assert.equal(expired.status, "failed");
+  assert.match(expired.output + JSON.stringify(expired), /已過期/);
+  const blocked = await ui.runJob("repair-models", {});
+  assert.match(blocked.output + JSON.stringify(blocked), /管理頁完成首次設定/);
+  assert.equal(existsSync(join(runtime, "install.json")), false, "沒有送出有效的設定前不寫入安裝");
+  assert.equal((await ui.call("/api/shutdown", { method: "POST" })).status, 202);
+  for (let attempt = 0; attempt < 200 && existsSync(join(runtime, "manager.json")); attempt += 1) await delay(50);
+  const removed = spawn(process.execPath, [join(payloadDir, "installer.mjs"), "rollback"],
+    { env: { ...baseEnv(root, runtime), CODEX_MODEL_ROUTER_YES: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+  let removedOutput = "";
+  removed.stdout.on("data", (chunk) => { removedOutput += chunk; });
+  removed.stderr.on("data", (chunk) => { removedOutput += chunk; });
+  assert.equal((await once(removed, "exit"))[0], 0, removedOutput);
+  assert.match(removedOutput, /移除網頁管理頁/);
+  assert.equal(existsSync(runtime), false, "回退後管理頁檔案已封存");
 });
 
 test("舊版更新交接只傳權杖、不帶 --foreground 時，仍沿用權杖而不再啟動另一個管理頁", { timeout: 30000 }, async (t) => {
@@ -520,7 +568,8 @@ test("網頁管理介面：偵測並啟用中轉生圖，再停用封存", { tim
   const query = async (type) => (await ui.call("/api/query", { method: "POST", body: { type } })).json;
   const before = await query("imagegen");
   assert.deepEqual([before.enabled, before.models, before.lastCheck], [false, [], null]);
-  assert.deepEqual(before.choices.map((choice) => choice.id), ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"]);
+  assert.deepEqual(before.choices.map((choice) => choice.id), ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare",
+    "gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"]);
 
   const invalid = await ui.runJob("imagegen-setup", { models: ["gpt-image-1"] });
   assert.equal(invalid.status, "failed");

@@ -828,6 +828,7 @@ const stats = {
   imagesSaved: 0,
   imageRequests: 0,
   arkImageRequests: 0,
+  geminiImageRequests: 0,
   catalogRefreshes: 0,
   catalogRefreshFailures: 0,
   catalogModels: 0,
@@ -862,6 +863,7 @@ const stats = {
   lastAuthProbeStatus: null,
   credentialReads: 0,
   keyRotations: 0,
+  keyModelRoutes: 0,
   keyReadFailures: 0,
   lastKeyRotation: null,
   foreignHostRejects: 0,
@@ -1138,6 +1140,7 @@ export function normalizeKeyPool(source) {
   const result = new Map();
   const entries = source && typeof source === "object" && source.providers && typeof source.providers === "object"
     ? source.providers : {};
+  const modelSet = (list) => Array.isArray(list) && list.length ? new Set(list.filter((id) => typeof id === "string")) : null;
   for (const [providerId, list] of Object.entries(entries)) {
     if (!Array.isArray(list)) continue;
     const seen = new Set([PRIMARY_KEY_SLOT]);
@@ -1152,10 +1155,14 @@ export function normalizeKeyPool(source) {
         keychainService: item.keychainService,
         keychainAccount: typeof item.keychainAccount === "string" && item.keychainAccount ? item.keychainAccount : "codex",
         credentialPath: typeof item.credentialPath === "string" && item.credentialPath ? item.credentialPath : null,
+        models: modelSet(item.models),
       });
       if (slots.length >= MAX_BACKUP_KEYS) break;
     }
-    if (slots.length) result.set(String(providerId), slots);
+    if (slots.length) {
+      slots.primaryModels = modelSet(source.primaryModels?.[providerId]);
+      result.set(String(providerId), slots);
+    }
   }
   return result;
 }
@@ -1180,17 +1187,26 @@ function readKeyPool() {
   return pool;
 }
 
-function primaryKeySlot(provider) {
+function primaryKeySlot(provider, models = null) {
   return {
     id: PRIMARY_KEY_SLOT,
     keychainService: provider.keychainService,
     keychainAccount: provider.keychainAccount || "codex",
     credentialPath: provider.credentialPath || null,
+    models,
   };
 }
 
 export function keySlotsFor(provider, pool = readKeyPool()) {
-  return [primaryKeySlot(provider), ...(pool.get(provider.id) || [])];
+  const backups = pool.get(provider.id) || [];
+  return [primaryKeySlot(provider, backups.primaryModels || null), ...backups];
+}
+
+// 只在有這個模型的 Key 之間切換；清單未知（null）視為支援。都不支援時退回全部，維持原行為。
+export function keySlotsForModel(slots, model) {
+  if (typeof model !== "string" || !model) return slots;
+  const usable = slots.filter((slot) => !slot.models || slot.models.has(model));
+  return usable.length ? usable : slots;
 }
 
 // 只記在記憶體：路由器重啟後從主 Key 開始，最多多一次失敗請求就會換到可用的那把。
@@ -1599,8 +1615,9 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal) {
   return send(reloaded);
 }
 
-async function fetchCustom(provider, target, headers, body, signal) {
-  const slots = keySlotsFor(provider);
+async function fetchCustom(provider, target, headers, body, signal, { model = null } = {}) {
+  const slots = keySlotsForModel(keySlotsFor(provider), model);
+  if (slots[0]?.id !== PRIMARY_KEY_SLOT && model) stats.keyModelRoutes += 1;
   if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal);
   const bySlot = new Map(slots.map((slot) => [slot.id, slot]));
   const order = keyRotation.order(provider.id, slots.map((slot) => slot.id));
@@ -1742,6 +1759,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         anthropicBody,
         signal,
+        { model: route.upstreamModel },
       );
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -1775,6 +1793,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         chatBody,
         signal,
+        { model: route.upstreamModel },
       );
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -1790,6 +1809,7 @@ export async function fetchModelUpstream(
       requestHeaders,
       outboundBody,
       signal,
+      { model: route.upstreamModel },
     );
     stats.lastCustomStatus = upstream.status;
     recordUpstreamFailure(upstream, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -1826,6 +1846,10 @@ export async function fetchModelUpstream(
 // 因此一律轉給自訂閘道。閘道若不支援，它自己的錯誤訊息也比路由器的 404 有用。
 export const IMAGE_PATH_PATTERN = /^\/(?:v1\/)?images\/(?:generations|edits|variations)$/;
 export const ARK_IMAGE_PATH_PATTERN = /^\/v2\/extend\/image\/ark_gpt_image\/(?:generations|edits|tasks\/[A-Za-z0-9_-]{1,160})$/;
+// router-imagegen 的 Nano Banana（Gemini 圖片模型）：chat 轉到供應商的 chat/completions，
+// gemini 轉到供應商 origin 下的 Gemini 原生 generateContent。
+export const ROUTER_IMAGE_PATH_PATTERN = /^\/v1\/router-images\/(chat|gemini)$/;
+const GEMINI_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,120}){0,3}$/;
 
 // 路由器只聽 127.0.0.1，但瀏覽器裡的任何網頁都能對它發請求：跨站的「簡單請求」
 // （text/plain、multipart/form-data 的 POST）不會觸發 CORS 預檢，照樣送達；
@@ -1902,6 +1926,48 @@ async function handleArkImages(request, response, incomingUrl) {
   stats.lastImageStatus = upstream.status;
   await streamUpstream(upstream, response);
 }
+
+async function handleRouterImages(request, response, incomingUrl) {
+  const mode = ROUTER_IMAGE_PATH_PATTERN.exec(incomingUrl.pathname)?.[1];
+  if (!mode || request.method !== "POST") {
+    writeJson(response, 404, { error: { message: "未知的生圖端點。" } });
+    return;
+  }
+  if (rejectBrowserRequest(request, response)) return;
+  request.routerContext.route = "custom";
+  request.routerContext.provider = null;
+  const provider = imageProviderFor(request.headers);
+  request.routerContext.provider = provider;
+  if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
+  const rawBody = await readRequestBody(request);
+  const abortController = new AbortController();
+  request.on("aborted", () => abortController.abort());
+  response.on("close", () => { if (!response.writableFinished) abortController.abort(); });
+  let upstream;
+  if (mode === "chat") {
+    upstream = await fetchCustom(provider, new URL(`${provider.apiRoot}/chat/completions`), request.headers, rawBody, abortController.signal);
+  } else {
+    let body;
+    try { body = JSON.parse(rawBody.toString("utf8")); } catch { body = null; }
+    const model = body?.model;
+    if (!body || typeof body !== "object" || typeof model !== "string" || !GEMINI_MODEL_PATTERN.test(model)) {
+      writeJson(response, 400, { error: { message: "Gemini 生圖請求格式無效。", type: "router_error" } });
+      return;
+    }
+    delete body.model;
+    // 原生介面用 x-goog-api-key 帶 Key；生圖是付費請求，不因 401/403 換 Key 重送。
+    const apiKey = await getApiKey(provider, false, activeKeySlot(provider));
+    upstream = await fetch(new URL(`/v1beta/models/${model}:generateContent`, new URL(provider.apiRoot).origin), {
+      method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify(body), redirect: "manual", signal: abortController.signal,
+    });
+  }
+  stats.geminiImageRequests += 1;
+  stats.lastImageProvider = provider.id;
+  stats.lastImageStatus = upstream.status;
+  await streamUpstream(upstream, response);
+}
+
 
 async function handleImages(request, response, incomingUrl) {
   // 與自訂模型同一套驗證，但只在請求真的帶了 ChatGPT 憑證時才驗。
@@ -3368,6 +3434,10 @@ const server = http.createServer(async (request, response) => {
     }
     if (incomingUrl.pathname.startsWith("/v2/extend/image/ark_gpt_image/")) {
       await handleArkImages(request, response, incomingUrl);
+      return;
+    }
+    if (incomingUrl.pathname.startsWith("/v1/router-images/")) {
+      await handleRouterImages(request, response, incomingUrl);
       return;
     }
     await proxyToOfficial(request, response, incomingUrl);

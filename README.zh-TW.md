@@ -31,7 +31,7 @@ curl -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/c
 curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
 ```
 
-執行後會先出現選單，直接按 Enter（第 1 項「安裝或重新配置」）開始。安裝器會依序詢問 Base URL、API Key 和要加入的模型；輸入 API Key 時畫面不會顯示任何字元，貼上後直接按 Enter。選中的模型會先發送測試請求確認可用，可能產生少量費用。
+執行後會先安裝網頁管理頁（含捷徑與 Codex 裡的入口，不改動任何模型設定），並在瀏覽器開啟。在管理頁點「連接 API 供應商」，選擇常用供應商或填入 Base URL、API Key，勾選要加入的模型即可完成安裝；選中的模型會先發送測試請求確認可用，可能產生少量費用。不急著加模型的話，也可以先只在「設定」調整全域上下文。已經安裝過的話會直接開啟管理頁。習慣終端操作可以在指令後加上 `menu` 使用終端選單。
 
 想固定版本或先核對檔案雜湊，見[固定版本並驗證下載](docs/guide.zh-TW.md#固定版本並驗證下載可選)。
 
@@ -57,11 +57,12 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 
 *截圖中的供應商名稱與網址已替換或模糊處理。*
 
-也可以直接下指令（在安裝器所在的資料夾執行）：macOS 用 `bash codex-model-router.sh <指令>`，Windows 用 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 <指令>`。不帶指令會出現選單。
+也可以直接下指令（在安裝器所在的資料夾執行）：macOS 用 `bash codex-model-router.sh <指令>`，Windows 用 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 <指令>`。不帶指令會開啟網頁管理頁，`menu` 顯示終端選單。
 
 | 指令 | 用途 |
 | --- | --- |
 | `ui` | 開啟網頁管理頁 |
+| `menu` | 終端選單（網頁管理頁的備用方式） |
 | `update` | 升級到新版，保留所有設定 |
 | `add`、`remove` | 加入、刪除自訂模型 |
 | `providers` | 新增或移除供應商、更換 API Key |
@@ -75,7 +76,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 
 ## 升級與移除
 
-**升級**：在網頁管理頁左上角的版本選單一鍵更新；或重新執行上面的安裝指令，在選單輸入 `3`（「更新到最新版本」，等同 `update`）。Base URL、API Key 與已加入的模型都會保留，不必重新設定；更新失敗會自動還原。
+**升級**：在網頁管理頁左上角的版本選單一鍵更新；或執行 `update` 指令。Base URL、API Key 與已加入的模型都會保留，不必重新設定；更新失敗會自動還原。
 
 **移除**：執行 `rollback`。用過 Claude 模型的舊對話，移除後切回官方模型可能無法繼續，請改開新對話（[原因](docs/troubleshooting.zh-TW.md#回退之後用過-claude-模型的舊對話會壞掉)）。
 

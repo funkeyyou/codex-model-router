@@ -122,6 +122,9 @@ td.tight, th.tight { width: 1%; white-space: nowrap; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; word-break: break-all; }
 .empty { padding: 30px 20px; text-align: center; color: var(--muted); }
+.welcome { padding: 26px 28px; display: grid; gap: 18px; max-width: 760px; }
+.welcome ol { margin: 0; padding-left: 22px; line-height: 2; }
+.welcome .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .notes { display: grid; gap: 6px; margin: -4px 0 14px; }
 .note { color: var(--muted); font-size: 12.5px; }
 .note.warn { color: #fde68a; }
@@ -389,8 +392,24 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "關閉提示": "Dismiss",
 "桌面版": "the desktop app",
 "讀取中…": "Loading…",
-"這個 CODEX_HOME 還沒有安裝 Codex 模型路由器。": "Codex Model Router is not installed in this CODEX_HOME.",
-"請先在終端執行安裝器，選擇「安裝或重新配置」。": "Run the installer in a terminal first and choose “安裝或重新配置” (Install or reconfigure).",
+"開始使用": "Get started",
+"管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。": "The manager is installed. Connect an API provider or a Claude subscription to use their models from the Codex model picker, or just adjust the global context for now.",
+"選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。": "Choose an API Key connection (a common provider or your own Base URL), or a Claude subscription signed in with Claude Code.",
+"勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。": "Pick the models to add to Codex. Small test requests confirm they work before the router is installed.",
+"安裝完成後重新啟動 {app}，即可在模型選單選到新模型。": "After installation, restart {app} to see the new models in the picker.",
+"連接供應商": "Connect a provider",
+"調整全域上下文": "Adjust global context",
+"連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。": "Connecting a provider installs the router; you can add more providers, relay image generation and backup keys afterwards. Prefer the terminal? Run the installer with menu to use the terminal menu.",
+"尚未連接供應商，這裡只能調整不需要路由器的設定。": "No provider is connected yet, so only settings that don't need the router are available here.",
+"首次設定": "First-time setup",
+"僅備用 Key": "Backup key only",
+"主 Key 沒有這個模型；路由器會固定用有它的備用 Key。": "The primary key doesn't have this model, so the router always uses a backup key that does.",
+"強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。": "Force-showing hidden models relies on the model list served by the router. Connect a provider to install the router before saving.",
+"每個模型會發送一次短測試並使用訂閱用量；有模型通過才會安裝路由器並添加，固定使用回應中的完整模型版本。": "Each model gets one short test that uses your subscription. The router is installed and models are added only if a test passes; the exact model version from the response is kept.",
+"開始測試並安裝": "Test and install",
+"尚未連接供應商": "No provider connected",
+"將安裝路由器，並探測以下 {count} 個模型：": "The router will be installed, and these {count} models will be tested:",
+"開始探測並安裝": "Test and install",
 "路由器狀態、最近的錯誤與執行環境。": "Router status, recent errors, and environment.",
 "同步與修復模型清單": "Sync and repair model list",
 "重新啟動路由器": "Restart router",
@@ -620,6 +639,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "添加 Claude 訂閱模型": "Add Claude subscription models",
 "通用 Images API": "Standard Images API",
 "Ark 任務介面": "Ark task API",
+"Chat Completions 介面": "Chat Completions API",
+"Gemini 原生介面": "Native Gemini API",
 "用中轉供應商的圖片 API 生成或編輯圖片，適合免費帳號或內建生圖不可用的時候。Codex 裡以 $router-imagegen 技能使用，沿用路由器保存的憑證。": "Generate or edit images with a relay provider's image API, useful on free accounts or when built-in image generation isn't available. In Codex it's used through the $router-imagegen skill with the router's saved credentials.",
 "重新整理生圖狀態": "Refresh image generation status",
 "目前狀態": "Current status",
@@ -633,8 +654,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "用哪一家供應商生圖": "Provider for image generation",
 "重新偵測": "Test again",
 "偵測並啟用": "Test and enable",
-"多選時由 AI 依需求挑選：一般生圖與快速迭代偏好 Flare，精細改圖與保留原圖細節偏好 Sunburst；Image 2 給指定或相容需求使用。": "With several models selected, the AI chooses as needed: Flare for general generation and fast iteration, Sunburst for precise edits that keep source details, and Image 2 when specifically requested or for compatibility.",
-"偵測會實際生圖並依供應商計費：每個勾選的模型先用通用介面各生成一張低品質圖；全部失敗時，再用 Ark 任務介面各試一次。只有通過的模型會啟用，沒有通過時既有設定保持不變。": "Testing really generates images and is billed by the provider: each selected model first generates one low-quality image through the standard API; if all fail, each is tried once with the Ark task API. Only models that pass are enabled; otherwise the current setup is unchanged.",
+"多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。": "With several models selected, the AI chooses as needed: among GPT Image, Flare for general generation and Sunburst for precise edits; among Nano Banana, 2.1 for general use, Pro for complex compositions and in-image text, and 2 Lite for fast bulk output. Image 2, Nano Banana 2 and the original Nano Banana are for explicit requests or compatibility.",
+"偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。": "Testing really generates images and is billed by the provider: GPT Image models first try the standard interface with one low-quality image each, then the Ark task API if all fail; Nano Banana models try Chat, native Gemini and the standard interface in turn, stopping at the first success. Only passing models are enabled; if none pass, the current setup is unchanged.",
 "重新偵測並套用": "Test again and apply",
 "最近一次偵測": "Last test",
 "結果": "Result",
@@ -644,7 +665,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "開始偵測": "Start test",
 "將用「{provider}」實際生圖測試以下 {count} 個模型：": "These {count} models will be tested by generating images with “{provider}”:",
 "主要供應商": "the primary provider",
-"會依供應商計費：通用介面每個模型一張低品質圖，全部失敗時 Ark 介面再各一張。生成失敗不會自動重送。": "Billed by the provider: one low-quality image per model with the standard API, plus one more each with the Ark API if all fail. Failed generations aren't retried automatically.",
+"會依供應商計費：每個模型每種介面最多一張圖，通過就不再試其他介面。生成失敗不會自動重送。": "Billed by the provider: at most one image per model per interface, stopping at the first that works. Failed generations aren't retried automatically.",
 "停用中轉 API 生圖": "Disable relay API image generation",
 "會把 $router-imagegen 技能封存到備份目錄，Codex 之後就不會再使用它；之後可以隨時重新偵測並啟用。": "The $router-imagegen skill is archived to the backup directory and Codex stops using it. You can test and enable it again at any time.",
 "停用中轉生圖": "Disable relay image generation",
@@ -871,7 +892,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "upstream_http_error": "The upstream service returned an HTTP error."
 },
 "enServer": [
-["^尚未安裝路由器，請先在終端執行「安裝或重新配置」。$", "The router isn't installed. Run the installer in a terminal and choose “安裝或重新配置” (Install or reconfigure)."],
+["^尚未安裝路由器，請先在管理頁完成首次設定。$", "The router isn't installed. Finish the first-time setup in the manager first."],
+["^路由器已經安裝，請重新整理管理頁。$", "The router is already installed. Reload the manager."],
 ["^路由器已是 (.+)，這個管理頁仍是 (.+)；請關閉管理頁後重新開啟。$", "The router is already $1, but this manager is still $2. Close the manager and open it again."],
 ["^這個管理頁是 (.+)，路由器仍是 (.+)；請先從左上角的版本選單套用新版本。$", "This manager is $1, but the router is still $2. Apply the new version from the version menu at the top left first."],
 ["^未找到 Codex CLI，請先安裝 (.+) 或 Codex CLI。$", "Codex CLI wasn't found. Install $1 or the Codex CLI first."],
@@ -889,9 +911,14 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 ["^上一代圖片模型，適合既有流程與相容需求。$", "Previous-generation image model, for existing workflows and compatibility."],
 ["^偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。$", "Focused on editing precision, for detailed edits that keep the original's details."],
 ["^偏重速度，適合一般生圖與快速迭代。$", "Focused on speed, for general generation and fast iteration."],
+["^Google 目前的主力生圖模型：速度快、成本低，畫質、文字渲染與多輪改圖一致性都比 Nano Banana 2 好。$", "Google's current workhorse: fast and low-cost, with better quality, text rendering and multi-turn editing consistency than Nano Banana 2."],
+["^Google 品質最高的生圖模型：適合複雜構圖、精準文字、品牌一致性與精細控制，較慢也較貴。$", "Google's highest-quality image model: for complex compositions, accurate text, brand consistency and fine control; slower and pricier."],
+["^上一代主力：兼顧速度、4K 輸出與多張參考圖的一致性。$", "Previous workhorse: balances speed, 4K output and consistency across multiple reference images."],
+["^最快、最便宜，適合大量出圖；不擅長多張參考圖或連續改圖。$", "Fastest and cheapest, for bulk output; weaker with multiple references or sequential edits."],
+["^初代舊型號，適合既有流程；Google 建議改用 Nano Banana 2 Lite。$", "The original legacy model, for existing workflows; Google recommends Nano Banana 2 Lite instead."],
+["^請從清單中至少選擇一個圖片模型。$", "Select at least one image model from the list."],
 ["^沒找到可用模型，生圖設定沒有變更。$", "No usable model was found; image generation settings weren't changed."],
 ["^中轉 API 生圖尚未啟用。$", "Relay API image generation isn't enabled."],
-["^請從 Image 2、Image 2\\.5 Sunburst、Image 2\\.5 Flare 中至少選擇一個模型。$", "Select at least one of Image 2, Image 2.5 Sunburst, and Image 2.5 Flare."],
 ["^選中的模型均未通過探測，配置未改動。$", "None of the selected models passed probing; nothing was changed."],
 ["^所選模型都已配置，配置未改動。$", "All selected models are already configured; nothing was changed."],
 ["^沒有需要探測的新模型。$", "There are no new models to probe."],
@@ -946,8 +973,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難電靜響頁頂項順須預頭頻題額類顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难电静响页顶项顺须预头频题额类显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -1504,7 +1531,8 @@ function renderSidebar() {
 
   const status = document.getElementById("router-status");
   if (!state || !state.installed) {
-    status.replaceChildren(h("span", { class: "status-dot" }), h("span", { text: state ? t("尚未安裝") : t("檢查中…") }));
+    status.replaceChildren(h("span", { class: "status-dot" }),
+      h("span", { text: !state ? t("檢查中…") : state.managerOnly ? t("尚未連接供應商") : t("尚未安裝") }));
   } else if (state.router && state.router.ok) {
     status.replaceChildren(h("span", { class: "status-dot ok" }), h("span", { text: t("路由器運作中 · :{port}", { port: state.router.port }) }));
   } else {
@@ -1556,8 +1584,7 @@ function renderView() {
     return;
   }
   if (!state.installed) {
-    view.replaceChildren(pageHead(t("尚未安裝"), t("這個 CODEX_HOME 還沒有安裝 Codex 模型路由器。")),
-      h("div", { class: "panel" }, h("div", { class: "empty", text: t("請先在終端執行安裝器，選擇「安裝或重新配置」。") })));
+    view.replaceChildren(...(currentView === "settings" ? renderSetupSettings() : renderWelcome()));
     return;
   }
   if (currentView === "models") view.replaceChildren(...renderModels());
@@ -1571,6 +1598,33 @@ function pageHead(title, subtitle, ...actions) {
   return h("header", { class: "page-head" },
     h("div", {}, h("h1", { text: title }), subtitle ? h("p", { text: subtitle }) : null),
     actions.length ? h("div", { class: "actions" }, ...actions) : null);
+}
+
+// 尚未連接供應商（只裝了管理頁）：連接供應商的流程與「新增供應商」相同，最後改成安裝路由器。
+function renderWelcome() {
+  const blocked = state.setupBlocked;
+  return [pageHead(t("開始使用"), t("管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。")),
+    h("div", { class: "panel welcome" },
+      h("ol", {},
+        h("li", { text: t("選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。") }),
+        h("li", { text: t("勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。") }),
+        h("li", { text: t("安裝完成後重新啟動 {app}，即可在模型選單選到新模型。", { app: desktopName() }) })),
+      blocked ? paragraph(serverText(blocked), "note warn") : null,
+      h("div", { class: "actions" },
+        h("button", { type: "button", class: "button primary", disabled: Boolean(blocked), onclick: () => openAddProvider({ firstInstall: true }) },
+          icon("plus"), t("連接供應商")),
+        h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("settings"), t("調整全域上下文"))),
+      paragraph(t("連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。"), "muted"))];
+}
+
+function renderSetupSettings() {
+  return [
+    pageHead(sectionTitle("設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
+    renderGlobalContextPanel(Boolean(state.setupBlocked)),
+    // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
+    renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
+    renderDiagnosticsPanel(),
+  ];
 }
 
 // ---- 總覽 --------------------------------------------------------------------
@@ -1961,6 +2015,7 @@ function backupKeysRow(provider, blocked) {
   if (!keys.length) return null;
   return cardRow(t("備用 Key"), h("span", { class: "key-list" }, keys.map((item) => h("span", { class: "key-item" },
     h("span", { class: "mono", text: "••••" + (item.tail || "") }),
+    item.modelCount ? h("span", { class: "faint", text: t("{count} 個模型", { count: item.modelCount }) }) : null,
     keyStatusChip(provider, item.id),
     h("button", { type: "button", class: "icon-button", disabled: blocked, title: t("移除備用 Key"), "aria-label": t("移除備用 Key"),
       onclick: () => confirmRemoveBackupKey(provider, item) }, icon("trash"))))));
@@ -2402,7 +2457,7 @@ function claudeChoiceLabel(choice) {
 }
 
 // Claude 訂閱的確認步驟：列出要測試的模型與上下文、輸出設定，提醒會使用訂閱用量。
-function showClaudeCliConfirm(modal, chooser, back) {
+function showClaudeCliConfirm(modal, chooser, back, { firstInstall = false } = {}) {
   const invalid = chooser.invalidManual();
   if (invalid.length) {
     toast(t("模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：{models}", { models: joinList(invalid) }), "error");
@@ -2419,22 +2474,25 @@ function showClaudeCliConfirm(modal, chooser, back) {
     h("ul", { class: "plain-list" }, models.map((model) => h("li", { class: "mono", text: model }))),
     chooser.limits.nodes,
     globalContextBanner(),
-    banner("warn", "alert", t("每個模型會發送一次短測試並使用訂閱用量；只有通過的會添加，並固定使用回應中的完整模型版本。完成後會重新啟動路由器，進行中的對話會短暫重新連線。")));
+    banner("warn", "alert", firstInstall
+      ? t("每個模型會發送一次短測試並使用訂閱用量；有模型通過才會安裝路由器並添加，固定使用回應中的完整模型版本。")
+      : t("每個模型會發送一次短測試並使用訂閱用量；只有通過的會添加，並固定使用回應中的完整模型版本。完成後會重新啟動路由器，進行中的對話會短暫重新連線。")));
   modal.setFoot(h("span", { class: "grow" }),
     h("button", { type: "button", class: "button", text: t("上一步"), onclick: back }),
-    h("button", { type: "button", class: "button primary", text: t("開始測試並添加"), onclick: () => {
+    h("button", { type: "button", class: "button primary", text: firstInstall ? t("開始測試並安裝") : t("開始測試並添加"), onclick: () => {
       const result = chooser.limits.read();
       if (result.error) { toast(result.error, "error"); return; }
       modal.close();
-      runJob("claude-cli-add", { models, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens },
-        { title: t("添加 Claude 訂閱模型") });
+      const params = { models, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens };
+      if (firstInstall) runJob("install-claude", params, { title: t("首次設定") });
+      else runJob("claude-cli-add", params, { title: t("添加 Claude 訂閱模型") });
     } }));
 }
 
 // ---- 生圖 ----------------------------------------------------------------------
 
 function apiModeLabel(mode) {
-  return { images: t("通用 Images API"), "ark-task": t("Ark 任務介面") }[mode] || mode;
+  return { images: t("通用 Images API"), "ark-task": t("Ark 任務介面"), chat: t("Chat Completions 介面"), gemini: t("Gemini 原生介面") }[mode] || mode;
 }
 
 function renderImagegen() {
@@ -2463,10 +2521,11 @@ function renderImagegen() {
       h("dt", { text: t("狀態") }), h("dd", {}, h("span", { class: "chip green", text: t("已啟用") })),
       h("dt", { text: sectionTitle("模型") }), h("dd", {}, info.models.map((model) => {
         const upstream = info.upstreamModels[model];
-        return h("div", {}, h("span", { text: labels.get(model) || model }), h("span", { class: "faint mono", text: "  " + (upstream || model) }));
+        const mode = (info.apiModes && info.apiModes[model]) || info.apiMode;
+        return h("div", {}, h("span", { text: labels.get(model) || model }), h("span", { class: "faint mono", text: "  " + (upstream || model) }),
+          mode ? h("span", { class: "faint", text: "  · " + apiModeLabel(mode) }) : null);
       })),
       h("dt", { text: t("供應商") }), h("dd", { text: info.providerId ? providerLabel(info.providerId) : "—" }),
-      h("dt", { text: t("介面") }), h("dd", { text: info.apiMode ? apiModeLabel(info.apiMode) : "—" }),
       h("dt", { text: t("技能位置") }), h("dd", { class: "mono", text: info.root }),
       h("dt", { text: t("使用方式") }), h("dd", { text: t("在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。") }))));
   } else {
@@ -2492,10 +2551,10 @@ function renderImagegen() {
   parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: info.enabled ? t("重新偵測") : t("偵測並啟用") })),
     h("div", { class: "panel-body stack" },
-      paragraph(t("多選時由 AI 依需求挑選：一般生圖與快速迭代偏好 Flare，精細改圖與保留原圖細節偏好 Sunburst；Image 2 給指定或相容需求使用。"), "muted"),
+      paragraph(t("多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。"), "muted"),
       h("div", { class: "check-list" }, options),
       providerField,
-      banner("warn", "alert", t("偵測會實際生圖並依供應商計費：每個勾選的模型先用通用介面各生成一張低品質圖；全部失敗時，再用 Ark 任務介面各試一次。只有通過的模型會啟用，沒有通過時既有設定保持不變。")),
+      banner("warn", "alert", t("偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。")),
       h("div", { class: "actions end" },
         h("button", { type: "button", class: "button primary", disabled: blocked || imagegenDraft.models.size === 0, onclick: () => confirmImagegenSetup(info) },
           icon("image"), info.enabled ? t("重新偵測並套用") : t("偵測並啟用"))))));
@@ -2524,7 +2583,7 @@ function confirmImagegenSetup(info) {
     body: [
       paragraph(t("將用「{provider}」實際生圖測試以下 {count} 個模型：", { provider: providerId ? providerLabel(providerId) : t("主要供應商"), count: chosen.length })),
       h("ul", { class: "plain-list" }, chosen.map((choice) => h("li", {}, choice.label, h("span", { class: "faint mono", text: "  " + choice.id })))),
-      banner("warn", "alert", t("會依供應商計費：通用介面每個模型一張低品質圖，全部失敗時 Ark 介面再各一張。生成失敗不會自動重送。")),
+      banner("warn", "alert", t("會依供應商計費：每個模型每種介面最多一張圖，通過就不再試其他介面。生成失敗不會自動重送。")),
     ],
   }).then((ok) => {
     if (ok) runJob("imagegen-setup", { providerId, models: chosen.map((choice) => choice.id) }, { title: t("偵測並啟用中轉生圖") });
@@ -2648,7 +2707,7 @@ function confirmClearGlobalContext() {
   }).then((ok) => { if (ok) runJob("set-global-context", { value: null }, { title: t("移除全域上下文") }); });
 }
 
-function renderHiddenModelsPanel(blocked) {
+function renderHiddenModelsPanel(blocked, note = null) {
   const entry = ensureQuery("hidden-models");
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("隱藏的官方模型") }),
     refreshButton("hidden-models", t("重新整理隱藏的官方模型"))));
@@ -2685,6 +2744,7 @@ function renderHiddenModelsPanel(blocked) {
           { title: t("設定隱藏的官方模型") });
       } }, t("儲存"))));
   }
+  if (note) body.prepend(paragraph(note, "note warn"));
   panel.append(body);
   return panel;
 }
@@ -2759,7 +2819,7 @@ function paragraph(text, className) {
 function jobTitle(type, fallback) {
   const titles = {
     "repair-models": t("同步與修復模型清單"), "add-models": t("添加模型"), "remove-models": t("刪除模型"),
-    "reorder-models": t("調整模型順序"), "edit-model": t("修改模型"), "add-provider": t("新增供應商"),
+    "reorder-models": t("調整模型順序"), "edit-model": t("修改模型"), "add-provider": t("新增供應商"), install: t("首次設定"), "install-claude": t("首次設定"),
     "edit-provider": t("修改供應商"), "remove-provider": t("移除供應商"), "replace-key": t("更換 API Key"),
     "add-backup-key": t("新增備用 API Key"), "remove-backup-key": t("移除備用 API Key"),
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
@@ -2930,6 +2990,7 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
           model.label && model.label !== model.id ? h("span", { class: "faint", text: model.label }) : null),
         model.configured ? h("span", { class: "chip", text: allowConfigured ? t("已添加，可重新設定") : t("已添加") }) : null,
         model.note ? h("span", { class: "chip amber", text: model.note }) : null,
+        model.onlyBackup ? h("span", { class: "chip amber", title: t("主 Key 沒有這個模型；路由器會固定用有它的備用 Key。"), text: t("僅備用 Key") }) : null,
         !model.configured && model.anthropic ? h("span", { class: "chip violet", text: t("Claude 轉譯") }) : null);
     }));
   }
@@ -3181,7 +3242,7 @@ function typeOption(iconName, title, chip, description, onclick) {
     icon("chevronRight"));
 }
 
-function openAddProvider() {
+function openAddProvider({ firstInstall = false } = {}) {
   const baseUrl = h("input", { type: "url", placeholder: "https://api.example.com/v1", autocomplete: "off", spellcheck: "false" });
   const apiKey = h("input", { type: "password", placeholder: "sk-…", autocomplete: "new-password", spellcheck: "false" });
   // 常用供應商：點一下就帶入 Base URL，並提供取得 API Key 的官方頁面。手動改網址時，選取狀態跟著對回去。
@@ -3242,7 +3303,7 @@ function openAddProvider() {
     backupField,
   ];
   const backButton = h("button", { type: "button", class: "button", text: t("上一步") });
-  const modal = openModal({ title: t("新增供應商"), wide: true });
+  const modal = openModal({ title: firstInstall ? t("首次設定") : t("新增供應商"), wide: true });
   cancelButton.onclick = () => modal.close();
   backButton.onclick = () => showTypeChoice();
   let draft = null;
@@ -3256,7 +3317,7 @@ function openAddProvider() {
   const cli = claudeCliChooser({ onChange: updateCli });
   const cliCount = h("span", { class: "grow" });
   const cliNext = h("button", { type: "button", class: "button primary", text: t("下一步"), disabled: true });
-  cliNext.onclick = () => showClaudeCliConfirm(modal, cli, showClaudeCli);
+  cliNext.onclick = () => showClaudeCliConfirm(modal, cli, showClaudeCli, { firstInstall });
 
   nextButton.onclick = async () => {
     if (!baseUrl.value.trim() || !apiKey.value.trim()) {
@@ -3279,7 +3340,7 @@ function openAddProvider() {
 
   function showTypeChoice() {
     const connected = (state.models || []).filter((model) => model.transport === "claude-cli").length;
-    modal.setTitle(t("新增供應商"));
+    modal.setTitle(firstInstall ? t("首次設定") : t("新增供應商"));
     modal.setBody(
       paragraph(t("選擇要新增的供應商類型。"), "muted"),
       h("div", { class: "type-choices" },
@@ -3293,13 +3354,13 @@ function openAddProvider() {
     modal.setFoot(h("span", { class: "grow" }), cancelButton);
   }
   function showRelayForm() {
-    modal.setTitle(t("新增供應商：API Key 連接"));
+    modal.setTitle(firstInstall ? t("首次設定") : t("新增供應商：API Key 連接"));
     modal.setBody(stepOne);
     modal.setFoot(status, backButton, nextButton);
     setTimeout(() => baseUrl.focus(), 30);
   }
   function showClaudeCli() {
-    modal.setTitle(t("新增供應商：Claude 訂閱帳號"));
+    modal.setTitle(firstInstall ? t("首次設定") : t("新增供應商：Claude 訂閱帳號"));
     modal.setBody(cli.element);
     modal.setFoot(cliCount, backButton, cliNext);
     cli.ensure();
@@ -3325,6 +3386,7 @@ function openAddProvider() {
     updateStepTwo();
   }
   function needsName() {
+    if (firstInstall) return false;
     const models = picker.selection();
     return models.length === 0 || models.some((model) => !model.includes("/"));
   }
@@ -3356,7 +3418,9 @@ function openAddProvider() {
     const models = picker.selection();
     const providerId = needsName() ? providerName.value.trim().toLowerCase() : null;
     modal.setBody(
-      paragraph(providerId
+      paragraph(firstInstall
+        ? t("將安裝路由器，並探測以下 {count} 個模型：", { count: models.length })
+        : providerId
         ? t("將新增供應商「{name}」，並探測以下 {count} 個模型：", { name: providerId, count: models.length })
         : t("將新增供應商（所選模型已有前綴，ID 自動產生），並探測以下 {count} 個模型：", { count: models.length })),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", { class: "mono", text: model }))),
@@ -3366,14 +3430,16 @@ function openAddProvider() {
       probeWarning(models.length, true));
     modal.setFoot(h("span", { class: "grow" }),
       h("button", { type: "button", class: "button", text: t("上一步"), onclick: showStepTwo }),
-      h("button", { type: "button", class: "button primary", text: t("開始探測並新增"), onclick: () => {
+      h("button", { type: "button", class: "button primary", text: firstInstall ? t("開始探測並安裝") : t("開始探測並新增"), onclick: () => {
         const result = limits.read();
         if (result.error) { toast(result.error, "error"); return; }
         modal.close();
-        runJob("add-provider", {
+        const params = {
           draftId: draft.draftId, models, providerId, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens,
           backupKeys: chosenBackups(),
-        }, { title: t("新增供應商") });
+        };
+        if (firstInstall) runJob("install", params, { title: t("首次設定") });
+        else runJob("add-provider", params, { title: t("新增供應商") });
         backups.clear();
       } }));
   }

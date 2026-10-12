@@ -75,7 +75,9 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 > 同樣地，用 `curl.exe` 下載不會被標上「來自網際網路」，不會觸發 SmartScreen 警告。
 > 若改用瀏覽器下載，先在檔案內容裡按「解除封鎖」再執行。
 
-安裝時會詢問三件事：Base URL、API Key、以及要加入哪些模型。
+從 1.31.0 起，不帶指令執行會先只安裝網頁管理頁（捷徑與 Codex 入口，不改動模型設定）並開啟它：在管理頁「連接 API 供應商」才會安裝路由器，也可以先只調整全域上下文。只裝了管理頁時，`rollback` 只移除管理頁、捷徑與 Codex 入口。以下是終端選單（`menu` → 第 1 項）的流程：
+
+終端安裝時會詢問三件事：Base URL、API Key、以及要加入哪些模型。
 輸入 API Key 時畫面不會顯示任何字元（跟 `sudo` 一樣），貼上後直接按 Enter。
 選模型時可以輸入編號、範圍或 `all`；閘道的 `/models` 沒列出的模型，也可以直接輸入模型 ID
 （例如 `1,3,qwen3-max`），一樣要通過探測才會加入。選中的模型會平行探測，同時最多 3 個；
@@ -132,7 +134,7 @@ Git 專案也可選用倉庫提供的 [Actions 設定](../.codex/environments/en
 - **模型**：拖曳排序，修改顯示名稱、上下文與輸出，勾選刪除。新增模型時可選中轉供應商或 Claude 訂閱；預設上下文 1,000,000、輸出 128,000，上游回報的上限較小時以上游為準。
 - **供應商**：新增「API Key 連接」（中轉站、OpenAI 相容服務或官方 Anthropic API）或「Claude 訂閱帳號（Claude CLI）」，更換 API Key、移除供應商。選 Claude 訂閱時會依序檢查 CLI 是否安裝、版本與訂閱登入，缺少的步驟可直接處理。1.28.0 起可修改供應商的顯示名稱與模型前綴：名稱只影響顯示，內部 ID、既有對話與 API Key 不變；前綴決定選擇器裡的「前綴/模型名」，會取代上游自帶的前綴（如 `ark/`），只改自動產生的名稱，手動改過的名稱保留，之後新增的模型也會套用。修改前可預覽，不重啟路由器。Claude 訂閱目前只能改前綴。
   - **常用供應商**：新增「API Key 連接」時可直接點選 DeepSeek、Kimi、通義千問、智譜 GLM／Z.ai、MiniMax、OpenRouter、xAI 等預設（分國際與中國大陸端點），自動帶入 Base URL 並附上取得 API Key 的官方頁面；終端的 `providers add` 也可以輸入編號。端點整理自 [CC Switch](https://github.com/farion1231/cc-switch) 的公開預設，實際可用的模型以你的 Key 查詢結果為準。
-  - **備用 Key**：每家供應商可再加最多 5 把備用 Key，可一次填齊；新增供應商、安裝或重新配置時會順便詢問，之後也可在供應商頁或終端 `providers backup` 添加。路由器一直用「使用中」的那把，遇到 401／403（被拒）、402（額度用完）或 429（限流）才自動換下一把並重送請求，失敗的那把冷卻一段時間（429 依上游的 Retry-After）；供應商卡片會顯示每把 Key 的末四碼與狀態。增減備用 Key 不重啟路由器。
+  - **備用 Key**：每家供應商可再加最多 5 把備用 Key，可一次填齊；新增供應商、安裝或重新配置時會順便詢問，之後也可在供應商頁或終端 `providers backup` 添加。路由器一直用「使用中」的那把，遇到 401／403（被拒）、402（額度用完）或 429（限流）才自動換下一把並重送請求，失敗的那把冷卻一段時間（429 依上游的 Retry-After）；供應商卡片會顯示每把 Key 的末四碼與狀態。增減備用 Key 不重啟路由器。從 1.31.0 起會記住每把 Key 的模型清單：添加模型時列出所有 Key 的模型（只有備用 Key 有的標成「僅備用 Key」，並用那把 Key 測試），路由器也只在有該模型的 Key 之間切換，不會換到沒有這個模型的 Key。
 - **生圖**：偵測、啟用或停用中轉 API 生圖。
 - **設定**：設定或移除全域上下文，勾選強制顯示被隱藏的官方模型；「診斷包」可下載或複製一份診斷資料，回報問題時附上（見[疑難排解](troubleshooting.zh-TW.md)）。
 - **版本**：左上角顯示目前版本，有新版時列出更新內容，可一鍵更新。
@@ -339,6 +341,19 @@ API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案�
 | Image 2 | `gpt-image-2` | 上一代模型，保留給既有流程或相容需求 |
 | Image 2.5 Sunburst | `gpt-image-2.5-sunburst` | 偏重編輯精準度，適合精細改圖與保留原圖細節 |
 | Image 2.5 Flare | `gpt-image-2.5-flare` | 偏重速度，適合一般生圖與快速迭代 |
+| Nano Banana 2.1 | `gemini-nano-banana-2.1` | Google 目前主力：快、便宜，畫質、文字與多輪改圖一致性比 Nano Banana 2 好 |
+| Nano Banana Pro | `gemini-3-pro-image` | Google 品質最高：複雜構圖、精準文字、品牌一致性，較慢較貴 |
+| Nano Banana 2 | `gemini-3.1-flash-image` | 上一代主力：兼顧速度、4K 與多張參考圖一致性 |
+| Nano Banana 2 Lite | `gemini-3.1-flash-lite-image` | 最快最便宜，適合大量出圖；不擅長多參考圖或連續改圖 |
+| Nano Banana | `gemini-2.5-flash-image` | 初代舊型號；Google 建議改用 Nano Banana 2 Lite |
+
+從 1.31.0 起支援 Google 的 Nano Banana（Gemini 圖片模型），ID 依 [Google 官方模型清單](https://ai.google.dev/gemini-api/docs/image-generation)；
+清單裡帶 `-preview` 的名稱（例如 `gemini-3-pro-image-preview`）也會辨識。每個 Nano Banana 模型各自依序測試
+Chat Completions（`chat/completions`，可解析 `message.images`、內容裡的圖片或 Markdown 圖片）、
+Gemini 原生 `/v1beta/models/<模型>:generateContent`（以 `x-goog-api-key` 帶 Key）與通用 Images API，通過就停，並記住各自的介面。
+Nano Banana 的 `--size`、`--quality` 只能 `auto`，不支援透明背景，比例與構圖寫在提示詞裡；
+輸出格式由上游決定，與 `--out` 副檔名不同時改用實際格式的副檔名儲存。
+Google AI Studio 的免費方案沒有生圖額度（會回 429），需要付費方案或支援這些模型的中轉站。
 
 偵測前可輸入模型編號（例如 `1,2`）或 `all`；輸入 `cancel` 返回，不送生圖請求。
 成功後自動添加通過的已選模型並記住介面類型，正式生圖不會重新探測或切換介面重送。
@@ -373,6 +388,7 @@ node "$env:USERPROFILE\.codex\skills\router-imagegen\scripts\imagegen.mjs" gener
 每次生成一張圖，預設 `size=auto`、`quality=auto`、輸出 PNG，保留已存在的輸出檔。
 `--image` 可重複提供參考圖，`--dry-run` 不送出生成請求。`--model` 省略時，生圖依
 Flare → Sunburst → Image 2、改圖依 Sunburst → Flare → Image 2，使用第一個已啟用模型。
+Nano Banana 排在 GPT Image 之後：生圖依 2.1 → Pro → 2 → 2 Lite → 初代，改圖優先 Pro。
 通用模式需支援 Images API 的 JSON／multipart 請求與 `b64_json` 圖片回應。
 Ark 模式使用同一供應商 origin 下的 `/v2/extend/image/ark_gpt_image/generations`、`edits` 及 `tasks/{task_id}`：
 提交取得任務編號後查詢結果，再下載公開 HTTPS 圖片；下載不附帶 API Key，並驗證目的位址與圖片格式。

@@ -103,7 +103,7 @@ test("remove 輸入 cancel 不修改檔案也不建立備份", { skip: process.p
   assert.equal(child.status, 0, child.stderr || child.stdout);
   assert.match(child.stdout, /未進行任何修改/);
   const exitNumber = installer.MENU_ITEMS.findIndex(([action]) => action === "exit") + 1;
-  const menu = spawnSync("bash", [script], { env: childEnv, input: `${exitNumber}\n`, encoding: "utf8" });
+  const menu = spawnSync("bash", [script, "menu"], { env: childEnv, input: `${exitNumber}\n`, encoding: "utf8" });
   assert.equal(menu.status, 0, menu.stderr || menu.stdout);
   assert.match(menu.stdout, new RegExp(`${exitNumber}\\. 退出`));
   assert.match(menu.stdout, /未進行任何修改/);

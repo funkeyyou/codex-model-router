@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer, dir: payloadDir } = await loadPayloads();
-const all = installer.RELAY_IMAGE_MODELS.map((model) => model.id);
+const all = installer.RELAY_IMAGE_MODELS.map((model) => model.id).filter((id) => id.startsWith("gpt-"));
 const sourcePath = fileURLToPath(new URL("../codex-model-router.sh", import.meta.url));
 
 function fixture(t) {
@@ -151,7 +151,7 @@ test("已同意的安裝會沿用授權刷新，不再重問同意", async () =>
 
 const probePng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
 
-async function setupThroughCommand(t, { ids = [], status = 200, testModels = "all",
+async function setupThroughCommand(t, { ids = [], status = 200, testModels = "1,2,3",
   imageResponses = {}, arkModels = [], routes = [], existingModels = null, extraEnv = {} } = {}) {
   const { home, options } = fixture(t);
   const requests = [];
@@ -266,7 +266,7 @@ test("清單沒有圖片模型時，依既有路由前綴實測成功後仍可�
   const generated = fs.readdirSync(join(probeDir, fs.readdirSync(probeDir)[0]));
   assert.deepEqual(generated.sort(), all.slice(1).map((id) => `${id}.png`).sort());
   assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), all.slice(1).map((id) => "ark/" + id));
-  assert.match(result.output, /每種介面最多測 2 次/);
+  assert.match(result.output, /每個已選模型每種介面最多測一次/);
 });
 
 test("只選 Flare 就只測一次，即使重複填編號也不重送；未選模型不觸發前綴問題", async (t) => {
@@ -274,7 +274,7 @@ test("只選 Flare 就只測一次，即使重複填編號也不重送；未選�
     imageResponses: Object.fromEntries(all.map((id) => ["ark/" + id, {}])) });
   assert.equal(result.code, 0, result.output);
   assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), ["ark/" + all[2]]);
-  assert.match(result.output, /每種介面最多測 1 次/);
+  assert.match(result.output, /每個已選模型每種介面最多測一次/);
   assert.doesNotMatch(result.output, /清單未列出的圖片模型前綴/);
   const config = JSON.parse(readFileSync(join(result.root, "config.json"), "utf8"));
   assert.deepEqual(config.models, [all[2]]);
@@ -290,7 +290,7 @@ test("測試選擇留空時，新設定預選 Flare，既有設定只預選已�
 });
 
 test("選測模型時取消或輸入無效編號，不查上游模型、不生圖、不更動技能", async (t) => {
-  for (const testModels of ["cancel", "4"]) {
+  for (const testModels of ["cancel", "9"]) {
     const result = await setupThroughCommand(t, { testModels, existingModels: [all[2]] });
     assert.equal(result.code, testModels === "cancel" ? 0 : 1, result.output);
     assert.equal(result.requests.some((r) => r.path.startsWith("/v1/")), false);

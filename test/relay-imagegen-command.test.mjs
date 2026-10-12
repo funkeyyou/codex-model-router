@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { loadPayloads, loadRouterWith } from "./helpers/payloads.mjs";
 
 const { imagegen } = await loadPayloads();
-const all = imagegen.IMAGE_MODELS;
+const all = imagegen.GPT_IMAGE_MODELS;
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
 
 function fixture(t, models = all) {

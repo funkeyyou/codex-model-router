@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.30.1";
+const INSTALLER_VERSION = "1.31.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -79,7 +79,13 @@ export const RELAY_IMAGE_MODELS = [
   { id: "gpt-image-2", label: "Image 2", description: "上一代圖片模型，適合既有流程與相容需求。" },
   { id: "gpt-image-2.5-sunburst", label: "Image 2.5 Sunburst", description: "偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。" },
   { id: "gpt-image-2.5-flare", label: "Image 2.5 Flare", description: "偏重速度，適合一般生圖與快速迭代。" },
+  { id: "gemini-nano-banana-2.1", label: "Nano Banana 2.1", description: "Google 目前的主力生圖模型：速度快、成本低，畫質、文字渲染與多輪改圖一致性都比 Nano Banana 2 好。" },
+  { id: "gemini-3-pro-image", label: "Nano Banana Pro", description: "Google 品質最高的生圖模型：適合複雜構圖、精準文字、品牌一致性與精細控制，較慢也較貴。" },
+  { id: "gemini-3.1-flash-image", label: "Nano Banana 2", description: "上一代主力：兼顧速度、4K 輸出與多張參考圖的一致性。" },
+  { id: "gemini-3.1-flash-lite-image", label: "Nano Banana 2 Lite", description: "最快、最便宜，適合大量出圖；不擅長多張參考圖或連續改圖。" },
+  { id: "gemini-2.5-flash-image", label: "Nano Banana", description: "初代舊型號，適合既有流程；Google 建議改用 Nano Banana 2 Lite。" },
 ];
+const RELAY_IMAGE_MODE_LABELS = { images: "通用", "ark-task": "Ark", chat: "Chat", gemini: "Gemini 原生" };
 const installHash = createHash("sha256")
   .update(codexHome)
   .digest("hex")
@@ -327,6 +333,14 @@ const codexBin = findExecutable(codexCandidates());
 function readManifest() {
   if (!existsSync(manifestPath)) return null;
   return JSON.parse(readFileSync(manifestPath, "utf8"));
+}
+
+// 只安裝網頁管理頁（尚未連接供應商）時的記錄：版本與 Codex 入口的回退資料。
+// 完整安裝後這些資料改存在 install.json，這份記錄隨即刪除。
+const managerRecordPath = join(installRoot, "manager-install.json");
+function readManagerRecord() {
+  if (!existsSync(managerRecordPath)) return null;
+  try { return JSON.parse(readFileSync(managerRecordPath, "utf8")); } catch { return null; }
 }
 
 function extractRouterSource() {
@@ -671,6 +685,7 @@ export const MAX_BACKUP_KEYS = 5;
 
 export function normalizeKeyPoolFile(source) {
   const providers = {};
+  const primaryModels = {};
   const entries = source && typeof source === "object" && source.providers && typeof source.providers === "object"
     ? source.providers : {};
   for (const [providerId, list] of Object.entries(entries)) {
@@ -684,10 +699,22 @@ export function normalizeKeyPoolFile(source) {
         credentialPath: typeof item.credentialPath === "string" && item.credentialPath ? item.credentialPath : null,
         tail: typeof item.tail === "string" ? item.tail.slice(-4) : "",
         addedAt: typeof item.addedAt === "string" ? item.addedAt : null,
+        models: normalizeKeyModels(item.models),
       }));
-    if (kept.length) providers[providerId] = kept;
+    if (kept.length) {
+      providers[providerId] = kept;
+      const primary = normalizeKeyModels(source.primaryModels?.[providerId]);
+      if (primary) primaryModels[providerId] = primary;
+    }
   }
-  return { version: 1, providers };
+  return { version: 1, providers, primaryModels };
+}
+
+// 每把 Key 查到的模型清單：路由器只在有這個模型的 Key 之間切換。查不到時為 null（視為都支援）。
+export function normalizeKeyModels(list) {
+  if (!Array.isArray(list)) return null;
+  const models = [...new Set(list.filter((id) => typeof id === "string" && id && id.length <= 200 && !/[\x00-\x1f\x7f]/.test(id)))];
+  return models.length ? models.slice(0, 5000) : null;
 }
 
 function readKeyPoolFile() {
@@ -710,6 +737,63 @@ function writeKeyPoolFile(pool) {
 
 export function backupKeysOf(pool, providerId) {
   return Array.isArray(pool?.providers?.[providerId]) ? pool.providers[providerId] : [];
+}
+
+// 用某把 Key 查模型清單。查不到（網路錯誤、非 2xx、格式不符）時 models 為 null。
+async function fetchKeyModels(apiRoot, key) {
+  try {
+    const response = await fetchWithTimeout(`${apiRoot}/models`, { headers: upstreamAuthHeaders(apiRoot, key) }, 15000);
+    if (!response.ok) {
+      await response.arrayBuffer().catch(() => {});
+      return { status: response.status, models: null };
+    }
+    let payload = null;
+    try { payload = await response.json(); } catch { /* 不是 JSON 就當作查不到清單。 */ }
+    return { status: response.status, models: payload ? normalizeKeyModels(parseModelList(payload)) : null };
+  } catch (error) {
+    return { status: null, models: null, problem: error?.name === "AbortError" ? "逾時" : error.message };
+  }
+}
+
+// 主 Key 換了或重新查過：更新它的模型清單（只有這家有備用 Key 時才需要）。
+function rememberPrimaryModels(providerId, models) {
+  try {
+    const pool = readKeyPoolFile();
+    if (!backupKeysOf(pool, providerId).length) return;
+    pool.primaryModels = { ...(pool.primaryModels || {}) };
+    if (models) pool.primaryModels[providerId] = models; else delete pool.primaryModels[providerId];
+    writeKeyPoolFile(pool);
+  } catch { /* 清單只用來挑 Key，存不下時路由器把主 Key 視為支援全部模型。 */ }
+}
+
+// 合併主 Key 與備用 Key 的模型清單，順便把各自的清單記進 key-pool.json 給路由器用。
+// 只有備用 Key 有的模型列在主 Key 的後面，並用 keyFor 取得能測它的那把 Key。
+async function discoverProviderModels(provider, primaryKey) {
+  const discovery = await discoverApiRoot(provider.baseUrl, primaryKey);
+  const pool = readKeyPoolFile();
+  const backups = backupKeysOf(pool, provider.id);
+  if (!backups.length) return { discovery, onlyBackup: new Set(), keyFor: () => primaryKey };
+  const lists = await Promise.all(backups.map(async (item) => {
+    let key;
+    try { key = readApiKey(item.keychainService); } catch { return { item, key: null, models: null }; }
+    return { item, key, models: (await fetchKeyModels(discovery.apiRoot, key)).models };
+  }));
+  const primarySet = new Set(discovery.models);
+  try {
+    pool.primaryModels = { ...(pool.primaryModels || {}), [provider.id]: discovery.models };
+    for (const { item, models } of lists) if (models) item.models = models;
+    writeKeyPoolFile(pool);
+  } catch (error) {
+    console.error(`各 Key 的模型清單未能保存：${error.message}`);
+  }
+  const extra = [];
+  for (const { models } of lists) {
+    for (const model of models || []) if (!primarySet.has(model) && !extra.includes(model)) extra.push(model);
+  }
+  if (extra.length) console.log(`備用 Key 另外提供 ${extra.length} 個主 Key 沒有的模型。`);
+  const keyFor = (model) => primarySet.has(model) ? primaryKey
+    : lists.find((entry) => entry.key && entry.models?.includes(model))?.key || primaryKey;
+  return { discovery: { ...discovery, models: [...discovery.models, ...extra] }, onlyBackup: new Set(extra), keyFor };
 }
 
 // 供應商被移除或整個回退時呼叫：刪掉這些備用 Key 的鑰匙圈項目／密文檔與清單記錄。
@@ -3317,7 +3401,9 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
   return { route, transient: false, transientEfforts: probe.transientEfforts || [] };
 }
 
-async function install() {
+// preset 由網頁管理頁的首次設定帶入：Base URL、Key、查詢結果與所選模型都已確定，
+// 不能再向終端提問。終端安裝（preset 為 null）的流程不變。
+async function install(preset = null) {
   const existingManifest = readManifest();
   if (existingManifest?.version) assertInstallerNotOlder(existingManifest.version);
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -3332,38 +3418,52 @@ async function install() {
   const primary = existingProviders[0] || null;
   const otherProviders = existingProviders.slice(1);
   const primaryId = primary?.id || DEFAULT_PROVIDER_ID;
+  // bare：只裝路由器、不加 API 供應商（網頁上只連接 Claude 訂閱時使用），模型稍後另外寫入。
+  const bare = Boolean(preset?.bare);
+  if (bare && existingManifest) fail("路由器已經安裝。");
   if (otherProviders.length > 0) {
     console.log(`這裡設定的是主要供應商「${primaryId}」；其他 ${otherProviders.length} 家供應商與它們的模型保持不變。`);
   }
-  const defaultBaseUrl = primary?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
-  const baseUrl = normalizeUrl(
-    env.CODEX_MODEL_ROUTER_BASE_URL ||
-      (await askProviderBaseUrl(defaultBaseUrl)),
-  );
-  const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
-  if (clash) {
-    fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
-  }
-  const keychainService = keychainServiceFor(baseUrl);
+  let baseUrl = null;
+  let keychainService = null;
+  let apiKey = null;
+  let discovery = { apiRoot: null, models: [] };
+  let selectedModels = [];
+  if (!bare) {
+    const defaultBaseUrl = primary?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
+    baseUrl = normalizeUrl(preset?.baseUrl ||
+      env.CODEX_MODEL_ROUTER_BASE_URL ||
+        (await askProviderBaseUrl(defaultBaseUrl)));
+    const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
+    if (clash) {
+      fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
+    }
+    keychainService = keychainServiceFor(baseUrl);
 
-  if (keychainHas(keychainService)) {
-    const update = await confirm(
-      `${secretStoreLabel}中已存在 API Key，是否替換？`,
-      false,
-    );
-    if (update) await storeApiKey(keychainService, baseUrl);
-  } else {
-    await storeApiKey(keychainService, baseUrl);
-  }
-  const apiKey = readApiKey(keychainService);
+    if (preset) {
+      storeApiKeyValue(keychainService, baseUrl, preset.apiKey);
+    } else if (keychainHas(keychainService)) {
+      const update = await confirm(
+        `${secretStoreLabel}中已存在 API Key，是否替換？`,
+        false,
+      );
+      if (update) await storeApiKey(keychainService, baseUrl);
+    } else {
+      await storeApiKey(keychainService, baseUrl);
+    }
+    apiKey = readApiKey(keychainService);
 
-  console.log("正在發現可用模型..." );
-  const discovery = await discoverApiRoot(baseUrl, apiKey);
-  console.log(`API 根地址：${discovery.apiRoot}`);
-  const selectedModels = await selectModels(discovery.models);
-  console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
-  if (!(await confirm("是否繼續進行能力探測？", true))) {
-    fail("已在修改配置前取消安裝。" );
+    discovery = preset?.discovery;
+    if (!discovery) {
+      console.log("正在發現可用模型..." );
+      discovery = await discoverApiRoot(baseUrl, apiKey);
+    }
+    console.log(`API 根地址：${discovery.apiRoot}`);
+    selectedModels = preset ? preset.models : await selectModels(discovery.models);
+    console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
+    if (!preset && !(await confirm("是否繼續進行能力探測？", true))) {
+      fail("已在修改配置前取消安裝。" );
+    }
   }
 
   // 重新配置時，這次探測遇到的暫時性失敗不足以推翻上次已經驗過的結果。
@@ -3400,9 +3500,10 @@ async function install() {
     }
     // 重新探測的既有模型沿用原本的顯示名稱：使用者可能手動改過名，或依前綴命名過。
     const previousName = previousRoutes.get(model)?.displayName;
-    routes.push(withDefaultModelPrefix(previousName && kept !== "model" ? { ...route, displayName: previousName } : route));
+    const named = withDefaultModelPrefix(previousName && kept !== "model" ? { ...route, displayName: previousName } : route);
+    routes.push(preset?.defaults ? applyNewModelDefaults(named, preset.defaults) : named);
   }
-  if (routes.length === 0) fail("選中的模型均未通過 Responses API 探測。" );
+  if (routes.length === 0 && !bare) fail("選中的模型均未通過 Responses API 探測。" );
   // 新模型依主要供應商的模型前綴命名；沿用的名稱只有仍是預設規則產生的才會補上前綴。
   routes.splice(0, routes.length, ...applyModelPrefix(routes, primary?.modelPrefix || null));
   if (keptModels.length > 0 || keptEfforts.length > 0) {
@@ -3412,7 +3513,7 @@ async function install() {
     console.log("  上游恢復後重跑一次安裝器，即可用最新探測結果覆蓋。" );
   }
 
-  const bundledCatalog = loadCatalogTemplates();
+  const bundledCatalog = await withCodexLock(() => loadCatalogTemplates());
   const discoveredOfficial = bundledCatalog.models.filter(
     (model) => !String(model.slug).startsWith("custom/"),
   );
@@ -3423,7 +3524,7 @@ async function install() {
     readSettingsIfExists().forceListedModels,
   );
   const officialModels = applyForcedVisibility(discoveredOfficial, forceListedModels);
-  const providers = [{
+  const providers = bare ? [...otherProviders] : [{
     id: primaryId,
     baseUrl,
     apiRoot: discovery.apiRoot,
@@ -3432,6 +3533,8 @@ async function install() {
     credentialPath: isWindows ? credentialFileFor(keychainService) : null,
     // 顯示名稱與模型前綴屬於這家供應商本身，重新配置 Base URL 或 Key 時保留。
     ...(primary?.name ? { name: primary.name } : {}),
+    // 網頁首次設定若選了常用供應商，直接用它的名稱顯示，之後可在供應商頁修改。
+    ...(!primary && preset && presetForBaseUrl(baseUrl) ? { name: presetForBaseUrl(baseUrl).name } : {}),
     ...(primary?.modelPrefix ? { modelPrefix: primary.modelPrefix } : {}),
   }, ...otherProviders];
   // 主要供應商的項目依這次探測重建；其他供應商的沿用現有目錄裡那份。
@@ -3451,6 +3554,8 @@ async function install() {
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
   const userConfig = await readUserConfig();
+  // 先前只裝了管理頁：沿用它記下的 Codex 入口回退資料，回退時才能一併還原。
+  const entrySource = existingManifest || readManagerRecord();
   const previousConfig =
     existingManifest?.previousConfig || {
       modelProvider: deepGet(userConfig.config, "model_provider"),
@@ -3542,8 +3647,8 @@ async function install() {
       configVersionAfterInstall: writeResult.version || null,
       codexBin,
       nodeBin,
-      ...(existingManifest?.managerFileHandler ? { managerFileHandler: existingManifest.managerFileHandler } : {}),
-      ...(existingManifest?.managerMcpEntry ? { managerMcpEntry: existingManifest.managerMcpEntry } : {}),
+      ...(entrySource?.managerFileHandler ? { managerFileHandler: entrySource.managerFileHandler } : {}),
+      ...(entrySource?.managerMcpEntry ? { managerMcpEntry: entrySource.managerMcpEntry } : {}),
     }, providers);
     writeJsonAtomic(manifestPath, manifest);
     await waitForPickerModels(allRoutes,
@@ -3581,16 +3686,14 @@ async function install() {
           renameSync(path, join(failedInstallDir, basename(path)));
         }
       }
-      if (existsSync(installRoot)) {
-        renameSync(installRoot, join(failedInstallDir, "model-router"));
-      }
+      archiveFailedInstallRoot(join(failedInstallDir, "model-router"));
     }
     throw error;
   }
 
   printHeading("安裝完成");
   console.log(`路由器：http://127.0.0.1:${port}`);
-  console.log("已添加模型：");
+  if (routes.length) console.log("已添加模型：");
   for (const route of routes) {
     const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供應商預設值";
     console.log(`  - ${route.displayName}`);
@@ -3605,7 +3708,7 @@ async function install() {
     primary?.keychainService &&
     primary.keychainService !== keychainService &&
     !otherProviders.some((provider) => provider.keychainService === primary.keychainService) &&
-    !testMode
+    !testMode && !preset
   ) {
     const removeOldKey = await confirm(
       `是否從${secretStoreLabel}中刪除上一個 Base URL 對應的 API Key？`,
@@ -3621,13 +3724,38 @@ async function install() {
     if (purged) console.log(`已移除上一個 Base URL 的 ${purged} 把備用 Key。`);
   }
   const installedPrimary = installedProviders(readSettingsIfExists(), readManifest())[0];
-  if (installedPrimary && !testMode) await askBackupKeys(installedPrimary);
+  let backupResult = null;
+  if (preset) {
+    if (installedPrimary && preset.backupKeys?.length) {
+      console.log("");
+      // 路由器已經裝好；備用 Key 出問題只回報，不回滾安裝。
+      try { backupResult = await addBackupKeys(installedPrimary, preset.backupKeys); }
+      catch (error) { console.error(`備用 Key 未加入：${error.message}`); }
+    }
+  } else if (installedPrimary && !testMode) await askBackupKeys(installedPrimary);
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
   console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
   console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
   console.log(`回退命令：${basename(scriptPath)} rollback`);
   printManagerLauncher(await installManagerLauncher());
-  await offerInstalledRelayImagegen();
+  if (existsSync(managerRecordPath)) rmSync(managerRecordPath, { force: true });
+  // 網頁首次設定不能在終端提問；中轉生圖改由管理頁的「生圖」頁設定。
+  if (!preset) await offerInstalledRelayImagegen();
+  return { added: routes.map(summarizeRoute), backupKeys: backupResult, restartDesktop: true };
+}
+
+// 首次安裝失敗時封存已寫入的檔案。網頁首次設定的管理頁本身也在這個目錄
+// （manager.json 鎖檔、啟動用的暫存程式），那些要留在原地，管理頁才能繼續運作。
+const MANAGER_RUNTIME_FILE = /^(manager\.json|manager-starting\.json|manager-handoff\.json|manager-install\.json|manager-entry(-[\w-]+)?\.mjs|manager-worker.*|manager-open\.(sh|js)|manager-icon\.svg|codex-model-router\.(sh|ps1))$/;
+function archiveFailedInstallRoot(destination) {
+  if (!existsSync(installRoot)) return;
+  const entries = readdirSync(installRoot).filter((name) => !MANAGER_RUNTIME_FILE.test(name));
+  if (entries.length === readdirSync(installRoot).length) {
+    renameSync(installRoot, destination);
+    return;
+  }
+  ensureDirectory(destination);
+  for (const name of entries) renameSync(join(installRoot, name), join(destination, name));
 }
 
 // 在既有安裝上追加模型：沿用已保存的 Base URL、API Key、端口與既有路由，
@@ -3666,7 +3794,7 @@ async function addModels() {
 
   const apiKey = readApiKey(keychainService);
   console.log("\n正在發現可用模型...");
-  const discovery = await discoverApiRoot(baseUrl, apiKey);
+  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
   const configured = new Set(providerRoutes.map((route) => route.upstreamModel));
   const available = discovery.models.filter((model) => !configured.has(model));
   if (available.length === 0) {
@@ -3686,7 +3814,7 @@ async function addModels() {
 
   // 這裡的模型都是新選的，沒有既有設定可以沿用；暫時性失敗只能略過。
   const outcomes = await probeModelsInParallel(selectedModels,
-    (model, log) => buildRouteForModel(discovery, apiKey, model, log, provider.id));
+    (model, log) => buildRouteForModel(discovery, keyFor(model), model, log, provider.id));
   const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean);
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
 
@@ -3908,7 +4036,6 @@ function requireInstallation() {
     fail("安裝設定或模型目錄不完整，請改用「安裝或重新配置」。");
   }
   const providers = installedProviders(settings, manifest);
-  if (providers.length === 0) fail("找不到中轉供應商設定，請改用「安裝或重新配置」。");
   return { manifest, settings, catalog, providers };
 }
 
@@ -4580,6 +4707,7 @@ async function executeRemoveProvider(providerId, { expectedDefault } = {}) {
 
 async function replaceProviderKey() {
   const { settings, providers } = requireInstallation();
+  if (!providers.length) fail("尚未連接 API 供應商，沒有可更換的 API Key。");
   printHeading("更換 API Key");
   const provider = providers.length === 1
     ? providers[0]
@@ -4591,18 +4719,13 @@ async function replaceProviderKey() {
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   await storeApiKey(provider.keychainService, provider.baseUrl);
   // 舊 Key 已被覆寫，驗證不通過也無從還原，只提醒使用者。
-  try {
-    const apiKey = readApiKey(provider.keychainService);
-    const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-      headers: upstreamAuthHeaders(provider.apiRoot, apiKey),
-    }, 15000);
-    await response.arrayBuffer();
-    console.log(response.ok
-      ? "已更換，新 Key 可以正常查詢模型清單。"
-      : `已更換，但用新 Key 查詢模型清單得到 HTTP ${response.status}，請確認 Key 是否正確。`);
-  } catch (error) {
-    console.log(`已更換，但無法用新 Key 查詢模型清單（${error.message}）。`);
-  }
+  const checked = await fetchKeyModels(provider.apiRoot, readApiKey(provider.keychainService));
+  rememberPrimaryModels(provider.id, checked.models);
+  console.log(checked.status != null && checked.status >= 200 && checked.status < 300
+    ? "已更換，新 Key 可以正常查詢模型清單。"
+    : checked.status != null
+      ? `已更換，但用新 Key 查詢模型清單得到 HTTP ${checked.status}，請確認 Key 是否正確。`
+      : `已更換，但無法用新 Key 查詢模型清單（${checked.problem}）。`);
   console.log(isWindows
     ? "路由器下一個請求就會改用新 Key，不必重啟。"
     : "路由器最晚 5 分鐘內改用新 Key；上游拒絕舊 Key 時會立即改用。");
@@ -4618,7 +4741,8 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
   if (!Array.isArray(settings.routes)) return { ok: false, reason: "no-routes" };
   const routes = settings.routes.map(withDefaultModelPrefix);
   const providers = installedProviders(settings, manifest);
-  if (providers.length === 0) return { ok: false, reason: "no-providers" };
+  // 只連接 Claude 訂閱時沒有 API 供應商，路由仍完整。
+  if (providers.length === 0 && !settings.claudeCli?.binary) return { ok: false, reason: "no-providers" };
   const providerIds = new Set(providers.map((provider) => provider.id));
   if (routes.some((route) => route.transport === "claude-cli"
     ? route.translate !== "anthropic" || !settings.claudeCli?.binary
@@ -4676,6 +4800,7 @@ export function isManagedCatalogPath(value, managedPath) {
 
 async function update() {
   const manifest = readManifest();
+  if (!manifest && readManagerRecord()) return updateManagerOnly();
   const settings = existsSync(settingsPath)
     ? JSON.parse(readFileSync(settingsPath, "utf8"))
     : null;
@@ -5015,7 +5140,10 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
     "使用者明確指定的模型優先；若未啟用，說明並請使用者從安裝器設定，不擅自啟用。",
     "一般生圖／快速迭代優先 Flare；需要精確修改或保留原圖細節時優先 Sunburst。",
     "Image 2 用於使用者指定、既有流程或相容需求。只從已啟用模型中選擇，速度與費用以中轉商實際回應為準。", "",
-    "若省略 --model，命令的生圖預設依 Flare → Sunburst → Image 2，改圖依 Sunburst → Flare → Image 2，選第一個已啟用模型。AI 應明確指定，不以這個順序代替需求判斷。", "",
+    "Nano Banana（Google Gemini 圖片模型）：一般生圖選 Nano Banana 2.1；複雜構圖、圖中要有精準文字或品牌一致性選 Nano Banana Pro；",
+    "大量、求快求便宜選 Nano Banana 2 Lite；Nano Banana 2 與初代 Nano Banana 只在使用者指定或既有流程使用。",
+    "GPT Image 與 Nano Banana 都啟用時，依需求與使用者偏好選擇；使用者沒指定時以 GPT Image 為主。", "",
+    "若省略 --model，命令的生圖預設依 Flare → Sunburst → Image 2 → Nano Banana 2.1 → Pro → 2 → 2 Lite → Nano Banana，改圖則先 Sunburst → Flare → Image 2 → Nano Banana Pro，選第一個已啟用模型。AI 應明確指定，不以這個順序代替需求判斷。", "",
     "## 執行", "",
     "把提示詞寫進 UTF-8 檔案，避免 shell 引號與特殊字元影響內容。使用絕對路徑。",
     "新圖片用 generate；改圖或帶參考圖用 edit，先查看本機參考圖，並寫清楚要保留及修改的部分。",
@@ -5028,6 +5156,8 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
     "--image 可重複提供；--quality 支援 auto、low、medium、high，兩個 2.5 模型另支援 xhigh、max。",
     "--size 可用 auto 或 WIDTHxHEIGHT；--background 可用 auto、opaque、transparent；--output-format 可用 png、jpeg、webp。",
     "list 回傳 apiMode=ark-task 時，使用已偵測到的 Ark 任務介面：size、quality 保持 auto，background 只能 auto 或 opaque。命令會省略不支援的欄位、以 JSON 傳送參考圖、查詢任務並下載結果；不要自行取得 API Key。",
+    "list 的 apiModes 列出每個模型的介面。Nano Banana（chat 或 gemini 介面）的 size、quality 只能 auto，background 不支援 transparent；比例、尺寸與構圖寫進提示詞。",
+    "Nano Banana 的輸出格式由上游決定，與 --out 副檔名不同時命令會改用實際格式的副檔名儲存，以回傳的 path 為準。",
     "--dry-run 只檢查參數，不送出圖片 API 請求。命令每次只生成一張圖，預設逾時 300 秒。",
     "已存在的輸出檔會被拒絕；換新檔名保留原圖。生成失敗或逾時時回報原因，不自動換模型重送，以免重複計費。",
     "成功後查看輸出圖片，確認符合需求，再以絕對路徑顯示圖片，並告知使用的模型及檔案位置。",
@@ -5036,17 +5166,24 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
 }
 
 // 此功能獨立提交／還原，不把技能寫檔失敗變成整個路由器安裝失敗。
-export function installRelayImageSkill({ models, aliases = {}, apiMode, providerId = null, root = relaySkillRoot,
+export function installRelayImageSkill({ models, aliases = {}, apiMode, apiModes: apiModesInput = null, providerId = null, root = relaySkillRoot,
   settingsFile = settingsPath, backupRoot = backupsRoot, nodePath = nodeBin,
   sourcePath = scriptPath, platform = process.platform } = {}) {
   const allowed = new Set(RELAY_IMAGE_MODELS.map((model) => model.id));
   if (!Array.isArray(models) || !models.length || models.some((model) => !allowed.has(model))) {
-    fail("中轉生圖只支援 Image 2、Sunburst、Flare，至少選擇一個。");
+    fail("中轉生圖只支援清單中的 GPT Image 與 Nano Banana 模型，至少選擇一個。");
   }
   models = [...new Set(models)];
   const previous = relayConfig(root, settingsFile);
   apiMode = apiMode || previous?.apiMode || "images";
   if (!["images", "ark-task"].includes(apiMode)) fail("無效的生圖介面設定。");
+  // 逐模型記錄介面；GPT Image 沿用共用的 apiMode（舊版命令也讀得懂）。
+  const apiModes = Object.fromEntries(models.map((model) => {
+    const gemini = model.startsWith("gemini-");
+    const mode = apiModesInput?.[model] || previous?.apiModes?.[model] || (gemini ? "chat" : apiMode);
+    if (!(gemini ? ["chat", "gemini", "images"] : ["images", "ark-task"]).includes(mode)) fail(`無效的生圖介面設定：${model}`);
+    return [model, mode];
+  }));
   // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。
   providerId = providerId || previous?.providerId || DEFAULT_PROVIDER_ID;
   if (!PROVIDER_ID_PATTERN.test(providerId)) fail("無效的生圖供應商設定。");
@@ -5076,7 +5213,8 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, provider
   }
   const upstreamModels = Object.fromEntries(models.map((model) => {
     const upstream = aliases[model] || previous?.upstreamModels?.[model] || model;
-    if (upstream !== model && !(typeof upstream === "string" && upstream.endsWith(`/${model}`) && !/[\s?#]/.test(upstream))) {
+    if (typeof upstream !== "string" || /[\s\x00-\x1f\x7f?#]/.test(upstream) ||
+      !(model.startsWith("gemini-") ? [model, `${model}-preview`] : [model]).some((name) => upstream === name || upstream.endsWith(`/${name}`))) {
       fail(`無效的圖片模型對應：${model}`);
     }
     return [model, upstream];
@@ -5094,7 +5232,7 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, provider
       writeFileSync(join(stage, name), content, { mode: 0o600 });
     }
     const config = { managedBy: RELAY_IMAGEGEN_OWNER, version: INSTALLER_VERSION,
-      routerSettingsPath: settingsFile, models, upstreamModels, apiMode, providerId, hashes };
+      routerSettingsPath: settingsFile, models, upstreamModels, apiMode, apiModes, providerId, hashes };
     writeJsonAtomic(join(stage, "config.json"), config);
     if (previous) {
       ensureDirectory(backup);
@@ -5119,9 +5257,10 @@ export function archiveRelayImageSkill(destination, root = relaySkillRoot, setti
 }
 
 export function resolveRelayImageAliases(models, availableModels) {
+  // 正式名稱優先，其次帶前綴的同名模型，再其次 -preview（部分中轉與 Google 的預覽版名稱）。
+  const find = (name) => availableModels.includes(name) ? name : availableModels.find((id) => id.endsWith(`/${name}`));
   return Object.fromEntries(models.map((model) => [model,
-    availableModels.includes(model) ? model : availableModels.find((id) => id.endsWith(`/${model}`)) || model,
-  ]));
+    find(model) || (model.startsWith("gemini-") && find(`${model}-preview`)) || model]));
 }
 
 export function detectRelayImageModels(availableModels) {
@@ -5178,7 +5317,8 @@ async function discoverRelayImageModelNames(apiRoot, apiKey) {
     let payload;
     try { payload = await response.json(); } catch { fail("上游模型清單無法解析，將以實際生圖測試確認。"); }
     if (!Array.isArray(payload?.data) && !Array.isArray(payload?.models)) fail("上游未返回有效模型清單，將以實際生圖測試確認。");
-    return parseModelList(payload);
+    // Google 的清單是 models/gemini-…，models/ 不是供應商前綴。
+    return parseModelList(payload).map((id) => typeof id === "string" ? id.replace(/^models\//, "") : id);
   } catch (error) {
     if (response) throw error;
     fail("無法讀取中轉模型清單，可自行確認前綴後進行生圖測試。");
@@ -5192,7 +5332,7 @@ async function configureRelayImagegen() {
   const providers = installedProviders(settings, readManifest());
   if (providers.length === 0) fail("找不到中轉供應商設定，請先執行「安裝或重新配置」。");
   printHeading("中轉 API 生圖");
-  console.log(`${providers.length > 1 ? "沿用已設定的中轉供應商與憑證" : "沿用現有中轉 Base URL 與憑證"}。偵測會實際生圖並依供應商計費；先測通用介面，全部未通過時自動改測 Ark 任務介面。`);
+  console.log(`${providers.length > 1 ? "沿用已設定的中轉供應商與憑證" : "沿用現有中轉 Base URL 與憑證"}。偵測會實際生圖並依供應商計費；GPT Image 先測通用介面，全部未通過時改測 Ark 任務介面；Nano Banana 依序試 Chat、Gemini 原生與通用介面。`);
   console.log("先選擇要偵測的模型，只有勾選的項目會進行生圖測試；下列模型尚未驗證可用性。");
   RELAY_IMAGE_MODELS.forEach((model, index) => console.log(`  ${index + 1}. ${model.label} — ${model.description}`));
   const defaultTests = current?.models?.map((id) => RELAY_IMAGE_MODELS.findIndex((model) => model.id === id) + 1).filter(Boolean).join(",") || "3";
@@ -5222,7 +5362,8 @@ function disableRelayImagegen() {
 }
 
 // 偵測並啟用中轉生圖，終端選單與網頁共用：推斷名稱前綴、只對勾選的模型實際生圖
-// （先通用介面，全部失敗才改 Ark 任務介面）、保存測試圖，再安裝技能。
+// （GPT Image 先通用介面，全部失敗才改 Ark 任務介面；Nano Banana 逐一試 chat、Gemini 原生、Images API）、
+// 保存測試圖，再安裝技能。
 // 沒有模型通過時不動既有技能，回傳 available 為空陣列。
 async function runRelayImagegenSetup({ provider, selected, current, settings, providers }) {
   const currentProviderId = current ? current.providerId ?? DEFAULT_PROVIDER_ID : null;
@@ -5239,7 +5380,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   const candidates = planRelayImageProbes(names, prefix).filter((model) => selected.includes(model.id));
   console.log("將依序測試：");
   candidates.forEach((model) => console.log(`  ${model.label}：${model.upstreamModel}`));
-  console.log(`每種介面最多測 ${candidates.length} 次，每個已選模型各一張；通用介面使用低品質，Ark 尺寸與品質由上游決定。`);
+  console.log("每個已選模型每種介面最多測一次、每次一張；通過就不再試其他介面。通用介面使用低品質，Ark 與 Nano Banana 的尺寸與品質由上游決定。");
   // 用 data URL 載入同一份獨立命令，測試與正式生圖共用回應驗證。
   const { discoverUsableRelayImages } = await import(`data:text/javascript;base64,${Buffer.from(loadImagegenSource()).toString("base64")}`);
   const probeRoot = join(installRoot, "imagegen-probes", timestamp());
@@ -5248,7 +5389,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   let discovery;
   try {
     discovery = await discoverUsableRelayImages({ candidates, apiRoot: provider.apiRoot, apiKey,
-      onProbe: (mode, model, index) => console.log(`[${index + 1}/${candidates.length}] ${mode === "images" ? "通用" : "Ark"}：正在測試 ${model.upstreamModel}...`) });
+      onProbe: (mode, model) => console.log(`[${RELAY_IMAGE_MODE_LABELS[mode] || mode}] 正在測試 ${model.upstreamModel}...`) });
   } finally { clearInterval(progress); }
   try {
     writeJsonAtomic(join(installRoot, "imagegen-last-check.json"), {
@@ -5259,7 +5400,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   if (!available.length) { console.log("沒找到可用模型。"); return { available: [], discovery }; }
   for (const model of available) {
     ensureDirectory(probeRoot);
-    const imagePath = join(probeRoot, `${model.id}.png`);
+    const imagePath = join(probeRoot, `${model.id}.${model.format === "jpeg" ? "jpg" : model.format || "png"}`);
     writeFileSync(imagePath, model.bytes, { flag: "wx", mode: 0o600 });
     console.log(`  通過，已收到圖片：${imagePath}`);
   }
@@ -5268,12 +5409,15 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   console.log("可複選：多個模型交由 AI 依需求選擇，使用者指定優先；只選一個就固定使用。");
   const models = available.map((model) => model.id);
   const aliases = Object.fromEntries(available.map((model) => [model.id, model.upstreamModel]));
-  const result = installRelayImageSkill({ models, aliases, apiMode: discovery.apiMode, providerId: provider.id });
+  const result = installRelayImageSkill({ models, aliases, apiMode: discovery.apiMode,
+    apiModes: discovery.apiModes, providerId: provider.id });
   console.log(`已啟用 $router-imagegen：${result.root}${providers.length > 1 ? `（供應商 ${providerName(provider)}）` : ""}`);
   if (result.backup) console.log(`備份：${result.backup}`);
   if (result.preserved.length) console.log(`保留手動修改的檔案：${result.preserved.join(", ")}`);
   console.log("請建立新任務使用 $router-imagegen；若尚未出現，重新啟動 Codex。所選模型已通過本次生圖測試。");
-  if (discovery.apiMode === "ark-task") console.log("Ark 生圖需要此版本的本機路由器；若只執行了 imagegen，請執行同一份安裝器的 update 更新路由器。");
+  if (Object.values(discovery.apiModes || {}).some((mode) => mode !== "images")) {
+    console.log("Ark 與 Nano Banana 生圖需要此版本的本機路由器；若只執行了 imagegen，請執行同一份安裝器的 update 更新路由器。");
+  }
   return { available, discovery, result, probeRoot };
 }
 
@@ -5288,7 +5432,7 @@ function refreshRelayImagegen() {
   const existing = relayConfig();
   if (!existing) return;
   const result = installRelayImageSkill({ models: existing.models, aliases: existing.upstreamModels, apiMode: existing.apiMode,
-    providerId: existing.providerId });
+    apiModes: existing.apiModes, providerId: existing.providerId });
   console.log(`中轉生圖技能已更新${result.preserved.length ? `（保留手動檔案：${result.preserved.join(", ")}）` : ""}。`);
 }
 
@@ -5451,7 +5595,8 @@ async function status() {
 async function rollback() {
   const manifest = readManifest();
   if (!manifest) {
-    console.log("沒有可回退的安裝。" );
+    if (readManagerRecord()) await rollbackManagerOnly();
+    else console.log("沒有可回退的安裝。" );
     return;
   }
   printHeading("回退 Codex 模型路由器");
@@ -5518,6 +5663,48 @@ async function rollback() {
   printHeading("回退完成");
   console.log(`安裝檔案已封存至：${archiveDir}`);
   console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
+}
+
+// 只裝了網頁管理頁：還原 Codex 入口、移除捷徑，封存管理頁檔案。沒有路由器或 Key 要處理。
+async function rollbackManagerOnly() {
+  const record = readManagerRecord();
+  printHeading("移除網頁管理頁");
+  console.log("尚未連接任何供應商，只會移除管理頁、捷徑與 Codex 裡的入口。");
+  if (!(await confirm("是否繼續？", true))) return;
+  if (record.managerMcpEntry && codexBin) {
+    const user = await readUserConfig();
+    const entryEdit = managerMcpRollbackEdit(user.config, record.managerMcpEntry);
+    if (entryEdit) await writeConfigEdits([entryEdit]);
+    else console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
+  }
+  const archiveDir = join(backupsRoot, `rollback-${timestamp()}`);
+  ensureDirectory(archiveDir);
+  archiveManagerShortcut(archiveDir);
+  if (existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
+  printHeading("移除完成");
+  console.log(`管理頁檔案已封存至：${archiveDir}`);
+  console.log(`請完全退出並重新打開 ${desktopAppName}。`);
+}
+
+// 只裝管理頁時第一次執行安裝器：放好管理頁、捷徑與 Codex 入口，不安裝路由器、不改模型設定。
+async function installManagerOnly() {
+  ensureDirectory(installRoot);
+  writeJsonAtomic(managerRecordPath, { ...(readManagerRecord() || {}), version: INSTALLER_VERSION,
+    installedAt: readManagerRecord()?.installedAt || new Date().toISOString() });
+  const result = await installManagerLauncher();
+  printManagerLauncher(result);
+  return result;
+}
+
+async function updateManagerOnly() {
+  const record = readManagerRecord();
+  if (record?.version) assertInstallerNotOlder(record.version);
+  printHeading("更新網頁管理頁");
+  console.log(`版本：${record?.version || "未知"} → ${INSTALLER_VERSION}`);
+  const result = await installManagerOnly();
+  if (!result.ok) fail(result.message);
+  printHeading("更新完成");
+  return { version: INSTALLER_VERSION };
 }
 
 // --- 網頁管理介面 -------------------------------------------------------------
@@ -5719,7 +5906,9 @@ export function managerMcpRollbackEdit(config, record) {
 async function installManagerMcpEntry() {
   try {
     const user = await readUserConfig();
-    const manifest = readManifest();
+    // 回退資料寫在完整安裝的 install.json；只裝管理頁時寫在 manager-install.json。
+    const recordPath = readManifest() ? manifestPath : managerRecordPath;
+    const manifest = readManifest() || readManagerRecord();
     if (!manifest) fail("請先安裝 Codex 模型路由器。");
     // 入口程式改變時，MCP 設定的識別也改變，客戶端不能繼續使用先前的連線快取。
     const revision = createHash("sha256").update(loadManagerEntrySource()).digest("hex").slice(0, 12);
@@ -5735,13 +5924,13 @@ async function installManagerMcpEntry() {
     // 先記錄恢復資料，途中中斷時仍能用 rollback 還原這一個設定項。
     const updatedManifest = { ...manifest, managerMcpEntry: { key: MANAGER_MCP_KEY, installed,
       previous: previous ? previous.previous : current } };
-    writeJsonAtomic(manifestPath, updatedManifest);
+    writeJsonAtomic(recordPath, updatedManifest);
     await writeConfigEdits([{ keyPath: MANAGER_MCP_KEY, value: installed }, ...(legacyEdit ? [legacyEdit] : [])]);
     const verified = await readUserConfig();
     if (!sameHandler(deepGet(verified.config, MANAGER_MCP_KEY).value, installed)) fail("Codex MCP 入口未成功寫入。");
     if (legacyEdit) {
       delete updatedManifest.managerFileHandler;
-      writeJsonAtomic(manifestPath, updatedManifest);
+      writeJsonAtomic(recordPath, updatedManifest);
     }
     return { ok: true };
   } catch (error) {
@@ -5750,7 +5939,7 @@ async function installManagerMcpEntry() {
 }
 
 async function setupManagerEntry() {
-  if (!readManifest()) fail("請先安裝 Codex 模型路由器。");
+  if (!readManifest() && !readManagerRecord()) fail("請先安裝 Codex 模型路由器或網頁管理頁。");
   const result = await installManagerLauncher();
   printManagerLauncher(result);
   if (!result.ok || result.desktop?.ok === false) fail("管理頁入口未完整安裝，請依上方訊息處理。");
@@ -6031,7 +6220,7 @@ function runDownloadedUpdate(path) {
 async function managerUpdate({ restartDesktop = false } = {}) {
   const catalog = await loadReleaseCatalog({ force: true });
   const latest = catalog.latest;
-  const installed = readManifest()?.version || null;
+  const installed = (readManifest() || readManagerRecord())?.version || null;
   if (compareVersions(latest, installed) !== 1) fail(`已是最新版本（${installed || INSTALLER_VERSION}）。`);
   console.log(`正在從 GitHub 下載 v${latest} 的安裝器與 SHA256SUMS…`);
   const sums = parseSha256Sums((await downloadReleaseAsset(latest, "SHA256SUMS", 64 * 1024)).toString("utf8"));
@@ -6125,7 +6314,7 @@ function summarizeRoute(route) {
 
 function managerWriteGuard() {
   const manifest = readManifest();
-  if (!manifest) return "尚未安裝路由器，請先在終端執行「安裝或重新配置」。";
+  if (!manifest) return "尚未安裝路由器，請先在管理頁完成首次設定。";
   const comparison = compareVersions(INSTALLER_VERSION, manifest.version);
   if (comparison != null && comparison < 0) {
     return `路由器已是 ${manifest.version}，這個管理頁仍是 ${INSTALLER_VERSION}；請關閉管理頁後重新開啟。`;
@@ -6144,7 +6333,17 @@ function assertManagerWritable() {
 
 async function managerState() {
   const manifest = readManifest();
-  if (!manifest) return { installed: false, versions: { manager: INSTALLER_VERSION } };
+  if (!manifest) {
+    const desktop = desktopApp();
+    const record = readManagerRecord();
+    return {
+      installed: false, managerOnly: Boolean(record), platform: process.platform,
+      versions: { manager: INSTALLER_VERSION, installed: terminalSafeText(record?.version, 32) || null },
+      setupBlocked: codexBin ? null : `未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`,
+      providerPresets: PROVIDER_PRESETS, providers: [], models: [],
+      desktop: { name: desktop?.name || desktopAppName, canRestart: Boolean(desktop) },
+    };
+  }
   const settings = readSettingsIfExists();
   const catalog = readCatalogIfExists();
   const providers = installedProviders(settings, manifest);
@@ -6209,7 +6408,8 @@ async function managerState() {
       baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
       modelCount: routes.filter((route) => routeProviderId(route) === provider.id).length,
       keyStored: env.CODEX_MODEL_ROUTER_TEST_API_KEY ? true : keychainHas(provider.keychainService),
-      backupKeys: backupKeysOf(keyPool, provider.id).map((item) => ({ id: item.id, tail: item.tail, addedAt: item.addedAt })),
+      backupKeys: backupKeysOf(keyPool, provider.id).map((item) => ({ id: item.id, tail: item.tail, addedAt: item.addedAt,
+        modelCount: Array.isArray(item.models) ? item.models.length : null })),
       keyPool: health.keyPools?.[provider.id] || null,
     })),
     models,
@@ -6236,7 +6436,7 @@ async function managerState() {
 
 async function managerVersionInfo({ refresh = false } = {}) {
   const manifest = readManifest();
-  const installed = terminalSafeText(manifest?.version, 32) || null;
+  const installed = terminalSafeText((manifest || readManagerRecord())?.version, 32) || null;
   const settings = readSettingsIfExists();
   const health = await routerHealth(Number(settings.port ?? manifest?.port));
   let catalog = null;
@@ -6530,11 +6730,16 @@ async function exportDiagnostics() {
 }
 
 function describeDiscoveredModel(id, configured = new Set()) {
+  return describeDiscoveredModelWith(id, configured, new Set());
+}
+
+function describeDiscoveredModelWith(id, configured, onlyBackup) {
   const owner = modelOwners.get(id) || null;
   return {
     id,
     configured: configured.has(id),
     anthropic: owner === "anthropic" || ((!owner || owner === "unknown") && looksAnthropic(id)),
+    ...(onlyBackup.has(id) ? { onlyBackup: true } : {}),
   };
 }
 
@@ -6548,12 +6753,12 @@ function configuredUpstreams(settings, providerId) {
 async function managerDiscover({ providerId } = {}) {
   const { settings, providers } = requireInstallation();
   const provider = managerProvider(providers, String(providerId || ""));
-  const discovery = await discoverApiRoot(provider.baseUrl, readApiKey(provider.keychainService));
+  const { discovery, onlyBackup } = await discoverProviderModels(provider, readApiKey(provider.keychainService));
   const configured = configuredUpstreams(settings, provider.id);
   return {
     providerId: provider.id,
     apiRoot: discovery.apiRoot,
-    models: discovery.models.map((model) => describeDiscoveredModel(model, configured)),
+    models: discovery.models.map((model) => describeDiscoveredModelWith(model, configured, onlyBackup)),
   };
 }
 
@@ -6562,7 +6767,8 @@ async function managerDiscover({ providerId } = {}) {
 const managerDrafts = new Map();
 
 async function managerProviderDraft({ baseUrl, apiKey } = {}) {
-  const { providers } = requireInstallation();
+  // 首次設定時還沒有任何供應商，同樣先查模型清單。
+  const { providers } = readManifest() ? requireInstallation() : { providers: [] };
   const normalized = normalizeUrl(String(baseUrl || "").trim());
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫 API Key。");
@@ -6608,10 +6814,10 @@ async function managerAddModels({ providerId, models, contextWindow, maxOutputTo
   const apiKey = readApiKey(provider.keychainService);
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("正在查詢模型清單…");
-  const discovery = await discoverApiRoot(provider.baseUrl, apiKey);
+  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
   console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
   const outcomes = await probeModelsInParallel(selected,
-    (model, log) => buildRouteForModel(discovery, apiKey, model, log, provider.id));
+    (model, log) => buildRouteForModel(discovery, keyFor(model), model, log, provider.id));
   const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean)
     .map((route) => applyNewModelDefaults(route, defaults));
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
@@ -6798,6 +7004,41 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
   }
 }
 
+// 網頁首次設定：沿用「新增供應商」查到的模型清單，跑與終端安裝相同的流程。
+async function managerFirstInstall({ draftId, models, contextWindow, maxOutputTokens, backupKeys } = {}) {
+  if (readManifest()) fail("路由器已經安裝，請重新整理管理頁。");
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  await withCodexLock(() => verifyLogin());
+  const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
+  const backups = parseBackupKeys(backupKeys ?? []);
+  if (backups.length > MAX_BACKUP_KEYS) fail(`備用 Key 最多 ${MAX_BACKUP_KEYS} 把，這次填了 ${backups.length} 把。`);
+  const draftKey = String(draftId || "");
+  const draft = managerDrafts.get(draftKey);
+  if (!draft || Date.now() - draft.createdAt > MANAGER_DRAFT_TTL_MS) fail("新增供應商的資料已過期，請重新查詢模型。");
+  const selected = managerModelSelection(models);
+  const keychainService = keychainServiceFor(draft.baseUrl);
+  let previousKey = null;
+  if (keychainHas(keychainService)) {
+    try { previousKey = readApiKey(keychainService); } catch {}
+  }
+  try {
+    const result = await install({ baseUrl: draft.baseUrl, apiKey: draft.apiKey, discovery: draft.discovery,
+      models: selected, defaults, backupKeys: backups });
+    managerDrafts.delete(draftKey);
+    managerConfigHints(true);
+    return result;
+  } catch (error) {
+    // 安裝沒完成就把憑證放回原狀，不留下沒有供應商在用的 Key。
+    if (!readManifest() && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+      try {
+        if (previousKey) storeApiKeyValue(keychainService, draft.baseUrl, previousKey);
+        else deleteApiKey(keychainService);
+      } catch {}
+    }
+    throw error;
+  }
+}
+
 async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
   assertManagerWritable();
   const { providers } = requireInstallation();
@@ -6834,19 +7075,10 @@ async function managerReplaceKey({ providerId, apiKey } = {}) {
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫新的 API Key。");
   console.log(`正在用新 Key 查詢「${providerName(provider)}」的模型清單…`);
-  let status = null;
-  let problem = null;
-  try {
-    const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-      headers: upstreamAuthHeaders(provider.apiRoot, key),
-    }, 15000);
-    await response.arrayBuffer();
-    status = response.status;
-  } catch (error) {
-    problem = error?.name === "AbortError" ? "逾時" : error.message;
-  }
+  const { status, problem, models: keyModels } = await fetchKeyModels(provider.apiRoot, key);
   if (status === 401 || status === 403) fail(`上游拒絕這把 Key（HTTP ${status}），沒有更換。`);
   storeApiKeyValue(provider.keychainService, provider.baseUrl, key);
+  rememberPrimaryModels(provider.id, keyModels);
   const verified = status != null && status >= 200 && status < 300;
   console.log(verified
     ? "已更換，新 Key 可以正常查詢模型清單。"
@@ -6897,17 +7129,7 @@ async function addBackupKeys(provider, input) {
       continue;
     }
     console.log(`正在用備用 Key ${mask} 查詢「${providerName(provider)}」的模型清單…`);
-    let status = null;
-    let problem = null;
-    try {
-      const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-        headers: upstreamAuthHeaders(provider.apiRoot, key),
-      }, 15000);
-      await response.arrayBuffer();
-      status = response.status;
-    } catch (error) {
-      problem = error?.name === "AbortError" ? "逾時" : error.message;
-    }
+    const { status, problem, models: keyModels } = await fetchKeyModels(provider.apiRoot, key);
     if (status === 401 || status === 403) {
       skipped.push({ tail: key.slice(-4), reason: `HTTP ${status}` });
       console.log(`跳過 ${mask}：上游拒絕這把 Key（HTTP ${status}）。`);
@@ -6917,15 +7139,23 @@ async function addBackupKeys(provider, input) {
     const service = `${provider.keychainService}.${id}`;
     storeApiKeyValue(service, provider.baseUrl, key);
     added.push({ id, keychainService: service, keychainAccount: "codex",
-      credentialPath: isWindows ? credentialFileFor(service) : null, tail: key.slice(-4), addedAt: new Date().toISOString() });
+      credentialPath: isWindows ? credentialFileFor(service) : null, tail: key.slice(-4), addedAt: new Date().toISOString(),
+      models: keyModels });
     stored.set(key, "已在備用清單");
     const verified = status != null && status >= 200 && status < 300;
-    console.log(verified ? `已加入 ${mask}，可以正常查詢模型清單。`
+    console.log(verified ? `已加入 ${mask}，可以正常查詢模型清單${keyModels ? `（${keyModels.length} 個模型）` : ""}。`
       : `已加入 ${mask}，但無法確認是否可用（${status != null ? `HTTP ${status}` : problem}）。`);
   }
   if (added.length) {
     try {
       pool.providers[provider.id] = [...existing, ...added];
+      // 主 Key 的清單也要記下：主 Key 沒有某模型時，路由器才會直接改用有它的備用 Key。
+      if (!pool.primaryModels?.[provider.id] && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+        try {
+          const primary = await fetchKeyModels(provider.apiRoot, readApiKey(provider.keychainService));
+          if (primary.models) pool.primaryModels = { ...(pool.primaryModels || {}), [provider.id]: primary.models };
+        } catch { /* 查不到就把主 Key 視為支援全部模型。 */ }
+      }
       writeKeyPoolFile(pool);
     } catch (error) {
       if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
@@ -6978,6 +7208,7 @@ async function askBackupKeys(provider) {
 
 async function manageBackupKeys() {
   const { settings, providers } = requireInstallation();
+  if (!providers.length) fail("尚未連接 API 供應商，沒有可加備用 Key 的對象。");
   const chosen = providers.length === 1 ? providers[0]
     : await chooseProvider(providers, settings.routes, "要為哪一家供應商添加備用 Key", { allowCancel: true });
   if (!chosen) {
@@ -7036,7 +7267,9 @@ async function managerGlobalContext() {
 }
 
 async function managerSetGlobalContext({ value } = {}) {
-  assertManagerWritable();
+  // 全域上下文只改 Codex 的 config.toml，不需要路由器：只裝管理頁時也能調整。
+  if (readManifest()) assertManagerWritable();
+  else if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   const target = normalizeGlobalContextWindow(value);
   console.log(target === null
     ? "正在移除全域 model_context_window…"
@@ -7104,7 +7337,7 @@ function relayImagegenStatus() {
     lastCheck = {
       checkedAt: terminalSafeText(saved.checkedAt, 40) || null,
       checks: (Array.isArray(saved.checks) ? saved.checks : []).slice(0, 12).map((check) => ({
-        apiMode: check?.apiMode === "ark-task" ? "ark-task" : "images",
+        apiMode: ["ark-task", "chat", "gemini"].includes(check?.apiMode) ? check.apiMode : "images",
         model: terminalSafeText(check?.model, 120),
         ok: check?.ok === true,
         error: check?.ok === true ? null : terminalSafeText(check?.error, 300) || null,
@@ -7117,6 +7350,8 @@ function relayImagegenStatus() {
     models: Array.isArray(config?.models) ? config.models : [],
     upstreamModels: config?.upstreamModels || {},
     apiMode: config?.apiMode || null,
+    apiModes: Array.isArray(config?.models)
+      ? Object.fromEntries(config.models.map((id) => [id, config.apiModes?.[id] || config.apiMode || "images"])) : {},
     // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。
     providerId: config ? config.providerId ?? DEFAULT_PROVIDER_ID : null,
     root: relaySkillRoot,
@@ -7131,17 +7366,18 @@ async function managerImagegenSetup({ providerId, models } = {}) {
   const allowed = RELAY_IMAGE_MODELS.map((model) => model.id);
   const selected = Array.isArray(models) ? [...new Set(models.map(String))] : [];
   if (selected.length === 0 || selected.some((model) => !allowed.includes(model))) {
-    fail("請從 Image 2、Image 2.5 Sunburst、Image 2.5 Flare 中至少選擇一個模型。");
+    fail("請從清單中至少選擇一個圖片模型。");
   }
   const provider = providers.length === 1 && !providerId ? providers[0] : managerProvider(providers, String(providerId || ""));
   const current = relayConfig();
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
-  console.log("偵測會實際生圖並依供應商計費；先測通用介面，全部未通過時自動改測 Ark 任務介面。");
+  console.log("偵測會實際生圖並依供應商計費；GPT Image 先測通用介面，全部未通過時改測 Ark 任務介面；Nano Banana 依序試 Chat、Gemini 原生與通用介面。");
   const outcome = await runRelayImagegenSetup({ provider, selected, current, settings, providers });
   if (!outcome.available.length) fail("沒找到可用模型，生圖設定沒有變更。");
   return {
     models: outcome.available.map((model) => model.id),
     apiMode: outcome.discovery.apiMode,
+    apiModes: outcome.discovery.apiModes,
     root: outcome.result.root,
     probeRoot: outcome.probeRoot,
   };
@@ -7237,8 +7473,13 @@ async function managerClaudeCliLogin({ force = false } = {}) {
   return { loggedIn: true };
 }
 
-async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = {}) {
-  assertManagerWritable();
+// firstInstall：尚未安裝路由器時只連接 Claude 訂閱。先測模型，通過後才安裝路由器並寫入，
+// 測試失敗不會留下沒有模型的路由器。
+async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, firstInstall = false } = {}) {
+  if (firstInstall) {
+    if (readManifest()) fail("路由器已經安裝，請重新整理管理頁。");
+    if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  } else assertManagerWritable();
   await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
   if (defaults.contextWindow > 1000000) fail("Claude CLI 模型的上下文上限最多 1,000,000。");
@@ -7247,7 +7488,9 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = 
   if (requested.length > 10) fail("一次最多測試 10 個模型。");
   const invalid = requested.filter((model) => !CLAUDE_CLI_MODEL_PATTERN.test(model));
   if (invalid.length) fail(`模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：${invalid.map((model) => terminalSafeText(model, 80)).join("、")}`);
-  const state = requireInstallation();
+  const state = firstInstall
+    ? { providers: [], settings: { routes: [] }, catalog: await withCodexLock(() => loadCatalogTemplates()) }
+    : requireInstallation();
   const found = inspectClaudeCli(state.settings);
   if (!found) fail("尚未安裝 Claude CLI，請先在供應商頁安裝。");
   if (!found.version || compareVersions(found.version, CLAUDE_CLI_MIN_VERSION) < 0) {
@@ -7262,6 +7505,10 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = 
   console.log(`將測試 ${requested.length} 個模型，每個發送一次短測試並使用訂閱用量；只有通過的會添加。`);
   const tested = await testClaudeCliModels(transport, { binary: found.binary, version: found.version, models: requested });
   if (!tested.passed.length) fail("沒有模型通過測試，路由配置未修改。");
+  if (firstInstall) {
+    console.log("\n測試通過，正在安裝路由器…");
+    await install({ bare: true });
+  }
   // 測試期間設定可能被更新，以最新檔案重新規劃。
   const plan = planClaudeCliModels(requireInstallation(), tested.binary, tested.passed, defaults.contextWindow,
     tested.resolvedModels, { maxOutputTokens: defaults.maxOutputTokens });
@@ -7299,6 +7546,8 @@ function managerOperations() {
       "reorder-models": job("調整模型順序", managerReorderModels),
       "edit-model": job("修改模型", managerEditModel),
       "add-provider": job("新增供應商", managerAddProvider),
+      install: job("首次設定", managerFirstInstall),
+      "install-claude": job("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
       "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
       "replace-key": job("更換 API Key", managerReplaceKey),
@@ -7388,7 +7637,8 @@ function closeManagerServer(server) {
 // 一般開啟只負責啟動／重用背景程序，再打開網址，完成即退出。
 // 管理程序直接用同一份 Node 負載啟動，不留下 PowerShell / cmd / 終端依附。
 async function openManager() {
-  if (!readManifest()) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先安裝。");
+  // 尚未安裝時同樣開啟管理頁，在網頁上完成首次設定；鎖檔與啟動程式都放在路由器目錄。
+  ensureDirectory(installRoot);
   // 兩次快速點擊也只能建立一個背景管理頁；啟動者意外退出後，下次會移除它的鎖。
   const path = join(installRoot, "manager-starting.json");
   const owner = { pid: process.pid, id: randomUUID() };
@@ -7469,7 +7719,7 @@ async function openManagerOnce() {
 }
 
 async function runManager() {
-  if (!readManifest()) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
+  ensureDirectory(installRoot);
   const inheritedToken = env.CODEX_MODEL_ROUTER_UI_TOKEN || null;
   const openPage = env.CODEX_MODEL_ROUTER_UI_NO_OPEN !== "1";
   if (!inheritedToken) {
@@ -7659,6 +7909,8 @@ function help() {
   console.log(`Codex 模型路由器 ${INSTALLER_VERSION}
 
 用法：
+  ${basename(scriptPath || "codex-model-router.command")}            （不帶指令：開啟網頁管理頁；尚未安裝時在網頁上完成首次設定）
+  ${basename(scriptPath || "codex-model-router.command")} menu       （終端選單）
   ${basename(scriptPath || "codex-model-router.command")} install
   ${basename(scriptPath || "codex-model-router.command")} ui
   ${basename(scriptPath || "codex-model-router.command")} ui-setup
@@ -7721,8 +7973,9 @@ hidden-models 用於單獨管理 Codex 內建目錄裡被標成隱藏的官方�
 
 imagegen 用於添加／設定中轉生圖技能 $router-imagegen，沿用現有憑證，不需 OPENAI_API_KEY。
 有多家供應商時會先問要用哪一家生圖。
-可複選 Image 2、Image 2.5 Sunburst、Image 2.5 Flare；多選時由 AI 按需求指定模型。
-選擇模型後自動偵測並添加成功項目：先測通用生圖，全部失敗時再測 Ark 任務介面。
+可複選 Image 2、Image 2.5 Sunburst、Image 2.5 Flare，以及 Nano Banana 2.1／Pro／2／2 Lite／初代；多選時由 AI 按需求指定模型。
+選擇模型後自動偵測並添加成功項目：GPT Image 先測通用生圖，全部失敗時再測 Ark 任務介面；
+Nano Banana 依序試 Chat Completions、Gemini 原生 generateContent 與通用 Images API。
 偵測可能產生費用，每個已選模型每種介面最多一次；不詢問介面、前綴或測試確認。
 都未通過會顯示「沒找到可用模型」。選擇模型時輸入 none 停用、cancel 返回，兩者不生圖。
 
@@ -7775,6 +8028,32 @@ async function chooseAction() {
   return action;
 }
 
+// 不帶指令執行：直接開啟網頁管理頁。什麼都沒裝時先只裝管理頁（捷徑與 Codex 入口），
+// 不安裝路由器、不加模型；連接供應商或調整全域上下文都在網頁上做。終端選單（menu）作為備用。
+async function startManager() {
+  const installed = Boolean(readManifest());
+  if (!installed) {
+    if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+    if (isWindows && !testMode) assertScriptHostAvailable();
+  }
+  if (!installed && !readManagerRecord()) {
+    printHeading("安裝網頁管理頁");
+    console.log("只安裝管理頁、捷徑與 Codex 裡的入口，不會改動模型設定；之後可在管理頁連接供應商。");
+    await installManagerOnly();
+  } else if (!installed) {
+    const record = readManagerRecord();
+    // 用較新的安裝器開啟時順便更新管理頁副本與入口。
+    if (compareVersions(INSTALLER_VERSION, record.version) === 1) await installManagerOnly();
+  }
+  printHeading("開啟網頁管理介面");
+  if (!installed) console.log("尚未連接供應商：可以在管理頁連接 API 供應商，或先只調整全域上下文。");
+  await openManager();
+  const menuCommand = isWindows
+    ? `powershell -ExecutionPolicy Bypass -File .\\${basename(scriptPath)} menu`
+    : `bash ${basename(scriptPath)} menu`;
+  console.log(`\n想改用終端選單操作，請執行：${menuCommand}`);
+}
+
 // 測試會 import 本檔以驗證版本比較等純函式，此時不能真的執行安裝流程。
 if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
   try {
@@ -7800,12 +8079,14 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       "imagegen",
       "relay-imagegen",
       "status",
+      "menu",
     ]);
     if (!requestedAction || versionAwareActions.has(requestedAction)) {
       await printVersionSummary();
     }
-    const action = requestedAction || (await chooseAction());
-    if (action === "ui" || action === "web" || action === "manager") {
+    const action = requestedAction === "menu" ? await chooseAction() : (requestedAction || "start");
+    if (action === "start") await startManager();
+    else if (action === "ui" || action === "web" || action === "manager") {
       // 1.27.3／1.27.4 的更新交接只有傳權杖、沒有 --foreground，仍須沿用原網址與權杖。
       if (process.argv.includes("--foreground") || env.CODEX_MODEL_ROUTER_UI_TOKEN) await runManager();
       else await openManager();

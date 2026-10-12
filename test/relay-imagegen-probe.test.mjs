@@ -5,14 +5,14 @@ import { once } from "node:events";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer, imagegen } = await loadPayloads();
-const all = imagegen.IMAGE_MODELS;
+const all = imagegen.GPT_IMAGE_MODELS;
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
 const base = { model: all[2], apiRoot: "https://gateway.example/v1", apiKey: "probe-fixture-secret" };
 
-test("探測規劃永遠限定三種模型，列出的原名優先，隱藏模型使用推斷的前綴", () => {
+test("探測規劃只含支援的圖片模型，列出的原名優先，隱藏模型使用推斷的前綴", () => {
   const plan = installer.planRelayImageProbes([all[0], "ark/" + all[1], "gpt-image-1.5"], "akr");
-  assert.deepEqual(plan.map((m) => m.upstreamModel), [all[0], "ark/" + all[1], "akr/" + all[2]]);
-  assert.deepEqual(installer.planRelayImageProbes([], "none").map((m) => m.upstreamModel), all);
+  assert.deepEqual(plan.slice(0, 3).map((m) => m.upstreamModel), [all[0], "ark/" + all[1], "akr/" + all[2]]);
+  assert.deepEqual(installer.planRelayImageProbes([], "none").map((m) => m.upstreamModel), imagegen.IMAGE_MODELS);
   assert.throws(() => installer.planRelayImageProbes([], "ark/?key=secret"));
 });
 

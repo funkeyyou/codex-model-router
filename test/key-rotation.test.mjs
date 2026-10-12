@@ -62,8 +62,26 @@ test("key-pool.json：忽略格式不對的項目、重複與保留的 primary�
   assert.deepEqual(router.keySlotsFor(provider, pool).map((slot) => slot.id), ["primary", "k-1", "k-3", "k-4", "k-5", "k-6"]);
   assert.deepEqual(router.keySlotsFor({ ...provider, id: "none" }, pool).map((slot) => slot.id), ["primary"]);
   assert.deepEqual(installer.normalizeKeyPoolFile({ providers: { default: [{ id: "k-1", keychainService: "s", tail: "abcdef" }] } }),
-    { version: 1, providers: { default: [{ id: "k-1", keychainService: "s", keychainAccount: "codex", credentialPath: null, tail: "cdef", addedAt: null }] } });
+    { version: 1, providers: { default: [{ id: "k-1", keychainService: "s", keychainAccount: "codex", credentialPath: null, tail: "cdef", addedAt: null, models: null }] },
+      primaryModels: {} });
   assert.equal(installer.maskKeyTail("wxyz"), "••••wxyz");
+});
+
+test("各 Key 的模型清單：只在有這個模型的 Key 之間切換；清單未知視為支援；都不支援時退回全部", () => {
+  const file = installer.normalizeKeyPoolFile({ providers: { default: [
+    { id: "k-a", keychainService: "s.a", models: ["model-a", "model-b", 3, "model-b"] },
+    { id: "k-b", keychainService: "s.b", models: [] },
+  ], gone: [] }, primaryModels: { default: ["model-a"], gone: ["x"] } });
+  assert.deepEqual(file.providers.default.map((item) => item.models), [["model-a", "model-b"], null]);
+  assert.deepEqual(file.primaryModels, { default: ["model-a"] }, "沒有備用 Key 的供應商不保留主 Key 清單");
+  const pool = router.normalizeKeyPool(file);
+  const provider = { id: "default", keychainService: "svc" };
+  const slots = router.keySlotsFor(provider, pool);
+  const ids = (model) => router.keySlotsForModel(slots, model).map((slot) => slot.id);
+  assert.deepEqual(ids("model-a"), ["primary", "k-a", "k-b"]);
+  assert.deepEqual(ids("model-b"), ["k-a", "k-b"], "主 Key 沒有的模型不送主 Key；k-b 清單未知仍保留");
+  assert.deepEqual(router.keySlotsForModel(slots.slice(0, 2), "model-z").map((slot) => slot.id), ["primary", "k-a"], "都不支援時不擋請求");
+  assert.deepEqual(ids(null), ["primary", "k-a", "k-b"]);
 });
 
 const provider = { id: "default", apiRoot: "https://relay.example/v1", keychainService: "svc", keychainAccount: "codex", credentialPath: null };
@@ -146,6 +164,24 @@ test("全部 Key 都失敗時回最後一把的上游錯誤；400／500 不換 K
     assert.equal(seen.length, 1, `HTTP ${status} 不應該換 Key`);
   }
 });
+
+test("主 Key 沒有的模型直接用有它的備用 Key；換到備用 Key 後，主 Key 才有的模型仍送主 Key", async (t) => {
+  const { instance, origin } = await startRouter(t, { providers: { default: [
+    { id: "k-a", keychainService: "svc.k-a", models: ["model-a", "model-b"] },
+  ] }, primaryModels: { default: ["model-c"] } });
+  const originalFetch = globalThis.fetch;
+  const seen = [];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    if (String(url).endsWith("/responses")) seen.push(new Headers(options.headers).get("authorization"));
+    return completed();
+  });
+  assert.equal(await send(instance), 200);
+  assert.deepEqual(seen, ["Bearer main-k-a"], "model-a 只在備用 Key 上，不先打主 Key");
+  const health = await originalFetch(`${origin}/healthz`).then((response) => response.json());
+  assert.equal(health.stats.keyModelRoutes, 1);
+  assert.equal(health.stats.keyRotations, 0, "不是失敗換 Key");
+});
+
 
 test("沒有備用 Key 時與以前相同：只送一次，Key 沒變不重送", async (t) => {
   const { instance, origin } = await startRouter(t, null);

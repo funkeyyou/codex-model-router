@@ -31,7 +31,7 @@ curl -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/c
 curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
 ```
 
-A menu appears first; press Enter to choose the default item 1 (install). The installer then asks for your Base URL, API key, and the models to add. API key input is hidden; paste it and press Enter. Selected models are tested with real API requests, which may incur small charges. Installer prompts are currently in Traditional Chinese; the web manager is available in English.
+It first installs the web manager (with a shortcut and an entry in Codex; no model settings are changed) and opens it in your browser. Click **Connect an API provider**, pick a common provider or enter a Base URL and API key, and choose the models to add to finish installing. Selected models are tested with real API requests, which may incur small charges. Not ready to add models? You can just adjust the global context under **Settings** for now. If it's already installed, the manager opens directly. To use the terminal menu instead, add `menu` to the command (terminal prompts are currently in Traditional Chinese).
 
 For a pinned version, download the installers and `SHA256SUMS` from [Releases](https://github.com/funkeyyou/codex-model-router/releases).
 
@@ -57,11 +57,12 @@ Most tasks can be done in the web manager. Open it from any of:
 
 *Provider names and URLs in the screenshots are replaced or blurred.*
 
-You can also run commands from the folder containing the installer: `bash codex-model-router.sh <command>` on macOS, or `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 <command>` on Windows. Run it without a command to get the menu.
+You can also run commands from the folder containing the installer: `bash codex-model-router.sh <command>` on macOS, or `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 <command>` on Windows. Without a command it opens the web manager; `menu` shows the terminal menu.
 
 | Command | What it does |
 | --- | --- |
 | `ui` | Open the web manager |
+| `menu` | Terminal menu (fallback for the web manager) |
 | `update` | Upgrade, keeping all settings |
 | `add`, `remove` | Add or remove custom models |
 | `providers` | Add or remove providers, change API keys |
@@ -73,7 +74,7 @@ You can also run commands from the folder containing the installer: `bash codex-
 
 ## Update and uninstall
 
-**Update**: use the version menu at the top left of the web manager, or rerun the install command above and enter `3` ("更新到最新版本", same as `update`). Your Base URL, API keys, and models are kept; a failed update is rolled back automatically.
+**Update**: use the version menu at the top left of the web manager, or run the `update` command. Your Base URL, API keys, and models are kept; a failed update is rolled back automatically.
 
 **Uninstall**: run `rollback`. Chats that used Claude models may stop working with official models afterwards, so start a new chat for them ([details in Chinese](docs/troubleshooting.zh-TW.md#回退之後用過-claude-模型的舊對話會壞掉)).
 

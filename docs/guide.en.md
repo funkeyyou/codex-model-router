@@ -39,6 +39,8 @@ Tool and attachment support varies. Claude and Chat Completions translation cann
 
 ## Web manager
 
+Since v1.31.0, running the installer without a command installs only the web manager (shortcut and Codex entry, no model settings changed) and opens it. The router is installed when you connect an API provider in the manager; until then you can still adjust the global context under Settings. With only the manager installed, `rollback` removes just the manager, its shortcut and the Codex entry. Use `menu` for the terminal menu.
+
 Since v1.27.0, menu item 2 or the `ui` command opens a local management page in your browser:
 
 ```bash
@@ -57,8 +59,8 @@ Git projects may also use the optional [Actions configuration](../.codex/environ
 - **Models**: drag to reorder; edit display names, context and output limits; remove models. When adding models you can pick an API provider or the Claude subscription. New models default to a 1,000,000-token context and 128,000-token output, capped by any smaller limit the upstream reports.
 - **Providers**: add an API key provider (a relay, OpenAI-compatible service, or the official Anthropic API) or a Claude subscription (Claude CLI), change API keys, and remove providers. The Claude subscription path checks the CLI installation, version, and subscription sign-in in order, and lets you fix each step in place. Since v1.28.0 you can edit a provider's display name and model prefix: the name is display-only, so the internal ID, existing chats, and API key stay the same; the prefix sets "prefix/model" in the picker, replaces an upstream prefix such as `ark/`, changes only auto-generated names (manual renames are kept), and also applies to models added later. Changes are previewed first and don't restart the router. For the Claude subscription, only the prefix can be changed for now.
   - **Common providers**: when adding an API key provider you can pick presets such as DeepSeek, Kimi, Qwen, Zhipu GLM / Z.ai, MiniMax, OpenRouter, and xAI (international and mainland China endpoints). The Base URL is filled in and a link to the provider's API key page is shown; `providers add` in the terminal accepts a number too. Endpoints come from [CC Switch](https://github.com/farion1231/cc-switch)'s public presets; the models you can use depend on what your key returns.
-  - **Backup keys**: each provider can have up to 5 backup keys, which you can enter all at once. You are asked when adding a provider, installing, or reconfiguring, and can add them later on the Providers page or with `providers backup` in the terminal. The router keeps using the key marked "In use" and only switches to the next one, resending the request, when it gets 401/403 (rejected), 402 (quota exhausted), or 429 (rate limited). The failed key cools down for a while (429 follows the upstream Retry-After). Provider cards show each key's last four characters and status. Adding or removing backup keys doesn't restart the router.
-- **Image generation**: detect, enable, or disable relay image generation.
+  - **Backup keys**: each provider can have up to 5 backup keys, which you can enter all at once. You are asked when adding a provider, installing, or reconfiguring, and can add them later on the Providers page or with `providers backup` in the terminal. The router keeps using the key marked "In use" and only switches to the next one, resending the request, when it gets 401/403 (rejected), 402 (quota exhausted), or 429 (rate limited). The failed key cools down for a while (429 follows the upstream Retry-After). Provider cards show each key's last four characters and status. Adding or removing backup keys doesn't restart the router. Since v1.31.0 each key's model list is remembered: Add models lists the models of every key (those only a backup key has are marked "Backup key only" and tested with that key), and the router only switches among keys that have the requested model.
+- **Image generation**: detect, enable, or disable relay image generation. Since v1.31.0 this includes Google's Nano Banana models (`gemini-nano-banana-2.1`, `gemini-3-pro-image` / Pro, `gemini-3.1-flash-image`, `gemini-3.1-flash-lite-image`, `gemini-2.5-flash-image`; `-preview` names are recognized). Each one is tested through Chat Completions, the native Gemini `generateContent` API, and the standard Images API in turn, and keeps the first interface that works. Size and quality stay `auto`; the output format is chosen upstream. Google AI Studio's free tier has no image quota.
 - **Settings**: set or remove the global context window, force-show official models hidden by Codex's bundled catalog, and download or copy a diagnostics bundle to attach to bug reports (see [troubleshooting](troubleshooting.md)).
 - **Version**: shows the current version, lists changes when a new release exists, and updates in one click.
 
@@ -92,7 +94,7 @@ Since v1.29.4, you can add Claude models with the official `https://api.anthropi
 
 ## Update and rollback
 
-Download the latest installer with the [install command](../README.en.md#install), then select the update option (menu item 3), or run:
+Use the version menu in the web manager, or download the latest installer with the [install command](../README.en.md#install) and run:
 
 ```bash
 bash codex-model-router.sh update

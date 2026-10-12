@@ -175,7 +175,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.30.1";
+const INSTALLER_VERSION = "1.31.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -226,7 +226,13 @@ export const RELAY_IMAGE_MODELS = [
   { id: "gpt-image-2", label: "Image 2", description: "上一代圖片模型，適合既有流程與相容需求。" },
   { id: "gpt-image-2.5-sunburst", label: "Image 2.5 Sunburst", description: "偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。" },
   { id: "gpt-image-2.5-flare", label: "Image 2.5 Flare", description: "偏重速度，適合一般生圖與快速迭代。" },
+  { id: "gemini-nano-banana-2.1", label: "Nano Banana 2.1", description: "Google 目前的主力生圖模型：速度快、成本低，畫質、文字渲染與多輪改圖一致性都比 Nano Banana 2 好。" },
+  { id: "gemini-3-pro-image", label: "Nano Banana Pro", description: "Google 品質最高的生圖模型：適合複雜構圖、精準文字、品牌一致性與精細控制，較慢也較貴。" },
+  { id: "gemini-3.1-flash-image", label: "Nano Banana 2", description: "上一代主力：兼顧速度、4K 輸出與多張參考圖的一致性。" },
+  { id: "gemini-3.1-flash-lite-image", label: "Nano Banana 2 Lite", description: "最快、最便宜，適合大量出圖；不擅長多張參考圖或連續改圖。" },
+  { id: "gemini-2.5-flash-image", label: "Nano Banana", description: "初代舊型號，適合既有流程；Google 建議改用 Nano Banana 2 Lite。" },
 ];
+const RELAY_IMAGE_MODE_LABELS = { images: "通用", "ark-task": "Ark", chat: "Chat", gemini: "Gemini 原生" };
 const installHash = createHash("sha256")
   .update(codexHome)
   .digest("hex")
@@ -474,6 +480,14 @@ const codexBin = findExecutable(codexCandidates());
 function readManifest() {
   if (!existsSync(manifestPath)) return null;
   return JSON.parse(readFileSync(manifestPath, "utf8"));
+}
+
+// 只安裝網頁管理頁（尚未連接供應商）時的記錄：版本與 Codex 入口的回退資料。
+// 完整安裝後這些資料改存在 install.json，這份記錄隨即刪除。
+const managerRecordPath = join(installRoot, "manager-install.json");
+function readManagerRecord() {
+  if (!existsSync(managerRecordPath)) return null;
+  try { return JSON.parse(readFileSync(managerRecordPath, "utf8")); } catch { return null; }
 }
 
 function extractRouterSource() {
@@ -818,6 +832,7 @@ export const MAX_BACKUP_KEYS = 5;
 
 export function normalizeKeyPoolFile(source) {
   const providers = {};
+  const primaryModels = {};
   const entries = source && typeof source === "object" && source.providers && typeof source.providers === "object"
     ? source.providers : {};
   for (const [providerId, list] of Object.entries(entries)) {
@@ -831,10 +846,22 @@ export function normalizeKeyPoolFile(source) {
         credentialPath: typeof item.credentialPath === "string" && item.credentialPath ? item.credentialPath : null,
         tail: typeof item.tail === "string" ? item.tail.slice(-4) : "",
         addedAt: typeof item.addedAt === "string" ? item.addedAt : null,
+        models: normalizeKeyModels(item.models),
       }));
-    if (kept.length) providers[providerId] = kept;
+    if (kept.length) {
+      providers[providerId] = kept;
+      const primary = normalizeKeyModels(source.primaryModels?.[providerId]);
+      if (primary) primaryModels[providerId] = primary;
+    }
   }
-  return { version: 1, providers };
+  return { version: 1, providers, primaryModels };
+}
+
+// 每把 Key 查到的模型清單：路由器只在有這個模型的 Key 之間切換。查不到時為 null（視為都支援）。
+export function normalizeKeyModels(list) {
+  if (!Array.isArray(list)) return null;
+  const models = [...new Set(list.filter((id) => typeof id === "string" && id && id.length <= 200 && !/[\x00-\x1f\x7f]/.test(id)))];
+  return models.length ? models.slice(0, 5000) : null;
 }
 
 function readKeyPoolFile() {
@@ -857,6 +884,63 @@ function writeKeyPoolFile(pool) {
 
 export function backupKeysOf(pool, providerId) {
   return Array.isArray(pool?.providers?.[providerId]) ? pool.providers[providerId] : [];
+}
+
+// 用某把 Key 查模型清單。查不到（網路錯誤、非 2xx、格式不符）時 models 為 null。
+async function fetchKeyModels(apiRoot, key) {
+  try {
+    const response = await fetchWithTimeout(`${apiRoot}/models`, { headers: upstreamAuthHeaders(apiRoot, key) }, 15000);
+    if (!response.ok) {
+      await response.arrayBuffer().catch(() => {});
+      return { status: response.status, models: null };
+    }
+    let payload = null;
+    try { payload = await response.json(); } catch { /* 不是 JSON 就當作查不到清單。 */ }
+    return { status: response.status, models: payload ? normalizeKeyModels(parseModelList(payload)) : null };
+  } catch (error) {
+    return { status: null, models: null, problem: error?.name === "AbortError" ? "逾時" : error.message };
+  }
+}
+
+// 主 Key 換了或重新查過：更新它的模型清單（只有這家有備用 Key 時才需要）。
+function rememberPrimaryModels(providerId, models) {
+  try {
+    const pool = readKeyPoolFile();
+    if (!backupKeysOf(pool, providerId).length) return;
+    pool.primaryModels = { ...(pool.primaryModels || {}) };
+    if (models) pool.primaryModels[providerId] = models; else delete pool.primaryModels[providerId];
+    writeKeyPoolFile(pool);
+  } catch { /* 清單只用來挑 Key，存不下時路由器把主 Key 視為支援全部模型。 */ }
+}
+
+// 合併主 Key 與備用 Key 的模型清單，順便把各自的清單記進 key-pool.json 給路由器用。
+// 只有備用 Key 有的模型列在主 Key 的後面，並用 keyFor 取得能測它的那把 Key。
+async function discoverProviderModels(provider, primaryKey) {
+  const discovery = await discoverApiRoot(provider.baseUrl, primaryKey);
+  const pool = readKeyPoolFile();
+  const backups = backupKeysOf(pool, provider.id);
+  if (!backups.length) return { discovery, onlyBackup: new Set(), keyFor: () => primaryKey };
+  const lists = await Promise.all(backups.map(async (item) => {
+    let key;
+    try { key = readApiKey(item.keychainService); } catch { return { item, key: null, models: null }; }
+    return { item, key, models: (await fetchKeyModels(discovery.apiRoot, key)).models };
+  }));
+  const primarySet = new Set(discovery.models);
+  try {
+    pool.primaryModels = { ...(pool.primaryModels || {}), [provider.id]: discovery.models };
+    for (const { item, models } of lists) if (models) item.models = models;
+    writeKeyPoolFile(pool);
+  } catch (error) {
+    console.error(`各 Key 的模型清單未能保存：${error.message}`);
+  }
+  const extra = [];
+  for (const { models } of lists) {
+    for (const model of models || []) if (!primarySet.has(model) && !extra.includes(model)) extra.push(model);
+  }
+  if (extra.length) console.log(`備用 Key 另外提供 ${extra.length} 個主 Key 沒有的模型。`);
+  const keyFor = (model) => primarySet.has(model) ? primaryKey
+    : lists.find((entry) => entry.key && entry.models?.includes(model))?.key || primaryKey;
+  return { discovery: { ...discovery, models: [...discovery.models, ...extra] }, onlyBackup: new Set(extra), keyFor };
 }
 
 // 供應商被移除或整個回退時呼叫：刪掉這些備用 Key 的鑰匙圈項目／密文檔與清單記錄。
@@ -3464,7 +3548,9 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
   return { route, transient: false, transientEfforts: probe.transientEfforts || [] };
 }
 
-async function install() {
+// preset 由網頁管理頁的首次設定帶入：Base URL、Key、查詢結果與所選模型都已確定，
+// 不能再向終端提問。終端安裝（preset 為 null）的流程不變。
+async function install(preset = null) {
   const existingManifest = readManifest();
   if (existingManifest?.version) assertInstallerNotOlder(existingManifest.version);
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -3479,38 +3565,52 @@ async function install() {
   const primary = existingProviders[0] || null;
   const otherProviders = existingProviders.slice(1);
   const primaryId = primary?.id || DEFAULT_PROVIDER_ID;
+  // bare：只裝路由器、不加 API 供應商（網頁上只連接 Claude 訂閱時使用），模型稍後另外寫入。
+  const bare = Boolean(preset?.bare);
+  if (bare && existingManifest) fail("路由器已經安裝。");
   if (otherProviders.length > 0) {
     console.log(`這裡設定的是主要供應商「${primaryId}」；其他 ${otherProviders.length} 家供應商與它們的模型保持不變。`);
   }
-  const defaultBaseUrl = primary?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
-  const baseUrl = normalizeUrl(
-    env.CODEX_MODEL_ROUTER_BASE_URL ||
-      (await askProviderBaseUrl(defaultBaseUrl)),
-  );
-  const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
-  if (clash) {
-    fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
-  }
-  const keychainService = keychainServiceFor(baseUrl);
+  let baseUrl = null;
+  let keychainService = null;
+  let apiKey = null;
+  let discovery = { apiRoot: null, models: [] };
+  let selectedModels = [];
+  if (!bare) {
+    const defaultBaseUrl = primary?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
+    baseUrl = normalizeUrl(preset?.baseUrl ||
+      env.CODEX_MODEL_ROUTER_BASE_URL ||
+        (await askProviderBaseUrl(defaultBaseUrl)));
+    const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
+    if (clash) {
+      fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要調整它的模型請用「添加自訂模型」或「刪除自訂模型」。`);
+    }
+    keychainService = keychainServiceFor(baseUrl);
 
-  if (keychainHas(keychainService)) {
-    const update = await confirm(
-      `${secretStoreLabel}中已存在 API Key，是否替換？`,
-      false,
-    );
-    if (update) await storeApiKey(keychainService, baseUrl);
-  } else {
-    await storeApiKey(keychainService, baseUrl);
-  }
-  const apiKey = readApiKey(keychainService);
+    if (preset) {
+      storeApiKeyValue(keychainService, baseUrl, preset.apiKey);
+    } else if (keychainHas(keychainService)) {
+      const update = await confirm(
+        `${secretStoreLabel}中已存在 API Key，是否替換？`,
+        false,
+      );
+      if (update) await storeApiKey(keychainService, baseUrl);
+    } else {
+      await storeApiKey(keychainService, baseUrl);
+    }
+    apiKey = readApiKey(keychainService);
 
-  console.log("正在發現可用模型..." );
-  const discovery = await discoverApiRoot(baseUrl, apiKey);
-  console.log(`API 根地址：${discovery.apiRoot}`);
-  const selectedModels = await selectModels(discovery.models);
-  console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
-  if (!(await confirm("是否繼續進行能力探測？", true))) {
-    fail("已在修改配置前取消安裝。" );
+    discovery = preset?.discovery;
+    if (!discovery) {
+      console.log("正在發現可用模型..." );
+      discovery = await discoverApiRoot(baseUrl, apiKey);
+    }
+    console.log(`API 根地址：${discovery.apiRoot}`);
+    selectedModels = preset ? preset.models : await selectModels(discovery.models);
+    console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
+    if (!preset && !(await confirm("是否繼續進行能力探測？", true))) {
+      fail("已在修改配置前取消安裝。" );
+    }
   }
 
   // 重新配置時，這次探測遇到的暫時性失敗不足以推翻上次已經驗過的結果。
@@ -3547,9 +3647,10 @@ async function install() {
     }
     // 重新探測的既有模型沿用原本的顯示名稱：使用者可能手動改過名，或依前綴命名過。
     const previousName = previousRoutes.get(model)?.displayName;
-    routes.push(withDefaultModelPrefix(previousName && kept !== "model" ? { ...route, displayName: previousName } : route));
+    const named = withDefaultModelPrefix(previousName && kept !== "model" ? { ...route, displayName: previousName } : route);
+    routes.push(preset?.defaults ? applyNewModelDefaults(named, preset.defaults) : named);
   }
-  if (routes.length === 0) fail("選中的模型均未通過 Responses API 探測。" );
+  if (routes.length === 0 && !bare) fail("選中的模型均未通過 Responses API 探測。" );
   // 新模型依主要供應商的模型前綴命名；沿用的名稱只有仍是預設規則產生的才會補上前綴。
   routes.splice(0, routes.length, ...applyModelPrefix(routes, primary?.modelPrefix || null));
   if (keptModels.length > 0 || keptEfforts.length > 0) {
@@ -3559,7 +3660,7 @@ async function install() {
     console.log("  上游恢復後重跑一次安裝器，即可用最新探測結果覆蓋。" );
   }
 
-  const bundledCatalog = loadCatalogTemplates();
+  const bundledCatalog = await withCodexLock(() => loadCatalogTemplates());
   const discoveredOfficial = bundledCatalog.models.filter(
     (model) => !String(model.slug).startsWith("custom/"),
   );
@@ -3570,7 +3671,7 @@ async function install() {
     readSettingsIfExists().forceListedModels,
   );
   const officialModels = applyForcedVisibility(discoveredOfficial, forceListedModels);
-  const providers = [{
+  const providers = bare ? [...otherProviders] : [{
     id: primaryId,
     baseUrl,
     apiRoot: discovery.apiRoot,
@@ -3579,6 +3680,8 @@ async function install() {
     credentialPath: isWindows ? credentialFileFor(keychainService) : null,
     // 顯示名稱與模型前綴屬於這家供應商本身，重新配置 Base URL 或 Key 時保留。
     ...(primary?.name ? { name: primary.name } : {}),
+    // 網頁首次設定若選了常用供應商，直接用它的名稱顯示，之後可在供應商頁修改。
+    ...(!primary && preset && presetForBaseUrl(baseUrl) ? { name: presetForBaseUrl(baseUrl).name } : {}),
     ...(primary?.modelPrefix ? { modelPrefix: primary.modelPrefix } : {}),
   }, ...otherProviders];
   // 主要供應商的項目依這次探測重建；其他供應商的沿用現有目錄裡那份。
@@ -3598,6 +3701,8 @@ async function install() {
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
   const userConfig = await readUserConfig();
+  // 先前只裝了管理頁：沿用它記下的 Codex 入口回退資料，回退時才能一併還原。
+  const entrySource = existingManifest || readManagerRecord();
   const previousConfig =
     existingManifest?.previousConfig || {
       modelProvider: deepGet(userConfig.config, "model_provider"),
@@ -3689,8 +3794,8 @@ async function install() {
       configVersionAfterInstall: writeResult.version || null,
       codexBin,
       nodeBin,
-      ...(existingManifest?.managerFileHandler ? { managerFileHandler: existingManifest.managerFileHandler } : {}),
-      ...(existingManifest?.managerMcpEntry ? { managerMcpEntry: existingManifest.managerMcpEntry } : {}),
+      ...(entrySource?.managerFileHandler ? { managerFileHandler: entrySource.managerFileHandler } : {}),
+      ...(entrySource?.managerMcpEntry ? { managerMcpEntry: entrySource.managerMcpEntry } : {}),
     }, providers);
     writeJsonAtomic(manifestPath, manifest);
     await waitForPickerModels(allRoutes,
@@ -3728,16 +3833,14 @@ async function install() {
           renameSync(path, join(failedInstallDir, basename(path)));
         }
       }
-      if (existsSync(installRoot)) {
-        renameSync(installRoot, join(failedInstallDir, "model-router"));
-      }
+      archiveFailedInstallRoot(join(failedInstallDir, "model-router"));
     }
     throw error;
   }
 
   printHeading("安裝完成");
   console.log(`路由器：http://127.0.0.1:${port}`);
-  console.log("已添加模型：");
+  if (routes.length) console.log("已添加模型：");
   for (const route of routes) {
     const effortText = route.efforts.length ? route.efforts.join(", ") : "使用供應商預設值";
     console.log(`  - ${route.displayName}`);
@@ -3752,7 +3855,7 @@ async function install() {
     primary?.keychainService &&
     primary.keychainService !== keychainService &&
     !otherProviders.some((provider) => provider.keychainService === primary.keychainService) &&
-    !testMode
+    !testMode && !preset
   ) {
     const removeOldKey = await confirm(
       `是否從${secretStoreLabel}中刪除上一個 Base URL 對應的 API Key？`,
@@ -3768,13 +3871,38 @@ async function install() {
     if (purged) console.log(`已移除上一個 Base URL 的 ${purged} 把備用 Key。`);
   }
   const installedPrimary = installedProviders(readSettingsIfExists(), readManifest())[0];
-  if (installedPrimary && !testMode) await askBackupKeys(installedPrimary);
+  let backupResult = null;
+  if (preset) {
+    if (installedPrimary && preset.backupKeys?.length) {
+      console.log("");
+      // 路由器已經裝好；備用 Key 出問題只回報，不回滾安裝。
+      try { backupResult = await addBackupKeys(installedPrimary, preset.backupKeys); }
+      catch (error) { console.error(`備用 Key 未加入：${error.message}`); }
+    }
+  } else if (installedPrimary && !testMode) await askBackupKeys(installedPrimary);
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
   console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
   console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
   console.log(`回退命令：${basename(scriptPath)} rollback`);
   printManagerLauncher(await installManagerLauncher());
-  await offerInstalledRelayImagegen();
+  if (existsSync(managerRecordPath)) rmSync(managerRecordPath, { force: true });
+  // 網頁首次設定不能在終端提問；中轉生圖改由管理頁的「生圖」頁設定。
+  if (!preset) await offerInstalledRelayImagegen();
+  return { added: routes.map(summarizeRoute), backupKeys: backupResult, restartDesktop: true };
+}
+
+// 首次安裝失敗時封存已寫入的檔案。網頁首次設定的管理頁本身也在這個目錄
+// （manager.json 鎖檔、啟動用的暫存程式），那些要留在原地，管理頁才能繼續運作。
+const MANAGER_RUNTIME_FILE = /^(manager\.json|manager-starting\.json|manager-handoff\.json|manager-install\.json|manager-entry(-[\w-]+)?\.mjs|manager-worker.*|manager-open\.(sh|js)|manager-icon\.svg|codex-model-router\.(sh|ps1))$/;
+function archiveFailedInstallRoot(destination) {
+  if (!existsSync(installRoot)) return;
+  const entries = readdirSync(installRoot).filter((name) => !MANAGER_RUNTIME_FILE.test(name));
+  if (entries.length === readdirSync(installRoot).length) {
+    renameSync(installRoot, destination);
+    return;
+  }
+  ensureDirectory(destination);
+  for (const name of entries) renameSync(join(installRoot, name), join(destination, name));
 }
 
 // 在既有安裝上追加模型：沿用已保存的 Base URL、API Key、端口與既有路由，
@@ -3813,7 +3941,7 @@ async function addModels() {
 
   const apiKey = readApiKey(keychainService);
   console.log("\n正在發現可用模型...");
-  const discovery = await discoverApiRoot(baseUrl, apiKey);
+  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
   const configured = new Set(providerRoutes.map((route) => route.upstreamModel));
   const available = discovery.models.filter((model) => !configured.has(model));
   if (available.length === 0) {
@@ -3833,7 +3961,7 @@ async function addModels() {
 
   // 這裡的模型都是新選的，沒有既有設定可以沿用；暫時性失敗只能略過。
   const outcomes = await probeModelsInParallel(selectedModels,
-    (model, log) => buildRouteForModel(discovery, apiKey, model, log, provider.id));
+    (model, log) => buildRouteForModel(discovery, keyFor(model), model, log, provider.id));
   const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean);
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
 
@@ -4055,7 +4183,6 @@ function requireInstallation() {
     fail("安裝設定或模型目錄不完整，請改用「安裝或重新配置」。");
   }
   const providers = installedProviders(settings, manifest);
-  if (providers.length === 0) fail("找不到中轉供應商設定，請改用「安裝或重新配置」。");
   return { manifest, settings, catalog, providers };
 }
 
@@ -4727,6 +4854,7 @@ async function executeRemoveProvider(providerId, { expectedDefault } = {}) {
 
 async function replaceProviderKey() {
   const { settings, providers } = requireInstallation();
+  if (!providers.length) fail("尚未連接 API 供應商，沒有可更換的 API Key。");
   printHeading("更換 API Key");
   const provider = providers.length === 1
     ? providers[0]
@@ -4738,18 +4866,13 @@ async function replaceProviderKey() {
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   await storeApiKey(provider.keychainService, provider.baseUrl);
   // 舊 Key 已被覆寫，驗證不通過也無從還原，只提醒使用者。
-  try {
-    const apiKey = readApiKey(provider.keychainService);
-    const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-      headers: upstreamAuthHeaders(provider.apiRoot, apiKey),
-    }, 15000);
-    await response.arrayBuffer();
-    console.log(response.ok
-      ? "已更換，新 Key 可以正常查詢模型清單。"
-      : `已更換，但用新 Key 查詢模型清單得到 HTTP ${response.status}，請確認 Key 是否正確。`);
-  } catch (error) {
-    console.log(`已更換，但無法用新 Key 查詢模型清單（${error.message}）。`);
-  }
+  const checked = await fetchKeyModels(provider.apiRoot, readApiKey(provider.keychainService));
+  rememberPrimaryModels(provider.id, checked.models);
+  console.log(checked.status != null && checked.status >= 200 && checked.status < 300
+    ? "已更換，新 Key 可以正常查詢模型清單。"
+    : checked.status != null
+      ? `已更換，但用新 Key 查詢模型清單得到 HTTP ${checked.status}，請確認 Key 是否正確。`
+      : `已更換，但無法用新 Key 查詢模型清單（${checked.problem}）。`);
   console.log(isWindows
     ? "路由器下一個請求就會改用新 Key，不必重啟。"
     : "路由器最晚 5 分鐘內改用新 Key；上游拒絕舊 Key 時會立即改用。");
@@ -4765,7 +4888,8 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
   if (!Array.isArray(settings.routes)) return { ok: false, reason: "no-routes" };
   const routes = settings.routes.map(withDefaultModelPrefix);
   const providers = installedProviders(settings, manifest);
-  if (providers.length === 0) return { ok: false, reason: "no-providers" };
+  // 只連接 Claude 訂閱時沒有 API 供應商，路由仍完整。
+  if (providers.length === 0 && !settings.claudeCli?.binary) return { ok: false, reason: "no-providers" };
   const providerIds = new Set(providers.map((provider) => provider.id));
   if (routes.some((route) => route.transport === "claude-cli"
     ? route.translate !== "anthropic" || !settings.claudeCli?.binary
@@ -4823,6 +4947,7 @@ export function isManagedCatalogPath(value, managedPath) {
 
 async function update() {
   const manifest = readManifest();
+  if (!manifest && readManagerRecord()) return updateManagerOnly();
   const settings = existsSync(settingsPath)
     ? JSON.parse(readFileSync(settingsPath, "utf8"))
     : null;
@@ -5162,7 +5287,10 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
     "使用者明確指定的模型優先；若未啟用，說明並請使用者從安裝器設定，不擅自啟用。",
     "一般生圖／快速迭代優先 Flare；需要精確修改或保留原圖細節時優先 Sunburst。",
     "Image 2 用於使用者指定、既有流程或相容需求。只從已啟用模型中選擇，速度與費用以中轉商實際回應為準。", "",
-    "若省略 --model，命令的生圖預設依 Flare → Sunburst → Image 2，改圖依 Sunburst → Flare → Image 2，選第一個已啟用模型。AI 應明確指定，不以這個順序代替需求判斷。", "",
+    "Nano Banana（Google Gemini 圖片模型）：一般生圖選 Nano Banana 2.1；複雜構圖、圖中要有精準文字或品牌一致性選 Nano Banana Pro；",
+    "大量、求快求便宜選 Nano Banana 2 Lite；Nano Banana 2 與初代 Nano Banana 只在使用者指定或既有流程使用。",
+    "GPT Image 與 Nano Banana 都啟用時，依需求與使用者偏好選擇；使用者沒指定時以 GPT Image 為主。", "",
+    "若省略 --model，命令的生圖預設依 Flare → Sunburst → Image 2 → Nano Banana 2.1 → Pro → 2 → 2 Lite → Nano Banana，改圖則先 Sunburst → Flare → Image 2 → Nano Banana Pro，選第一個已啟用模型。AI 應明確指定，不以這個順序代替需求判斷。", "",
     "## 執行", "",
     "把提示詞寫進 UTF-8 檔案，避免 shell 引號與特殊字元影響內容。使用絕對路徑。",
     "新圖片用 generate；改圖或帶參考圖用 edit，先查看本機參考圖，並寫清楚要保留及修改的部分。",
@@ -5175,6 +5303,8 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
     "--image 可重複提供；--quality 支援 auto、low、medium、high，兩個 2.5 模型另支援 xhigh、max。",
     "--size 可用 auto 或 WIDTHxHEIGHT；--background 可用 auto、opaque、transparent；--output-format 可用 png、jpeg、webp。",
     "list 回傳 apiMode=ark-task 時，使用已偵測到的 Ark 任務介面：size、quality 保持 auto，background 只能 auto 或 opaque。命令會省略不支援的欄位、以 JSON 傳送參考圖、查詢任務並下載結果；不要自行取得 API Key。",
+    "list 的 apiModes 列出每個模型的介面。Nano Banana（chat 或 gemini 介面）的 size、quality 只能 auto，background 不支援 transparent；比例、尺寸與構圖寫進提示詞。",
+    "Nano Banana 的輸出格式由上游決定，與 --out 副檔名不同時命令會改用實際格式的副檔名儲存，以回傳的 path 為準。",
     "--dry-run 只檢查參數，不送出圖片 API 請求。命令每次只生成一張圖，預設逾時 300 秒。",
     "已存在的輸出檔會被拒絕；換新檔名保留原圖。生成失敗或逾時時回報原因，不自動換模型重送，以免重複計費。",
     "成功後查看輸出圖片，確認符合需求，再以絕對路徑顯示圖片，並告知使用的模型及檔案位置。",
@@ -5183,17 +5313,24 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
 }
 
 // 此功能獨立提交／還原，不把技能寫檔失敗變成整個路由器安裝失敗。
-export function installRelayImageSkill({ models, aliases = {}, apiMode, providerId = null, root = relaySkillRoot,
+export function installRelayImageSkill({ models, aliases = {}, apiMode, apiModes: apiModesInput = null, providerId = null, root = relaySkillRoot,
   settingsFile = settingsPath, backupRoot = backupsRoot, nodePath = nodeBin,
   sourcePath = scriptPath, platform = process.platform } = {}) {
   const allowed = new Set(RELAY_IMAGE_MODELS.map((model) => model.id));
   if (!Array.isArray(models) || !models.length || models.some((model) => !allowed.has(model))) {
-    fail("中轉生圖只支援 Image 2、Sunburst、Flare，至少選擇一個。");
+    fail("中轉生圖只支援清單中的 GPT Image 與 Nano Banana 模型，至少選擇一個。");
   }
   models = [...new Set(models)];
   const previous = relayConfig(root, settingsFile);
   apiMode = apiMode || previous?.apiMode || "images";
   if (!["images", "ark-task"].includes(apiMode)) fail("無效的生圖介面設定。");
+  // 逐模型記錄介面；GPT Image 沿用共用的 apiMode（舊版命令也讀得懂）。
+  const apiModes = Object.fromEntries(models.map((model) => {
+    const gemini = model.startsWith("gemini-");
+    const mode = apiModesInput?.[model] || previous?.apiModes?.[model] || (gemini ? "chat" : apiMode);
+    if (!(gemini ? ["chat", "gemini", "images"] : ["images", "ark-task"]).includes(mode)) fail(`無效的生圖介面設定：${model}`);
+    return [model, mode];
+  }));
   // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。
   providerId = providerId || previous?.providerId || DEFAULT_PROVIDER_ID;
   if (!PROVIDER_ID_PATTERN.test(providerId)) fail("無效的生圖供應商設定。");
@@ -5223,7 +5360,8 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, provider
   }
   const upstreamModels = Object.fromEntries(models.map((model) => {
     const upstream = aliases[model] || previous?.upstreamModels?.[model] || model;
-    if (upstream !== model && !(typeof upstream === "string" && upstream.endsWith(`/${model}`) && !/[\s?#]/.test(upstream))) {
+    if (typeof upstream !== "string" || /[\s\x00-\x1f\x7f?#]/.test(upstream) ||
+      !(model.startsWith("gemini-") ? [model, `${model}-preview`] : [model]).some((name) => upstream === name || upstream.endsWith(`/${name}`))) {
       fail(`無效的圖片模型對應：${model}`);
     }
     return [model, upstream];
@@ -5241,7 +5379,7 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, provider
       writeFileSync(join(stage, name), content, { mode: 0o600 });
     }
     const config = { managedBy: RELAY_IMAGEGEN_OWNER, version: INSTALLER_VERSION,
-      routerSettingsPath: settingsFile, models, upstreamModels, apiMode, providerId, hashes };
+      routerSettingsPath: settingsFile, models, upstreamModels, apiMode, apiModes, providerId, hashes };
     writeJsonAtomic(join(stage, "config.json"), config);
     if (previous) {
       ensureDirectory(backup);
@@ -5266,9 +5404,10 @@ export function archiveRelayImageSkill(destination, root = relaySkillRoot, setti
 }
 
 export function resolveRelayImageAliases(models, availableModels) {
+  // 正式名稱優先，其次帶前綴的同名模型，再其次 -preview（部分中轉與 Google 的預覽版名稱）。
+  const find = (name) => availableModels.includes(name) ? name : availableModels.find((id) => id.endsWith(`/${name}`));
   return Object.fromEntries(models.map((model) => [model,
-    availableModels.includes(model) ? model : availableModels.find((id) => id.endsWith(`/${model}`)) || model,
-  ]));
+    find(model) || (model.startsWith("gemini-") && find(`${model}-preview`)) || model]));
 }
 
 export function detectRelayImageModels(availableModels) {
@@ -5325,7 +5464,8 @@ async function discoverRelayImageModelNames(apiRoot, apiKey) {
     let payload;
     try { payload = await response.json(); } catch { fail("上游模型清單無法解析，將以實際生圖測試確認。"); }
     if (!Array.isArray(payload?.data) && !Array.isArray(payload?.models)) fail("上游未返回有效模型清單，將以實際生圖測試確認。");
-    return parseModelList(payload);
+    // Google 的清單是 models/gemini-…，models/ 不是供應商前綴。
+    return parseModelList(payload).map((id) => typeof id === "string" ? id.replace(/^models\//, "") : id);
   } catch (error) {
     if (response) throw error;
     fail("無法讀取中轉模型清單，可自行確認前綴後進行生圖測試。");
@@ -5339,7 +5479,7 @@ async function configureRelayImagegen() {
   const providers = installedProviders(settings, readManifest());
   if (providers.length === 0) fail("找不到中轉供應商設定，請先執行「安裝或重新配置」。");
   printHeading("中轉 API 生圖");
-  console.log(`${providers.length > 1 ? "沿用已設定的中轉供應商與憑證" : "沿用現有中轉 Base URL 與憑證"}。偵測會實際生圖並依供應商計費；先測通用介面，全部未通過時自動改測 Ark 任務介面。`);
+  console.log(`${providers.length > 1 ? "沿用已設定的中轉供應商與憑證" : "沿用現有中轉 Base URL 與憑證"}。偵測會實際生圖並依供應商計費；GPT Image 先測通用介面，全部未通過時改測 Ark 任務介面；Nano Banana 依序試 Chat、Gemini 原生與通用介面。`);
   console.log("先選擇要偵測的模型，只有勾選的項目會進行生圖測試；下列模型尚未驗證可用性。");
   RELAY_IMAGE_MODELS.forEach((model, index) => console.log(`  ${index + 1}. ${model.label} — ${model.description}`));
   const defaultTests = current?.models?.map((id) => RELAY_IMAGE_MODELS.findIndex((model) => model.id === id) + 1).filter(Boolean).join(",") || "3";
@@ -5369,7 +5509,8 @@ function disableRelayImagegen() {
 }
 
 // 偵測並啟用中轉生圖，終端選單與網頁共用：推斷名稱前綴、只對勾選的模型實際生圖
-// （先通用介面，全部失敗才改 Ark 任務介面）、保存測試圖，再安裝技能。
+// （GPT Image 先通用介面，全部失敗才改 Ark 任務介面；Nano Banana 逐一試 chat、Gemini 原生、Images API）、
+// 保存測試圖，再安裝技能。
 // 沒有模型通過時不動既有技能，回傳 available 為空陣列。
 async function runRelayImagegenSetup({ provider, selected, current, settings, providers }) {
   const currentProviderId = current ? current.providerId ?? DEFAULT_PROVIDER_ID : null;
@@ -5386,7 +5527,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   const candidates = planRelayImageProbes(names, prefix).filter((model) => selected.includes(model.id));
   console.log("將依序測試：");
   candidates.forEach((model) => console.log(`  ${model.label}：${model.upstreamModel}`));
-  console.log(`每種介面最多測 ${candidates.length} 次，每個已選模型各一張；通用介面使用低品質，Ark 尺寸與品質由上游決定。`);
+  console.log("每個已選模型每種介面最多測一次、每次一張；通過就不再試其他介面。通用介面使用低品質，Ark 與 Nano Banana 的尺寸與品質由上游決定。");
   // 用 data URL 載入同一份獨立命令，測試與正式生圖共用回應驗證。
   const { discoverUsableRelayImages } = await import(`data:text/javascript;base64,${Buffer.from(loadImagegenSource()).toString("base64")}`);
   const probeRoot = join(installRoot, "imagegen-probes", timestamp());
@@ -5395,7 +5536,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   let discovery;
   try {
     discovery = await discoverUsableRelayImages({ candidates, apiRoot: provider.apiRoot, apiKey,
-      onProbe: (mode, model, index) => console.log(`[${index + 1}/${candidates.length}] ${mode === "images" ? "通用" : "Ark"}：正在測試 ${model.upstreamModel}...`) });
+      onProbe: (mode, model) => console.log(`[${RELAY_IMAGE_MODE_LABELS[mode] || mode}] 正在測試 ${model.upstreamModel}...`) });
   } finally { clearInterval(progress); }
   try {
     writeJsonAtomic(join(installRoot, "imagegen-last-check.json"), {
@@ -5406,7 +5547,7 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   if (!available.length) { console.log("沒找到可用模型。"); return { available: [], discovery }; }
   for (const model of available) {
     ensureDirectory(probeRoot);
-    const imagePath = join(probeRoot, `${model.id}.png`);
+    const imagePath = join(probeRoot, `${model.id}.${model.format === "jpeg" ? "jpg" : model.format || "png"}`);
     writeFileSync(imagePath, model.bytes, { flag: "wx", mode: 0o600 });
     console.log(`  通過，已收到圖片：${imagePath}`);
   }
@@ -5415,12 +5556,15 @@ async function runRelayImagegenSetup({ provider, selected, current, settings, pr
   console.log("可複選：多個模型交由 AI 依需求選擇，使用者指定優先；只選一個就固定使用。");
   const models = available.map((model) => model.id);
   const aliases = Object.fromEntries(available.map((model) => [model.id, model.upstreamModel]));
-  const result = installRelayImageSkill({ models, aliases, apiMode: discovery.apiMode, providerId: provider.id });
+  const result = installRelayImageSkill({ models, aliases, apiMode: discovery.apiMode,
+    apiModes: discovery.apiModes, providerId: provider.id });
   console.log(`已啟用 $router-imagegen：${result.root}${providers.length > 1 ? `（供應商 ${providerName(provider)}）` : ""}`);
   if (result.backup) console.log(`備份：${result.backup}`);
   if (result.preserved.length) console.log(`保留手動修改的檔案：${result.preserved.join(", ")}`);
   console.log("請建立新任務使用 $router-imagegen；若尚未出現，重新啟動 Codex。所選模型已通過本次生圖測試。");
-  if (discovery.apiMode === "ark-task") console.log("Ark 生圖需要此版本的本機路由器；若只執行了 imagegen，請執行同一份安裝器的 update 更新路由器。");
+  if (Object.values(discovery.apiModes || {}).some((mode) => mode !== "images")) {
+    console.log("Ark 與 Nano Banana 生圖需要此版本的本機路由器；若只執行了 imagegen，請執行同一份安裝器的 update 更新路由器。");
+  }
   return { available, discovery, result, probeRoot };
 }
 
@@ -5435,7 +5579,7 @@ function refreshRelayImagegen() {
   const existing = relayConfig();
   if (!existing) return;
   const result = installRelayImageSkill({ models: existing.models, aliases: existing.upstreamModels, apiMode: existing.apiMode,
-    providerId: existing.providerId });
+    apiModes: existing.apiModes, providerId: existing.providerId });
   console.log(`中轉生圖技能已更新${result.preserved.length ? `（保留手動檔案：${result.preserved.join(", ")}）` : ""}。`);
 }
 
@@ -5598,7 +5742,8 @@ async function status() {
 async function rollback() {
   const manifest = readManifest();
   if (!manifest) {
-    console.log("沒有可回退的安裝。" );
+    if (readManagerRecord()) await rollbackManagerOnly();
+    else console.log("沒有可回退的安裝。" );
     return;
   }
   printHeading("回退 Codex 模型路由器");
@@ -5665,6 +5810,48 @@ async function rollback() {
   printHeading("回退完成");
   console.log(`安裝檔案已封存至：${archiveDir}`);
   console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
+}
+
+// 只裝了網頁管理頁：還原 Codex 入口、移除捷徑，封存管理頁檔案。沒有路由器或 Key 要處理。
+async function rollbackManagerOnly() {
+  const record = readManagerRecord();
+  printHeading("移除網頁管理頁");
+  console.log("尚未連接任何供應商，只會移除管理頁、捷徑與 Codex 裡的入口。");
+  if (!(await confirm("是否繼續？", true))) return;
+  if (record.managerMcpEntry && codexBin) {
+    const user = await readUserConfig();
+    const entryEdit = managerMcpRollbackEdit(user.config, record.managerMcpEntry);
+    if (entryEdit) await writeConfigEdits([entryEdit]);
+    else console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
+  }
+  const archiveDir = join(backupsRoot, `rollback-${timestamp()}`);
+  ensureDirectory(archiveDir);
+  archiveManagerShortcut(archiveDir);
+  if (existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
+  printHeading("移除完成");
+  console.log(`管理頁檔案已封存至：${archiveDir}`);
+  console.log(`請完全退出並重新打開 ${desktopAppName}。`);
+}
+
+// 只裝管理頁時第一次執行安裝器：放好管理頁、捷徑與 Codex 入口，不安裝路由器、不改模型設定。
+async function installManagerOnly() {
+  ensureDirectory(installRoot);
+  writeJsonAtomic(managerRecordPath, { ...(readManagerRecord() || {}), version: INSTALLER_VERSION,
+    installedAt: readManagerRecord()?.installedAt || new Date().toISOString() });
+  const result = await installManagerLauncher();
+  printManagerLauncher(result);
+  return result;
+}
+
+async function updateManagerOnly() {
+  const record = readManagerRecord();
+  if (record?.version) assertInstallerNotOlder(record.version);
+  printHeading("更新網頁管理頁");
+  console.log(`版本：${record?.version || "未知"} → ${INSTALLER_VERSION}`);
+  const result = await installManagerOnly();
+  if (!result.ok) fail(result.message);
+  printHeading("更新完成");
+  return { version: INSTALLER_VERSION };
 }
 
 // --- 網頁管理介面 -------------------------------------------------------------
@@ -5866,7 +6053,9 @@ export function managerMcpRollbackEdit(config, record) {
 async function installManagerMcpEntry() {
   try {
     const user = await readUserConfig();
-    const manifest = readManifest();
+    // 回退資料寫在完整安裝的 install.json；只裝管理頁時寫在 manager-install.json。
+    const recordPath = readManifest() ? manifestPath : managerRecordPath;
+    const manifest = readManifest() || readManagerRecord();
     if (!manifest) fail("請先安裝 Codex 模型路由器。");
     // 入口程式改變時，MCP 設定的識別也改變，客戶端不能繼續使用先前的連線快取。
     const revision = createHash("sha256").update(loadManagerEntrySource()).digest("hex").slice(0, 12);
@@ -5882,13 +6071,13 @@ async function installManagerMcpEntry() {
     // 先記錄恢復資料，途中中斷時仍能用 rollback 還原這一個設定項。
     const updatedManifest = { ...manifest, managerMcpEntry: { key: MANAGER_MCP_KEY, installed,
       previous: previous ? previous.previous : current } };
-    writeJsonAtomic(manifestPath, updatedManifest);
+    writeJsonAtomic(recordPath, updatedManifest);
     await writeConfigEdits([{ keyPath: MANAGER_MCP_KEY, value: installed }, ...(legacyEdit ? [legacyEdit] : [])]);
     const verified = await readUserConfig();
     if (!sameHandler(deepGet(verified.config, MANAGER_MCP_KEY).value, installed)) fail("Codex MCP 入口未成功寫入。");
     if (legacyEdit) {
       delete updatedManifest.managerFileHandler;
-      writeJsonAtomic(manifestPath, updatedManifest);
+      writeJsonAtomic(recordPath, updatedManifest);
     }
     return { ok: true };
   } catch (error) {
@@ -5897,7 +6086,7 @@ async function installManagerMcpEntry() {
 }
 
 async function setupManagerEntry() {
-  if (!readManifest()) fail("請先安裝 Codex 模型路由器。");
+  if (!readManifest() && !readManagerRecord()) fail("請先安裝 Codex 模型路由器或網頁管理頁。");
   const result = await installManagerLauncher();
   printManagerLauncher(result);
   if (!result.ok || result.desktop?.ok === false) fail("管理頁入口未完整安裝，請依上方訊息處理。");
@@ -6178,7 +6367,7 @@ function runDownloadedUpdate(path) {
 async function managerUpdate({ restartDesktop = false } = {}) {
   const catalog = await loadReleaseCatalog({ force: true });
   const latest = catalog.latest;
-  const installed = readManifest()?.version || null;
+  const installed = (readManifest() || readManagerRecord())?.version || null;
   if (compareVersions(latest, installed) !== 1) fail(`已是最新版本（${installed || INSTALLER_VERSION}）。`);
   console.log(`正在從 GitHub 下載 v${latest} 的安裝器與 SHA256SUMS…`);
   const sums = parseSha256Sums((await downloadReleaseAsset(latest, "SHA256SUMS", 64 * 1024)).toString("utf8"));
@@ -6272,7 +6461,7 @@ function summarizeRoute(route) {
 
 function managerWriteGuard() {
   const manifest = readManifest();
-  if (!manifest) return "尚未安裝路由器，請先在終端執行「安裝或重新配置」。";
+  if (!manifest) return "尚未安裝路由器，請先在管理頁完成首次設定。";
   const comparison = compareVersions(INSTALLER_VERSION, manifest.version);
   if (comparison != null && comparison < 0) {
     return `路由器已是 ${manifest.version}，這個管理頁仍是 ${INSTALLER_VERSION}；請關閉管理頁後重新開啟。`;
@@ -6291,7 +6480,17 @@ function assertManagerWritable() {
 
 async function managerState() {
   const manifest = readManifest();
-  if (!manifest) return { installed: false, versions: { manager: INSTALLER_VERSION } };
+  if (!manifest) {
+    const desktop = desktopApp();
+    const record = readManagerRecord();
+    return {
+      installed: false, managerOnly: Boolean(record), platform: process.platform,
+      versions: { manager: INSTALLER_VERSION, installed: terminalSafeText(record?.version, 32) || null },
+      setupBlocked: codexBin ? null : `未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`,
+      providerPresets: PROVIDER_PRESETS, providers: [], models: [],
+      desktop: { name: desktop?.name || desktopAppName, canRestart: Boolean(desktop) },
+    };
+  }
   const settings = readSettingsIfExists();
   const catalog = readCatalogIfExists();
   const providers = installedProviders(settings, manifest);
@@ -6356,7 +6555,8 @@ async function managerState() {
       baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
       modelCount: routes.filter((route) => routeProviderId(route) === provider.id).length,
       keyStored: env.CODEX_MODEL_ROUTER_TEST_API_KEY ? true : keychainHas(provider.keychainService),
-      backupKeys: backupKeysOf(keyPool, provider.id).map((item) => ({ id: item.id, tail: item.tail, addedAt: item.addedAt })),
+      backupKeys: backupKeysOf(keyPool, provider.id).map((item) => ({ id: item.id, tail: item.tail, addedAt: item.addedAt,
+        modelCount: Array.isArray(item.models) ? item.models.length : null })),
       keyPool: health.keyPools?.[provider.id] || null,
     })),
     models,
@@ -6383,7 +6583,7 @@ async function managerState() {
 
 async function managerVersionInfo({ refresh = false } = {}) {
   const manifest = readManifest();
-  const installed = terminalSafeText(manifest?.version, 32) || null;
+  const installed = terminalSafeText((manifest || readManagerRecord())?.version, 32) || null;
   const settings = readSettingsIfExists();
   const health = await routerHealth(Number(settings.port ?? manifest?.port));
   let catalog = null;
@@ -6677,11 +6877,16 @@ async function exportDiagnostics() {
 }
 
 function describeDiscoveredModel(id, configured = new Set()) {
+  return describeDiscoveredModelWith(id, configured, new Set());
+}
+
+function describeDiscoveredModelWith(id, configured, onlyBackup) {
   const owner = modelOwners.get(id) || null;
   return {
     id,
     configured: configured.has(id),
     anthropic: owner === "anthropic" || ((!owner || owner === "unknown") && looksAnthropic(id)),
+    ...(onlyBackup.has(id) ? { onlyBackup: true } : {}),
   };
 }
 
@@ -6695,12 +6900,12 @@ function configuredUpstreams(settings, providerId) {
 async function managerDiscover({ providerId } = {}) {
   const { settings, providers } = requireInstallation();
   const provider = managerProvider(providers, String(providerId || ""));
-  const discovery = await discoverApiRoot(provider.baseUrl, readApiKey(provider.keychainService));
+  const { discovery, onlyBackup } = await discoverProviderModels(provider, readApiKey(provider.keychainService));
   const configured = configuredUpstreams(settings, provider.id);
   return {
     providerId: provider.id,
     apiRoot: discovery.apiRoot,
-    models: discovery.models.map((model) => describeDiscoveredModel(model, configured)),
+    models: discovery.models.map((model) => describeDiscoveredModelWith(model, configured, onlyBackup)),
   };
 }
 
@@ -6709,7 +6914,8 @@ async function managerDiscover({ providerId } = {}) {
 const managerDrafts = new Map();
 
 async function managerProviderDraft({ baseUrl, apiKey } = {}) {
-  const { providers } = requireInstallation();
+  // 首次設定時還沒有任何供應商，同樣先查模型清單。
+  const { providers } = readManifest() ? requireInstallation() : { providers: [] };
   const normalized = normalizeUrl(String(baseUrl || "").trim());
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫 API Key。");
@@ -6755,10 +6961,10 @@ async function managerAddModels({ providerId, models, contextWindow, maxOutputTo
   const apiKey = readApiKey(provider.keychainService);
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("正在查詢模型清單…");
-  const discovery = await discoverApiRoot(provider.baseUrl, apiKey);
+  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
   console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
   const outcomes = await probeModelsInParallel(selected,
-    (model, log) => buildRouteForModel(discovery, apiKey, model, log, provider.id));
+    (model, log) => buildRouteForModel(discovery, keyFor(model), model, log, provider.id));
   const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean)
     .map((route) => applyNewModelDefaults(route, defaults));
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
@@ -6945,6 +7151,41 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
   }
 }
 
+// 網頁首次設定：沿用「新增供應商」查到的模型清單，跑與終端安裝相同的流程。
+async function managerFirstInstall({ draftId, models, contextWindow, maxOutputTokens, backupKeys } = {}) {
+  if (readManifest()) fail("路由器已經安裝，請重新整理管理頁。");
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  await withCodexLock(() => verifyLogin());
+  const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
+  const backups = parseBackupKeys(backupKeys ?? []);
+  if (backups.length > MAX_BACKUP_KEYS) fail(`備用 Key 最多 ${MAX_BACKUP_KEYS} 把，這次填了 ${backups.length} 把。`);
+  const draftKey = String(draftId || "");
+  const draft = managerDrafts.get(draftKey);
+  if (!draft || Date.now() - draft.createdAt > MANAGER_DRAFT_TTL_MS) fail("新增供應商的資料已過期，請重新查詢模型。");
+  const selected = managerModelSelection(models);
+  const keychainService = keychainServiceFor(draft.baseUrl);
+  let previousKey = null;
+  if (keychainHas(keychainService)) {
+    try { previousKey = readApiKey(keychainService); } catch {}
+  }
+  try {
+    const result = await install({ baseUrl: draft.baseUrl, apiKey: draft.apiKey, discovery: draft.discovery,
+      models: selected, defaults, backupKeys: backups });
+    managerDrafts.delete(draftKey);
+    managerConfigHints(true);
+    return result;
+  } catch (error) {
+    // 安裝沒完成就把憑證放回原狀，不留下沒有供應商在用的 Key。
+    if (!readManifest() && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+      try {
+        if (previousKey) storeApiKeyValue(keychainService, draft.baseUrl, previousKey);
+        else deleteApiKey(keychainService);
+      } catch {}
+    }
+    throw error;
+  }
+}
+
 async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
   assertManagerWritable();
   const { providers } = requireInstallation();
@@ -6981,19 +7222,10 @@ async function managerReplaceKey({ providerId, apiKey } = {}) {
   const key = String(apiKey ?? "").trim();
   if (!key) fail("請填寫新的 API Key。");
   console.log(`正在用新 Key 查詢「${providerName(provider)}」的模型清單…`);
-  let status = null;
-  let problem = null;
-  try {
-    const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-      headers: upstreamAuthHeaders(provider.apiRoot, key),
-    }, 15000);
-    await response.arrayBuffer();
-    status = response.status;
-  } catch (error) {
-    problem = error?.name === "AbortError" ? "逾時" : error.message;
-  }
+  const { status, problem, models: keyModels } = await fetchKeyModels(provider.apiRoot, key);
   if (status === 401 || status === 403) fail(`上游拒絕這把 Key（HTTP ${status}），沒有更換。`);
   storeApiKeyValue(provider.keychainService, provider.baseUrl, key);
+  rememberPrimaryModels(provider.id, keyModels);
   const verified = status != null && status >= 200 && status < 300;
   console.log(verified
     ? "已更換，新 Key 可以正常查詢模型清單。"
@@ -7044,17 +7276,7 @@ async function addBackupKeys(provider, input) {
       continue;
     }
     console.log(`正在用備用 Key ${mask} 查詢「${providerName(provider)}」的模型清單…`);
-    let status = null;
-    let problem = null;
-    try {
-      const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
-        headers: upstreamAuthHeaders(provider.apiRoot, key),
-      }, 15000);
-      await response.arrayBuffer();
-      status = response.status;
-    } catch (error) {
-      problem = error?.name === "AbortError" ? "逾時" : error.message;
-    }
+    const { status, problem, models: keyModels } = await fetchKeyModels(provider.apiRoot, key);
     if (status === 401 || status === 403) {
       skipped.push({ tail: key.slice(-4), reason: `HTTP ${status}` });
       console.log(`跳過 ${mask}：上游拒絕這把 Key（HTTP ${status}）。`);
@@ -7064,15 +7286,23 @@ async function addBackupKeys(provider, input) {
     const service = `${provider.keychainService}.${id}`;
     storeApiKeyValue(service, provider.baseUrl, key);
     added.push({ id, keychainService: service, keychainAccount: "codex",
-      credentialPath: isWindows ? credentialFileFor(service) : null, tail: key.slice(-4), addedAt: new Date().toISOString() });
+      credentialPath: isWindows ? credentialFileFor(service) : null, tail: key.slice(-4), addedAt: new Date().toISOString(),
+      models: keyModels });
     stored.set(key, "已在備用清單");
     const verified = status != null && status >= 200 && status < 300;
-    console.log(verified ? `已加入 ${mask}，可以正常查詢模型清單。`
+    console.log(verified ? `已加入 ${mask}，可以正常查詢模型清單${keyModels ? `（${keyModels.length} 個模型）` : ""}。`
       : `已加入 ${mask}，但無法確認是否可用（${status != null ? `HTTP ${status}` : problem}）。`);
   }
   if (added.length) {
     try {
       pool.providers[provider.id] = [...existing, ...added];
+      // 主 Key 的清單也要記下：主 Key 沒有某模型時，路由器才會直接改用有它的備用 Key。
+      if (!pool.primaryModels?.[provider.id] && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+        try {
+          const primary = await fetchKeyModels(provider.apiRoot, readApiKey(provider.keychainService));
+          if (primary.models) pool.primaryModels = { ...(pool.primaryModels || {}), [provider.id]: primary.models };
+        } catch { /* 查不到就把主 Key 視為支援全部模型。 */ }
+      }
       writeKeyPoolFile(pool);
     } catch (error) {
       if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
@@ -7125,6 +7355,7 @@ async function askBackupKeys(provider) {
 
 async function manageBackupKeys() {
   const { settings, providers } = requireInstallation();
+  if (!providers.length) fail("尚未連接 API 供應商，沒有可加備用 Key 的對象。");
   const chosen = providers.length === 1 ? providers[0]
     : await chooseProvider(providers, settings.routes, "要為哪一家供應商添加備用 Key", { allowCancel: true });
   if (!chosen) {
@@ -7183,7 +7414,9 @@ async function managerGlobalContext() {
 }
 
 async function managerSetGlobalContext({ value } = {}) {
-  assertManagerWritable();
+  // 全域上下文只改 Codex 的 config.toml，不需要路由器：只裝管理頁時也能調整。
+  if (readManifest()) assertManagerWritable();
+  else if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   const target = normalizeGlobalContextWindow(value);
   console.log(target === null
     ? "正在移除全域 model_context_window…"
@@ -7251,7 +7484,7 @@ function relayImagegenStatus() {
     lastCheck = {
       checkedAt: terminalSafeText(saved.checkedAt, 40) || null,
       checks: (Array.isArray(saved.checks) ? saved.checks : []).slice(0, 12).map((check) => ({
-        apiMode: check?.apiMode === "ark-task" ? "ark-task" : "images",
+        apiMode: ["ark-task", "chat", "gemini"].includes(check?.apiMode) ? check.apiMode : "images",
         model: terminalSafeText(check?.model, 120),
         ok: check?.ok === true,
         error: check?.ok === true ? null : terminalSafeText(check?.error, 300) || null,
@@ -7264,6 +7497,8 @@ function relayImagegenStatus() {
     models: Array.isArray(config?.models) ? config.models : [],
     upstreamModels: config?.upstreamModels || {},
     apiMode: config?.apiMode || null,
+    apiModes: Array.isArray(config?.models)
+      ? Object.fromEntries(config.models.map((id) => [id, config.apiModes?.[id] || config.apiMode || "images"])) : {},
     // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。
     providerId: config ? config.providerId ?? DEFAULT_PROVIDER_ID : null,
     root: relaySkillRoot,
@@ -7278,17 +7513,18 @@ async function managerImagegenSetup({ providerId, models } = {}) {
   const allowed = RELAY_IMAGE_MODELS.map((model) => model.id);
   const selected = Array.isArray(models) ? [...new Set(models.map(String))] : [];
   if (selected.length === 0 || selected.some((model) => !allowed.includes(model))) {
-    fail("請從 Image 2、Image 2.5 Sunburst、Image 2.5 Flare 中至少選擇一個模型。");
+    fail("請從清單中至少選擇一個圖片模型。");
   }
   const provider = providers.length === 1 && !providerId ? providers[0] : managerProvider(providers, String(providerId || ""));
   const current = relayConfig();
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
-  console.log("偵測會實際生圖並依供應商計費；先測通用介面，全部未通過時自動改測 Ark 任務介面。");
+  console.log("偵測會實際生圖並依供應商計費；GPT Image 先測通用介面，全部未通過時改測 Ark 任務介面；Nano Banana 依序試 Chat、Gemini 原生與通用介面。");
   const outcome = await runRelayImagegenSetup({ provider, selected, current, settings, providers });
   if (!outcome.available.length) fail("沒找到可用模型，生圖設定沒有變更。");
   return {
     models: outcome.available.map((model) => model.id),
     apiMode: outcome.discovery.apiMode,
+    apiModes: outcome.discovery.apiModes,
     root: outcome.result.root,
     probeRoot: outcome.probeRoot,
   };
@@ -7384,8 +7620,13 @@ async function managerClaudeCliLogin({ force = false } = {}) {
   return { loggedIn: true };
 }
 
-async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = {}) {
-  assertManagerWritable();
+// firstInstall：尚未安裝路由器時只連接 Claude 訂閱。先測模型，通過後才安裝路由器並寫入，
+// 測試失敗不會留下沒有模型的路由器。
+async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, firstInstall = false } = {}) {
+  if (firstInstall) {
+    if (readManifest()) fail("路由器已經安裝，請重新整理管理頁。");
+    if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  } else assertManagerWritable();
   await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
   if (defaults.contextWindow > 1000000) fail("Claude CLI 模型的上下文上限最多 1,000,000。");
@@ -7394,7 +7635,9 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = 
   if (requested.length > 10) fail("一次最多測試 10 個模型。");
   const invalid = requested.filter((model) => !CLAUDE_CLI_MODEL_PATTERN.test(model));
   if (invalid.length) fail(`模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：${invalid.map((model) => terminalSafeText(model, 80)).join("、")}`);
-  const state = requireInstallation();
+  const state = firstInstall
+    ? { providers: [], settings: { routes: [] }, catalog: await withCodexLock(() => loadCatalogTemplates()) }
+    : requireInstallation();
   const found = inspectClaudeCli(state.settings);
   if (!found) fail("尚未安裝 Claude CLI，請先在供應商頁安裝。");
   if (!found.version || compareVersions(found.version, CLAUDE_CLI_MIN_VERSION) < 0) {
@@ -7409,6 +7652,10 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens } = 
   console.log(`將測試 ${requested.length} 個模型，每個發送一次短測試並使用訂閱用量；只有通過的會添加。`);
   const tested = await testClaudeCliModels(transport, { binary: found.binary, version: found.version, models: requested });
   if (!tested.passed.length) fail("沒有模型通過測試，路由配置未修改。");
+  if (firstInstall) {
+    console.log("\n測試通過，正在安裝路由器…");
+    await install({ bare: true });
+  }
   // 測試期間設定可能被更新，以最新檔案重新規劃。
   const plan = planClaudeCliModels(requireInstallation(), tested.binary, tested.passed, defaults.contextWindow,
     tested.resolvedModels, { maxOutputTokens: defaults.maxOutputTokens });
@@ -7446,6 +7693,8 @@ function managerOperations() {
       "reorder-models": job("調整模型順序", managerReorderModels),
       "edit-model": job("修改模型", managerEditModel),
       "add-provider": job("新增供應商", managerAddProvider),
+      install: job("首次設定", managerFirstInstall),
+      "install-claude": job("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
       "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
       "replace-key": job("更換 API Key", managerReplaceKey),
@@ -7535,7 +7784,8 @@ function closeManagerServer(server) {
 // 一般開啟只負責啟動／重用背景程序，再打開網址，完成即退出。
 // 管理程序直接用同一份 Node 負載啟動，不留下 PowerShell / cmd / 終端依附。
 async function openManager() {
-  if (!readManifest()) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先安裝。");
+  // 尚未安裝時同樣開啟管理頁，在網頁上完成首次設定；鎖檔與啟動程式都放在路由器目錄。
+  ensureDirectory(installRoot);
   // 兩次快速點擊也只能建立一個背景管理頁；啟動者意外退出後，下次會移除它的鎖。
   const path = join(installRoot, "manager-starting.json");
   const owner = { pid: process.pid, id: randomUUID() };
@@ -7616,7 +7866,7 @@ async function openManagerOnce() {
 }
 
 async function runManager() {
-  if (!readManifest()) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
+  ensureDirectory(installRoot);
   const inheritedToken = env.CODEX_MODEL_ROUTER_UI_TOKEN || null;
   const openPage = env.CODEX_MODEL_ROUTER_UI_NO_OPEN !== "1";
   if (!inheritedToken) {
@@ -7806,6 +8056,8 @@ function help() {
   console.log(`Codex 模型路由器 ${INSTALLER_VERSION}
 
 用法：
+  ${basename(scriptPath || "codex-model-router.command")}            （不帶指令：開啟網頁管理頁；尚未安裝時在網頁上完成首次設定）
+  ${basename(scriptPath || "codex-model-router.command")} menu       （終端選單）
   ${basename(scriptPath || "codex-model-router.command")} install
   ${basename(scriptPath || "codex-model-router.command")} ui
   ${basename(scriptPath || "codex-model-router.command")} ui-setup
@@ -7868,8 +8120,9 @@ hidden-models 用於單獨管理 Codex 內建目錄裡被標成隱藏的官方�
 
 imagegen 用於添加／設定中轉生圖技能 $router-imagegen，沿用現有憑證，不需 OPENAI_API_KEY。
 有多家供應商時會先問要用哪一家生圖。
-可複選 Image 2、Image 2.5 Sunburst、Image 2.5 Flare；多選時由 AI 按需求指定模型。
-選擇模型後自動偵測並添加成功項目：先測通用生圖，全部失敗時再測 Ark 任務介面。
+可複選 Image 2、Image 2.5 Sunburst、Image 2.5 Flare，以及 Nano Banana 2.1／Pro／2／2 Lite／初代；多選時由 AI 按需求指定模型。
+選擇模型後自動偵測並添加成功項目：GPT Image 先測通用生圖，全部失敗時再測 Ark 任務介面；
+Nano Banana 依序試 Chat Completions、Gemini 原生 generateContent 與通用 Images API。
 偵測可能產生費用，每個已選模型每種介面最多一次；不詢問介面、前綴或測試確認。
 都未通過會顯示「沒找到可用模型」。選擇模型時輸入 none 停用、cancel 返回，兩者不生圖。
 
@@ -7922,6 +8175,32 @@ async function chooseAction() {
   return action;
 }
 
+// 不帶指令執行：直接開啟網頁管理頁。什麼都沒裝時先只裝管理頁（捷徑與 Codex 入口），
+// 不安裝路由器、不加模型；連接供應商或調整全域上下文都在網頁上做。終端選單（menu）作為備用。
+async function startManager() {
+  const installed = Boolean(readManifest());
+  if (!installed) {
+    if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+    if (isWindows && !testMode) assertScriptHostAvailable();
+  }
+  if (!installed && !readManagerRecord()) {
+    printHeading("安裝網頁管理頁");
+    console.log("只安裝管理頁、捷徑與 Codex 裡的入口，不會改動模型設定；之後可在管理頁連接供應商。");
+    await installManagerOnly();
+  } else if (!installed) {
+    const record = readManagerRecord();
+    // 用較新的安裝器開啟時順便更新管理頁副本與入口。
+    if (compareVersions(INSTALLER_VERSION, record.version) === 1) await installManagerOnly();
+  }
+  printHeading("開啟網頁管理介面");
+  if (!installed) console.log("尚未連接供應商：可以在管理頁連接 API 供應商，或先只調整全域上下文。");
+  await openManager();
+  const menuCommand = isWindows
+    ? `powershell -ExecutionPolicy Bypass -File .\\${basename(scriptPath)} menu`
+    : `bash ${basename(scriptPath)} menu`;
+  console.log(`\n想改用終端選單操作，請執行：${menuCommand}`);
+}
+
 // 測試會 import 本檔以驗證版本比較等純函式，此時不能真的執行安裝流程。
 if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
   try {
@@ -7947,12 +8226,14 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       "imagegen",
       "relay-imagegen",
       "status",
+      "menu",
     ]);
     if (!requestedAction || versionAwareActions.has(requestedAction)) {
       await printVersionSummary();
     }
-    const action = requestedAction || (await chooseAction());
-    if (action === "ui" || action === "web" || action === "manager") {
+    const action = requestedAction === "menu" ? await chooseAction() : (requestedAction || "start");
+    if (action === "start") await startManager();
+    else if (action === "ui" || action === "web" || action === "manager") {
       // 1.27.3／1.27.4 的更新交接只有傳權杖、沒有 --foreground，仍須沿用原網址與權杖。
       if (process.argv.includes("--foreground") || env.CODEX_MODEL_ROUTER_UI_TOKEN) await runManager();
       else await openManager();
@@ -8821,6 +9102,7 @@ const stats = {
   imagesSaved: 0,
   imageRequests: 0,
   arkImageRequests: 0,
+  geminiImageRequests: 0,
   catalogRefreshes: 0,
   catalogRefreshFailures: 0,
   catalogModels: 0,
@@ -8855,6 +9137,7 @@ const stats = {
   lastAuthProbeStatus: null,
   credentialReads: 0,
   keyRotations: 0,
+  keyModelRoutes: 0,
   keyReadFailures: 0,
   lastKeyRotation: null,
   foreignHostRejects: 0,
@@ -9131,6 +9414,7 @@ export function normalizeKeyPool(source) {
   const result = new Map();
   const entries = source && typeof source === "object" && source.providers && typeof source.providers === "object"
     ? source.providers : {};
+  const modelSet = (list) => Array.isArray(list) && list.length ? new Set(list.filter((id) => typeof id === "string")) : null;
   for (const [providerId, list] of Object.entries(entries)) {
     if (!Array.isArray(list)) continue;
     const seen = new Set([PRIMARY_KEY_SLOT]);
@@ -9145,10 +9429,14 @@ export function normalizeKeyPool(source) {
         keychainService: item.keychainService,
         keychainAccount: typeof item.keychainAccount === "string" && item.keychainAccount ? item.keychainAccount : "codex",
         credentialPath: typeof item.credentialPath === "string" && item.credentialPath ? item.credentialPath : null,
+        models: modelSet(item.models),
       });
       if (slots.length >= MAX_BACKUP_KEYS) break;
     }
-    if (slots.length) result.set(String(providerId), slots);
+    if (slots.length) {
+      slots.primaryModels = modelSet(source.primaryModels?.[providerId]);
+      result.set(String(providerId), slots);
+    }
   }
   return result;
 }
@@ -9173,17 +9461,26 @@ function readKeyPool() {
   return pool;
 }
 
-function primaryKeySlot(provider) {
+function primaryKeySlot(provider, models = null) {
   return {
     id: PRIMARY_KEY_SLOT,
     keychainService: provider.keychainService,
     keychainAccount: provider.keychainAccount || "codex",
     credentialPath: provider.credentialPath || null,
+    models,
   };
 }
 
 export function keySlotsFor(provider, pool = readKeyPool()) {
-  return [primaryKeySlot(provider), ...(pool.get(provider.id) || [])];
+  const backups = pool.get(provider.id) || [];
+  return [primaryKeySlot(provider, backups.primaryModels || null), ...backups];
+}
+
+// 只在有這個模型的 Key 之間切換；清單未知（null）視為支援。都不支援時退回全部，維持原行為。
+export function keySlotsForModel(slots, model) {
+  if (typeof model !== "string" || !model) return slots;
+  const usable = slots.filter((slot) => !slot.models || slot.models.has(model));
+  return usable.length ? usable : slots;
 }
 
 // 只記在記憶體：路由器重啟後從主 Key 開始，最多多一次失敗請求就會換到可用的那把。
@@ -9592,8 +9889,9 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal) {
   return send(reloaded);
 }
 
-async function fetchCustom(provider, target, headers, body, signal) {
-  const slots = keySlotsFor(provider);
+async function fetchCustom(provider, target, headers, body, signal, { model = null } = {}) {
+  const slots = keySlotsForModel(keySlotsFor(provider), model);
+  if (slots[0]?.id !== PRIMARY_KEY_SLOT && model) stats.keyModelRoutes += 1;
   if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal);
   const bySlot = new Map(slots.map((slot) => [slot.id, slot]));
   const order = keyRotation.order(provider.id, slots.map((slot) => slot.id));
@@ -9735,6 +10033,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         anthropicBody,
         signal,
+        { model: route.upstreamModel },
       );
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -9768,6 +10067,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         chatBody,
         signal,
+        { model: route.upstreamModel },
       );
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -9783,6 +10083,7 @@ export async function fetchModelUpstream(
       requestHeaders,
       outboundBody,
       signal,
+      { model: route.upstreamModel },
     );
     stats.lastCustomStatus = upstream.status;
     recordUpstreamFailure(upstream, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -9819,6 +10120,10 @@ export async function fetchModelUpstream(
 // 因此一律轉給自訂閘道。閘道若不支援，它自己的錯誤訊息也比路由器的 404 有用。
 export const IMAGE_PATH_PATTERN = /^\/(?:v1\/)?images\/(?:generations|edits|variations)$/;
 export const ARK_IMAGE_PATH_PATTERN = /^\/v2\/extend\/image\/ark_gpt_image\/(?:generations|edits|tasks\/[A-Za-z0-9_-]{1,160})$/;
+// router-imagegen 的 Nano Banana（Gemini 圖片模型）：chat 轉到供應商的 chat/completions，
+// gemini 轉到供應商 origin 下的 Gemini 原生 generateContent。
+export const ROUTER_IMAGE_PATH_PATTERN = /^\/v1\/router-images\/(chat|gemini)$/;
+const GEMINI_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,120}){0,3}$/;
 
 // 路由器只聽 127.0.0.1，但瀏覽器裡的任何網頁都能對它發請求：跨站的「簡單請求」
 // （text/plain、multipart/form-data 的 POST）不會觸發 CORS 預檢，照樣送達；
@@ -9895,6 +10200,48 @@ async function handleArkImages(request, response, incomingUrl) {
   stats.lastImageStatus = upstream.status;
   await streamUpstream(upstream, response);
 }
+
+async function handleRouterImages(request, response, incomingUrl) {
+  const mode = ROUTER_IMAGE_PATH_PATTERN.exec(incomingUrl.pathname)?.[1];
+  if (!mode || request.method !== "POST") {
+    writeJson(response, 404, { error: { message: "未知的生圖端點。" } });
+    return;
+  }
+  if (rejectBrowserRequest(request, response)) return;
+  request.routerContext.route = "custom";
+  request.routerContext.provider = null;
+  const provider = imageProviderFor(request.headers);
+  request.routerContext.provider = provider;
+  if (authDigest(request.headers)) await validateOfficialAuth(request.headers);
+  const rawBody = await readRequestBody(request);
+  const abortController = new AbortController();
+  request.on("aborted", () => abortController.abort());
+  response.on("close", () => { if (!response.writableFinished) abortController.abort(); });
+  let upstream;
+  if (mode === "chat") {
+    upstream = await fetchCustom(provider, new URL(`${provider.apiRoot}/chat/completions`), request.headers, rawBody, abortController.signal);
+  } else {
+    let body;
+    try { body = JSON.parse(rawBody.toString("utf8")); } catch { body = null; }
+    const model = body?.model;
+    if (!body || typeof body !== "object" || typeof model !== "string" || !GEMINI_MODEL_PATTERN.test(model)) {
+      writeJson(response, 400, { error: { message: "Gemini 生圖請求格式無效。", type: "router_error" } });
+      return;
+    }
+    delete body.model;
+    // 原生介面用 x-goog-api-key 帶 Key；生圖是付費請求，不因 401/403 換 Key 重送。
+    const apiKey = await getApiKey(provider, false, activeKeySlot(provider));
+    upstream = await fetch(new URL(`/v1beta/models/${model}:generateContent`, new URL(provider.apiRoot).origin), {
+      method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify(body), redirect: "manual", signal: abortController.signal,
+    });
+  }
+  stats.geminiImageRequests += 1;
+  stats.lastImageProvider = provider.id;
+  stats.lastImageStatus = upstream.status;
+  await streamUpstream(upstream, response);
+}
+
 
 async function handleImages(request, response, incomingUrl) {
   // 與自訂模型同一套驗證，但只在請求真的帶了 ChatGPT 憑證時才驗。
@@ -11361,6 +11708,10 @@ const server = http.createServer(async (request, response) => {
     }
     if (incomingUrl.pathname.startsWith("/v2/extend/image/ark_gpt_image/")) {
       await handleArkImages(request, response, incomingUrl);
+      return;
+    }
+    if (incomingUrl.pathname.startsWith("/v1/router-images/")) {
+      await handleRouterImages(request, response, incomingUrl);
       return;
     }
     await proxyToOfficial(request, response, incomingUrl);
@@ -14002,8 +14353,26 @@ import { get as httpsGet } from "node:https";
 import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 
-export const IMAGE_MODELS = ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"];
+export const GPT_IMAGE_MODELS = ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"];
+// Google 的 Nano Banana 系列（Gemini 圖片模型），ID 依 Google 官方模型清單。
+export const GEMINI_IMAGE_MODELS = ["gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image",
+  "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"];
+export const IMAGE_MODELS = [...GPT_IMAGE_MODELS, ...GEMINI_IMAGE_MODELS];
 export const ARK_IMAGE_PATH = "/v2/extend/image/ark_gpt_image";
+// Gemini 圖片模型經路由器轉送的兩條路徑：OpenAI 相容的 chat/completions，與 Gemini 原生 generateContent。
+export const CHAT_IMAGE_PATH = "/v1/router-images/chat";
+export const GEMINI_IMAGE_PATH = "/v1/router-images/gemini";
+export const IMAGE_API_MODES = ["images", "ark-task", "chat", "gemini"];
+// 每個模型依序嘗試的介面：GPT Image 先通用 Images API 再 Ark；Gemini 先 chat，再原生，最後 Images API。
+export function imageApiModesFor(model) {
+  return GEMINI_IMAGE_MODELS.includes(model) ? ["chat", "gemini", "images"] : ["images", "ark-task"];
+}
+// 上游名稱可以帶供應商前綴（ark/…）或 -preview 後綴（部分中轉與 Google 的預覽版名稱）。
+export function validImageUpstream(model, upstream) {
+  if (typeof upstream !== "string" || /[\s\x00-\x1f\x7f?#]/.test(upstream)) return false;
+  const names = GEMINI_IMAGE_MODELS.includes(model) ? [model, `${model}-preview`] : [model];
+  return names.some((name) => upstream === name || upstream.endsWith(`/${name}`));
+}
 // 路由器依這個標頭決定用哪一家供應商生圖；與 router.mjs 的 PROVIDER_HEADER 相同。
 export const PROVIDER_HEADER = "x-codex-router-provider";
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
@@ -14011,20 +14380,27 @@ const MODEL_ALIASES = {
   image2: IMAGE_MODELS[0], "image-2": IMAGE_MODELS[0],
   sunburst: IMAGE_MODELS[1], "image2.5-sunburst": IMAGE_MODELS[1],
   flare: IMAGE_MODELS[2], "image2.5-flare": IMAGE_MODELS[2],
+  "banana2.1": "gemini-nano-banana-2.1", "nano-banana-2.1": "gemini-nano-banana-2.1",
+  "banana-pro": "gemini-3-pro-image", "nano-banana-pro": "gemini-3-pro-image",
+  banana2: "gemini-3.1-flash-image", "nano-banana-2": "gemini-3.1-flash-image",
+  "banana2-lite": "gemini-3.1-flash-lite-image", "nano-banana-2-lite": "gemini-3.1-flash-lite-image",
+  banana: "gemini-2.5-flash-image", "nano-banana": "gemini-2.5-flash-image",
 };
 const HELP = `中轉 API 生圖（不需要 OPENAI_API_KEY）
   imagegen.mjs list
   imagegen.mjs generate --model flare --prompt-file prompt.txt --out output.png
   imagegen.mjs edit --model sunburst --prompt-file prompt.txt --image input.png --out output-v2.png
 
-模型只可從安裝時勾選的 Image 2、Sunburst、Flare 選擇。
---model 可用完整模型 ID 或 image2 / sunburst / flare。
+模型只可從設定時勾選並通過測試的模型選擇。
+--model 可用完整模型 ID 或 image2 / sunburst / flare / banana2.1 / banana-pro / banana2 / banana2-lite / banana。
 --image 可重複提供（最多 16 張 PNG、JPEG 或 WebP），edit 必須提供至少一張。
 --prompt 與 --prompt-file 二擇一；提示詞上限 32000 字元。
 --size auto 或 WIDTHxHEIGHT；--quality auto / low / medium / high / xhigh / max。
 --background auto / opaque / transparent；--output-format png / jpeg / webp。
 Image 2 不支援 xhigh / max。透明背景需使用 PNG 或 WebP。
 Ark 任務介面：size、quality 只能 auto，background 不支援 transparent；程式會自動省略不支援的欄位。
+Nano Banana（Gemini）：size、quality 只能 auto，background 不支援 transparent；輸出格式由上游決定，
+與 --out 副檔名不同時會改用實際格式的副檔名儲存。
 --timeout 秒數（預設 300，最多 1800）；--dry-run 只檢查、不生成圖片。
 每次生成一張圖片，不覆寫已有檔案，不自動重試或切換模型。
 `;
@@ -14058,7 +14434,10 @@ export function chooseImageModel(config, requested, action) {
     if (!enabled.includes(id)) throw new Error("此圖片模型未啟用；請從已勾選的模型中選擇，或在路由器選單重新設定。");
     return id;
   }
-  const priority = action === "edit" ? [IMAGE_MODELS[1], IMAGE_MODELS[2], IMAGE_MODELS[0]] : [IMAGE_MODELS[2], IMAGE_MODELS[1], IMAGE_MODELS[0]];
+  const gemini = ["gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"];
+  const priority = action === "edit"
+    ? [IMAGE_MODELS[1], IMAGE_MODELS[2], IMAGE_MODELS[0], "gemini-3-pro-image", ...gemini]
+    : [IMAGE_MODELS[2], IMAGE_MODELS[1], IMAGE_MODELS[0], ...gemini];
   return priority.find((id) => enabled.includes(id));
 }
 
@@ -14101,6 +14480,94 @@ function decodeImageResult(result, format) {
   if (fileImageFormat(bytes) !== format) throw new Error("上游回傳的圖片格式與要求不符，未寫入輸出檔。");
   return bytes;
 }
+
+
+// ---- Gemini（Nano Banana）介面 -------------------------------------------------
+const DATA_IMAGE_URL = /data:image\/(?:png|jpe?g|webp);base64,([A-Za-z0-9+/=\s]+)/;
+
+function inlineImage(base64) {
+  if (typeof base64 !== "string" || !base64) return null;
+  const bytes = Buffer.from(base64.replace(/\s/g, ""), "base64");
+  const format = fileImageFormat(bytes);
+  return format ? { bytes, format } : null;
+}
+
+export function chatImagePayload(model, prompt, inputs = [], { modalities = true } = {}) {
+  const content = inputs.length
+    ? [{ type: "text", text: prompt }, ...inputs.map((image) => ({ type: "image_url",
+      image_url: { url: `data:image/${image.type};base64,${image.bytes.toString("base64")}` } }))]
+    : prompt;
+  return { model, messages: [{ role: "user", content }], stream: false, ...(modalities ? { modalities: ["image", "text"] } : {}) };
+}
+
+export function geminiImagePayload(prompt, inputs = []) {
+  return {
+    contents: [{ role: "user", parts: [{ text: prompt }, ...inputs.map((image) => ({
+      inlineData: { mimeType: `image/${image.type}`, data: image.bytes.toString("base64") } }))] }],
+    generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+  };
+}
+
+// 中轉站回傳圖片的方式不一：message.images（OpenRouter 等）、content 陣列裡的 image_url，
+// 或 Markdown 文字裡的 data URL／https 圖片網址。https 圖片以不帶憑證的安全下載取得。
+export async function extractChatImage(result, { download = downloadArkImage, signal } = {}) {
+  const message = result?.choices?.[0]?.message;
+  const urls = [];
+  const texts = [];
+  for (const image of Array.isArray(message?.images) ? message.images : []) {
+    urls.push(typeof image === "string" ? image : image?.image_url?.url ?? image?.image_url ?? image?.url);
+  }
+  const content = message?.content;
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      urls.push(part?.image_url?.url ?? part?.image_url);
+      if (typeof part?.b64_json === "string") urls.push(`data:image/png;base64,${part.b64_json}`);
+      if (typeof part?.text === "string") texts.push(part.text);
+    }
+  } else if (typeof content === "string") texts.push(content);
+  for (const url of urls) {
+    const match = typeof url === "string" ? DATA_IMAGE_URL.exec(url) : null;
+    const image = match && inlineImage(match[1]);
+    if (image) return image;
+  }
+  for (const text of texts) {
+    const match = DATA_IMAGE_URL.exec(text);
+    const image = match && inlineImage(match[1]);
+    if (image) return image;
+  }
+  const remote = [...urls, ...texts.flatMap((text) => [...text.matchAll(/!\[[^\]]*\]\((https:\/\/[^)\s]+)\)/g)].map((m) => m[1]))]
+    .find((url) => typeof url === "string" && /^https:\/\//.test(url));
+  if (remote) {
+    const bytes = await download(remote, { signal });
+    const format = fileImageFormat(bytes);
+    if (format) return { bytes, format };
+  }
+  throw new Error("上游沒有回傳圖片；請確認這個模型在該供應商支援生圖輸出。");
+}
+
+export function extractGeminiImage(result) {
+  for (const candidate of Array.isArray(result?.candidates) ? result.candidates : []) {
+    for (const part of Array.isArray(candidate?.content?.parts) ? candidate.content.parts : []) {
+      const image = inlineImage((part?.inlineData || part?.inline_data)?.data);
+      if (image) return image;
+    }
+  }
+  const reason = result?.promptFeedback?.blockReason || result?.candidates?.[0]?.finishReason;
+  throw new Error(`上游沒有回傳圖片${reason ? `（${String(reason).slice(0, 60)}）` : ""}；請確認模型支援生圖，或調整提示詞。`);
+}
+
+// chat 介面先帶 modalities（OpenRouter 等需要它才輸出圖片）；上游明確不認這個欄位時去掉重送一次。
+// 400 是在生成前被拒絕，不會重複計費。
+async function postChatImage(url, build, { headers, signal, fetchImpl }) {
+  const send = async (modalities) => {
+    const response = await fetchImpl(url, { method: "POST", headers, body: JSON.stringify(build(modalities)), redirect: "error", signal });
+    return { response, result: await responseJson(response) };
+  };
+  let outcome = await send(true);
+  if (outcome.response.status === 400 && /modalit/i.test(JSON.stringify(outcome.result))) outcome = await send(false);
+  return outcome;
+}
+
 
 function publicImageAddress(address) {
   const value = String(address).toLowerCase();
@@ -14230,9 +14697,32 @@ export async function runArkImageTask({ origin, payload, action = "generate", ap
 // 安裝器只測已選模型；每種介面每個模型最多提交一次。
 export async function probeRelayImageModel({ model, upstreamModel = model, apiRoot, apiKey,
   fetchImpl = globalThis.fetch, timeoutMs = 300000, apiMode = "images", downloadImpl, pollIntervalMs } = {}) {
-  if (!IMAGE_MODELS.includes(model) || typeof upstreamModel !== "string" ||
-      (upstreamModel !== model && !upstreamModel.endsWith(`/${model}`)) || /[\s\x00-\x1f\x7f?#]/.test(upstreamModel)) {
+  if (!IMAGE_MODELS.includes(model) || !validImageUpstream(model, upstreamModel)) {
     throw new Error("無效的圖片測試模型。");
+  }
+  if (!imageApiModesFor(model).includes(apiMode)) throw new Error("此模型不支援這種生圖介面。");
+  const testPrompt = "A small black circle centered on a plain white background.";
+  if (apiMode === "chat" || apiMode === "gemini") {
+    const signal = AbortSignal.timeout(timeoutMs);
+    try {
+      const { response, result } = apiMode === "chat"
+        ? await postChatImage(`${String(apiRoot).replace(/\/$/, "")}/chat/completions`,
+          (modalities) => chatImagePayload(upstreamModel, testPrompt, [], { modalities }),
+          { headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` }, signal, fetchImpl })
+        : await (async () => {
+          const response = await fetchImpl(`${new URL(apiRoot).origin}/v1beta/models/${upstreamModel}:generateContent`, {
+            method: "POST", redirect: "error", signal,
+            headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+            body: JSON.stringify(geminiImagePayload(testPrompt)) });
+          return { response, result: await responseJson(response) };
+        })();
+      if (!response.ok) return { ok: false, error: apiError(Array.isArray(result) ? result[0] : result, response.status, apiKey).message };
+      const image = apiMode === "chat" ? await extractChatImage(result, { signal, download: downloadImpl }) : extractGeminiImage(result);
+      return { ok: true, bytes: image.bytes, format: image.format };
+    } catch (error) {
+      return { ok: false, error: error.name === "TimeoutError" || error.name === "AbortError"
+        ? "生圖測試逾時；上游可能仍在處理或計費，未自動重試。" : String(error.message || "生圖測試失敗。").slice(0, 600) };
+    }
   }
   if (apiMode === "ark-task") {
     try {
@@ -14267,7 +14757,26 @@ export async function probeRelayImageModel({ model, upstreamModel = model, apiRo
 }
 
 export async function discoverUsableRelayImages({ candidates, onProbe = () => {}, ...options } = {}) {
-  const selected = [...new Map(candidates.map((model) => [model.id, model])).values()];
+  const unique = [...new Map(candidates.map((model) => [model.id, model])).values()];
+  const gpt = await discoverGptImages({ candidates: unique.filter((model) => GPT_IMAGE_MODELS.includes(model.id)), onProbe, ...options });
+  const checks = [...gpt.checks];
+  const models = [...gpt.models];
+  const apiModes = Object.fromEntries(gpt.models.map((model) => [model.id, gpt.apiMode]));
+  // Gemini 每個模型各自依序試介面，通過就停；同一模型每種介面最多一次。
+  const gemini = unique.filter((model) => GEMINI_IMAGE_MODELS.includes(model.id));
+  for (const [index, candidate] of gemini.entries()) {
+    for (const apiMode of imageApiModesFor(candidate.id)) {
+      onProbe(apiMode, candidate, index);
+      const result = await probeRelayImageModel({ ...options, model: candidate.id, upstreamModel: candidate.upstreamModel, apiMode });
+      checks.push({ apiMode, model: candidate.upstreamModel, ok: result.ok, ...(result.ok ? {} : { error: result.error }) });
+      if (result.ok) { models.push({ ...candidate, bytes: result.bytes, format: result.format || "png" }); apiModes[candidate.id] = apiMode; break; }
+    }
+  }
+  return { apiMode: gpt.apiMode, apiModes, models, checks };
+}
+
+async function discoverGptImages({ candidates, onProbe = () => {}, ...options } = {}) {
+  const selected = candidates;
   const checks = [];
   for (const apiMode of ["images", "ark-task"]) {
     const models = [];
@@ -14303,13 +14812,15 @@ export async function runRelayImagegen(args, {
     throw new Error("生圖供應商設定無效，請從路由器選單重新設定中轉 API 生圖。");
   }
   const providerHeaders = providerId ? { [PROVIDER_HEADER]: providerId } : {};
-  const apiMode = config.apiMode || "images";
-  if (!["images", "ark-task"].includes(apiMode)) throw new Error("生圖介面設定無效，請重新設定中轉生圖。");
+  // 新版技能逐模型記錄介面（apiModes）；舊版只有一個共用的 apiMode。
+  const apiMode = config.apiModes?.[model] || config.apiMode || "images";
+  if (!IMAGE_API_MODES.includes(apiMode) || !imageApiModesFor(model).includes(apiMode)) throw new Error("生圖介面設定無效，請重新設定中轉生圖。");
   const upstreamModel = config.upstreamModels?.[model] || model;
-  if (upstreamModel !== model && !(typeof upstreamModel === "string" && upstreamModel.endsWith(`/${model}`) && !/[\s?#]/.test(upstreamModel))) {
+  if (!validImageUpstream(model, upstreamModel)) {
     throw new Error("圖片模型對應無效，請重新設定中轉生圖。");
   }
-  if (options.action === "list") return { models: config.models, upstreamModels: config.upstreamModels, apiMode, provider: providerId,
+  if (options.action === "list") return { models: config.models, upstreamModels: config.upstreamModels, apiMode: config.apiMode || "images",
+    apiModes: Object.fromEntries(config.models.map((id) => [id, config.apiModes?.[id] || config.apiMode || "images"])), provider: providerId,
     defaultGenerate: chooseImageModel(config, null, "generate"), defaultEdit: chooseImageModel(config, null, "edit") };
 
   const settings = JSON.parse(readFileSync(config.routerSettingsPath, "utf8"));
@@ -14328,7 +14839,12 @@ export async function runRelayImagegen(args, {
   if (apiMode === "ark-task" && (options.size !== "auto" || options.quality !== "auto" || options.background === "transparent")) {
     throw new Error("Ark 任務介面由上游決定尺寸與品質：size、quality 請使用 auto，background 只可用 auto 或 opaque。");
   }
-  const qualities = model === IMAGE_MODELS[0] ? ["auto", "low", "medium", "high"] : ["auto", "low", "medium", "high", "xhigh", "max"];
+  const nativeGemini = apiMode === "chat" || apiMode === "gemini";
+  if (nativeGemini && (options.size !== "auto" || options.quality !== "auto" || options.background === "transparent")) {
+    throw new Error("Nano Banana 由上游決定尺寸與品質：size、quality 請使用 auto，background 只可用 auto 或 opaque；比例與構圖請寫在提示詞裡。");
+  }
+  const qualities = model === IMAGE_MODELS[0] ? ["auto", "low", "medium", "high"]
+    : GEMINI_IMAGE_MODELS.includes(model) ? ["auto"] : ["auto", "low", "medium", "high", "xhigh", "max"];
   if (!qualities.includes(options.quality)) throw new Error(`此模型不支援 quality=${options.quality}。`);
   if (!["auto", "opaque", "transparent"].includes(options.background)) throw new Error("background 只支援 auto、opaque、transparent。");
   if (options.background === "transparent" && format === "jpeg") throw new Error("透明背景需使用 PNG 或 WebP。");
@@ -14353,7 +14869,8 @@ export async function runRelayImagegen(args, {
     return { path, bytes, type };
   });
   const origin = `http://127.0.0.1:${port}`;
-  const endpoint = `${origin}${apiMode === "ark-task" ? ARK_IMAGE_PATH : "/v1/images"}/${options.action === "edit" ? "edits" : "generations"}`;
+  const endpoint = apiMode === "chat" ? `${origin}${CHAT_IMAGE_PATH}` : apiMode === "gemini" ? `${origin}${GEMINI_IMAGE_PATH}`
+    : `${origin}${apiMode === "ark-task" ? ARK_IMAGE_PATH : "/v1/images"}/${options.action === "edit" ? "edits" : "generations"}`;
   const payload = { model: upstreamModel, prompt, n: 1, size: options.size,
     quality: options.quality, background: options.background, output_format: format };
   if (options.dryRun) return { dryRun: true, model, upstreamModel, apiMode, endpoint, out, inputImages: inputs.length };
@@ -14363,8 +14880,35 @@ export async function runRelayImagegen(args, {
     const response = await fetchImpl(`${origin}/healthz`, { signal: AbortSignal.timeout(5000), redirect: "error" });
     health = await response.json();
     if (!response.ok || health?.status !== "ok" || typeof health.stats?.imageRequests !== "number" ||
-        (apiMode === "ark-task" && typeof health.stats?.arkImageRequests !== "number")) throw new Error("health");
+        (apiMode === "ark-task" && typeof health.stats?.arkImageRequests !== "number") ||
+        (nativeGemini && typeof health.stats?.geminiImageRequests !== "number")) throw new Error("health");
   } catch { throw new Error("本機圖片路由不可用；請從路由器選單檢查狀態或執行 update，沒有送出生圖請求。"); }
+  if (nativeGemini) {
+    const headers = { "content-type": "application/json", ...providerHeaders };
+    const signal = AbortSignal.timeout(timeout * 1000);
+    let response;
+    let result;
+    try {
+      if (apiMode === "chat") {
+        ({ response, result } = await postChatImage(endpoint,
+          (modalities) => chatImagePayload(upstreamModel, prompt, inputs, { modalities }), { headers, signal, fetchImpl }));
+      } else {
+        response = await fetchImpl(endpoint, { method: "POST", headers, redirect: "error", signal,
+          body: JSON.stringify({ model: upstreamModel, ...geminiImagePayload(prompt, inputs) }) });
+        result = await responseJson(response);
+      }
+    } catch (error) {
+      if (error.name === "TimeoutError" || error.name === "AbortError") throw new Error("圖片請求逾時；上游可能仍在處理，未自動重試以避免重複計費。");
+      throw error;
+    }
+    if (!response.ok) throw apiError(Array.isArray(result) ? result[0] : result, response.status);
+    const image = apiMode === "chat" ? await extractChatImage(result, { signal, download: downloadImpl }) : extractGeminiImage(result);
+    // Gemini 自己決定輸出格式；與要求不同時改用實際格式的副檔名，不轉檔也不寫錯副檔名。
+    const path = image.format === format ? out : out.replace(/\.[A-Za-z0-9]+$/, "") + (image.format === "jpeg" ? ".jpg" : `.${image.format}`);
+    if (path !== out && existsSync(path)) throw new Error(`上游回傳 ${image.format}，對應的輸出檔已存在，請換一個檔名：${path}`);
+    writeFileSync(path, image.bytes, { mode: 0o600, flag: "wx" });
+    return { model, upstreamModel, apiMode, path, format: image.format, bytes: image.bytes.length };
+  }
   if (apiMode === "ark-task") {
     const arkPayload = { model: upstreamModel, prompt, output_format: format, background: options.background };
     if (options.action === "edit") arkPayload.image_base64s = inputs.map((image) => `data:image/${image.type};base64,${image.bytes.toString("base64")}`);
@@ -15508,6 +16052,9 @@ td.tight, th.tight { width: 1%; white-space: nowrap; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; word-break: break-all; }
 .empty { padding: 30px 20px; text-align: center; color: var(--muted); }
+.welcome { padding: 26px 28px; display: grid; gap: 18px; max-width: 760px; }
+.welcome ol { margin: 0; padding-left: 22px; line-height: 2; }
+.welcome .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .notes { display: grid; gap: 6px; margin: -4px 0 14px; }
 .note { color: var(--muted); font-size: 12.5px; }
 .note.warn { color: #fde68a; }
@@ -15775,8 +16322,24 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "關閉提示": "Dismiss",
 "桌面版": "the desktop app",
 "讀取中…": "Loading…",
-"這個 CODEX_HOME 還沒有安裝 Codex 模型路由器。": "Codex Model Router is not installed in this CODEX_HOME.",
-"請先在終端執行安裝器，選擇「安裝或重新配置」。": "Run the installer in a terminal first and choose “安裝或重新配置” (Install or reconfigure).",
+"開始使用": "Get started",
+"管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。": "The manager is installed. Connect an API provider or a Claude subscription to use their models from the Codex model picker, or just adjust the global context for now.",
+"選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。": "Choose an API Key connection (a common provider or your own Base URL), or a Claude subscription signed in with Claude Code.",
+"勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。": "Pick the models to add to Codex. Small test requests confirm they work before the router is installed.",
+"安裝完成後重新啟動 {app}，即可在模型選單選到新模型。": "After installation, restart {app} to see the new models in the picker.",
+"連接供應商": "Connect a provider",
+"調整全域上下文": "Adjust global context",
+"連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。": "Connecting a provider installs the router; you can add more providers, relay image generation and backup keys afterwards. Prefer the terminal? Run the installer with menu to use the terminal menu.",
+"尚未連接供應商，這裡只能調整不需要路由器的設定。": "No provider is connected yet, so only settings that don't need the router are available here.",
+"首次設定": "First-time setup",
+"僅備用 Key": "Backup key only",
+"主 Key 沒有這個模型；路由器會固定用有它的備用 Key。": "The primary key doesn't have this model, so the router always uses a backup key that does.",
+"強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。": "Force-showing hidden models relies on the model list served by the router. Connect a provider to install the router before saving.",
+"每個模型會發送一次短測試並使用訂閱用量；有模型通過才會安裝路由器並添加，固定使用回應中的完整模型版本。": "Each model gets one short test that uses your subscription. The router is installed and models are added only if a test passes; the exact model version from the response is kept.",
+"開始測試並安裝": "Test and install",
+"尚未連接供應商": "No provider connected",
+"將安裝路由器，並探測以下 {count} 個模型：": "The router will be installed, and these {count} models will be tested:",
+"開始探測並安裝": "Test and install",
 "路由器狀態、最近的錯誤與執行環境。": "Router status, recent errors, and environment.",
 "同步與修復模型清單": "Sync and repair model list",
 "重新啟動路由器": "Restart router",
@@ -16006,6 +16569,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "添加 Claude 訂閱模型": "Add Claude subscription models",
 "通用 Images API": "Standard Images API",
 "Ark 任務介面": "Ark task API",
+"Chat Completions 介面": "Chat Completions API",
+"Gemini 原生介面": "Native Gemini API",
 "用中轉供應商的圖片 API 生成或編輯圖片，適合免費帳號或內建生圖不可用的時候。Codex 裡以 $router-imagegen 技能使用，沿用路由器保存的憑證。": "Generate or edit images with a relay provider's image API, useful on free accounts or when built-in image generation isn't available. In Codex it's used through the $router-imagegen skill with the router's saved credentials.",
 "重新整理生圖狀態": "Refresh image generation status",
 "目前狀態": "Current status",
@@ -16019,8 +16584,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "用哪一家供應商生圖": "Provider for image generation",
 "重新偵測": "Test again",
 "偵測並啟用": "Test and enable",
-"多選時由 AI 依需求挑選：一般生圖與快速迭代偏好 Flare，精細改圖與保留原圖細節偏好 Sunburst；Image 2 給指定或相容需求使用。": "With several models selected, the AI chooses as needed: Flare for general generation and fast iteration, Sunburst for precise edits that keep source details, and Image 2 when specifically requested or for compatibility.",
-"偵測會實際生圖並依供應商計費：每個勾選的模型先用通用介面各生成一張低品質圖；全部失敗時，再用 Ark 任務介面各試一次。只有通過的模型會啟用，沒有通過時既有設定保持不變。": "Testing really generates images and is billed by the provider: each selected model first generates one low-quality image through the standard API; if all fail, each is tried once with the Ark task API. Only models that pass are enabled; otherwise the current setup is unchanged.",
+"多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。": "With several models selected, the AI chooses as needed: among GPT Image, Flare for general generation and Sunburst for precise edits; among Nano Banana, 2.1 for general use, Pro for complex compositions and in-image text, and 2 Lite for fast bulk output. Image 2, Nano Banana 2 and the original Nano Banana are for explicit requests or compatibility.",
+"偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。": "Testing really generates images and is billed by the provider: GPT Image models first try the standard interface with one low-quality image each, then the Ark task API if all fail; Nano Banana models try Chat, native Gemini and the standard interface in turn, stopping at the first success. Only passing models are enabled; if none pass, the current setup is unchanged.",
 "重新偵測並套用": "Test again and apply",
 "最近一次偵測": "Last test",
 "結果": "Result",
@@ -16030,7 +16595,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "開始偵測": "Start test",
 "將用「{provider}」實際生圖測試以下 {count} 個模型：": "These {count} models will be tested by generating images with “{provider}”:",
 "主要供應商": "the primary provider",
-"會依供應商計費：通用介面每個模型一張低品質圖，全部失敗時 Ark 介面再各一張。生成失敗不會自動重送。": "Billed by the provider: one low-quality image per model with the standard API, plus one more each with the Ark API if all fail. Failed generations aren't retried automatically.",
+"會依供應商計費：每個模型每種介面最多一張圖，通過就不再試其他介面。生成失敗不會自動重送。": "Billed by the provider: at most one image per model per interface, stopping at the first that works. Failed generations aren't retried automatically.",
 "停用中轉 API 生圖": "Disable relay API image generation",
 "會把 $router-imagegen 技能封存到備份目錄，Codex 之後就不會再使用它；之後可以隨時重新偵測並啟用。": "The $router-imagegen skill is archived to the backup directory and Codex stops using it. You can test and enable it again at any time.",
 "停用中轉生圖": "Disable relay image generation",
@@ -16257,7 +16822,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "upstream_http_error": "The upstream service returned an HTTP error."
 },
 "enServer": [
-["^尚未安裝路由器，請先在終端執行「安裝或重新配置」。$", "The router isn't installed. Run the installer in a terminal and choose “安裝或重新配置” (Install or reconfigure)."],
+["^尚未安裝路由器，請先在管理頁完成首次設定。$", "The router isn't installed. Finish the first-time setup in the manager first."],
+["^路由器已經安裝，請重新整理管理頁。$", "The router is already installed. Reload the manager."],
 ["^路由器已是 (.+)，這個管理頁仍是 (.+)；請關閉管理頁後重新開啟。$", "The router is already $1, but this manager is still $2. Close the manager and open it again."],
 ["^這個管理頁是 (.+)，路由器仍是 (.+)；請先從左上角的版本選單套用新版本。$", "This manager is $1, but the router is still $2. Apply the new version from the version menu at the top left first."],
 ["^未找到 Codex CLI，請先安裝 (.+) 或 Codex CLI。$", "Codex CLI wasn't found. Install $1 or the Codex CLI first."],
@@ -16275,9 +16841,14 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 ["^上一代圖片模型，適合既有流程與相容需求。$", "Previous-generation image model, for existing workflows and compatibility."],
 ["^偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。$", "Focused on editing precision, for detailed edits that keep the original's details."],
 ["^偏重速度，適合一般生圖與快速迭代。$", "Focused on speed, for general generation and fast iteration."],
+["^Google 目前的主力生圖模型：速度快、成本低，畫質、文字渲染與多輪改圖一致性都比 Nano Banana 2 好。$", "Google's current workhorse: fast and low-cost, with better quality, text rendering and multi-turn editing consistency than Nano Banana 2."],
+["^Google 品質最高的生圖模型：適合複雜構圖、精準文字、品牌一致性與精細控制，較慢也較貴。$", "Google's highest-quality image model: for complex compositions, accurate text, brand consistency and fine control; slower and pricier."],
+["^上一代主力：兼顧速度、4K 輸出與多張參考圖的一致性。$", "Previous workhorse: balances speed, 4K output and consistency across multiple reference images."],
+["^最快、最便宜，適合大量出圖；不擅長多張參考圖或連續改圖。$", "Fastest and cheapest, for bulk output; weaker with multiple references or sequential edits."],
+["^初代舊型號，適合既有流程；Google 建議改用 Nano Banana 2 Lite。$", "The original legacy model, for existing workflows; Google recommends Nano Banana 2 Lite instead."],
+["^請從清單中至少選擇一個圖片模型。$", "Select at least one image model from the list."],
 ["^沒找到可用模型，生圖設定沒有變更。$", "No usable model was found; image generation settings weren't changed."],
 ["^中轉 API 生圖尚未啟用。$", "Relay API image generation isn't enabled."],
-["^請從 Image 2、Image 2\\.5 Sunburst、Image 2\\.5 Flare 中至少選擇一個模型。$", "Select at least one of Image 2, Image 2.5 Sunburst, and Image 2.5 Flare."],
 ["^選中的模型均未通過探測，配置未改動。$", "None of the selected models passed probing; nothing was changed."],
 ["^所選模型都已配置，配置未改動。$", "All selected models are already configured; nothing was changed."],
 ["^沒有需要探測的新模型。$", "There are no new models to probe."],
@@ -16332,8 +16903,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難電靜響頁頂項順須預頭頻題額類顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难电静响页顶项顺须预头频题额类显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -16890,7 +17461,8 @@ function renderSidebar() {
 
   const status = document.getElementById("router-status");
   if (!state || !state.installed) {
-    status.replaceChildren(h("span", { class: "status-dot" }), h("span", { text: state ? t("尚未安裝") : t("檢查中…") }));
+    status.replaceChildren(h("span", { class: "status-dot" }),
+      h("span", { text: !state ? t("檢查中…") : state.managerOnly ? t("尚未連接供應商") : t("尚未安裝") }));
   } else if (state.router && state.router.ok) {
     status.replaceChildren(h("span", { class: "status-dot ok" }), h("span", { text: t("路由器運作中 · :{port}", { port: state.router.port }) }));
   } else {
@@ -16942,8 +17514,7 @@ function renderView() {
     return;
   }
   if (!state.installed) {
-    view.replaceChildren(pageHead(t("尚未安裝"), t("這個 CODEX_HOME 還沒有安裝 Codex 模型路由器。")),
-      h("div", { class: "panel" }, h("div", { class: "empty", text: t("請先在終端執行安裝器，選擇「安裝或重新配置」。") })));
+    view.replaceChildren(...(currentView === "settings" ? renderSetupSettings() : renderWelcome()));
     return;
   }
   if (currentView === "models") view.replaceChildren(...renderModels());
@@ -16957,6 +17528,33 @@ function pageHead(title, subtitle, ...actions) {
   return h("header", { class: "page-head" },
     h("div", {}, h("h1", { text: title }), subtitle ? h("p", { text: subtitle }) : null),
     actions.length ? h("div", { class: "actions" }, ...actions) : null);
+}
+
+// 尚未連接供應商（只裝了管理頁）：連接供應商的流程與「新增供應商」相同，最後改成安裝路由器。
+function renderWelcome() {
+  const blocked = state.setupBlocked;
+  return [pageHead(t("開始使用"), t("管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。")),
+    h("div", { class: "panel welcome" },
+      h("ol", {},
+        h("li", { text: t("選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。") }),
+        h("li", { text: t("勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。") }),
+        h("li", { text: t("安裝完成後重新啟動 {app}，即可在模型選單選到新模型。", { app: desktopName() }) })),
+      blocked ? paragraph(serverText(blocked), "note warn") : null,
+      h("div", { class: "actions" },
+        h("button", { type: "button", class: "button primary", disabled: Boolean(blocked), onclick: () => openAddProvider({ firstInstall: true }) },
+          icon("plus"), t("連接供應商")),
+        h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("settings"), t("調整全域上下文"))),
+      paragraph(t("連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。"), "muted"))];
+}
+
+function renderSetupSettings() {
+  return [
+    pageHead(sectionTitle("設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
+    renderGlobalContextPanel(Boolean(state.setupBlocked)),
+    // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
+    renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
+    renderDiagnosticsPanel(),
+  ];
 }
 
 // ---- 總覽 --------------------------------------------------------------------
@@ -17347,6 +17945,7 @@ function backupKeysRow(provider, blocked) {
   if (!keys.length) return null;
   return cardRow(t("備用 Key"), h("span", { class: "key-list" }, keys.map((item) => h("span", { class: "key-item" },
     h("span", { class: "mono", text: "••••" + (item.tail || "") }),
+    item.modelCount ? h("span", { class: "faint", text: t("{count} 個模型", { count: item.modelCount }) }) : null,
     keyStatusChip(provider, item.id),
     h("button", { type: "button", class: "icon-button", disabled: blocked, title: t("移除備用 Key"), "aria-label": t("移除備用 Key"),
       onclick: () => confirmRemoveBackupKey(provider, item) }, icon("trash"))))));
@@ -17788,7 +18387,7 @@ function claudeChoiceLabel(choice) {
 }
 
 // Claude 訂閱的確認步驟：列出要測試的模型與上下文、輸出設定，提醒會使用訂閱用量。
-function showClaudeCliConfirm(modal, chooser, back) {
+function showClaudeCliConfirm(modal, chooser, back, { firstInstall = false } = {}) {
   const invalid = chooser.invalidManual();
   if (invalid.length) {
     toast(t("模型名稱只能是 opus、sonnet、haiku、fable 或完整 claude-* 名稱：{models}", { models: joinList(invalid) }), "error");
@@ -17805,22 +18404,25 @@ function showClaudeCliConfirm(modal, chooser, back) {
     h("ul", { class: "plain-list" }, models.map((model) => h("li", { class: "mono", text: model }))),
     chooser.limits.nodes,
     globalContextBanner(),
-    banner("warn", "alert", t("每個模型會發送一次短測試並使用訂閱用量；只有通過的會添加，並固定使用回應中的完整模型版本。完成後會重新啟動路由器，進行中的對話會短暫重新連線。")));
+    banner("warn", "alert", firstInstall
+      ? t("每個模型會發送一次短測試並使用訂閱用量；有模型通過才會安裝路由器並添加，固定使用回應中的完整模型版本。")
+      : t("每個模型會發送一次短測試並使用訂閱用量；只有通過的會添加，並固定使用回應中的完整模型版本。完成後會重新啟動路由器，進行中的對話會短暫重新連線。")));
   modal.setFoot(h("span", { class: "grow" }),
     h("button", { type: "button", class: "button", text: t("上一步"), onclick: back }),
-    h("button", { type: "button", class: "button primary", text: t("開始測試並添加"), onclick: () => {
+    h("button", { type: "button", class: "button primary", text: firstInstall ? t("開始測試並安裝") : t("開始測試並添加"), onclick: () => {
       const result = chooser.limits.read();
       if (result.error) { toast(result.error, "error"); return; }
       modal.close();
-      runJob("claude-cli-add", { models, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens },
-        { title: t("添加 Claude 訂閱模型") });
+      const params = { models, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens };
+      if (firstInstall) runJob("install-claude", params, { title: t("首次設定") });
+      else runJob("claude-cli-add", params, { title: t("添加 Claude 訂閱模型") });
     } }));
 }
 
 // ---- 生圖 ----------------------------------------------------------------------
 
 function apiModeLabel(mode) {
-  return { images: t("通用 Images API"), "ark-task": t("Ark 任務介面") }[mode] || mode;
+  return { images: t("通用 Images API"), "ark-task": t("Ark 任務介面"), chat: t("Chat Completions 介面"), gemini: t("Gemini 原生介面") }[mode] || mode;
 }
 
 function renderImagegen() {
@@ -17849,10 +18451,11 @@ function renderImagegen() {
       h("dt", { text: t("狀態") }), h("dd", {}, h("span", { class: "chip green", text: t("已啟用") })),
       h("dt", { text: sectionTitle("模型") }), h("dd", {}, info.models.map((model) => {
         const upstream = info.upstreamModels[model];
-        return h("div", {}, h("span", { text: labels.get(model) || model }), h("span", { class: "faint mono", text: "  " + (upstream || model) }));
+        const mode = (info.apiModes && info.apiModes[model]) || info.apiMode;
+        return h("div", {}, h("span", { text: labels.get(model) || model }), h("span", { class: "faint mono", text: "  " + (upstream || model) }),
+          mode ? h("span", { class: "faint", text: "  · " + apiModeLabel(mode) }) : null);
       })),
       h("dt", { text: t("供應商") }), h("dd", { text: info.providerId ? providerLabel(info.providerId) : "—" }),
-      h("dt", { text: t("介面") }), h("dd", { text: info.apiMode ? apiModeLabel(info.apiMode) : "—" }),
       h("dt", { text: t("技能位置") }), h("dd", { class: "mono", text: info.root }),
       h("dt", { text: t("使用方式") }), h("dd", { text: t("在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。") }))));
   } else {
@@ -17878,10 +18481,10 @@ function renderImagegen() {
   parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: info.enabled ? t("重新偵測") : t("偵測並啟用") })),
     h("div", { class: "panel-body stack" },
-      paragraph(t("多選時由 AI 依需求挑選：一般生圖與快速迭代偏好 Flare，精細改圖與保留原圖細節偏好 Sunburst；Image 2 給指定或相容需求使用。"), "muted"),
+      paragraph(t("多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。"), "muted"),
       h("div", { class: "check-list" }, options),
       providerField,
-      banner("warn", "alert", t("偵測會實際生圖並依供應商計費：每個勾選的模型先用通用介面各生成一張低品質圖；全部失敗時，再用 Ark 任務介面各試一次。只有通過的模型會啟用，沒有通過時既有設定保持不變。")),
+      banner("warn", "alert", t("偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。")),
       h("div", { class: "actions end" },
         h("button", { type: "button", class: "button primary", disabled: blocked || imagegenDraft.models.size === 0, onclick: () => confirmImagegenSetup(info) },
           icon("image"), info.enabled ? t("重新偵測並套用") : t("偵測並啟用"))))));
@@ -17910,7 +18513,7 @@ function confirmImagegenSetup(info) {
     body: [
       paragraph(t("將用「{provider}」實際生圖測試以下 {count} 個模型：", { provider: providerId ? providerLabel(providerId) : t("主要供應商"), count: chosen.length })),
       h("ul", { class: "plain-list" }, chosen.map((choice) => h("li", {}, choice.label, h("span", { class: "faint mono", text: "  " + choice.id })))),
-      banner("warn", "alert", t("會依供應商計費：通用介面每個模型一張低品質圖，全部失敗時 Ark 介面再各一張。生成失敗不會自動重送。")),
+      banner("warn", "alert", t("會依供應商計費：每個模型每種介面最多一張圖，通過就不再試其他介面。生成失敗不會自動重送。")),
     ],
   }).then((ok) => {
     if (ok) runJob("imagegen-setup", { providerId, models: chosen.map((choice) => choice.id) }, { title: t("偵測並啟用中轉生圖") });
@@ -18034,7 +18637,7 @@ function confirmClearGlobalContext() {
   }).then((ok) => { if (ok) runJob("set-global-context", { value: null }, { title: t("移除全域上下文") }); });
 }
 
-function renderHiddenModelsPanel(blocked) {
+function renderHiddenModelsPanel(blocked, note = null) {
   const entry = ensureQuery("hidden-models");
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("隱藏的官方模型") }),
     refreshButton("hidden-models", t("重新整理隱藏的官方模型"))));
@@ -18071,6 +18674,7 @@ function renderHiddenModelsPanel(blocked) {
           { title: t("設定隱藏的官方模型") });
       } }, t("儲存"))));
   }
+  if (note) body.prepend(paragraph(note, "note warn"));
   panel.append(body);
   return panel;
 }
@@ -18145,7 +18749,7 @@ function paragraph(text, className) {
 function jobTitle(type, fallback) {
   const titles = {
     "repair-models": t("同步與修復模型清單"), "add-models": t("添加模型"), "remove-models": t("刪除模型"),
-    "reorder-models": t("調整模型順序"), "edit-model": t("修改模型"), "add-provider": t("新增供應商"),
+    "reorder-models": t("調整模型順序"), "edit-model": t("修改模型"), "add-provider": t("新增供應商"), install: t("首次設定"), "install-claude": t("首次設定"),
     "edit-provider": t("修改供應商"), "remove-provider": t("移除供應商"), "replace-key": t("更換 API Key"),
     "add-backup-key": t("新增備用 API Key"), "remove-backup-key": t("移除備用 API Key"),
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
@@ -18316,6 +18920,7 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
           model.label && model.label !== model.id ? h("span", { class: "faint", text: model.label }) : null),
         model.configured ? h("span", { class: "chip", text: allowConfigured ? t("已添加，可重新設定") : t("已添加") }) : null,
         model.note ? h("span", { class: "chip amber", text: model.note }) : null,
+        model.onlyBackup ? h("span", { class: "chip amber", title: t("主 Key 沒有這個模型；路由器會固定用有它的備用 Key。"), text: t("僅備用 Key") }) : null,
         !model.configured && model.anthropic ? h("span", { class: "chip violet", text: t("Claude 轉譯") }) : null);
     }));
   }
@@ -18567,7 +19172,7 @@ function typeOption(iconName, title, chip, description, onclick) {
     icon("chevronRight"));
 }
 
-function openAddProvider() {
+function openAddProvider({ firstInstall = false } = {}) {
   const baseUrl = h("input", { type: "url", placeholder: "https://api.example.com/v1", autocomplete: "off", spellcheck: "false" });
   const apiKey = h("input", { type: "password", placeholder: "sk-…", autocomplete: "new-password", spellcheck: "false" });
   // 常用供應商：點一下就帶入 Base URL，並提供取得 API Key 的官方頁面。手動改網址時，選取狀態跟著對回去。
@@ -18628,7 +19233,7 @@ function openAddProvider() {
     backupField,
   ];
   const backButton = h("button", { type: "button", class: "button", text: t("上一步") });
-  const modal = openModal({ title: t("新增供應商"), wide: true });
+  const modal = openModal({ title: firstInstall ? t("首次設定") : t("新增供應商"), wide: true });
   cancelButton.onclick = () => modal.close();
   backButton.onclick = () => showTypeChoice();
   let draft = null;
@@ -18642,7 +19247,7 @@ function openAddProvider() {
   const cli = claudeCliChooser({ onChange: updateCli });
   const cliCount = h("span", { class: "grow" });
   const cliNext = h("button", { type: "button", class: "button primary", text: t("下一步"), disabled: true });
-  cliNext.onclick = () => showClaudeCliConfirm(modal, cli, showClaudeCli);
+  cliNext.onclick = () => showClaudeCliConfirm(modal, cli, showClaudeCli, { firstInstall });
 
   nextButton.onclick = async () => {
     if (!baseUrl.value.trim() || !apiKey.value.trim()) {
@@ -18665,7 +19270,7 @@ function openAddProvider() {
 
   function showTypeChoice() {
     const connected = (state.models || []).filter((model) => model.transport === "claude-cli").length;
-    modal.setTitle(t("新增供應商"));
+    modal.setTitle(firstInstall ? t("首次設定") : t("新增供應商"));
     modal.setBody(
       paragraph(t("選擇要新增的供應商類型。"), "muted"),
       h("div", { class: "type-choices" },
@@ -18679,13 +19284,13 @@ function openAddProvider() {
     modal.setFoot(h("span", { class: "grow" }), cancelButton);
   }
   function showRelayForm() {
-    modal.setTitle(t("新增供應商：API Key 連接"));
+    modal.setTitle(firstInstall ? t("首次設定") : t("新增供應商：API Key 連接"));
     modal.setBody(stepOne);
     modal.setFoot(status, backButton, nextButton);
     setTimeout(() => baseUrl.focus(), 30);
   }
   function showClaudeCli() {
-    modal.setTitle(t("新增供應商：Claude 訂閱帳號"));
+    modal.setTitle(firstInstall ? t("首次設定") : t("新增供應商：Claude 訂閱帳號"));
     modal.setBody(cli.element);
     modal.setFoot(cliCount, backButton, cliNext);
     cli.ensure();
@@ -18711,6 +19316,7 @@ function openAddProvider() {
     updateStepTwo();
   }
   function needsName() {
+    if (firstInstall) return false;
     const models = picker.selection();
     return models.length === 0 || models.some((model) => !model.includes("/"));
   }
@@ -18742,7 +19348,9 @@ function openAddProvider() {
     const models = picker.selection();
     const providerId = needsName() ? providerName.value.trim().toLowerCase() : null;
     modal.setBody(
-      paragraph(providerId
+      paragraph(firstInstall
+        ? t("將安裝路由器，並探測以下 {count} 個模型：", { count: models.length })
+        : providerId
         ? t("將新增供應商「{name}」，並探測以下 {count} 個模型：", { name: providerId, count: models.length })
         : t("將新增供應商（所選模型已有前綴，ID 自動產生），並探測以下 {count} 個模型：", { count: models.length })),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", { class: "mono", text: model }))),
@@ -18752,14 +19360,16 @@ function openAddProvider() {
       probeWarning(models.length, true));
     modal.setFoot(h("span", { class: "grow" }),
       h("button", { type: "button", class: "button", text: t("上一步"), onclick: showStepTwo }),
-      h("button", { type: "button", class: "button primary", text: t("開始探測並新增"), onclick: () => {
+      h("button", { type: "button", class: "button primary", text: firstInstall ? t("開始探測並安裝") : t("開始探測並新增"), onclick: () => {
         const result = limits.read();
         if (result.error) { toast(result.error, "error"); return; }
         modal.close();
-        runJob("add-provider", {
+        const params = {
           draftId: draft.draftId, models, providerId, contextWindow: result.contextWindow, maxOutputTokens: result.maxOutputTokens,
           backupKeys: chosenBackups(),
-        }, { title: t("新增供應商") });
+        };
+        if (firstInstall) runJob("install", params, { title: t("首次設定") });
+        else runJob("add-provider", params, { title: t("新增供應商") });
         backups.clear();
       } }));
   }
