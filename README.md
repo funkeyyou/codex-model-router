@@ -45,9 +45,17 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 
 大部分操作都能在网页管理页完成，任选一种方式打开：
 
-- Codex 里的「自訂模型管理」入口（安装后需重启 Codex 一次才会出现）
+- Codex 里的「自定义模型管理」入口（名称跟随 Codex 界面语言；安装后需重启 Codex 一次才会出现）
 - 「Codex 模型路由器」快捷方式（Windows 在开始菜单，macOS 在 `~/Applications`）
 - 运行 `ui` 命令
+
+<img src="docs/images/codex-manager-entry.png" alt="Codex 侧边栏「更多」菜单中的模型管理入口（截图为繁体界面）" width="300">
+
+<img src="docs/images/manager-models-zh-Hans.png" alt="网页管理页的模型列表：调整顺序、上下文、输出与推理强度">
+
+<img src="docs/images/manager-providers-zh-Hans.png" alt="网页管理页的供应商页：API Key 供应商与 Claude 订阅">
+
+*截图中的供应商名称与网址已替换或模糊处理。*
 
 也可以直接用命令（在安装器所在的文件夹运行）：macOS 用 `bash codex-model-router.sh <命令>`，Windows 用 `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 <命令>`。不带命令运行会显示菜单。
 

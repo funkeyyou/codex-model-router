@@ -122,7 +122,7 @@ powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 
 安裝或更新完成後，安裝器會在路由器目錄放一份安裝器副本，並建立「Codex 模型路由器」捷徑（macOS 在 `~/Applications`，Windows 在開始功能表），之後雙擊即可開啟，不必再找當初下載的安裝器。
 
-從 1.27.5 起，安裝或更新會自動加入 Codex 的「自訂模型管理」全域入口。重新開啟 Codex 後，點擊入口即可在瀏覽器開啟本機管理頁，不需要下載倉庫或設定專案 Actions。入口使用官方支援的 [MCP Apps 全域擴充](https://developers.openai.com/plugins/build/extensions#sidebar-apps)，需要支援 MCP Apps 的桌面版本；不同版本會顯示在頂部或側邊欄。開啟入口不需要模型推理或消耗中轉額度。若只想重新註冊入口，可執行 `ui-setup`，不重啟路由器。
+從 1.27.5 起，安裝或更新會自動加入 Codex 的「自訂模型管理」全域入口；從 1.30.1 起入口名稱跟隨 Codex 介面語言（繁中、簡中，其他語言顯示英文），切換語言後重開 Codex 生效。重新開啟 Codex 後，點擊入口即可在瀏覽器開啟本機管理頁，不需要下載倉庫或設定專案 Actions。入口使用官方支援的 [MCP Apps 全域擴充](https://developers.openai.com/plugins/build/extensions#sidebar-apps)，需要支援 MCP Apps 的桌面版本；不同版本會顯示在頂部或側邊欄。開啟入口不需要模型推理或消耗中轉額度。若只想重新註冊入口，可執行 `ui-setup`，不重啟路由器。
 
 這個本機 MCP 只提供「開啟管理頁」工具，不暴露設定讀寫或 API Key。管理操作仍在原有的本機網頁中完成。安裝器只管理自己的 `mcp_servers.model_router_manager` 項目；同名項目已被使用者設定時會保留並提示，其他 MCP 伺服器不受影響。回退會移除仍由本工具管理的入口。
 

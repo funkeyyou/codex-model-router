@@ -188,7 +188,7 @@ test("簡體：大陸慣用詞、覆寫、保留 Codex 介面上的名稱，記�
   assert.equal(sectionTitle("總覽"), "概览");
   assert.equal(t("Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。"),
     data.hans["Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。"]);
-  assert.equal(toSimplified("請從 Codex 的「自訂模型管理」開啟"), "请从 Codex 的「自訂模型管理」打开", "Codex 裡實際顯示的名稱不轉換");
+  assert.equal(toSimplified("請從 Codex 的「自訂模型管理」開啟"), "请从 Codex 的「自定义模型管理」打开", "與簡體 Codex 裡實際顯示的入口名稱一致");
   assert.equal(toSimplified("英文字母與預設程式碼"), "英文字母与默认代码", "較長的詞優先，不會被拆開");
   assert.equal(serverText("網路連線逾時"), "网络连接超时");
   assert.equal(logText("背景程序已結束"), "后台进程已结束");
@@ -196,7 +196,7 @@ test("簡體：大陸慣用詞、覆寫、保留 Codex 介面上的名稱，記�
   for (const key of uiKeys) {
     const converted = t(key);
     const leftovers = [...converted].filter((char) => [...data.t2s.from].includes(char));
-    assert.deepEqual(leftovers.filter((char) => !"自訂模型管理".includes(char)), [], key);
+    assert.deepEqual(leftovers, [], key);
   }
 });
 

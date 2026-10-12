@@ -261,7 +261,7 @@ test("Codex 全域入口：真實 config RPC 註冊並保留其他設定，重�
   const inventory = await installer.codexRpc("mcpServerStatus/list", {},
     result => result.data?.some(server => server.name === "model_router_manager" && Object.keys(server.tools || {}).length), codexBin, root);
   const tool = inventory.data.find(server => server.name === "model_router_manager").tools.open_model_manager;
-  assert.equal(tool.title, "自訂模型管理");
+  assert.ok(["自訂模型管理", "自定义模型管理", "Custom Model Manager"].includes(tool.title), tool.title);
   assert.deepEqual(tool._meta["openai/ui"].entrypoints, [{ type: "global" }]);
   const beforeRepeat = readFileSync(configPath, "utf8");
   const second = await runSetup();
