@@ -9,7 +9,7 @@ It is a small router that runs on your computer (a local LLM proxy). Official mo
 - **Supported APIs**: OpenAI Responses API, Anthropic Claude Messages API, and Chat Completions-only endpoints (DeepSeek, Qwen, GLM, Kimi, Gemini, Ollama, vLLM, and more; capabilities are probed during setup).
 - **Multiple providers**: connect several at once; each API key is stored encrypted (macOS Keychain / Windows DPAPI).
 - **Web manager**: add or remove models, manage providers and API keys, and update in one click from your browser.
-- **Optional**: relay image generation and Claude Code subscription routing (experimental).
+- **Optional**: relay image generation and Claude Code subscription routing.
 
 ## Install
 
@@ -60,6 +60,7 @@ You can also run commands from the folder containing the installer: `bash codex-
 | `imagegen` | Configure relay image generation |
 | `repair-models` | Fix stale or removed models in the picker |
 | `status` | Check installation and service status |
+| `diagnostics` | Export a diagnostics bundle to the desktop (keys masked) to attach to bug reports |
 | `rollback` | Remove the router |
 
 ## Update and uninstall

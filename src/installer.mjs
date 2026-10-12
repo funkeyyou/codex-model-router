@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer, isIP } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { homedir, release as osRelease, tmpdir } from "node:os";
 import { Writable } from "node:stream";
 import { basename, dirname, join, posix, resolve, win32 } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.29.5";
+const INSTALLER_VERSION = "1.30.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -70,6 +70,8 @@ const chatBridgePath = join(installRoot, "chat-bridge.mjs");
 const claudeCliPath = join(installRoot, "claude-cli.mjs");
 const settingsPath = join(installRoot, "settings.json");
 const catalogPath = join(installRoot, "models.json");
+// 備用 API Key 清單（只有鑰匙圈項目名稱與 Key 末四碼，沒有 Key 本身）。路由器依修改時間重讀。
+const keyPoolPath = join(installRoot, "key-pool.json");
 const logPath = join(installRoot, "router.err.log");
 const relaySkillRoot = join(codexHome, "skills", "router-imagegen");
 const RELAY_IMAGEGEN_OWNER = "codex-model-router";
@@ -659,6 +661,78 @@ function deleteApiKey(service, account = "codex") {
     ["delete-generic-password", "-a", account, "-s", service],
     { allowFailure: true },
   );
+}
+
+// --- 備用 API Key ----------------------------------------------------------------
+//
+// 同一家供應商可以再放最多 5 把備用 Key。主 Key 仍是供應商原本那一把；路由器在目前這把
+// 回 401／402／403／429 時自動換下一把（見 router.mjs 的 createKeyRotation）。
+export const MAX_BACKUP_KEYS = 5;
+
+export function normalizeKeyPoolFile(source) {
+  const providers = {};
+  const entries = source && typeof source === "object" && source.providers && typeof source.providers === "object"
+    ? source.providers : {};
+  for (const [providerId, list] of Object.entries(entries)) {
+    if (!Array.isArray(list)) continue;
+    const kept = list.filter((item) => item && typeof item.id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(item.id) &&
+      item.id !== "primary" && typeof item.keychainService === "string" && item.keychainService)
+      .map((item) => ({
+        id: item.id,
+        keychainService: item.keychainService,
+        keychainAccount: "codex",
+        credentialPath: typeof item.credentialPath === "string" && item.credentialPath ? item.credentialPath : null,
+        tail: typeof item.tail === "string" ? item.tail.slice(-4) : "",
+        addedAt: typeof item.addedAt === "string" ? item.addedAt : null,
+      }));
+    if (kept.length) providers[providerId] = kept;
+  }
+  return { version: 1, providers };
+}
+
+function readKeyPoolFile() {
+  if (!existsSync(keyPoolPath)) return { version: 1, providers: {} };
+  try {
+    return normalizeKeyPoolFile(JSON.parse(readFileSync(keyPoolPath, "utf8")));
+  } catch {
+    fail(`key-pool.json 已損壞；刪除 ${keyPoolPath} 後重新新增備用 Key 即可，主 Key 不受影響。`);
+  }
+}
+
+function writeKeyPoolFile(pool) {
+  const next = normalizeKeyPoolFile(pool);
+  if (Object.keys(next.providers).length === 0) {
+    rmSync(keyPoolPath, { force: true });
+    return;
+  }
+  writeJsonAtomic(keyPoolPath, next);
+}
+
+export function backupKeysOf(pool, providerId) {
+  return Array.isArray(pool?.providers?.[providerId]) ? pool.providers[providerId] : [];
+}
+
+// 供應商被移除或整個回退時呼叫：刪掉這些備用 Key 的鑰匙圈項目／密文檔與清單記錄。
+function purgeBackupKeys(providerIds, { deleteSecrets = true } = {}) {
+  if (!existsSync(keyPoolPath)) return 0;
+  let pool;
+  try { pool = normalizeKeyPoolFile(JSON.parse(readFileSync(keyPoolPath, "utf8"))); } catch { return 0; }
+  let removed = 0;
+  for (const providerId of providerIds) {
+    for (const item of backupKeysOf(pool, providerId)) {
+      if (deleteSecrets && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+        try { deleteApiKey(item.keychainService, item.keychainAccount); } catch { /* 留下一筆沒人用的憑證而已。 */ }
+      }
+      removed += 1;
+    }
+    delete pool.providers[providerId];
+  }
+  if (existsSync(installRoot)) writeKeyPoolFile(pool);
+  return removed;
+}
+
+export function maskKeyTail(tail) {
+  return tail ? `••••${tail}` : "••••";
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
@@ -1629,9 +1703,71 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
 const GENERIC_HOST_LABELS = new Set(["api", "www", "gateway", "gw"]);
 const SECOND_LEVEL_SUFFIXES = new Set(["com", "net", "org", "co", "ac", "gov", "edu"]);
 
+// 常用供應商的預設 Base URL。端點與協議整理自 CC Switch（MIT）公開的 Codex 供應商預設
+// （https://github.com/farion1231/cc-switch/blob/main/src/config/codexProviderPresets.ts），
+// 只收原廠 API 與中立的聚合平台，不收推廣或邀請碼連結。協議不必寫：新增時照常探測
+// /responses，不通再改用 /chat/completions；預設只省去查網址，能不能用仍以使用者的 Key 實測為準。
+export const PROVIDER_PRESETS = Object.freeze([
+  { key: "anthropic", id: "anthropic", icon: "anthropic", name: "Anthropic API", region: "global", baseUrl: "https://api.anthropic.com", keyUrl: "https://console.anthropic.com/settings/keys" },
+  { key: "openai", id: "openai", icon: "openai", name: "OpenAI API", region: "global", baseUrl: "https://api.openai.com/v1", keyUrl: "https://platform.openai.com/api-keys" },
+  { key: "openrouter", id: "openrouter", icon: "openrouter", name: "OpenRouter", region: "global", baseUrl: "https://openrouter.ai/api/v1", keyUrl: "https://openrouter.ai/keys" },
+  { key: "deepseek", id: "deepseek", icon: "deepseek", name: "DeepSeek", region: "global", baseUrl: "https://api.deepseek.com", keyUrl: "https://platform.deepseek.com/api_keys" },
+  { key: "xai", id: "xai", icon: "xai", name: "xAI (Grok)", region: "global", baseUrl: "https://api.x.ai/v1", keyUrl: "https://console.x.ai" },
+  { key: "kimi", id: "kimi", icon: "kimi", name: "Kimi (Moonshot)", region: "global", baseUrl: "https://api.moonshot.ai/v1", keyUrl: "https://platform.kimi.ai/console/api-keys" },
+  { key: "kimi-coding", id: "kimi-coding", icon: "kimi", name: "Kimi For Coding", region: "global", baseUrl: "https://api.kimi.ai/coding/v1", keyUrl: "https://www.kimi.ai/code" },
+  { key: "zai", id: "zai", icon: "zhipu", name: "Z.ai (GLM)", region: "global", baseUrl: "https://api.z.ai/api/v1", keyUrl: "https://z.ai" },
+  { key: "qwen", id: "qwen", icon: "qwen", name: "Qwen (DashScope)", region: "global", baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", keyUrl: "https://home.qwencloud.com/api-keys" },
+  { key: "minimax", id: "minimax", icon: "minimax", name: "MiniMax", region: "global", baseUrl: "https://api.minimax.io/v1", keyUrl: "https://platform.minimax.io" },
+  { key: "stepfun", id: "stepfun", icon: "stepfun", name: "StepFun", region: "global", baseUrl: "https://api.stepfun.ai/v1", keyUrl: "https://platform.stepfun.ai/interface-key" },
+  { key: "siliconflow", id: "siliconflow", icon: "siliconflow", name: "SiliconFlow", region: "global", baseUrl: "https://api.siliconflow.com/v1", keyUrl: "https://siliconflow.com" },
+  { key: "nvidia", id: "nvidia", icon: "nvidia", name: "NVIDIA NIM", region: "global", baseUrl: "https://integrate.api.nvidia.com/v1", keyUrl: "https://build.nvidia.com/settings/api-keys" },
+  { key: "opencode-go", id: "opencode-go", icon: "opencode", name: "OpenCode Go", region: "global", baseUrl: "https://opencode.ai/zen/go/v1", keyUrl: "https://opencode.ai/go" },
+  { key: "novita", id: "novita", icon: "novita", name: "Novita AI", region: "global", baseUrl: "https://api.novita.ai/openai/v1", keyUrl: "https://novita.ai" },
+  { key: "aihubmix", id: "aihubmix", icon: "aihubmix", name: "AiHubMix", region: "global", baseUrl: "https://aihubmix.com/v1", keyUrl: "https://aihubmix.com" },
+  { key: "kimi-cn", id: "kimi", icon: "kimi", name: "Kimi (Moonshot)", region: "cn", baseUrl: "https://api.moonshot.cn/v1", keyUrl: "https://platform.kimi.com/console/api-keys" },
+  { key: "kimi-coding-cn", id: "kimi-coding", icon: "kimi", name: "Kimi For Coding", region: "cn", baseUrl: "https://api.kimi.com/coding/v1", keyUrl: "https://www.kimi.com/code" },
+  { key: "zhipu", id: "zhipu", icon: "zhipu", name: "Zhipu GLM (BigModel)", region: "cn", baseUrl: "https://open.bigmodel.cn/api/v1", keyUrl: "https://open.bigmodel.cn" },
+  { key: "qwen-cn", id: "qwen", icon: "qwen", name: "Qwen (DashScope)", region: "cn", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", keyUrl: "https://platform.qianwenai.com/home/api-keys" },
+  { key: "minimax-cn", id: "minimax", icon: "minimax", name: "MiniMax", region: "cn", baseUrl: "https://api.minimax.cn/v1", keyUrl: "https://platform.minimax.cn" },
+  { key: "stepfun-cn", id: "stepfun", icon: "stepfun", name: "StepFun", region: "cn", baseUrl: "https://api.stepfun.com/v1", keyUrl: "https://platform.stepfun.com/interface-key" },
+  { key: "siliconflow-cn", id: "siliconflow", icon: "siliconflow", name: "SiliconFlow", region: "cn", baseUrl: "https://api.siliconflow.cn/v1", keyUrl: "https://siliconflow.cn" },
+  { key: "mimo", id: "mimo", icon: "mimo", name: "Xiaomi MiMo", region: "cn", baseUrl: "https://api.xiaomimimo.com/v1", keyUrl: "https://platform.xiaomimimo.com/#/console/api-keys" },
+  { key: "hunyuan", id: "hunyuan", icon: "hunyuan", name: "Tencent TokenHub (Hunyuan)", region: "cn", baseUrl: "https://tokenhub.tencentmaas.com/v1", keyUrl: "https://console.cloud.tencent.com/tokenhub/apikey" },
+  { key: "qianfan", id: "qianfan", icon: "qianfan", name: "Baidu Qianfan", region: "cn", baseUrl: "https://qianfan.baidubce.com/v2", keyUrl: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application" },
+  { key: "modelscope", id: "modelscope", icon: "modelscope", name: "ModelScope", region: "cn", baseUrl: "https://api-inference.modelscope.cn/v1", keyUrl: "https://modelscope.cn/my/myaccesstoken" },
+  { key: "longcat", id: "longcat", icon: "longcat", name: "LongCat", region: "cn", baseUrl: "https://api.longcat.chat/openai/v1", keyUrl: "https://longcat.chat/platform/api_keys" },
+].map((preset) => Object.freeze(preset)));
+
+export function presetForBaseUrl(baseUrl) {
+  const target = String(baseUrl || "").trim().replace(/\/+$/, "").toLowerCase();
+  return PROVIDER_PRESETS.find((preset) => preset.baseUrl.toLowerCase() === target) || null;
+}
+
+function presetLabel(preset) {
+  return `${preset.name}${preset.region === "cn" ? "（中國大陸）" : ""}`;
+}
+
+// 終端的 Base URL 提問：先列出常用供應商，可以輸入編號，也可以直接貼網址。
+async function askProviderBaseUrl(defaultValue = null) {
+  console.log("常用供應商（輸入編號即可帶入網址；其他服務直接貼上 Base URL）：");
+  const width = String(PROVIDER_PRESETS.length).length;
+  PROVIDER_PRESETS.forEach((preset, index) => {
+    console.log(`  ${String(index + 1).padStart(width)}. ${presetLabel(preset)}  ${preset.baseUrl}`);
+  });
+  const answer = String(await ask("Base URL（OpenAI 相容服務或官方 Anthropic API）", defaultValue) ?? "").trim();
+  if (!/^\d{1,3}$/.test(answer)) return answer;
+  const preset = PROVIDER_PRESETS[Number(answer) - 1];
+  if (!preset) fail(`沒有編號 ${answer} 的常用供應商。`);
+  console.log(`已選擇 ${presetLabel(preset)}：${preset.baseUrl}`);
+  console.log(`取得 API Key：${preset.keyUrl}`);
+  return preset.baseUrl;
+}
+
 export function suggestProviderId(baseUrl, takenIds = []) {
   let base = "relay";
-  try {
+  const preset = presetForBaseUrl(baseUrl);
+  if (preset) base = preset.id;
+  else try {
     const hostname = new URL(baseUrl).hostname.replace(/^\[|\]$/g, "").toLowerCase();
     if (hostname === "localhost" || isIP(hostname)) base = "local";
     else {
@@ -3202,7 +3338,7 @@ async function install() {
   const defaultBaseUrl = primary?.baseUrl || env.CODEX_MODEL_ROUTER_BASE_URL || null;
   const baseUrl = normalizeUrl(
     env.CODEX_MODEL_ROUTER_BASE_URL ||
-      (await ask("Base URL（OpenAI 相容服務或官方 Anthropic API）", defaultBaseUrl)),
+      (await askProviderBaseUrl(defaultBaseUrl)),
   );
   const clash = otherProviders.find((provider) => provider.baseUrl === baseUrl);
   if (clash) {
@@ -3479,6 +3615,13 @@ async function install() {
       deleteApiKey(primary.keychainService, primary.keychainAccount || "codex");
     }
   }
+  // 換了 Base URL：舊的備用 Key 屬於上一個服務，不能拿來打新的上游。
+  if (primary?.keychainService && primary.keychainService !== keychainService) {
+    const purged = purgeBackupKeys([primaryId]);
+    if (purged) console.log(`已移除上一個 Base URL 的 ${purged} 把備用 Key。`);
+  }
+  const installedPrimary = installedProviders(readSettingsIfExists(), readManifest())[0];
+  if (installedPrimary && !testMode) await askBackupKeys(installedPrimary);
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
   console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
   console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
@@ -3935,7 +4078,7 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
   const retained = state.catalog.models.filter((model) => !replaced.has(model.slug));
   const maxPriority = Math.max(0, ...retained.map((model) => Number(model.priority) || 0));
   const entries = newRoutes.map((route, index) => ({ ...customCatalogEntry(official, route, index),
-    priority: maxPriority + index + 1, description: "實驗性 Claude CLI 訂閱路由；上下文為手動設定，非探測值。" }));
+    priority: maxPriority + index + 1, description: "Claude CLI 訂閱路由；上下文為手動設定，非探測值。" }));
   const claudeCli = { ...state.settings.claudeCli, binary,
     timeoutMs: state.settings.claudeCli?.timeoutMs || 180000,
     totalTimeoutMs: state.settings.claudeCli?.totalTimeoutMs || 900000 };
@@ -4146,7 +4289,7 @@ async function configureClaudeCli(subcommand = null) {
   if (subcommand === "login") return;
   if (!codexBin) fail("未找到 Codex CLI。");
   verifyLogin();
-  printHeading("連接 Claude 訂閱帳號（實驗性）");
+  printHeading("連接 Claude 訂閱帳號");
   console.log("正在讀取 Claude CLI 模型清單（不發送推理請求）...");
   let discovered = [];
   try { discovered = await transport.discoverClaudeCliModels(binary); }
@@ -4199,6 +4342,7 @@ async function manageProviders(subcommand = null) {
     console.log("  edit    修改供應商的名稱與模型前綴（不重新探測）");
     console.log("  remove  移除供應商與它的模型");
     console.log("  key     更換某一家的 API Key");
+    console.log("  backup  添加備用 API Key（一次最多 5 把，Key 被拒或額度用完時自動切換）");
     action = (await ask("請選擇操作（Enter 返回）")).trim().toLowerCase();
   }
   if (!action || action === "cancel") {
@@ -4209,6 +4353,7 @@ async function manageProviders(subcommand = null) {
   else if (["edit", "e", "rename", "prefix"].includes(action)) await editProvider();
   else if (["remove", "r", "rm", "delete"].includes(action)) await removeProvider();
   else if (["key", "k", "api-key"].includes(action)) await replaceProviderKey();
+  else if (["backup", "b", "backup-key", "backup-keys"].includes(action)) await manageBackupKeys();
   else fail(`無法識別的操作：${action}`);
 }
 
@@ -4301,7 +4446,7 @@ async function addProvider() {
   verifyLogin();
   printHeading("新增供應商");
   console.log("每家供應商各自保存 API Key；已有前綴的模型保留原名，無前綴的模型才加供應商名稱。");
-  const baseUrl = normalizeUrl(await ask("Base URL（OpenAI 相容服務或官方 Anthropic API）"));
+  const baseUrl = normalizeUrl(await askProviderBaseUrl());
   const clash = providers.find((provider) => provider.baseUrl === baseUrl);
   if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」；要添加它的模型請用「添加自訂模型」。`);
   const keychainService = keychainServiceFor(baseUrl);
@@ -4349,6 +4494,7 @@ async function addProvider() {
     }
     console.log(`現共 ${plan.providers.length} 家供應商、${plan.settings.routes.length} 個自訂模型。`);
     console.log(`備份：${backupDir}`);
+    await askBackupKeys(provider);
     console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
   } catch (error) {
     if (!keyExisted) {
@@ -4394,6 +4540,9 @@ async function removeProvider() {
   console.log(`備份：${backupDir}`);
   if (await confirm(`是否從${secretStoreLabel}中刪除「${providerName(chosen)}」的 API Key？`, true)) {
     deleteApiKey(chosen.keychainService, chosen.keychainAccount || "codex");
+    purgeBackupKeys([chosen.id]);
+  } else {
+    purgeBackupKeys([chosen.id], { deleteSecrets: false });
   }
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
@@ -5244,7 +5393,7 @@ async function status() {
   const shortcut = managerShortcutPath();
   console.log(`網頁管理介面：${existsSync(shortcut) ? `雙擊「${shortcut}」，或` : ""}選單第 ${menuNumber("ui")} 項`);
   const cliRoutes = routes.filter((route) => route.transport === "claude-cli");
-  if (cliRoutes.length) console.log(`Claude CLI（實驗性）：${cliRoutes.map((route) => route.displayName).join("、")}；登入狀態請執行 claude-cli status。`);
+  if (cliRoutes.length) console.log(`Claude CLI：${cliRoutes.map((route) => route.displayName).join("、")}；登入狀態請執行 claude-cli status。`);
   console.log(
     `背景服務：${manifest.serviceName || manifest.launchLabel}（${serviceKindLabel}）`,
   );
@@ -5308,6 +5457,11 @@ async function rollback() {
   printHeading("回退 Codex 模型路由器");
   // 安裝目錄稍後會整個封存，要刪的 Key 得先讀出來。
   const providers = installedProviders(readSettingsIfExists(), manifest);
+  let backupKeys = [];
+  try {
+    const pool = existsSync(keyPoolPath) ? normalizeKeyPoolFile(JSON.parse(readFileSync(keyPoolPath, "utf8"))) : null;
+    backupKeys = pool ? Object.values(pool.providers).flat() : [];
+  } catch { /* 清單損壞時只刪主 Key。 */ }
   console.log("只會還原由安裝器管理的 Codex 配置項。" );
   console.log(`完整配置備份：${manifest.configBackup}`);
   if (!(await confirm("是否繼續？", true))) return;
@@ -5355,6 +5509,9 @@ async function rollback() {
   if (removeKey) {
     for (const provider of providers) {
       deleteApiKey(provider.keychainService, provider.keychainAccount || "codex");
+    }
+    for (const item of backupKeys) {
+      try { deleteApiKey(item.keychainService, item.keychainAccount); } catch { /* 留下一筆沒人用的憑證而已。 */ }
     }
   }
 
@@ -5945,6 +6102,7 @@ async function routerHealth(port) {
     return {
       ok: health.status === "ok", status: health.status ?? null, version: health.version ?? null,
       uptimeSeconds: health.uptimeSeconds ?? null, stats: health.stats || {},
+      keyPools: health.keyPools && typeof health.keyPools === "object" ? health.keyPools : {},
     };
   } catch (error) {
     return { ok: false, error: error?.name === "AbortError" ? "逾時" : (error?.cause?.code || error?.message || "無法連線") };
@@ -5999,6 +6157,8 @@ async function managerState() {
     routerHealth(port),
     Promise.race([managerConfigHints(), delay(2500).then(() => undefined)]),
   ]);
+  let keyPool = { providers: {} };
+  try { keyPool = readKeyPoolFile(); } catch { /* 清單損壞時照常顯示其他資料。 */ }
   const models = routes.map((route) => {
     const entry = entries.get(route.pickerSlug);
     const context = positiveNumber(Number(entry?.context_window ?? route.contextWindow));
@@ -6049,9 +6209,12 @@ async function managerState() {
       baseUrl: provider.baseUrl || null, apiRoot: provider.apiRoot || null, primary: index === 0,
       modelCount: routes.filter((route) => routeProviderId(route) === provider.id).length,
       keyStored: env.CODEX_MODEL_ROUTER_TEST_API_KEY ? true : keychainHas(provider.keychainService),
+      backupKeys: backupKeysOf(keyPool, provider.id).map((item) => ({ id: item.id, tail: item.tail, addedAt: item.addedAt })),
+      keyPool: health.keyPools?.[provider.id] || null,
     })),
     models,
     officialModelCount: catalogModels.filter((model) => !String(model.slug).startsWith("custom/")).length,
+    providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     config: hints === undefined ? null : hints,
     imagegen,
@@ -6158,6 +6321,212 @@ function managerProvider(providers, providerId) {
   const provider = providers.find((item) => item.id === providerId);
   if (!provider) fail(`找不到供應商：${providerId}`);
   return provider;
+}
+
+// --- 診斷包 ----------------------------------------------------------------------
+//
+// 回報問題時讓使用者一次交出需要的資訊：版本、系統、路由器健康狀態與計數、供應商與模型的
+// 設定摘要、最近的錯誤與記錄尾端。完全唯讀、不發任何付費請求。整份輸出最後再過一次遮蔽：
+// API Key、Bearer 權杖、JWT、長串密鑰、電子郵件與使用者家目錄都換成占位字樣。
+const DIAGNOSTIC_CONFIG_KEYS = [
+  "openai_base_url", "model", "model_provider", "model_reasoning_effort", "model_context_window",
+  "model_auto_compact_token_limit", "model_catalog_json", "service_tier", "profile",
+];
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function redactDiagnosticText(text, { home = homeDir } = {}) {
+  let value = String(text ?? "");
+  const homes = [home, home && home.replaceAll("\\", "\\\\")].filter((item) => item && item.length > 3);
+  for (const item of [...new Set(homes)].sort((left, right) => right.length - left.length)) {
+    value = value.replace(new RegExp(escapeRegExp(item), "g"), "~");
+  }
+  return value
+    .replace(/\/Users\/[^/\s"'\\]+/g, "/Users/<user>")
+    .replace(/\/home\/[^/\s"'\\]+/g, "/home/<user>")
+    .replace(/([A-Za-z]:(?:\\\\|\\)Users(?:\\\\|\\))[^\\\s"']+/gi, "$1<user>")
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[已遮蔽的權杖]")
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [已遮蔽]")
+    .replace(/\b(sk|pk|rk|ak)-[A-Za-z0-9_-]{8,}/g, "$1-[已遮蔽]")
+    .replace(/\b(api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|secret|password|authorization)(\\?["']?\s*[:=]\s*\\?["']?)[^\s"',}\\]{6,}/gi,
+      "$1$2[已遮蔽]")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[電子郵件]")
+    .replace(/\b[A-Za-z0-9]{40,}\b/g, "[已遮蔽]")
+    .replace(/[A-Za-z0-9+/_=-]{64,}/g, "[已遮蔽]");
+}
+
+function diagnosticFile(path) {
+  try {
+    const info = statSync(path);
+    return { exists: true, bytes: info.size, modifiedAt: new Date(info.mtimeMs).toISOString() };
+  } catch {
+    return { exists: false };
+  }
+}
+
+// 非同步執行並限時 5 秒：管理頁的請求 15 秒逾時，幾個版本查詢與 config 讀取要能並行完成。
+function diagnosticCommandVersion(command, args = ["--version"]) {
+  if (!command) return Promise.resolve(null);
+  return new Promise((resolvePromise) => {
+    let stdout = "";
+    let child;
+    try {
+      child = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    } catch {
+      resolvePromise(null);
+      return;
+    }
+    const timer = setTimeout(() => { child.kill(); resolvePromise(null); }, 5000);
+    child.stdout.on("data", (chunk) => { stdout = (stdout + chunk).slice(0, 4096); });
+    child.once("error", () => { clearTimeout(timer); resolvePromise(null); });
+    child.once("close", (status) => {
+      clearTimeout(timer);
+      resolvePromise(status === 0 ? terminalSafeText(stdout.trim().split(/\r?\n/)[0], 120) || null : null);
+    });
+  });
+}
+
+export async function collectDiagnostics() {
+  const manifest = readManifest();
+  const settings = manifest ? readSettingsIfExists() : {};
+  const catalog = manifest ? readCatalogIfExists() : null;
+  const providers = manifest ? installedProviders(settings, manifest) : [];
+  const routes = Array.isArray(settings?.routes) ? settings.routes : [];
+  const port = Number(settings?.port ?? manifest?.port);
+  let configSummary = null;
+  const [health, userConfig, codexVersion, claudeVersion] = await Promise.all([
+    manifest ? routerHealthDetail(port) : Promise.resolve(null),
+    codexBin ? Promise.race([readUserConfig().catch((error) => ({ error: error.message })), delay(5000).then(() => ({ error: "逾時" }))])
+      : Promise.resolve(null),
+    diagnosticCommandVersion(codexBin),
+    diagnosticCommandVersion(settings?.claudeCli?.binary || null),
+  ]);
+  if (userConfig?.config) {
+    configSummary = {};
+    for (const key of DIAGNOSTIC_CONFIG_KEYS) {
+      if (userConfig.config[key] !== undefined) configSummary[key] = userConfig.config[key];
+    }
+    const localProviders = Object.entries(userConfig.config.model_providers || {})
+      .filter(([, value]) => /127\.0\.0\.1|localhost/.test(String(value?.base_url || "")));
+    configSummary.routerProviders = Object.fromEntries(localProviders.map(([name, value]) => [name, {
+      base_url: value.base_url ?? null, wire_api: value.wire_api ?? null, requires_openai_auth: value.requires_openai_auth ?? null,
+    }]));
+    configSummary.managerEntry = Boolean(userConfig.config.mcp_servers?.model_router_manager);
+  } else if (userConfig?.error) {
+    configSummary = { error: userConfig.error };
+  }
+  let keyPool = { providers: {} };
+  try { keyPool = readKeyPoolFile(); } catch (error) { keyPool = { providers: {}, error: error.message }; }
+  let imagegen;
+  try {
+    const config = relayConfig();
+    imagegen = config ? { models: config.models || [], providerId: config.providerId ?? DEFAULT_PROVIDER_ID } : { enabled: false };
+  } catch (error) {
+    imagegen = { error: error.message };
+  }
+  let recentErrors = [];
+  let logTail = null;
+  if (existsSync(logPath)) {
+    try {
+      const tail = readFileTail(logPath, 512 * 1024);
+      recentErrors = parseRouterLog(tail, 100);
+      logTail = tail.split(/\r?\n/).filter(Boolean).slice(-200);
+    } catch (error) {
+      logTail = [`無法讀取記錄檔：${error.message}`];
+    }
+  }
+  const desktop = desktopApp();
+  const catalogModels = Array.isArray(catalog?.models) ? catalog.models : [];
+  const entries = new Map(catalogModels.map((model) => [model.slug, model]));
+  const report = {
+    kind: "codex-model-router-diagnostics",
+    schema: 1,
+    generatedAt: new Date().toISOString(),
+    privacy: "API Key、權杖、電子郵件與個人路徑已自動遮蔽；供應商只保留主機名稱。分享前仍建議自行看過一遍。",
+    versions: {
+      installer: INSTALLER_VERSION,
+      installed: manifest?.version ?? null,
+      router: health?.version ?? null,
+      codexCli: codexVersion,
+      claudeCli: claudeVersion,
+      node: process.version,
+    },
+    system: { platform: process.platform, arch: process.arch, release: osRelease(), desktop: desktop?.name || null },
+    installed: Boolean(manifest),
+    codexConfig: configSummary,
+    router: health,
+    providers: providers.map((provider, index) => ({
+      id: provider.id, name: provider.name || null, modelPrefix: provider.modelPrefix || null,
+      host: hostOfUrl(provider.apiRoot || provider.baseUrl), primary: index === 0,
+      keyStored: env.CODEX_MODEL_ROUTER_TEST_API_KEY ? true : keychainHas(provider.keychainService),
+      backupKeys: backupKeysOf(keyPool, provider.id).length,
+      models: routes.filter((route) => routeProviderId(route) === provider.id).length,
+    })),
+    claudeCli: { routes: routes.filter((route) => route.transport === "claude-cli").length, binary: settings?.claudeCli?.binary || null },
+    routes: routes.map((route) => ({
+      pickerSlug: route.pickerSlug, upstreamModel: route.upstreamModel, providerId: routeProviderId(route),
+      transport: routeTransport(route), inCatalog: entries.has(route.pickerSlug),
+      contextWindow: entries.get(route.pickerSlug)?.context_window ?? route.contextWindow ?? null,
+      maxOutputTokens: route.maxOutputTokens ?? null, efforts: Array.isArray(route.efforts) ? route.efforts : [],
+      serviceTiers: entries.get(route.pickerSlug)?.additional_speed_tiers ?? null,
+    })),
+    catalog: {
+      models: catalogModels.length,
+      custom: catalogModels.filter((model) => String(model.slug).startsWith("custom/")).length,
+    },
+    imagegen,
+    files: {
+      "router.mjs": diagnosticFile(routerPath), "claude-bridge.mjs": diagnosticFile(bridgePath),
+      "chat-bridge.mjs": diagnosticFile(chatBridgePath), "claude-cli.mjs": diagnosticFile(claudeCliPath),
+      "settings.json": diagnosticFile(settingsPath), "models.json": diagnosticFile(catalogPath),
+      "install.json": diagnosticFile(manifestPath), "key-pool.json": diagnosticFile(keyPoolPath),
+      "router.err.log": diagnosticFile(logPath),
+    },
+    recentErrors,
+    logTail,
+  };
+  return JSON.parse(redactDiagnosticText(JSON.stringify(report)));
+}
+
+function hostOfUrl(value) {
+  try { return new URL(value).host; } catch { return null; }
+}
+
+// 診斷包要完整的 /healthz（含計數與備用 Key 狀態），不是 routerHealth 的精簡版。
+async function routerHealthDetail(port) {
+  if (!Number.isInteger(port) || port <= 0) return { ok: false, error: "沒有可用的連接埠設定" };
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${port}/healthz`, {}, 2500);
+    if (!response.ok) return { ok: false, port, error: `HTTP ${response.status}` };
+    return { ok: true, port, ...(await response.json()) };
+  } catch (error) {
+    return { ok: false, port, error: error?.name === "AbortError" ? "逾時" : (error?.cause?.code || error?.message || "無法連線") };
+  }
+}
+
+export function diagnosticFileName(date = new Date()) {
+  const stamp = date.toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
+  return `codex-model-router-diagnostics-${stamp}.json`;
+}
+
+async function managerDiagnostics() {
+  const report = await collectDiagnostics();
+  return { fileName: diagnosticFileName(), report };
+}
+
+// 終端命令：寫到桌面（沒有桌面資料夾就寫到目前目錄），方便直接拖進聊天或 issue。
+async function exportDiagnostics() {
+  printHeading("匯出診斷包");
+  const report = await collectDiagnostics();
+  const desktopDir = join(homeDir, "Desktop");
+  const directory = existsSync(desktopDir) ? desktopDir : process.cwd();
+  const target = join(directory, diagnosticFileName());
+  writeFileSync(target, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+  console.log(`已寫入：${target}`);
+  console.log("API Key、權杖、電子郵件與個人路徑已自動遮蔽；分享前仍建議自行看過一遍。");
+  return target;
 }
 
 function describeDiscoveredModel(id, configured = new Set()) {
@@ -6363,10 +6732,12 @@ async function managerEditProvider({ providerId, ...fields } = {}) {
   return { changed: true, renamed: plan.renames.length, backupDir, restartDesktop: plan.restartDesktop };
 }
 
-async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens } = {}) {
+async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens, backupKeys } = {}) {
   assertManagerWritable();
   await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
+  const backups = parseBackupKeys(backupKeys ?? []);
+  if (backups.length > MAX_BACKUP_KEYS) fail(`備用 Key 最多 ${MAX_BACKUP_KEYS} 把，這次填了 ${backups.length} 把。`);
   const draftKey = String(draftId || "");
   const draft = managerDrafts.get(draftKey);
   if (!draft || Date.now() - draft.createdAt > MANAGER_DRAFT_TTL_MS) fail("新增供應商的資料已過期，請重新查詢模型。");
@@ -6407,7 +6778,14 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
     console.log(`已新增供應商「${id}」。`);
     printAddedLimits(newRoutes, defaults);
     console.log(`備份：${backupDir}`);
-    return { providerId: id, added: newRoutes.map(summarizeRoute), backupDir, restartDesktop: true };
+    let backupResult = null;
+    if (backups.length) {
+      console.log("");
+      // 供應商已經寫好；備用 Key 出問題只回報，不回滾已完成的新增。
+      try { backupResult = await addBackupKeys(provider, backups); }
+      catch (error) { console.error(`備用 Key 未加入：${error.message}`); }
+    }
+    return { providerId: id, added: newRoutes.map(summarizeRoute), backupDir, backupKeys: backupResult, restartDesktop: true };
   } catch (error) {
     // 寫入失敗時把憑證放回原狀，不留下沒有供應商在用的 Key。
     if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
@@ -6437,6 +6815,8 @@ async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
       console.error(`API Key 未能刪除：${error.message}`);
     }
   }
+  const backupKeysRemoved = purgeBackupKeys([provider.id], { deleteSecrets: deleteKey !== false });
+  if (backupKeysRemoved) console.log(`已一併移除 ${backupKeysRemoved} 把備用 Key。`);
   if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
   console.log(`已移除供應商「${providerName(provider)}」與 ${plan.removedRoutes.length} 個模型。備份：${backupDir}`);
   managerConfigHints(true);
@@ -6475,6 +6855,163 @@ async function managerReplaceKey({ providerId, apiKey } = {}) {
     ? "路由器下一個請求就會改用新 Key，不必重啟。"
     : "路由器最晚 5 分鐘內改用新 Key；上游拒絕舊 Key 時會立即改用。");
   return { verified, status };
+}
+
+// 一次可貼多把：換行、逗號或空白分隔，去掉重複。
+export function parseBackupKeys(input) {
+  const list = Array.isArray(input) ? input : [input];
+  const keys = [];
+  for (const item of list) {
+    for (const part of String(item ?? "").split(/[\s,，;；]+/)) {
+      const key = part.trim();
+      if (key && !keys.includes(key)) keys.push(key);
+    }
+  }
+  return keys;
+}
+
+// 新增備用 Key（一次最多補滿 5 把）：每把都先查一次模型清單，上游明確拒絕（401／403）就跳過；
+// 與主 Key 或已有的備用 Key 重複也跳過。其餘照常加入，一把失敗不影響其他把。
+// 寫入 key-pool.json 後路由器下一個請求就看得到，不必重啟。
+async function addBackupKeys(provider, input) {
+  const keys = parseBackupKeys(input);
+  if (keys.length === 0) fail("請填寫備用 API Key。");
+  const pool = readKeyPoolFile();
+  const existing = backupKeysOf(pool, provider.id);
+  const room = MAX_BACKUP_KEYS - existing.length;
+  if (room <= 0) fail(`每家供應商最多 ${MAX_BACKUP_KEYS} 把備用 Key，請先移除不用的。`);
+  if (keys.length > room) fail(`這次填了 ${keys.length} 把，但只能再加 ${room} 把（每家最多 ${MAX_BACKUP_KEYS} 把備用 Key）。`);
+  const stored = new Map();
+  if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+    for (const item of [{ keychainService: provider.keychainService, primary: true }, ...existing]) {
+      try { stored.set(readApiKey(item.keychainService), item.primary ? "主 Key" : "已在備用清單"); } catch { /* 讀不到就不比對。 */ }
+    }
+  }
+  const added = [];
+  const skipped = [];
+  for (const key of keys) {
+    const mask = maskKeyTail(key.slice(-4));
+    if (stored.has(key)) {
+      skipped.push({ tail: key.slice(-4), reason: stored.get(key) });
+      console.log(`跳過 ${mask}：${stored.get(key) === "主 Key" ? "這把就是目前的主 Key" : "已經在備用清單裡"}。`);
+      continue;
+    }
+    console.log(`正在用備用 Key ${mask} 查詢「${providerName(provider)}」的模型清單…`);
+    let status = null;
+    let problem = null;
+    try {
+      const response = await fetchWithTimeout(`${provider.apiRoot}/models`, {
+        headers: upstreamAuthHeaders(provider.apiRoot, key),
+      }, 15000);
+      await response.arrayBuffer();
+      status = response.status;
+    } catch (error) {
+      problem = error?.name === "AbortError" ? "逾時" : error.message;
+    }
+    if (status === 401 || status === 403) {
+      skipped.push({ tail: key.slice(-4), reason: `HTTP ${status}` });
+      console.log(`跳過 ${mask}：上游拒絕這把 Key（HTTP ${status}）。`);
+      continue;
+    }
+    const id = `k-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+    const service = `${provider.keychainService}.${id}`;
+    storeApiKeyValue(service, provider.baseUrl, key);
+    added.push({ id, keychainService: service, keychainAccount: "codex",
+      credentialPath: isWindows ? credentialFileFor(service) : null, tail: key.slice(-4), addedAt: new Date().toISOString() });
+    stored.set(key, "已在備用清單");
+    const verified = status != null && status >= 200 && status < 300;
+    console.log(verified ? `已加入 ${mask}，可以正常查詢模型清單。`
+      : `已加入 ${mask}，但無法確認是否可用（${status != null ? `HTTP ${status}` : problem}）。`);
+  }
+  if (added.length) {
+    try {
+      pool.providers[provider.id] = [...existing, ...added];
+      writeKeyPoolFile(pool);
+    } catch (error) {
+      if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+        for (const item of added) {
+          try { deleteApiKey(item.keychainService); } catch { /* 寫清單失敗時盡量不留下孤兒憑證。 */ }
+        }
+      }
+      throw error;
+    }
+  }
+  const total = existing.length + added.length;
+  console.log(`備用 Key：新增 ${added.length} 把${skipped.length ? `、跳過 ${skipped.length} 把` : ""}，目前共 ${total} 把備用 Key。`);
+  if (added.length) console.log("使用中的 Key 被拒、額度用完或限流時，路由器會自動換下一把，不必重啟。");
+  return { added: added.map((item) => ({ id: item.id, tail: item.tail })), skipped, total };
+}
+
+async function managerAddBackupKey({ providerId, apiKeys, apiKey } = {}) {
+  assertManagerWritable();
+  const { providers } = requireInstallation();
+  const provider = managerProvider(providers, String(providerId || ""));
+  const result = await addBackupKeys(provider, apiKeys ?? apiKey);
+  if (result.added.length === 0) fail("沒有新增任何備用 Key，請檢查上面的訊息。");
+  return result;
+}
+
+// 終端：新增供應商或重新配置後順便問；也可以從 providers backup 單獨進入。
+async function askBackupKeys(provider) {
+  const existing = backupKeysOf(readKeyPoolFile(), provider.id).length;
+  const room = MAX_BACKUP_KEYS - existing;
+  if (room <= 0 || !input.isTTY || assumeYes) return null;
+  console.log(`\n可以為「${providerName(provider)}」再加最多 ${room} 把備用 Key：使用中的 Key 被拒、額度用完或限流時自動換下一把。`);
+  if (!(await confirm("要添加備用 API Key 嗎？", false))) return null;
+  const keys = [];
+  while (keys.length < room) {
+    const value = (await askSecret(`備用 API Key ${keys.length + 1}/${room}（輸入不會顯示，直接 Enter 結束）`)).trim();
+    if (!value) break;
+    keys.push(...parseBackupKeys(value).filter((key) => !keys.includes(key)));
+  }
+  if (keys.length === 0) {
+    console.log("沒有輸入備用 Key。");
+    return null;
+  }
+  try {
+    return await addBackupKeys(provider, keys.slice(0, room));
+  } catch (error) {
+    console.error(`備用 Key 未加入：${error.message}`);
+    return null;
+  }
+}
+
+async function manageBackupKeys() {
+  const { settings, providers } = requireInstallation();
+  const chosen = providers.length === 1 ? providers[0]
+    : await chooseProvider(providers, settings.routes, "要為哪一家供應商添加備用 Key", { allowCancel: true });
+  if (!chosen) {
+    console.log("未進行任何修改。");
+    return;
+  }
+  const pool = readKeyPoolFile();
+  const existing = backupKeysOf(pool, chosen.id);
+  console.log(existing.length
+    ? `「${providerName(chosen)}」目前有 ${existing.length} 把備用 Key：${existing.map((item) => maskKeyTail(item.tail)).join("、")}`
+    : `「${providerName(chosen)}」目前沒有備用 Key。`);
+  if (existing.length >= MAX_BACKUP_KEYS) {
+    console.log(`已達上限 ${MAX_BACKUP_KEYS} 把；要移除請用網頁管理介面的供應商頁。`);
+    return;
+  }
+  await askBackupKeys(chosen);
+}
+
+async function managerRemoveBackupKey({ providerId, keyId } = {}) {
+  assertManagerWritable();
+  const { providers } = requireInstallation();
+  const provider = managerProvider(providers, String(providerId || ""));
+  const pool = readKeyPoolFile();
+  const existing = backupKeysOf(pool, provider.id);
+  const target = existing.find((item) => item.id === String(keyId || ""));
+  if (!target) fail("找不到這把備用 Key，可能已經移除。");
+  pool.providers[provider.id] = existing.filter((item) => item !== target);
+  writeKeyPoolFile(pool);
+  if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+    try { deleteApiKey(target.keychainService, target.keychainAccount); }
+    catch (error) { console.error(`備用 Key 已停用，但${secretStoreLabel}項目未能刪除：${error.message}`); }
+  }
+  console.log(`已移除備用 Key ${maskKeyTail(target.tail)}。`);
+  return { removed: target.id, remaining: existing.length - 1 };
 }
 
 async function managerRestartRouter() {
@@ -6753,6 +7290,7 @@ function managerOperations() {
       "claude-cli": () => managerClaudeCliStatus(),
       "claude-cli-models": () => managerClaudeCliModels(),
       "provider-preview": (params) => managerProviderPreview(params),
+      diagnostics: () => managerDiagnostics(),
     },
     jobs: {
       "repair-models": job("同步與修復模型清單", repairModels),
@@ -6764,6 +7302,8 @@ function managerOperations() {
       "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
       "replace-key": job("更換 API Key", managerReplaceKey),
+      "add-backup-key": job("新增備用 API Key", managerAddBackupKey),
+      "remove-backup-key": job("移除備用 API Key", managerRemoveBackupKey),
       "restart-router": job("重新啟動路由器", managerRestartRouter),
       "restart-desktop": job("重新啟動桌面版", () => {
         if (!desktopApp() || !existsSync(managerInstallerPath)) fail("找不到可重新啟動的桌面版或管理頁安裝器副本。");
@@ -7102,7 +7642,7 @@ export const MENU_ITEMS = [
   ["add", "添加自訂模型"],
   ["remove", "刪除自訂模型"],
   ["providers", "管理供應商（新增／修改名稱與前綴／移除／更換 API Key）"],
-  ["claude-cli", "連接 Claude 訂閱帳號（實驗性）"],
+  ["claude-cli", "連接 Claude 訂閱帳號"],
   ["hidden-models", "管理隱藏的官方模型"],
   ["context-1m", "設定全域上下文 100 萬"],
   ["imagegen", "中轉 API 生圖（添加／設定）"],
@@ -7125,13 +7665,14 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} update
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} remove
-  ${basename(scriptPath || "codex-model-router.command")} providers [add|edit|remove|key]
+  ${basename(scriptPath || "codex-model-router.command")} providers [add|edit|remove|key|backup]
   ${basename(scriptPath || "codex-model-router.command")} claude-cli [status|login]
   ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} context-1m
   ${basename(scriptPath || "codex-model-router.command")} imagegen
   ${basename(scriptPath || "codex-model-router.command")} imagegen-disable
   ${basename(scriptPath || "codex-model-router.command")} status
+  ${basename(scriptPath || "codex-model-router.command")} diagnostics
   ${basename(scriptPath || "codex-model-router.command")} rollback
 
 安裝時會詢問：
@@ -7151,6 +7692,9 @@ Claude 訂閱（CLI），並可檢查新版本、一鍵更新後重新啟動。�
 安裝與更新完成後會建立捷徑（macOS：~/Applications/Codex 模型路由器.command；
 Windows：開始功能表），雙擊即可開啟。重新開啟支援 MCP Apps 的 Codex 後，也可點擊介面中的
 「自訂模型管理」直接開啟（依版本顯示在頂部或側邊欄）。ui-setup 可單獨修復入口，不重啟路由器。
+
+diagnostics 匯出診斷包到桌面（版本、路由器狀態、模型設定摘要、最近錯誤與記錄尾端），
+API Key、權杖、電子郵件與個人路徑會自動遮蔽，回報問題時直接附上這個檔案即可。
 
 update 用於升級到這支安裝器的版本：只換掉路由器與轉譯層程式碼並重寫服務定義，
 沿用已儲存的 Base URL、API Key、連接埠與全部自訂模型，不重問任何設定，
@@ -7284,6 +7828,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
       await manageHiddenModels();
     }
     else if (action === "status") await status();
+    else if (["diagnostics", "diagnose", "doctor", "support-bundle"].includes(action)) await exportDiagnostics();
     else if (action === "rollback" || action === "uninstall") await rollback();
     else if (action === "exit") console.log("未進行任何修改。" );
     else if (action === "help" || action === "--help" || action === "-h") help();

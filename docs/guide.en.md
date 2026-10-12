@@ -11,7 +11,7 @@ Quick install and everyday commands are in the [README](../README.en.md). The co
 - [Web manager](#web-manager)
 - [Manage models and providers](#manage-models-and-providers)
 - [Update and rollback](#update-and-rollback)
-- [Claude Code subscription routing (experimental)](#claude-code-subscription-routing-experimental)
+- [Claude Code subscription routing](#claude-code-subscription-routing)
 - [Model picker shows stale or removed models](#model-picker-shows-stale-or-removed-models)
 - [Development and help](#development-and-help)
 
@@ -56,8 +56,10 @@ Git projects may also use the optional [Actions configuration](../.codex/environ
 - **Overview**: router status, request counts, recent errors with diagnostic IDs, and the runtime environment.
 - **Models**: drag to reorder; edit display names, context and output limits; remove models. When adding models you can pick an API provider or the Claude subscription. New models default to a 1,000,000-token context and 128,000-token output, capped by any smaller limit the upstream reports.
 - **Providers**: add an API key provider (a relay, OpenAI-compatible service, or the official Anthropic API) or a Claude subscription (Claude CLI), change API keys, and remove providers. The Claude subscription path checks the CLI installation, version, and subscription sign-in in order, and lets you fix each step in place. Since v1.28.0 you can edit a provider's display name and model prefix: the name is display-only, so the internal ID, existing chats, and API key stay the same; the prefix sets "prefix/model" in the picker, replaces an upstream prefix such as `ark/`, changes only auto-generated names (manual renames are kept), and also applies to models added later. Changes are previewed first and don't restart the router. For the Claude subscription, only the prefix can be changed for now.
+  - **Common providers**: when adding an API key provider you can pick presets such as DeepSeek, Kimi, Qwen, Zhipu GLM / Z.ai, MiniMax, OpenRouter, and xAI (international and mainland China endpoints). The Base URL is filled in and a link to the provider's API key page is shown; `providers add` in the terminal accepts a number too. Endpoints come from [CC Switch](https://github.com/farion1231/cc-switch)'s public presets; the models you can use depend on what your key returns.
+  - **Backup keys**: each provider can have up to 5 backup keys, which you can enter all at once. You are asked when adding a provider, installing, or reconfiguring, and can add them later on the Providers page or with `providers backup` in the terminal. The router keeps using the key marked "In use" and only switches to the next one, resending the request, when it gets 401/403 (rejected), 402 (quota exhausted), or 429 (rate limited). The failed key cools down for a while (429 follows the upstream Retry-After). Provider cards show each key's last four characters and status. Adding or removing backup keys doesn't restart the router.
 - **Image generation**: detect, enable, or disable relay image generation.
-- **Settings**: set or remove the global context window, and force-show official models hidden by Codex's bundled catalog.
+- **Settings**: set or remove the global context window, force-show official models hidden by Codex's bundled catalog, and download or copy a diagnostics bundle to attach to bug reports (see [troubleshooting](troubleshooting.md)).
 - **Version**: shows the current version, lists changes when a new release exists, and updates in one click.
 
 It uses the same backup-and-restore flows as the menu. Probes that cost money or subscription quota are listed and confirmed first. Reordering, renaming, and context changes only rewrite the model catalog; output changes and adding or removing models restart the router. Output limits apply only to Claude models (Claude's `max_tokens`, or `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for Claude CLI); GPT and Chat Completions routes leave output length to the upstream.
@@ -79,6 +81,7 @@ bash codex-model-router.sh providers key      # Change a provider's API key
 bash codex-model-router.sh providers remove   # Remove a provider and its models
 bash codex-model-router.sh imagegen           # Configure relay image generation
 bash codex-model-router.sh status             # Check installation and service status
+bash codex-model-router.sh diagnostics        # Export a diagnostics bundle to the desktop
 ```
 
 On Windows, replace `bash codex-model-router.sh` with `powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1`.
@@ -109,9 +112,9 @@ bash codex-model-router.sh rollback
 
 **Before rollback:** conversations containing translated Claude history may no longer work with the official backend once the router is removed. Start a new conversation after rollback, or keep the router for those existing conversations. Read the [rollback details](troubleshooting.zh-TW.md#回退之後用過-claude-模型的舊對話會壞掉) first.
 
-## Claude Code subscription routing (experimental)
+## Claude Code subscription routing
 
-Experimental [Claude CLI subscription routing](claude-cli-experimental.md) is available through menu item 7 or the `claude-cli` command, and since v1.27.0 also from Add provider or Add model in the [web manager](#web-manager). It asks before installing or updating Claude Code and guides subscription sign-in when needed.
+[Claude CLI subscription routing](claude-cli-experimental.md) is available through menu item 7 or the `claude-cli` command, and since v1.27.0 also from Add provider or Add model in the [web manager](#web-manager). It asks before installing or updating Claude Code and guides subscription sign-in when needed.
 
 Since v1.26.1, the installer reads the CLI's current model list first and shows numbered entries with full model IDs. Enter `1`, `1,3`, `1-3`, or `all`; you can also enter an explicit model ID or `cancel`. Numbers follow the current list order. Aliases resolving to the same version are deduplicated, and previously configured models remain listed.
 

@@ -1,4 +1,4 @@
-// Experimental Claude Code transport. The CLI owns authentication; this module
+// Claude Code transport. The CLI owns authentication; this module
 // never reads OAuth credentials. Codex remains the only tool executor.
 import http from "node:http";
 import { spawn } from "node:child_process";

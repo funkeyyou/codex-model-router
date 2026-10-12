@@ -9,7 +9,7 @@
     "sync": "node tools/build.mjs",
     "lint": "eslint .",
     "test": "node --test \"test/*.test.mjs\"",
-    "check": "node tools/build.mjs --check && eslint . && npm test"
+    "check": "node tools/provider-icons.mjs --check && node tools/build.mjs --check && eslint . && npm test"
   },
   "license": "MIT",
   "devDependencies": {

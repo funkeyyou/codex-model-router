@@ -16,7 +16,7 @@
 - [版本信息与更新内容](#版本信息与更新内容)
 - [同时使用多家供应商](#同时使用多家供应商)
 - [只有 Chat Completions 的模型](#只有-chat-completions-的模型)
-- [Claude Code 订阅路由（实验性）](#claude-code-订阅路由实验性)
+- [Claude Code 订阅路由](#claude-code-订阅路由)
 - [中转 API 生图（可选）](#中转-api-生图可选)
 - [工具可用性与兼容范围](#工具可用性与兼容范围)
 - [平台差异](#平台差异)
@@ -133,8 +133,10 @@ Git 项目也可选用仓库提供的 [Actions 配置](../.codex/environments/en
 - **总览**：路由器状态、请求统计、最近的错误与诊断 ID、执行环境。
 - **模型**：拖曳排序，修改显示名称、上下文与输出，勾选删除。新增模型时可选中转供应商或 Claude 订阅；默认上下文 1,000,000、输出 128,000，上游回报的上限较小时以上游为准。
 - **供应商**：新增「API Key 连接」（中转站、OpenAI 兼容服务或官方 Anthropic API）或「Claude 订阅账号（Claude CLI）」，更换 API Key、移除供应商。选 Claude 订阅时会依序检查 CLI 是否安装、版本与订阅登录，缺少的步骤可直接处理。1.28.0 起可修改供应商的显示名称与模型前缀：名称只影响显示，内部 ID、已有对话与 API Key 不变；前缀决定选择器里的「前缀/模型名」，会替换上游自带的前缀（如 `ark/`），只改自动生成的名称，手动改过的名称保留，之后新增的模型也会套用。修改前可预览，不重启路由器。Claude 订阅目前只能改前缀。
+  - **常用供应商**：新增「API Key 连接」时可直接点选 DeepSeek、Kimi、通义千问、智谱 GLM／Z.ai、MiniMax、OpenRouter、xAI 等预设（分国际与中国大陆端点），自动带入 Base URL 并附上获取 API Key 的官方页面；终端的 `providers add` 也可以输入编号。端点整理自 [CC Switch](https://github.com/farion1231/cc-switch) 的公开预设，实际可用的模型以你的 Key 查询结果为准。
+  - **备用 Key**：每家供应商可再加最多 5 把备用 Key，可一次填齐；新增供应商、安装或重新配置时会顺便询问，之后也可在供应商页或终端 `providers backup` 添加。路由器一直用「使用中」的那把，遇到 401／403（被拒）、402（额度用完）或 429（限流）才自动换下一把并重送请求，失败的那把冷却一段时间（429 依上游的 Retry-After）；供应商卡片会显示每把 Key 的末四码与状态。增减备用 Key 不重启路由器。
 - **生图**：检测、启用或停用中转 API 生图。
-- **设置**：设置或移除全局上下文，勾选强制显示被隐藏的官方模型。
+- **设置**：设置或移除全局上下文，勾选强制显示被隐藏的官方模型；「诊断包」可下载或复制一份诊断资料，反馈问题时附上（见[疑难排解](troubleshooting.md)）。
 - **版本**：左上角显示当前版本，有新版时列出更新内容，可一键更新。
 
 背后沿用菜单的流程：写入前备份，失败自动还原；会产生费用或使用订阅额度的探测、生图检测与 Claude 测试，都会先列出内容再确认。排序、改名与修改上下文只写入模型目录，不重启路由器；修改输出、添加或删除模型会重启路由器。输出上限只对 Claude 模型有效（送往 Claude 的 `max_tokens`，或 Claude CLI 的 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`），GPT 与 Chat Completions 模型不送这个值，由上游决定。
@@ -206,6 +208,7 @@ bash codex-model-router.sh providers  # 新增／移除供應商、更換 API Ke
 bash codex-model-router.sh hidden-models # 單獨管理被隱藏的官方模型
 bash codex-model-router.sh imagegen   # 單獨添加／設定中轉 API 生圖
 bash codex-model-router.sh status     # 檢視安裝狀態與健康度
+bash codex-model-router.sh diagnostics # 导出诊断包到桌面（自动遮蔽 Key）
 bash codex-model-router.sh rollback   # 回退（安裝檔會封存，不會刪除）
 ```
 
@@ -294,9 +297,9 @@ DeepSeek、通义千问、GLM、Kimi、Gemini 的 OpenAI 兼容接口、Ollama�
 - 上游多半不反馈上下文上限。没有同名的官方模型可以参考时，会沿用通用模板的上限并在安装时提示；
   与实际不符时请手动修改 `models.json`。
 
-## Claude Code 订阅路由（实验性）
+## Claude Code 订阅路由
 
-实验性的「[Claude CLI 订阅路由](claude-cli-experimental.md)」可从主菜单第 7 项或 `claude-cli` 开启，1.27.0 起也可在网页管理界面的「新增供应商」或「新增模型」选择 Claude 订阅。缺少 CLI 或版本过旧时会先询问是否安装／更新，未登录时引导官方登录。
+「[Claude CLI 订阅路由](claude-cli-experimental.md)」可从主菜单第 7 项或 `claude-cli` 开启，1.27.0 起也可在网页管理界面的「新增供应商」或「新增模型」选择 Claude 订阅。缺少 CLI 或版本过旧时会先询问是否安装／更新，未登录时引导官方登录。
 
 从 1.26.1 起，优先读取 Claude CLI 当前模型清单并以编号列出完整版本。输入 `1` 选一个、`1,3` 复选、`1-3` 选范围，也支持 `all`、完整模型 ID 及 `cancel` 返回。编号依当次清单排列，已添加的项目会标示；相同版本的别名会合并。
 

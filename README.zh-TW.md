@@ -9,7 +9,7 @@
 - **支援的 API**：OpenAI Responses API、Anthropic Claude Messages API，以及只有 Chat Completions 的相容端點（DeepSeek、Qwen、GLM、Kimi、Gemini、Ollama、vLLM 等，安裝時會實際探測能力）。
 - **多家供應商**：可同時接多家，API Key 各自加密保存（macOS 鑰匙圈／Windows DPAPI）。
 - **網頁管理頁**：在瀏覽器加減模型、管理供應商與 API Key、一鍵更新。
-- **可選功能**：中轉 API 生圖、Claude Code 訂閱路由（實驗性）。
+- **可選功能**：中轉 API 生圖、Claude Code 訂閱路由。
 
 ## 安裝
 
@@ -60,6 +60,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 | `imagegen` | 設定中轉 API 生圖 |
 | `repair-models` | 模型選單出現舊名稱或已刪除的模型時修復 |
 | `status` | 查看安裝與服務狀態 |
+| `diagnostics` | 匯出診斷包到桌面（自動遮蔽 Key），回報問題時附上 |
 | `rollback` | 移除路由器 |
 
 其他指令見[完整說明](docs/guide.zh-TW.md#其他指令)。
@@ -80,7 +81,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 
 - [完整說明](docs/guide.zh-TW.md)：網頁管理頁、升級細節、多家供應商、Chat Completions 模型、中轉生圖、相容性與運作細節
 - [疑難排解與健康檢查](docs/troubleshooting.zh-TW.md)
-- [Claude Code 訂閱路由（實驗性）](docs/claude-cli-experimental.md)
+- [Claude Code 訂閱路由](docs/claude-cli-experimental.md)
 - [開發與發布](docs/development.zh-TW.md)
 - [版本更新內容](https://github.com/funkeyyou/codex-model-router/releases)
 

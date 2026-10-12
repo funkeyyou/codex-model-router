@@ -861,6 +861,9 @@ const stats = {
   claudeToolResultsReordered: 0,
   lastAuthProbeStatus: null,
   credentialReads: 0,
+  keyRotations: 0,
+  keyReadFailures: 0,
+  lastKeyRotation: null,
   foreignHostRejects: 0,
   browserRequestsRejected: 0,
   models: 0,
@@ -1072,30 +1075,190 @@ function credentialFingerprint(provider) {
   }
 }
 
-// 每家供應商各自一份快取：換掉其中一家的 Key 不影響其他家。
+// 每把 Key 各自一份快取（供應商 ID + Key 編號）：換掉其中一把不影響其他把。
 const secretCaches = new Map();
 
-function secretCacheFor(provider) {
-  let cache = secretCaches.get(provider.id);
+function secretCacheFor(provider, slot = primaryKeySlot(provider)) {
+  const cacheKey = `${provider.id}\u0000${slot.id}`;
+  let cache = secretCaches.get(cacheKey);
   if (!cache) {
     cache = createSecretCache({
       read: async () => {
         stats.credentialReads += 1;
-        return readStoredSecret(provider);
+        return readStoredSecret(slot);
       },
-      fingerprint: () => credentialFingerprint(provider),
-      ttlMs: process.platform === "win32" && provider.credentialPath ? credentialCacheTtlMs : tokenCacheTtlMs,
+      fingerprint: () => credentialFingerprint(slot),
+      ttlMs: process.platform === "win32" && slot.credentialPath ? credentialCacheTtlMs : tokenCacheTtlMs,
     });
-    secretCaches.set(provider.id, cache);
+    secretCaches.set(cacheKey, cache);
   }
   return cache;
 }
 
-async function getApiKey(provider, reload = false) {
+async function getApiKey(provider, reload = false, slot = undefined) {
   if (process.env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+    // 測試用：備用 Key 以「主 Key + 後綴」區分，讓測試上游能分辨請求用的是哪一把。
+    if (slot && slot.id !== PRIMARY_KEY_SLOT) return `${process.env.CODEX_MODEL_ROUTER_TEST_API_KEY}-${slot.id}`;
     return process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
   }
-  return secretCacheFor(provider)({ reload });
+  return secretCacheFor(provider, slot)({ reload });
+}
+
+// --- 多把 Key 輪替 ---------------------------------------------------------------
+//
+// 主 Key 沿用供應商原本的鑰匙圈項目／密文檔；備用 Key 記在 key-pool.json，由管理頁新增或移除。
+// 這個檔案獨立於 settings.json，路由器依修改時間重讀，所以增減備用 Key 不必重啟、不會中斷對話。
+//
+// 規則（容錯切換，不是平均分攤）：一直用「目前這把」，直到它回 401／402／403／429 才換下一把，
+// 失敗的那把冷卻一段時間；換到能用的那把後就固定用它。沒有備用 Key 的供應商行為與以前完全相同。
+export const PRIMARY_KEY_SLOT = "primary";
+export const KEY_ROTATION_STATUSES = new Set([401, 402, 403, 429]);
+const KEY_SLOT_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const MAX_BACKUP_KEYS = 5;
+const keyPoolPath = join(routerDirectory, "key-pool.json");
+export const KEY_POOL_FILE = keyPoolPath;
+
+// 冷卻時間：Key 被拒（401／403）或額度用完（402）通常不會很快恢復；429 先照上游的 Retry-After。
+export function keyCooldownMs(status, retryAfterSeconds = null) {
+  if (status === 429) {
+    const seconds = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? retryAfterSeconds : 60;
+    return Math.min(Math.max(seconds, 5), 15 * 60) * 1000;
+  }
+  if (status === 402) return 30 * 60 * 1000;
+  return 10 * 60 * 1000;
+}
+
+export function keyFailureReason(status) {
+  if (status === 429) return "rate_limited";
+  if (status === 402) return "quota_exhausted";
+  return "rejected";
+}
+
+export function normalizeKeyPool(source) {
+  const result = new Map();
+  const entries = source && typeof source === "object" && source.providers && typeof source.providers === "object"
+    ? source.providers : {};
+  for (const [providerId, list] of Object.entries(entries)) {
+    if (!Array.isArray(list)) continue;
+    const seen = new Set([PRIMARY_KEY_SLOT]);
+    const slots = [];
+    for (const item of list) {
+      const id = typeof item?.id === "string" ? item.id : "";
+      if (!KEY_SLOT_PATTERN.test(id) || seen.has(id)) continue;
+      if (typeof item.keychainService !== "string" || !item.keychainService.trim()) continue;
+      seen.add(id);
+      slots.push({
+        id,
+        keychainService: item.keychainService,
+        keychainAccount: typeof item.keychainAccount === "string" && item.keychainAccount ? item.keychainAccount : "codex",
+        credentialPath: typeof item.credentialPath === "string" && item.credentialPath ? item.credentialPath : null,
+      });
+      if (slots.length >= MAX_BACKUP_KEYS) break;
+    }
+    if (slots.length) result.set(String(providerId), slots);
+  }
+  return result;
+}
+
+let keyPoolCache = { stamp: null, pool: new Map() };
+
+function readKeyPool() {
+  let stamp;
+  try {
+    const info = statSync(keyPoolPath);
+    stamp = `${info.mtimeMs}:${info.size}`;
+  } catch {
+    stamp = "missing";
+  }
+  if (stamp === keyPoolCache.stamp) return keyPoolCache.pool;
+  let pool = new Map();
+  if (stamp !== "missing") {
+    try { pool = normalizeKeyPool(JSON.parse(readFileSync(keyPoolPath, "utf8"))); }
+    catch { pool = keyPoolCache.pool; }
+  }
+  keyPoolCache = { stamp, pool };
+  return pool;
+}
+
+function primaryKeySlot(provider) {
+  return {
+    id: PRIMARY_KEY_SLOT,
+    keychainService: provider.keychainService,
+    keychainAccount: provider.keychainAccount || "codex",
+    credentialPath: provider.credentialPath || null,
+  };
+}
+
+export function keySlotsFor(provider, pool = readKeyPool()) {
+  return [primaryKeySlot(provider), ...(pool.get(provider.id) || [])];
+}
+
+// 只記在記憶體：路由器重啟後從主 Key 開始，最多多一次失敗請求就會換到可用的那把。
+export function createKeyRotation({ now = Date.now } = {}) {
+  const active = new Map();
+  const cooling = new Map();
+  const coolKey = (providerId, slotId) => `${providerId}\u0000${slotId}`;
+  return {
+    // 嘗試順序：從目前這把開始、跳過冷卻中的；全部都在冷卻時，仍依解除時間先後全部試一次，
+    // 不會因為冷卻就讓請求直接失敗。
+    order(providerId, slotIds) {
+      if (slotIds.length <= 1) return [...slotIds];
+      const current = Math.max(0, slotIds.indexOf(active.get(providerId)));
+      const rotated = [...slotIds.slice(current), ...slotIds.slice(0, current)];
+      const time = now();
+      const ready = [];
+      const waiting = [];
+      for (const id of rotated) {
+        const entry = cooling.get(coolKey(providerId, id));
+        if (entry && entry.until > time) waiting.push({ id, until: entry.until });
+        else ready.push(id);
+      }
+      waiting.sort((left, right) => left.until - right.until);
+      return [...ready, ...waiting.map((item) => item.id)];
+    },
+    fail(providerId, slotId, status, retryAfterSeconds = null) {
+      const until = now() + keyCooldownMs(status, retryAfterSeconds);
+      cooling.set(coolKey(providerId, slotId), { until, status, reason: keyFailureReason(status) });
+    },
+    succeed(providerId, slotId) {
+      active.set(providerId, slotId);
+      cooling.delete(coolKey(providerId, slotId));
+    },
+    active(providerId) {
+      return active.get(providerId) || PRIMARY_KEY_SLOT;
+    },
+    snapshot(providerId, slotIds) {
+      const time = now();
+      const current = active.get(providerId);
+      return {
+        keys: slotIds.length,
+        active: slotIds.includes(current) ? current : slotIds[0] || null,
+        cooling: slotIds.flatMap((id) => {
+          const entry = cooling.get(coolKey(providerId, id));
+          return entry && entry.until > time
+            ? [{ id, status: entry.status, reason: entry.reason, until: new Date(entry.until).toISOString() }]
+            : [];
+        }),
+      };
+    },
+  };
+}
+
+const keyRotation = createKeyRotation();
+
+function activeKeySlot(provider) {
+  const slots = keySlotsFor(provider);
+  return slots.find((slot) => slot.id === keyRotation.active(provider.id)) || slots[0];
+}
+
+function keyPoolSummary() {
+  const pool = readKeyPool();
+  const summary = {};
+  for (const provider of providers) {
+    const slots = keySlotsFor(provider, pool);
+    if (slots.length > 1) summary[provider.id] = keyRotation.snapshot(provider.id, slots.map((slot) => slot.id));
+  }
+  return summary;
 }
 
 function appendHeader(headers, name, value) {
@@ -1411,25 +1574,61 @@ export async function streamUpstream(upstream, response, history = null, respons
   response.end();
 }
 
-async function fetchCustom(provider, target, headers, body, signal) {
-  let apiKey = await getApiKey(provider, false);
-  let upstream = await fetch(target, {
+// 單把 Key 的一次請求。上游回 401／403 時重讀這把 Key（可能剛在管理頁換過）；
+// 只有內容真的變了才重送，Key 本身無效時不會白白多打一次。
+async function fetchWithKeySlot(provider, slot, target, headers, body, signal) {
+  const send = (apiKey) => fetch(target, {
     method: "POST",
     headers: buildCustomHeaders(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
   });
+  let apiKey;
+  try {
+    apiKey = await getApiKey(provider, false, slot);
+  } catch (error) {
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { keyReadFailed: true });
+  }
+  const upstream = await send(apiKey);
   if (upstream.status !== 401 && upstream.status !== 403) return upstream;
-  await upstream.arrayBuffer();
-  apiKey = await getApiKey(provider, true);
-  return fetch(target, {
-    method: "POST",
-    headers: buildCustomHeaders(headers, apiKey, target),
-    body,
-    redirect: "manual",
-    signal,
-  });
+  let reloaded;
+  try { reloaded = await getApiKey(provider, true, slot); } catch { return upstream; }
+  if (reloaded === apiKey) return upstream;
+  await upstream.arrayBuffer().catch(() => {});
+  return send(reloaded);
+}
+
+async function fetchCustom(provider, target, headers, body, signal) {
+  const slots = keySlotsFor(provider);
+  if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal);
+  const bySlot = new Map(slots.map((slot) => [slot.id, slot]));
+  const order = keyRotation.order(provider.id, slots.map((slot) => slot.id));
+  for (let index = 0; index < order.length; index += 1) {
+    const slot = bySlot.get(order[index]);
+    let upstream;
+    try {
+      upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal);
+    } catch (error) {
+      // 讀不到這把 Key（被刪掉、密文檔損壞）：當作被拒，換下一把；連線錯誤照常往外拋。
+      if (!error?.keyReadFailed || index === order.length - 1) throw error;
+      keyRotation.fail(provider.id, slot.id, 401);
+      stats.keyReadFailures += 1;
+      continue;
+    }
+    if (!KEY_ROTATION_STATUSES.has(upstream.status)) {
+      if (upstream.status < 400) keyRotation.succeed(provider.id, slot.id);
+      return upstream;
+    }
+    keyRotation.fail(provider.id, slot.id, upstream.status, parseRetryAfter(upstream.headers.get("retry-after")));
+    if (index === order.length - 1) return upstream;
+    await upstream.arrayBuffer().catch(() => {});
+    stats.keyRotations += 1;
+    stats.lastKeyRotation = {
+      at: new Date().toISOString(), provider: provider.id, from: slot.id, to: order[index + 1], status: upstream.status,
+    };
+  }
+  throw new Error("沒有可用的 API Key");
 }
 
 export async function fetchModelUpstream(
@@ -1693,7 +1892,7 @@ async function handleArkImages(request, response, incomingUrl) {
   // 此路徑相對於已配置的供應商 origin，不接在 /v1 後，也不轉送官方後端。
   // 任務提交只發一次，不以 401/403 為由重送付費提交。Key 由快取提供：Windows 的密文檔
   // 一改寫就會重讀，不必每次都起 PowerShell（任務輪詢每 2 秒一次，以前每次都卡住路由器）。
-  const apiKey = await getApiKey(provider);
+  const apiKey = await getApiKey(provider, false, activeKeySlot(provider));
   const upstream = await fetch(new URL(incomingUrl.pathname, new URL(provider.apiRoot).origin), {
     method: request.method, headers: buildCustomHeaders(request.headers, apiKey),
     body: taskQuery ? undefined : Buffer.concat(chunks), redirect: "manual", signal: controller.signal,
@@ -3140,6 +3339,7 @@ const server = http.createServer(async (request, response) => {
         uptimeSeconds: Math.floor(process.uptime()),
         historyCache: historyCacheInfo(),
         providers: providerSummary,
+        keyPools: keyPoolSummary(),
         stats,
       });
       return;
