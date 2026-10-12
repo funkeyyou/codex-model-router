@@ -7,7 +7,8 @@ import { buildIconBlock, embedIcons, prepareIcon } from "../tools/provider-icons
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer } = await loadPayloads();
-const page = readFileSync(new URL("../src/manager.html", import.meta.url), "utf8");
+// Windows 簽出可能是 CRLF；比對前統一換行。
+const page = readFileSync(new URL("../src/manager.html", import.meta.url), "utf8").replaceAll("\r\n", "\n");
 
 test("每個預設都有唯一 key、有效 ID、https 網址與內嵌圖示", () => {
   const icons = JSON.parse(/id="provider-icons">([\s\S]*?)<\/script>/.exec(page)[1]);

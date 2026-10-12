@@ -19,7 +19,8 @@ const OPEN = '<script type="application/json" id="provider-icons">';
 const CLOSE = "</script>";
 
 export function prepareIcon(name, source) {
-  let svg = String(source).replace(/<\?xml[^>]*>/g, "").replace(/<title>[\s\S]*?<\/title>/g, "").trim();
+  // Windows 簽出時檔案可能被轉成 CRLF；統一換行，各平台產生的內容才會一致。
+  let svg = String(source).replace(/\r\n?/g, "\n").replace(/<\?xml[^>]*>/g, "").replace(/<title>[\s\S]*?<\/title>/g, "").trim();
   if (!/^<svg[\s>]/.test(svg)) throw new Error(`${name}: 不是 SVG`);
   if (/<script|<foreignObject|\son[a-z]+\s*=|(?:href|src)\s*=\s*["'](?!#)/i.test(svg)) {
     throw new Error(`${name}: 含有腳本、事件或外部參照`);
@@ -48,7 +49,7 @@ export function embedIcons(page, block) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const page = readFileSync(pagePath, "utf8");
+  const page = readFileSync(pagePath, "utf8").replaceAll("\r\n", "\n");
   const next = embedIcons(page, buildIconBlock());
   if (process.argv.includes("--check")) {
     if (next !== page) {
