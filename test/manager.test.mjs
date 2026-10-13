@@ -402,7 +402,7 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "apply-update", "claude-cli-add", "claude-cli-install",
     "claude-cli-login", "claude-cli-update", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-claude", "remove-backup-key", "remove-models",
     "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "set-global-context", "set-hidden-models",
-    "update"]);
+    "uninstall", "update"]);
   // 頁面用到的查詢都要是安裝器提供的。
   const queryTypes = new Set([...managerPage.matchAll(/(?:ensureQuery|refreshButton|reloadQuery)\("([a-z-]+)"/g)].map((match) => match[1]));
   for (const match of managerPage.matchAll(/type: "([a-z-]+)" \} \}\)/g)) queryTypes.add(match[1]);

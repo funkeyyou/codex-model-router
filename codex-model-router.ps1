@@ -175,7 +175,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.31.0";
+const INSTALLER_VERSION = "1.32.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5747,6 +5747,21 @@ async function rollback() {
     return;
   }
   printHeading("回退 Codex 模型路由器");
+  console.log("只會還原由安裝器管理的 Codex 配置項。" );
+  console.log(`完整配置備份：${manifest.configBackup}`);
+  if (!(await confirm("是否繼續？", true))) return;
+  const result = await uninstallRouter(manifest, {
+    deleteKeys: (count) => confirm(
+      `是否從${secretStoreLabel}中刪除${count > 1 ? `全部 ${count} 家` : ""}自訂供應商的 API Key？`, true),
+  });
+  printHeading("回退完成");
+  console.log(`安裝檔案已封存至：${result.archiveDir}`);
+  console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
+}
+
+// 還原 Codex 配置、停止並移除路由器服務、封存檔案；終端與管理頁共用。
+// deferArchive：安裝目錄留到管理頁結束後再搬，因為管理程式自己還在裡面執行。
+async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
   // 安裝目錄稍後會整個封存，要刪的 Key 得先讀出來。
   const providers = installedProviders(readSettingsIfExists(), manifest);
   let backupKeys = [];
@@ -5754,10 +5769,6 @@ async function rollback() {
     const pool = existsSync(keyPoolPath) ? normalizeKeyPoolFile(JSON.parse(readFileSync(keyPoolPath, "utf8"))) : null;
     backupKeys = pool ? Object.values(pool.providers).flat() : [];
   } catch { /* 清單損壞時只刪主 Key。 */ }
-  console.log("只會還原由安裝器管理的 Codex 配置項。" );
-  console.log(`完整配置備份：${manifest.configBackup}`);
-  if (!(await confirm("是否繼續？", true))) return;
-
   const edits = rollbackEdits(manifest.previousConfig);
   const userBeforeRollback = await readUserConfig();
   // 只清除本工具擁有的路由引用；不影響其他供應商碰巧使用 custom/ 的模型。
@@ -5792,12 +5803,9 @@ async function rollback() {
     if (path.startsWith(installRoot)) continue;
     if (existsSync(path)) renameSync(path, join(archiveDir, basename(path)));
   }
-  if (existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
+  if (!deferArchive && existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
 
-  const removeKey = await confirm(
-    `是否從${secretStoreLabel}中刪除${providers.length > 1 ? `全部 ${providers.length} 家` : ""}自訂供應商的 API Key？`,
-    true,
-  );
+  const removeKey = await deleteKeys(providers.length);
   if (removeKey) {
     for (const provider of providers) {
       deleteApiKey(provider.keychainService, provider.keychainAccount || "codex");
@@ -5806,18 +5814,22 @@ async function rollback() {
       try { deleteApiKey(item.keychainService, item.keychainAccount); } catch { /* 留下一筆沒人用的憑證而已。 */ }
     }
   }
-
-  printHeading("回退完成");
-  console.log(`安裝檔案已封存至：${archiveDir}`);
-  console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
+  return { archiveDir, keysDeleted: Boolean(removeKey), providerCount: providers.length };
 }
 
 // 只裝了網頁管理頁：還原 Codex 入口、移除捷徑，封存管理頁檔案。沒有路由器或 Key 要處理。
 async function rollbackManagerOnly() {
-  const record = readManagerRecord();
   printHeading("移除網頁管理頁");
   console.log("尚未連接任何供應商，只會移除管理頁、捷徑與 Codex 裡的入口。");
   if (!(await confirm("是否繼續？", true))) return;
+  const result = await uninstallManagerOnly();
+  printHeading("移除完成");
+  console.log(`管理頁檔案已封存至：${result.archiveDir}`);
+  console.log(`請完全退出並重新打開 ${desktopAppName}。`);
+}
+
+async function uninstallManagerOnly({ deferArchive = false } = {}) {
+  const record = readManagerRecord();
   if (record.managerMcpEntry && codexBin) {
     const user = await readUserConfig();
     const entryEdit = managerMcpRollbackEdit(user.config, record.managerMcpEntry);
@@ -5827,10 +5839,8 @@ async function rollbackManagerOnly() {
   const archiveDir = join(backupsRoot, `rollback-${timestamp()}`);
   ensureDirectory(archiveDir);
   archiveManagerShortcut(archiveDir);
-  if (existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
-  printHeading("移除完成");
-  console.log(`管理頁檔案已封存至：${archiveDir}`);
-  console.log(`請完全退出並重新打開 ${desktopAppName}。`);
+  if (!deferArchive && existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
+  return { archiveDir };
 }
 
 // 只裝管理頁時第一次執行安裝器：放好管理頁、捷徑與 Codex 入口，不安裝路由器、不改模型設定。
@@ -7668,6 +7678,49 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, fir
   return { added, failures: tested.failures, backupDir, restartDesktop: true };
 }
 
+// 管理頁的「解除安裝」：與終端的 rollback 相同，只是不問問題；安裝目錄等管理頁結束後再封存。
+async function managerUninstall(params = {}) {
+  const deleteKeys = params.deleteKeys !== false;
+  const manifest = readManifest();
+  let result;
+  if (manifest) {
+    console.log("正在還原 Codex 配置、停止路由器並移除服務…");
+    result = await uninstallRouter(manifest, { deleteKeys: async () => deleteKeys, deferArchive: true });
+    if (result.keysDeleted) console.log(`已從${secretStoreLabel}刪除自訂供應商的 API Key。`);
+    else console.log(`保留${secretStoreLabel}中的 API Key。`);
+  } else if (readManagerRecord()) {
+    console.log("尚未連接任何供應商，只移除管理頁、捷徑與 Codex 裡的入口。");
+    result = await uninstallManagerOnly({ deferArchive: true });
+  } else {
+    fail("沒有可解除安裝的項目。");
+  }
+  console.log(`管理頁結束後，安裝檔案會封存至：${result.archiveDir}`);
+  console.log(`請完全退出並重新打開 ${desktopAppName}，然後建立一個新任務。`);
+  return { uninstalled: true, managerExit: true, archiveDir: result.archiveDir, keysDeleted: Boolean(result.keysDeleted) };
+}
+
+// 管理程式（以及啟動它的背景 worker）都退出後，才把安裝目錄搬進封存目錄；
+// Windows 上開著的檔案不能搬，所以交給獨立的小程序等待後重試。
+function scheduleInstallArchive(archiveDir) {
+  const target = join(archiveDir, "model-router");
+  const code = [
+    "const { existsSync, readdirSync, renameSync } = require('node:fs');",
+    "const [source, target, ...pids] = process.argv.slice(1);",
+    "const alive = (pid) => { try { process.kill(Number(pid), 0); return true; } catch (error) { return error.code === 'EPERM'; } };",
+    "const busy = () => { try { return readdirSync(source).some((name) => /^manager-worker-.+\\.(mjs|json)$/.test(name)); } catch { return false; } };",
+    "const started = Date.now();",
+    "const tick = () => {",
+    "  if (Date.now() - started < 30000 && (pids.some(alive) || busy())) return setTimeout(tick, 300);",
+    "  try { if (existsSync(source) && !existsSync(target)) renameSync(source, target); }",
+    "  catch { if (Date.now() - started < 90000) return setTimeout(tick, 1000); }",
+    "};",
+    "setTimeout(tick, 300);",
+  ].join("\n");
+  const child = spawn(process.execPath, ["-e", code, installRoot, target, String(process.pid)],
+    { detached: true, stdio: "ignore", windowsHide: true, cwd: tmpdir() });
+  child.unref();
+}
+
 function managerOperations() {
   const job = (title, run) => ({ title, run });
   return {
@@ -7715,6 +7768,7 @@ function managerOperations() {
       "claude-cli-update": job("更新 Claude CLI", managerClaudeCliUpdate),
       "claude-cli-login": job("登入 Claude 訂閱帳號", managerClaudeCliLogin),
       "claude-cli-add": job("添加 Claude 訂閱模型", managerClaudeCliAdd),
+      uninstall: job("解除安裝", managerUninstall),
     },
   };
 }
@@ -7886,7 +7940,14 @@ async function runManager() {
   const instanceId = manager.createToken();
   let finish = () => {};
   const finished = new Promise((resolvePromise) => { finish = resolvePromise; });
+  let uninstallArchive = null;
   const jobs = manager.createJobRunner({ onFinished: (job) => {
+    if (job.status === "succeeded" && job.result?.managerExit) {
+      uninstallArchive = job.result.archiveDir;
+      // 留一點時間讓分頁讀到最後的操作結果。
+      setTimeout(() => finish("uninstall"), 2500);
+      return;
+    }
     if (job.status !== "succeeded" || !job.result?.managerRestart) return;
     try {
       writeJsonAtomic(managerHandoffPath, { token, job: jobs.view(job), createdAt: new Date().toISOString() });
@@ -7982,6 +8043,13 @@ async function runManager() {
   if (reason !== "restart") removeManagerLock(token);
   restoreOutput();
   managerMode = false;
+  if (reason === "uninstall") {
+    try { scheduleInstallArchive(uninstallArchive); } catch (error) {
+      console.error(`無法封存安裝目錄，請手動移除 ${installRoot}：${error.message}`);
+    }
+    console.log("\n已解除安裝，網頁管理介面已結束。");
+    return;
+  }
   if (reason === "restart") {
     await restartIntoInstalledManager(port, token);
     return;
@@ -16470,6 +16538,17 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "API Key、權杖、電子郵件與個人路徑會自動遮蔽，供應商只保留主機名稱；分享前仍建議自己看過一遍。不會發送任何付費請求。": "API keys, tokens, email addresses and personal paths are masked automatically, and providers keep only their host name; still review it before sharing. No paid requests are sent.",
 "正在收集…": "Collecting…",
 "下載診斷包": "Download diagnostics",
+"解除安裝": "Uninstall",
+"解除安裝 Codex 模型路由器": "Uninstall Codex Model Router",
+"還原安裝器改過的 Codex 設定，停止並移除路由器、中轉生圖技能、桌面捷徑與 Codex 裡的「自訂模型管理」入口。": "Restores the Codex settings the installer changed, then stops and removes the router, the relay image skill, the desktop shortcut, and the “Custom Model Manager” entry in Codex.",
+"目前只裝了管理頁：會移除管理頁、桌面捷徑與 Codex 裡的「自訂模型管理」入口。": "Only the manager is installed: this removes the manager, the desktop shortcut, and the “Custom Model Manager” entry in Codex.",
+"安裝檔案會封存到 Codex 的 backups 目錄，不會直接刪除；之後重新執行安裝器即可再次安裝。": "Installed files are archived in Codex's backups folder, not deleted. Run the installer again any time to reinstall.",
+"自訂模型會從 Codex 的模型選單消失，使用自訂模型的任務需要切回官方模型。完成後管理頁會自動結束。": "Custom models disappear from the Codex model picker; tasks using them need to switch back to an official model. The manager quits automatically when done.",
+"完成後管理頁會自動結束。": "The manager quits automatically when done.",
+"同時刪除{store}中儲存的 API Key（含備用 Key）": "Also delete the API Keys stored in {store} (including backup keys)",
+"已解除安裝": "Uninstalled",
+"請完全退出並重新打開 {app}，然後建立一個新任務。這個分頁可以關閉了。": "Fully quit and reopen {app}, then start a new task. You can close this tab now.",
+"封存位置：{path}": "Archived to: {path}",
 "複製到剪貼簿": "Copy to clipboard",
 "已複製診斷包，可以直接貼到 issue 或聊天中。": "Diagnostics copied; paste them into an issue or chat.",
 "已下載 {file}": "Downloaded {file}",
@@ -16828,6 +16907,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 ["^這個管理頁是 (.+)，路由器仍是 (.+)；請先從左上角的版本選單套用新版本。$", "This manager is $1, but the router is still $2. Apply the new version from the version menu at the top left first."],
 ["^未找到 Codex CLI，請先安裝 (.+) 或 Codex CLI。$", "Codex CLI wasn't found. Install $1 or the Codex CLI first."],
 ["^未找到 Codex CLI。$", "Codex CLI wasn't found."],
+["^沒有可解除安裝的項目。$", "There's nothing installed to uninstall."],
 ["^當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。$", "Codex Model Router isn't installed in this CODEX_HOME. Choose “安裝或重新配置” (Install or reconfigure) first."],
 ["^尚未安裝路由器。$", "The router isn't installed."],
 ["^「(.+)」正在進行中，請等它完成。$", "“$1” is in progress. Wait for it to finish."],
@@ -17554,6 +17634,7 @@ function renderSetupSettings() {
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
     renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
     renderDiagnosticsPanel(),
+    renderUninstallPanel(),
   ];
 }
 
@@ -18538,7 +18619,52 @@ function renderSettings() {
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
     renderDiagnosticsPanel(),
+    renderUninstallPanel(),
   ];
+}
+
+// 解除安裝：與終端的「回退配置」相同；還原 Codex 配置、移除路由器與入口，檔案封存不刪除。
+function renderUninstallPanel() {
+  const routerInstalled = Boolean(state.installed);
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("解除安裝") })));
+  panel.append(h("div", { class: "panel-body setting-body" },
+    paragraph(routerInstalled
+      ? t("還原安裝器改過的 Codex 設定，停止並移除路由器、中轉生圖技能、桌面捷徑與 Codex 裡的「自訂模型管理」入口。")
+      : t("目前只裝了管理頁：會移除管理頁、桌面捷徑與 Codex 裡的「自訂模型管理」入口。"), "muted"),
+    paragraph(t("安裝檔案會封存到 Codex 的 backups 目錄，不會直接刪除；之後重新執行安裝器即可再次安裝。"), "note"),
+    h("div", { class: "actions" },
+      h("button", { type: "button", class: "button danger", onclick: confirmUninstall }, icon("trash"), t("解除安裝")))));
+  return panel;
+}
+
+function confirmUninstall() {
+  const routerInstalled = Boolean(state.installed);
+  const store = state.platform === "win32" ? t("Windows 憑證保護") : t("鑰匙圈");
+  const keyBox = h("input", { type: "checkbox", checked: true });
+  confirmDialog({
+    title: t("解除安裝 Codex 模型路由器"),
+    danger: true,
+    confirmLabel: t("解除安裝"),
+    body: [
+      paragraph(routerInstalled
+        ? t("自訂模型會從 Codex 的模型選單消失，使用自訂模型的任務需要切回官方模型。完成後管理頁會自動結束。")
+        : t("完成後管理頁會自動結束。")),
+      routerInstalled ? h("label", { class: "check-line" }, keyBox,
+        h("span", { text: t("同時刪除{store}中儲存的 API Key（含備用 Key）", { store }) })) : null,
+    ],
+  }).then(async (ok) => {
+    if (!ok) return;
+    const view = await runJob("uninstall", { deleteKeys: routerInstalled && keyBox.checked }, { title: t("解除安裝") });
+    if (!view || view.status !== "succeeded" || !(view.result && view.result.uninstalled)) return;
+    restartingManager = true;
+    try { sessionStorage.removeItem(JOB_KEY); } catch { /* 忽略 */ }
+    setTimeout(() => {
+      document.body.replaceChildren(h("div", { class: "fatal" },
+        h("h1", { text: t("已解除安裝") }),
+        h("p", { text: t("請完全退出並重新打開 {app}，然後建立一個新任務。這個分頁可以關閉了。", { app: desktopName() }) }),
+        view.result.archiveDir ? h("p", { class: "mono", text: t("封存位置：{path}", { path: view.result.archiveDir }) }) : null));
+    }, 1200);
+  });
 }
 
 // 診斷包：唯讀、不花額度。匯出成 JSON 檔或複製到剪貼簿，回報問題時直接附上。
@@ -18756,6 +18882,7 @@ function jobTitle(type, fallback) {
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
     "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
+    uninstall: t("解除安裝"),
   };
   return titles[type] || serverText(fallback) || type;
 }

@@ -252,6 +252,26 @@ test("不帶指令執行：先只裝管理頁再開啟，網頁可查詢模型�
   assert.equal(existsSync(runtime), false, "回退後管理頁檔案已封存");
 });
 
+test("管理頁的解除安裝：只裝管理頁時移除入口與捷徑，管理頁自動結束後才封存安裝目錄", { timeout: 60000 }, async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-uninstall-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  const ui = await startManager(defer, baseEnv(root, runtime), { foreground: false, args: [] });
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
+  assert.equal(existsSync(join(runtime, "manager-install.json")), true);
+  const finished = await ui.runJob("uninstall", { deleteKeys: false });
+  assert.equal(finished.status, "succeeded", JSON.stringify(finished));
+  assert.equal(finished.result.uninstalled, true);
+  assert.match(finished.output, /只移除管理頁/);
+  assert.ok(finished.result.archiveDir.startsWith(join(root, "backups")), finished.result.archiveDir);
+  assert.equal(existsSync(join(root, "shortcuts")) && readdirSync(join(root, "shortcuts")).length > 0, false, "捷徑已封存");
+  for (let attempt = 0; attempt < 300 && existsSync(runtime); attempt += 1) await delay(100);
+  assert.equal(existsSync(runtime), false, "管理頁結束後安裝目錄已封存");
+  assert.equal(existsSync(join(finished.result.archiveDir, "model-router", "manager-install.json")), true);
+  assert.equal(existsSync(join(finished.result.archiveDir, "model-router", "manager.json")), false, "管理頁鎖已清除");
+});
+
 test("舊版更新交接只傳權杖、不帶 --foreground 時，仍沿用權杖而不再啟動另一個管理頁", { timeout: 30000 }, async (t) => {
   const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-legacy-handoff-"));
