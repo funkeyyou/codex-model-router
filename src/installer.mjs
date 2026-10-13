@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.32.0";
+const INSTALLER_VERSION = "1.33.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1219,12 +1219,13 @@ export async function probeModelsInParallel(models, probe, {
   return results;
 }
 
-async function testResponse(apiRoot, apiKey, model, effort) {
+async function testResponse(apiRoot, apiKey, model, effort, extra = {}) {
   const body = {
     model,
     input: "Reply with exactly OK.",
     max_output_tokens: 128,
     store: false,
+    ...extra,
   };
   if (effort) body.reasoning = { effort };
   const response = await fetchWithTimeout(
@@ -1350,6 +1351,48 @@ async function probeAnthropicModel(apiRoot, apiKey, model) {
 // 把原本正常的模型或推理強度從設定裡刪掉，而且刪得無聲無息。
 export function isTransientProbeStatus(status) {
   return status === 0 || status === 408 || status === 429 || status >= 500;
+}
+
+// 第三方的 Fast（service_tier=priority）。不少閘道收到任何 service_tier 都回 200、
+// 實際上不處理，所以再送一個無效等級做對照：priority 通過、無效值被拒（400／422），
+// 才代表上游真的認得這個欄位。回應裡的 service_tier 不可靠（有的閘道加速了仍回 default），
+// 不拿來判斷。send(tier) 回傳 { ok, status }。
+//
+// 回傳 "supported"、"unsupported"（priority 被拒）、"unvalidated"（無效值也通過，
+// 無法確認是否生效）或 "unknown"（這次問不到）。只有 supported 會自動開啟 Fast。
+export const FAST_PROBE_INVALID_TIER = "codex-router-invalid-tier";
+export async function probeServiceTier(send, log = consoleProbeLog) {
+  const describe = (error) => (error instanceof Error ? error.message : String(error));
+  log.write("  Fast 模式     ");
+  try {
+    const fast = await send("priority");
+    if (!fast.ok) {
+      if (isTransientProbeStatus(fast.status)) {
+        log.line(`暫時無法確認（HTTP ${fast.status}），不開啟`);
+        return "unknown";
+      }
+      log.line(`不支援（HTTP ${fast.status}）`);
+      return "unsupported";
+    }
+    const control = await send(FAST_PROBE_INVALID_TIER);
+    if (control.ok) {
+      log.line("上游不檢查 service_tier，無法確認是否生效，不自動開啟（可在管理頁手動開啟）");
+      return "unvalidated";
+    }
+    if (control.status === 400 || control.status === 422) {
+      log.line("支援（service_tier=priority），選擇器會顯示 Fast");
+      return "supported";
+    }
+    log.line(`暫時無法確認（對照請求 HTTP ${control.status}），不開啟`);
+    return "unknown";
+  } catch (error) {
+    log.line(`暫時無法確認（${describe(error)}），不開啟`);
+    return "unknown";
+  }
+}
+
+export function fastFieldsFromProbe(fastProbe) {
+  return fastProbe ? { fast: fastProbe === "supported", fastProbe } : {};
 }
 
 async function probeModel(apiRoot, apiKey, model, log = consoleProbeLog) {
@@ -1498,7 +1541,9 @@ export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeL
   } catch (error) {
     log.line(`暫時無法確認（${describe(error)}），使用模型預設`);
   }
-  return { supported: true, transient: false, tools, streamOptions, efforts };
+  const fastProbe = await probeServiceTier(
+    (tier) => testChatCompletion(apiRoot, apiKey, model, { ...base, service_tier: tier }), log);
+  return { supported: true, transient: false, tools, streamOptions, efforts, fastProbe };
 }
 
 // --- 中轉供應商 ---------------------------------------------------------------
@@ -2189,13 +2234,24 @@ export function mergeAddedModels(officialModels, current, routes, newRoutes) {
 }
 
 // Claude CLI 的 Opus 可用 Claude Code 快速模式；是否真的可用（使用點數、帳號設定、
-// 模型版本）由 CLI 判斷，不可用時 CLI 會改用一般速度。其他自訂模型不支援。
+// 模型版本）由 CLI 判斷，不可用時 CLI 會改用一般速度。
+// Responses／Chat Completions 路由：新增時探測到上游認得 service_tier=priority，或使用者
+// 在管理頁手動開啟（route.fast === true）才顯示；路由器只對這些路由轉送 service_tier。
+// Claude API 路由不支援。
+export function fastConfigurable(route) {
+  return Boolean(route) && route.transport !== "claude-cli" && route.translate !== "anthropic";
+}
+
 export function customSpeedTiers(route) {
-  const fast = route?.transport === "claude-cli" && /opus/i.test(route.upstreamModel || "");
+  const cliFast = route?.transport === "claude-cli" && /opus/i.test(route.upstreamModel || "");
+  const apiFast = fastConfigurable(route) && route.fast === true;
+  const fast = cliFast || apiFast;
   return {
     additional_speed_tiers: fast ? ["fast"] : [],
     service_tiers: fast
-      ? [{ id: "priority", name: "Fast", description: "Claude 快速模式：輸出更快，改扣使用點數（usage credits）" }]
+      ? [cliFast
+        ? { id: "priority", name: "Fast", description: "Claude 快速模式：輸出更快，改扣使用點數（usage credits）" }
+        : { id: "priority", name: "Fast", description: "供應商的優先處理（service_tier=priority）：通常更快，費用依供應商計算" }]
       : [],
   };
 }
@@ -2405,13 +2461,18 @@ export function describeRouteLimits(route) {
 // 修改選擇器顯示名稱、上下文上限與輸出上限。名稱與上下文只影響模型目錄，路由器轉發時
 // 用不到，不必重啟；輸出上限由路由器在轉送 Claude 請求時套用，改了要重啟路由器才會生效
 // （restartRouter）。上游 ID、選擇器 ID、推理強度與憑證一律不變。
-export function planEditModel(manifest, settings, catalog, slug, { displayName, contextWindow, maxOutputTokens } = {}) {
+export function planEditModel(manifest, settings, catalog, slug, { displayName, contextWindow, maxOutputTokens, fast } = {}) {
   if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
     fail("安裝設定或模型目錄不完整，無法修改模型。");
   }
   const route = settings.routes.find((item) => item.pickerSlug === slug);
   const entry = catalog.models.find((model) => model.slug === slug);
   if (!route || !entry || !String(slug).startsWith("custom/")) fail(`所選模型不是已配置的自訂模型：${slug}`);
+
+  if (fast !== undefined && fast !== null) {
+    if (typeof fast !== "boolean") fail("Fast 設定必須是開或關。");
+    if (!fastConfigurable(route)) fail("這個模型的介面不支援在這裡切換 Fast。");
+  }
 
   let name = entry.display_name || route.displayName || route.upstreamModel;
   if (displayName !== undefined && displayName !== null) {
@@ -2455,14 +2516,20 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
   const nameChanged = name !== entry.display_name || name !== route.displayName;
   const routeContextChanged = context != null && route.contextWindow !== context;
   const outputChanged = Boolean(outputPatch) && Object.entries(outputPatch).some(([key, value]) => route[key] !== value);
+  // 手動切換 Fast：記成 fastManual，之後重新探測也不覆蓋。路由器依 route.fast 決定是否轉送
+  // service_tier，所以要重啟路由器；選擇器的 Fast 按鈕要重新啟動桌面版才會出現或消失。
+  const fastPatch = typeof fast === "boolean" ? { fast, fastManual: true } : null;
+  const fastChanged = Boolean(fastPatch) && (route.fast !== fast || route.fastManual !== true);
   const editRoute = (item) => item.pickerSlug !== slug ? item : {
     ...item, displayName: name, ...(context != null ? { contextWindow: context } : {}), ...(outputChanged ? outputPatch : {}),
+    ...(fastChanged ? fastPatch : {}),
   };
   const routes = settings.routes.map(editRoute);
+  const tiers = fastChanged ? customSpeedTiers({ ...route, ...fastPatch }) : {};
   return {
-    changed: nameChanged || contextChanged || routeContextChanged || outputChanged,
-    restartRouter: outputChanged,
-    restartDesktop: nameChanged || contextChanged || routeContextChanged,
+    changed: nameChanged || contextChanged || routeContextChanged || outputChanged || fastChanged,
+    restartRouter: outputChanged || fastChanged,
+    restartDesktop: nameChanged || contextChanged || routeContextChanged || fastChanged,
     settings: { ...settings, routes },
     manifest: { ...manifest, routes: Array.isArray(manifest.routes) ? manifest.routes.map(editRoute) : routes },
     catalog: {
@@ -2476,8 +2543,39 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
           effective_context_window_percent: model.effective_context_window_percent ?? 95,
         } : {}),
         ...(outputChanged && outputPatch.maxOutputTokens ? { max_output_tokens: outputPatch.maxOutputTokens } : {}),
+        ...tiers,
       }),
     },
+  };
+}
+
+// 重新偵測 Fast 的結果寫回：清掉手動設定，改用探測結果。unknown 不改任何東西。
+export function planDetectedFast(manifest, settings, catalog, slug, fastProbe) {
+  if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
+    fail("安裝設定或模型目錄不完整，無法修改模型。");
+  }
+  const route = settings.routes.find((item) => item.pickerSlug === slug);
+  if (!route || !fastConfigurable(route)) fail(`所選模型不支援偵測 Fast：${slug}`);
+  if (fastProbe === "unknown") return { changed: false, fast: route.fast === true };
+  const fields = fastFieldsFromProbe(fastProbe);
+  const editRoute = (item) => {
+    if (item.pickerSlug !== slug) return item;
+    const { fastManual: _manual, ...rest } = item;
+    return { ...rest, ...fields };
+  };
+  const routes = settings.routes.map(editRoute);
+  const updated = routes.find((item) => item.pickerSlug === slug);
+  const changed = JSON.stringify(updated) !== JSON.stringify(route);
+  const tiers = customSpeedTiers(updated);
+  const tiersChanged = catalog.models.some((model) => model.slug === slug
+    && JSON.stringify(model.additional_speed_tiers ?? []) !== JSON.stringify(tiers.additional_speed_tiers));
+  return {
+    changed: changed || tiersChanged,
+    fast: updated.fast === true,
+    restartDesktop: tiersChanged,
+    settings: { ...settings, routes },
+    manifest: { ...manifest, routes: Array.isArray(manifest.routes) ? manifest.routes.map(editRoute) : routes },
+    catalog: { ...catalog, models: catalog.models.map((model) => model.slug !== slug ? model : { ...model, ...tiers }) },
   };
 }
 
@@ -3207,6 +3305,21 @@ function rollbackEdits(previousConfig) {
 //   kept      "model"（整條沿用）、"efforts"（補回強度）或 null（用新結果）
 //   restored  被補回來的推理強度
 export function resolveRouteWithPrevious(outcome, previous) {
+  const result = resolveRouteWithPreviousEfforts(outcome, previous);
+  return result.route ? { ...result, route: keepPreviousFast(result.route, previous) } : result;
+}
+
+// 重新探測時保留 Fast 設定：使用者手動切過的一律沿用；這次問不到（unknown）時沿用上次結果。
+export function keepPreviousFast(route, previous) {
+  if (!previous || route === previous || typeof previous.fast !== "boolean") return route;
+  if (previous.fastManual) return { ...route, fast: previous.fast, fastManual: true };
+  if (route.fastProbe === "unknown" && previous.fastProbe) {
+    return { ...route, fast: previous.fast, fastProbe: previous.fastProbe };
+  }
+  return route;
+}
+
+function resolveRouteWithPreviousEfforts(outcome, previous) {
   const { route, transient, transientEfforts = [] } = outcome;
 
   if (!route) {
@@ -3370,6 +3483,7 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
         translate: "chat",
         chatTools: chat.tools,
         chatStreamOptions: chat.streamOptions,
+        ...fastFieldsFromProbe(chat.fastProbe),
       };
       return { route, transient: false, transientEfforts: [] };
     }
@@ -3388,6 +3502,9 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
       transientEfforts: probe.transientEfforts || [],
     };
   }
+  const probeEffort = probe.stripReasoning ? null : (probe.efforts.includes("low") ? "low" : probe.efforts[0] ?? null);
+  const fastProbe = await probeServiceTier(
+    (tier) => testResponse(discovery.apiRoot, apiKey, model, probeEffort, { service_tier: tier }), log);
   const route = {
     pickerSlug: pickerSlug(model, providerId),
     upstreamModel: model,
@@ -3397,6 +3514,7 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
     efforts: probe.efforts,
     stripReasoning: probe.stripReasoning,
     contextWindow: null,
+    ...fastFieldsFromProbe(fastProbe),
   };
   return { route, transient: false, transientEfforts: probe.transientEfforts || [] };
 }
@@ -6390,6 +6508,11 @@ async function managerState() {
       outputCap,
       // API 路由的上限是新增時上游回報的值，修改不能超過；CLI 路由的上限可以一起調整。
       outputCapFixed: outputConfigurable && route.transport !== "claude-cli" && Boolean(outputCap),
+      // Fast：選擇器是否顯示（依模型目錄）、能否在管理頁切換與偵測、上次偵測結果與是否手動設定。
+      fast: Array.isArray(entry?.additional_speed_tiers) && entry.additional_speed_tiers.includes("fast"),
+      fastConfigurable: fastConfigurable(route),
+      fastProbe: typeof route.fastProbe === "string" ? route.fastProbe : null,
+      fastManual: route.fastManual === true,
       inCatalog: Boolean(entry),
     };
   }).sort((left, right) => (position.get(left.slug) ?? Number.MAX_SAFE_INTEGER) -
@@ -6887,17 +7010,17 @@ async function managerReorderModels({ slugs } = {}) {
   return { changed: true, backupDir, restartDesktop: true };
 }
 
-async function managerEditModel({ slug, displayName, contextWindow, maxOutputTokens } = {}) {
+async function managerEditModel({ slug, displayName, contextWindow, maxOutputTokens, fast } = {}) {
   assertManagerWritable();
   const { manifest, settings, catalog } = requireInstallation();
-  const plan = planEditModel(manifest, settings, catalog, String(slug || ""), { displayName, contextWindow, maxOutputTokens });
+  const plan = planEditModel(manifest, settings, catalog, String(slug || ""), { displayName, contextWindow, maxOutputTokens, fast });
   if (!plan.changed) {
     console.log("沒有任何變更。");
     return { changed: false };
   }
   if (plan.restartRouter) {
-    // 輸出上限由路由器在轉送時套用，路由器沒有熱重載，必須重啟才會生效。
-    console.log("正在寫入模型設定並重新啟動路由器（輸出上限要重啟後才會套用）…");
+    // 輸出上限與 Fast 由路由器在轉送時套用，路由器沒有熱重載，必須重啟才會生效。
+    console.log("正在寫入模型設定並重新啟動路由器（輸出上限與 Fast 要重啟後才會套用）…");
     const backupDir = await commitRouterChange("edit-model", plan);
     console.log(`已儲存。備份：${backupDir}`);
     return { changed: true, backupDir, restartDesktop: plan.restartDesktop };
@@ -6906,6 +7029,38 @@ async function managerEditModel({ slug, displayName, contextWindow, maxOutputTok
   const backupDir = await commitCatalogChange("edit-model", plan);
   console.log(`已儲存。備份：${backupDir}`);
   return { changed: true, backupDir, restartDesktop: plan.restartDesktop };
+}
+
+// 對已添加的模型重新偵測 Fast：送兩個很短的請求（priority 與無效等級對照），依結果開關。
+async function managerDetectFast({ slug } = {}) {
+  assertManagerWritable();
+  const { manifest, settings, catalog, providers } = requireInstallation();
+  const target = String(slug || "");
+  const route = settings.routes.find((item) => item.pickerSlug === target);
+  if (!route || !fastConfigurable(route)) fail(`所選模型不支援偵測 Fast：${target}`);
+  const provider = managerProvider(providers, routeProviderId(route));
+  const apiKey = readApiKey(provider.keychainService);
+  console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
+  console.log("正在查詢模型清單…");
+  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
+  console.log(`正在偵測 ${route.upstreamModel} 的 Fast（service_tier=priority），會送出兩個很短的請求…`);
+  const key = keyFor(route.upstreamModel);
+  const effort = route.stripReasoning || !route.efforts?.length ? null
+    : (route.efforts.includes("low") ? "low" : route.efforts[0]);
+  const fastProbe = await probeServiceTier(route.translate === "chat"
+    ? (tier) => testChatCompletion(discovery.apiRoot, key, route.upstreamModel, {
+      ...(route.chatStreamOptions === false ? {} : { stream_options: { include_usage: true } }), service_tier: tier })
+    : (tier) => testResponse(discovery.apiRoot, key, route.upstreamModel, effort, { service_tier: tier }));
+  const plan = planDetectedFast(manifest, settings, catalog, target, fastProbe);
+  if (!plan.changed) {
+    console.log(fastProbe === "unknown" ? "這次問不到結果，設定維持不變。" : "結果與目前設定相同，沒有變更。");
+    return { changed: false, fastProbe, fast: plan.fast };
+  }
+  console.log("正在寫入結果並重新啟動路由器…");
+  const backupDir = await commitRouterChange("detect-fast", plan);
+  console.log(plan.fast ? "已開啟 Fast。" : "已關閉 Fast。");
+  console.log(`備份：${backupDir}`);
+  return { changed: true, fastProbe, fast: plan.fast, backupDir, restartDesktop: plan.restartDesktop };
 }
 
 // 網頁送來的名稱與前綴：undefined 不修改，null 或空字串恢復預設，其他型別一律拒絕。
@@ -7598,6 +7753,7 @@ function managerOperations() {
       "remove-models": job("刪除模型", managerRemoveModels),
       "reorder-models": job("調整模型順序", managerReorderModels),
       "edit-model": job("修改模型", managerEditModel),
+      "detect-fast": job("偵測 Fast", managerDetectFast),
       "add-provider": job("新增供應商", managerAddProvider),
       install: job("首次設定", managerFirstInstall),
       "install-claude": job("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),

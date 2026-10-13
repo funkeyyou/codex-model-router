@@ -664,6 +664,18 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。": "Not enabled. Select models below and test them; models that pass are added to the $router-imagegen skill.",
 "用哪一家供應商生圖": "Provider for image generation",
 "重新偵測": "Test again",
+"偵測 Fast": "Test Fast",
+"偵測 Fast：{name}": "Test Fast: {name}",
+"在選擇器顯示 Fast": "Show Fast in the picker",
+"選擇器會顯示 Fast（service_tier=priority）": "The picker shows Fast (service_tier=priority)",
+"開啟後，選擇 Fast 會送出 service_tier=priority：通常更快，費用依供應商計算（多半較貴）。上游不支援時可能被拒或沒有效果。": "When on, choosing Fast sends service_tier=priority: usually faster, billed by the provider (often at a higher rate). Providers that don't support it may reject it or ignore it.",
+"目前：手動開啟。": "Currently: turned on manually.",
+"目前：手動關閉。": "Currently: turned off manually.",
+"偵測結果：上游支援 service_tier=priority，已自動開啟。": "Test result: the provider supports service_tier=priority, so Fast was turned on automatically.",
+"偵測結果：上游拒收 service_tier=priority。": "Test result: the provider rejects service_tier=priority.",
+"偵測結果：上游不檢查 service_tier，無法確認是否生效，因此沒有自動開啟。": "Test result: the provider doesn't validate service_tier, so there's no way to confirm it works; Fast was not turned on automatically.",
+"偵測結果：上次沒有問到結果，可以重新偵測。": "Test result: the last test got no answer. You can test again.",
+"尚未偵測（新增這個模型時還沒有這項偵測），可以按「重新偵測」。": "Not tested yet (this model was added before this test existed). Click “Test again”.",
 "偵測並啟用": "Test and enable",
 "多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。": "With several models selected, the AI chooses as needed: among GPT Image, Flare for general generation and Sunburst for precise edits; among Nano Banana, 2.1 for general use, Pro for complex compositions and in-image text, and 2 Lite for fast bulk output. Image 2, Nano Banana 2 and the original Nano Banana are for explicit requests or compatibility.",
 "偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。": "Testing really generates images and is billed by the provider: GPT Image models first try the standard interface with one low-quality image each, then the Ark task API if all fail; Nano Banana models try Chat, native Gemini and the standard interface in turn, stopping at the first success. Only passing models are enabled; if none pass, the current setup is unchanged.",
@@ -1876,6 +1888,7 @@ function modelRow(model, index, count, blocked) {
         model.inCatalog ? null : h("span", { class: "chip rose", text: t("目錄缺少"), title: t("models.json 裡沒有這個模型，請執行 update 修復") })),
       h("div", { class: "model-sub", text: model.upstreamModel, title: t("選擇器 ID：{slug}", { slug: model.slug }) }),
       h("div", { class: "model-meta" }, h("span", { class: "chip", text: providerLabel(model.providerId) }), transportChip(model.transport),
+        model.fast ? h("span", { class: "chip violet", text: "Fast", title: t("選擇器會顯示 Fast（service_tier=priority）") }) : null,
         h("span", { class: "faint", text: effortText(model.efforts) }))),
     h("td", { class: "col-provider" }, h("span", { class: "chip", text: providerLabel(model.providerId) })),
     h("td", { class: "col-transport" }, transportChip(model.transport)),
@@ -2878,6 +2891,7 @@ function jobTitle(type, fallback) {
   const titles = {
     "repair-models": t("同步與修復模型清單"), "add-models": t("添加模型"), "remove-models": t("刪除模型"),
     "reorder-models": t("調整模型順序"), "edit-model": t("修改模型"), "add-provider": t("新增供應商"), install: t("首次設定"), "install-claude": t("首次設定"),
+    "detect-fast": t("偵測 Fast"),
     "edit-provider": t("修改供應商"), "remove-provider": t("移除供應商"), "replace-key": t("更換 API Key"),
     "add-backup-key": t("新增備用 API Key"), "remove-backup-key": t("移除備用 API Key"),
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
@@ -3234,6 +3248,18 @@ function confirmRemoveModels(slugs) {
   });
 }
 
+// 上次 Fast 偵測的結果。
+function fastStatusText(model) {
+  if (model.fastManual) return model.fast ? t("目前：手動開啟。") : t("目前：手動關閉。");
+  switch (model.fastProbe) {
+    case "supported": return t("偵測結果：上游支援 service_tier=priority，已自動開啟。");
+    case "unsupported": return t("偵測結果：上游拒收 service_tier=priority。");
+    case "unvalidated": return t("偵測結果：上游不檢查 service_tier，無法確認是否生效，因此沒有自動開啟。");
+    case "unknown": return t("偵測結果：上次沒有問到結果，可以重新偵測。");
+    default: return t("尚未偵測（新增這個模型時還沒有這項偵測），可以按「重新偵測」。");
+  }
+}
+
 function openEditModel(model) {
   const maxContext = model.transport === "claude-cli" ? 1000000 : TOKEN_LIMITS.maxContext;
   const name = h("input", { type: "text", value: model.displayName, maxlength: "80" });
@@ -3258,9 +3284,20 @@ function openEditModel(model) {
     h("dt", { text: t("上下文來源") }), h("dd", { text: contextSource }),
     model.outputConfigurable ? null : h("dt", { text: t("輸出") }),
     model.outputConfigurable ? null : h("dd", { text: t("由上游決定：這個介面不送出輸出上限，因此不需要設定。") }));
+  // Fast：只有 Responses 與 Chat Completions 路由可以切換。
+  const fastBox = model.fastConfigurable ? h("input", { type: "checkbox", checked: Boolean(model.fast) }) : null;
+  const fastField = fastBox ? h("div", { class: "field" },
+    h("label", { class: "check-line" }, fastBox, h("span", { text: t("在選擇器顯示 Fast") })),
+    h("span", { class: "hint", text: fastStatusText(model) }),
+    h("span", { class: "hint", text: t("開啟後，選擇 Fast 會送出 service_tier=priority：通常更快，費用依供應商計算（多半較貴）。上游不支援時可能被拒或沒有效果。") }),
+    h("div", {}, h("button", { type: "button", class: "button small", onclick: () => {
+      modal.close();
+      runJob("detect-fast", { slug: model.slug }, { title: t("偵測 Fast：{name}", { name: model.displayName }) });
+    } }, icon("refresh"), t("重新偵測")))) : null;
   const body = [
     h("label", { class: "field" }, h("span", { text: t("顯示名稱") }), name, h("span", { class: "hint", text: t("只影響選擇器裡顯示的名稱；上游模型 ID 與選擇器 ID 不變。") })),
     limits.nodes,
+    fastField,
     globalContextBanner(),
     info,
     paragraph(model.outputConfigurable
@@ -3279,7 +3316,8 @@ function openEditModel(model) {
       const params = { slug: model.slug, displayName };
       if (result.contextWindow != null && result.contextWindow !== model.contextWindow) params.contextWindow = result.contextWindow;
       if (result.maxOutputTokens != null && result.maxOutputTokens !== model.outputTokens) params.maxOutputTokens = result.maxOutputTokens;
-      if (displayName === model.displayName && !("contextWindow" in params) && !("maxOutputTokens" in params)) {
+      if (fastBox && fastBox.checked !== Boolean(model.fast)) params.fast = fastBox.checked;
+      if (displayName === model.displayName && !("contextWindow" in params) && !("maxOutputTokens" in params) && !("fast" in params)) {
         modal.close();
         toast(t("沒有任何變更。"));
         return;

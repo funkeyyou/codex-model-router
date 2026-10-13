@@ -446,6 +446,8 @@ export function toChatRequest(body, route) {
   }
   // 串流預設不回用量；要明確要求。少數閘道不認得 stream_options，探測時會記下來。
   if (route?.chatStreamOptions !== false) request.stream_options = { include_usage: true };
+  // Fast：路由器只對開啟 Fast 的路由保留 service_tier，這裡原樣帶給 Chat Completions。
+  if (route?.fast === true && typeof body.service_tier === "string") request.service_tier = body.service_tier;
 
   // 壓縮回合只能回摘要，不送 tools。歷史裡的工具呼叫與結果照樣保留，Chat Completions
   // 不要求本輪一定要定義 tools。

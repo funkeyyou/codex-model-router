@@ -845,6 +845,9 @@ const stats = {
   // Claude CLI 拒收路由器加的歷史快取斷點、改以無斷點重送的次數；應為 0。
   claudeCliCacheFallbacks: 0,
   claudeCliFastRequests: 0,
+  // 第三方 Fast：轉送了 service_tier=priority 的次數；送往未開啟 Fast 的自訂路由而被拿掉的次數。
+  customFastRequests: 0,
+  serviceTierStripped: 0,
   lastClaudeCliFastState: null,
   lastClaudeCliFastDisabledReason: null,
   chatTranslatedRequests: 0,
@@ -1494,8 +1497,18 @@ function fallbackEffort(efforts) {
   return null;
 }
 
-function rewriteCustomBody(body, route) {
+export function rewriteCustomBody(body, route) {
   const rewritten = { ...body, model: route.upstreamModel };
+  // service_tier 只轉送給確認支援 Fast 的路由（Claude CLI 另外在轉送時讀取）。其他上游
+  // 可能直接拒收不認得的等級，例如 Codex 全域設定了 service_tier 時。
+  if (rewritten.service_tier !== undefined && route.transport !== "claude-cli") {
+    if (route.fast === true && route.translate !== "anthropic") {
+      if (rewritten.service_tier === "priority") stats.customFastRequests += 1;
+    } else {
+      delete rewritten.service_tier;
+      stats.serviceTierStripped += 1;
+    }
+  }
   const requestedEffort = body?.reasoning?.effort;
   if (route.stripReasoning || route.efforts.length === 0) {
     delete rewritten.reasoning;

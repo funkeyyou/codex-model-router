@@ -34,6 +34,7 @@ async function fakeGateway(t, behavior = {}) {
     if (behavior.rejectStreamOptions && body.stream_options) return reject(400);
     if (behavior.rejectTools && body.tools) return reject(400);
     if (behavior.rejectEffort && body.reasoning_effort) return reject(400);
+    if (behavior.rejectInvalidTier && body.service_tier && body.service_tier !== "priority") return reject(400);
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end(`data: ${JSON.stringify(delta({ content: "OK" }, "stop"))}\n\ndata: [DONE]\n\n`);
   });
@@ -46,13 +47,15 @@ async function fakeGateway(t, behavior = {}) {
 test("探測：支援工具與推理強度時全部記下；不收 stream_options 的閘道改成不要求用量", async (t) => {
   const full = await fakeGateway(t);
   assert.deepEqual(await installer.probeChatModel(full.apiRoot, "key", "deepseek-chat", silent),
-    { supported: true, transient: false, tools: true, streamOptions: true, efforts: ["low", "medium", "high"] });
+    { supported: true, transient: false, tools: true, streamOptions: true, efforts: ["low", "medium", "high"], fastProbe: "unvalidated" });
 
-  const strict = await fakeGateway(t, { rejectStreamOptions: true, rejectTools: true, rejectEffort: true });
+  const strict = await fakeGateway(t, { rejectStreamOptions: true, rejectTools: true, rejectEffort: true, rejectInvalidTier: true });
   assert.deepEqual(await installer.probeChatModel(strict.apiRoot, "key", "qwen-local", silent),
-    { supported: true, transient: false, tools: false, streamOptions: false, efforts: [] });
+    { supported: true, transient: false, tools: false, streamOptions: false, efforts: [], fastProbe: "supported" });
   assert.ok(strict.requests.filter((request) => request.body?.tools || request.body?.reasoning_effort)
     .every((request) => !request.body.stream_options), "拿掉 stream_options 之後的探測都不能再帶它");
+  assert.ok(strict.requests.filter((request) => request.body?.service_tier)
+    .every((request) => !request.body.stream_options), "Fast 探測沿用不帶 stream_options 的設定");
 });
 
 test("探測：404 代表不支援，5xx 代表暫時問不到", async (t) => {
@@ -79,6 +82,8 @@ test("/responses 不通時改走 Chat Completions，路由標上 translate:chat 
     translate: "chat",
     chatTools: true,
     chatStreamOptions: true,
+    fast: false,
+    fastProbe: "unvalidated",
   });
   assert.ok(gateway.requests.some((request) => request.path.endsWith("/responses")), "先探 /responses");
 });
