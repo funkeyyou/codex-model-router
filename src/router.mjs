@@ -906,11 +906,13 @@ const validatedAuthDigests = new Map();
 // 官方模型與官方直通端點一律在本機擋下，Key 本身絕不轉發給 chatgpt.com。
 // 檔案依修改時間重讀，開關模式不必重新啟動路由器。
 const quotaModePath = join(routerDirectory, "quota-mode.json");
+// 只比修改時間不夠：Windows 上同一個時間刻度內的兩次寫入看起來一樣，因此連大小與檔案識別一起比。
+const fileStamp = (info) => [info.mtimeMs, info.ctimeMs, info.size, info.ino].join(":");
 let quotaModeCache = { mtimeMs: null, digest: null };
 
 function quotaModeDigest() {
   let mtimeMs;
-  try { mtimeMs = statSync(quotaModePath).mtimeMs; }
+  try { mtimeMs = fileStamp(statSync(quotaModePath)); }
   catch { quotaModeCache = { mtimeMs: null, digest: null }; return null; }
   if (mtimeMs !== quotaModeCache.mtimeMs) {
     let digest = null;
@@ -1020,7 +1022,7 @@ export const BACKGROUND_TASK_PATTERNS = [
 // 兩者分開設定，記憶整理會呼叫工具、內容長，適合選另一個模型。舊格式 { model } 視為 light。
 function backgroundModelSetting() {
   let mtimeMs;
-  try { mtimeMs = statSync(backgroundModelPath).mtimeMs; }
+  try { mtimeMs = fileStamp(statSync(backgroundModelPath)); }
   catch { backgroundModelCache = { mtimeMs: null, light: null, memory: null }; return backgroundModelCache; }
   if (mtimeMs !== backgroundModelCache.mtimeMs) {
     const valid = (value) => (typeof value === "string" && value.startsWith("custom/") ? value : null);
