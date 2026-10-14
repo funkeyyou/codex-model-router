@@ -399,9 +399,9 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   const jobTypes = new Set([...managerPage.matchAll(/runJob\("([a-z-]+)"/g)].map((match) => match[1]));
   jobTypes.add("update");
   jobTypes.add("apply-update");
-  assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "apply-update", "claude-cli-add", "claude-cli-install",
+  assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "apply-update", "chatgpt-login", "claude-cli-add", "claude-cli-install",
     "claude-cli-login", "claude-cli-update", "detect-fast", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-claude", "remove-backup-key", "remove-models",
-    "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "set-global-context", "set-hidden-models",
+    "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "set-background-model", "set-global-context", "set-hidden-models", "set-quota-mode",
     "uninstall", "update"]);
   // 頁面用到的查詢都要是安裝器提供的。
   const queryTypes = new Set([...managerPage.matchAll(/(?:ensureQuery|refreshButton|reloadQuery)\("([a-z-]+)"/g)].map((match) => match[1]));

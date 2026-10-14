@@ -110,6 +110,7 @@ td.tight, th.tight { width: 1%; white-space: nowrap; }
 .chip.amber { background: rgba(245, 158, 11, .12); border-color: rgba(245, 158, 11, .32); color: #fde68a; }
 .chip.green { background: rgba(34, 197, 94, .12); border-color: rgba(34, 197, 94, .32); color: #bbf7d0; }
 .chip.rose { background: rgba(244, 63, 94, .12); border-color: rgba(244, 63, 94, .32); color: #fecdd3; }
+td.num { font-variant-numeric: tabular-nums; }
 
 .banner { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 10px; margin-bottom: 16px; border: 1px solid; font-size: 13.5px; }
 .banner svg { width: 18px; height: 18px; flex: none; }
@@ -210,6 +211,12 @@ input[type=checkbox] { width: 16px; height: 16px; accent-color: #22d3ee; cursor:
 .field { display: grid; gap: 6px; align-content: start; }
 .field > span { color: var(--muted); font-size: 12.5px; }
 .field .hint { color: var(--faint); font-size: 12px; }
+.field .hint.warn { color: #fde68a; }
+.panel.compact .compact-bar { display: flex; align-items: center; gap: 12px; padding: 10px 18px; }
+.panel.compact .compact-title { font-weight: 600; font-size: 13.5px; white-space: nowrap; }
+.panel.compact .compact-summary { color: var(--muted); font-size: 12.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel.compact .panel-body { border-top: 1px solid var(--border); }
+.field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 input[type=text], input[type=password], input[type=number], input[type=search], input[type=url], select { width: 100%; padding: 9px 11px; border-radius: 10px; border: 1px solid var(--border-strong); background: #0d1528; color: var(--text); font: inherit; }
 input::placeholder { color: #4b5b75; }
 input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7); box-shadow: 0 0 0 3px rgba(56, 189, 248, .15); }
@@ -703,6 +710,71 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "修改前會自動備份；不需要重新啟動路由器，重新啟動 {app} 後生效。": "A backup is made first. No router restart needed; takes effect after restarting {app}.",
 "全域上下文必須是 16,000～4,000,000 之間的整數。": "Global context must be an integer between 16,000 and 4,000,000.",
 "設定全域上下文": "Set global context",
+"API Key 模式": "API key mode",
+"已開啟": "On",
+"未開啟": "Off",
+"開啟 API Key 模式": "Turn on API key mode",
+"關閉 API Key 模式": "Turn off API key mode",
+"切換 API Key 模式": "Switch API key mode",
+"和 Codex 官方的 API Key 登入相同：Codex 改用本機產生的 API Key 登入，不需要 ChatGPT 帳號也能使用第三方模型。ChatGPT 帳號額度用完、{app} 鎖住發送按鈕時，開啟後第三方模型也能照常發送；選到官方模型時會直接提示目前不可用。": "Works like Codex's official API key sign-in: Codex signs in with a locally generated API key, so third-party models work without a ChatGPT account. When your ChatGPT usage runs out and {app} locks the Send button, turning this on lets third-party models send as usual; picking an official model shows a clear “unavailable” message instead.",
+"原本的任務都會保留：打開任務後在模型選單改選第三方模型即可接續。關閉後 ChatGPT 登入會原樣還原，不需要重新登入。": "All existing tasks stay: open a task and pick a third-party model to continue it. Turning this off restores your ChatGPT sign-in exactly as before, no need to sign in again.",
+"安裝時 Codex 沒有登入帳號，因此預設開啟。要改用 ChatGPT 帳號時按「關閉並登入 ChatGPT」，會帶你到瀏覽器登入。": "Turned on by default because Codex wasn't signed in during setup. To switch to a ChatGPT account, choose “Turn off and sign in to ChatGPT” and your browser will take you through sign-in.",
+"Codex 目前沒有登入帳號；開啟後不必登入也能使用第三方模型，或直接登入 ChatGPT 帳號。": "Codex isn't signed in. Turn this on to use third-party models without signing in, or sign in with a ChatGPT account.",
+"開啟於 {time}": "Turned on at {time}",
+"Codex 目前的登入方式與這個模式不一致（可能在 Codex 裡重新登入過）。請重新開啟或關閉一次。": "Codex's current sign-in doesn't match this mode (you may have signed in again inside Codex). Turn the mode on or off once more.",
+"Codex 目前以您自己的 OpenAI API Key 登入，請先在 Codex 登出後再開啟。": "Codex is signed in with your own OpenAI API key. Sign out in Codex first, then turn this on.",
+"請先添加第三方模型。": "Add a third-party model first.",
+"開啟後會重新啟動 {app}，進行中的任務會中斷，重新打開後可以接續。": "{app} will restart; running tasks are interrupted and can be continued after it reopens.",
+"開啟期間，官方模型與需要 ChatGPT 帳號的 Codex 功能（例如雲端任務、官方網頁搜尋）暫停使用。": "While it's on, official models and Codex features that need a ChatGPT account (such as cloud tasks and official web search) are paused.",
+"關閉後會重新啟動 {app}，還原 ChatGPT 登入，官方模型恢復可用；原本的任務都會保留。": "{app} will restart and your ChatGPT sign-in is restored, so official models work again; all existing tasks stay.",
+"會先開啟瀏覽器，請用 ChatGPT 帳號登入 Codex；登入成功後才關閉 API Key 模式並重新啟動 {app}。登入失敗或取消時不會改動任何設定，原本的任務都會保留。": "Your browser opens first so you can sign in to Codex with a ChatGPT account. API key mode turns off and {app} restarts only after sign-in succeeds; if sign-in fails or is cancelled, nothing changes. All existing tasks stay.",
+"關閉並登入 ChatGPT": "Turn off and sign in to ChatGPT",
+"登入 ChatGPT 帳號": "Sign in with ChatGPT",
+"開啟": "Turn on",
+"關閉": "Turn off",
+"API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送。": "API key mode is on: official models are paused, third-party models send as usual.",
+"前往設定": "Open settings",
+"背景任務模型": "Background task model",
+"標題等：{light} · 記憶整理：{memory}": "Titles etc.: {light} · Memory: {memory}",
+"收合": "Collapse",
+"任務標題": "Task title",
+"後續建議": "Follow-up suggestions",
+"分支描述": "Fork description",
+"記憶整理": "Memory consolidation",
+"{value} 毫秒": "{value} ms",
+"{value} 秒": "{value} s",
+"時間範圍": "Time range",
+"最近 1 小時": "Last hour",
+"最近 24 小時": "Last 24 hours",
+"最近 7 天": "Last 7 days",
+"最近 30 天": "Last 30 days",
+"每一輪對話的模型、token 用量、快取命中與耗時；只記數字，不記對話內容。最近的錯誤在「總覽」。": "Model, token usage, cache hits and duration for every turn. Only numbers are recorded, never conversation content. Recent errors are on Overview.",
+"重新整理使用記錄": "Refresh usage",
+"失敗 {count}": "{count} failed",
+"輸入 tokens": "Input tokens",
+"快取命中 {rate} · 快取寫入 {write}": "Cache hits {rate} · cache writes {write}",
+"輸出 tokens": "Output tokens",
+"其中推理 {value}": "{value} reasoning",
+"平均耗時": "Average duration",
+"每一輪從送出到結束": "Per turn, from send to finish",
+"這段時間沒有使用記錄。": "No usage recorded in this period.",
+"各模型": "By model",
+"輸入": "Input",
+"快取命中": "Cache hits",
+"快取寫入": "Cache writes",
+"官方": "Official",
+"最近的請求": "Recent requests",
+"耗時": "Duration",
+"未完成": "Incomplete",
+"原本選的模型已刪除，目前使用官方模型。": "The previously selected model was deleted; official models are used for now.",
+"Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。": "Whichever model you pick, Codex runs a few background tasks on small official models. They use your ChatGPT usage and are blocked in API key mode. Pick a third-party model to handle them instead.",
+"任務標題、後續建議、分支描述": "Task titles, follow-up suggestions, fork descriptions",
+"記憶整理（會呼叫工具、內容較長，用量較多）": "Memory consolidation (calls tools and is longer, so it uses more)",
+"只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。": "Only these background tasks' fixed prompts are recognized; conversations where you pick an official model yourself aren't affected. Changes apply immediately, no restart needed.",
+"官方模型（Codex 預設）": "Official models (Codex default)",
+"已改由第三方模型處理 {count} 個背景任務。": "{count} background tasks handled by the third-party model so far.",
+"設定背景任務模型": "Set background task model",
+"API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送（已擋下 {count} 個官方模型請求）。": "API key mode is on: official models are paused, third-party models send as usual ({count} official-model requests blocked).",
 "移除全域上下文": "Remove global context",
 "移除後每個模型改用自己的上下文：官方模型使用 Codex 內建值，自訂模型使用模型頁的設定。修改前會自動備份。": "Each model then uses its own context: official models use Codex's built-in values, custom models use the Models page settings. A backup is made first.",
 "隱藏的官方模型": "Hidden official models",
@@ -891,7 +963,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Models",
 "供應商": "Providers",
 "生圖": "Images",
-"設定": "Settings"
+"設定": "Settings",
+"使用記錄": "Usage"
 },
 "enErrors": {
 "provider_not_configured": "The provider for this model isn't configured. Run the installer's update, or delete and re-add the model.",
@@ -997,8 +1070,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -1295,6 +1368,7 @@ const ICONS = {
   info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5"/><path d="M12 7.6h.01"/>',
   external: '<path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
   image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="m20.5 16-5-5-8.5 8.5"/>',
+  usage: '<path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M3.5 20.5h17"/>',
   settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   chevronRight: '<path d="m9 6 6 6-6 6"/>',
   claude: '<path d="M12 3v5.5M12 15.5V21M3 12h5.5M15.5 12H21M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>',
@@ -1522,6 +1596,7 @@ function writeBlocked() {
 
 const VIEWS = [
   { id: "overview", label: () => sectionTitle("總覽"), icon: "overview" },
+  { id: "usage", label: () => sectionTitle("使用記錄"), icon: "usage" },
   { id: "models", label: () => sectionTitle("模型"), icon: "models" },
   { id: "providers", label: () => sectionTitle("供應商"), icon: "providers" },
   { id: "imagegen", label: () => sectionTitle("生圖"), icon: "image" },
@@ -1585,6 +1660,13 @@ function renderBanners() {
     items.push(banner("error", "alert", t("與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。")));
   }
   if (state && state.writeBlocked) items.push(banner("warn", "alert", serverText(state.writeBlocked)));
+  if (state && state.installed && state.quotaMode && state.quotaMode.enabled) {
+    const blockedCount = Number(state.router && state.router.stats && state.router.stats.quotaModeOfficialBlocked) || 0;
+    items.push(banner("warn", "power", blockedCount
+      ? t("API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送（已擋下 {count} 個官方模型請求）。", { count: formatNumber(blockedCount) })
+      : t("API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送。"),
+      h("button", { type: "button", class: "button small", onclick: () => switchView("settings") }, t("前往設定"))));
+  }
   if (pendingDesktopRestart && state && state.installed) {
     const canRestart = state.desktop && state.desktop.canRestart;
     items.push(banner("info", "info",
@@ -1612,6 +1694,7 @@ function renderView() {
     return;
   }
   if (currentView === "models") view.replaceChildren(...renderModels());
+  else if (currentView === "usage") view.replaceChildren(...renderUsage());
   else if (currentView === "providers") view.replaceChildren(...renderProviders());
   else if (currentView === "imagegen") view.replaceChildren(...renderImagegen());
   else if (currentView === "settings") view.replaceChildren(...renderSettings());
@@ -1832,6 +1915,7 @@ function renderModels() {
       h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")))));
     return parts;
   }
+  parts.push(renderBackgroundModelPanel(models, blocked));
 
   const allChecked = models.every((model) => selected.has(model.slug));
   const headerBox = h("input", {
@@ -1846,6 +1930,135 @@ function renderModels() {
       h("th", { class: "col-effort", text: t("推理強度") }), h("th", { text: t("上下文") }), h("th", { text: t("輸出") }), h("th", { class: "tight" }))),
     h("tbody", {}, rows)))));
   return parts;
+}
+
+// ---- 使用記錄 -------------------------------------------------------------------
+// 與「最近的錯誤」分開：每一輪的模型、token 用量、快取命中與耗時，方便回頭排查用量與快取情況。
+let usageData = null;
+let usageHours = 24;
+let usageLoading = false;
+
+function backgroundKindLabel(kind) {
+  const labels = { title: t("任務標題"), suggestions: t("後續建議"), "fork-description": t("分支描述"), memory: t("記憶整理") };
+  return labels[kind] || kind;
+}
+
+async function loadUsage() {
+  if (usageLoading) return;
+  usageLoading = true;
+  renderView();
+  try {
+    usageData = await api("/api/query", { method: "POST", body: { type: "usage", params: { sinceHours: usageHours, limit: 300 } } });
+  } catch (error) {
+    usageData = { error: error.message };
+  } finally {
+    usageLoading = false;
+    renderView();
+  }
+}
+
+function modelLabel(slug) {
+  const model = (state.models || []).find((item) => item.slug === slug);
+  return model ? model.displayName : slug || "—";
+}
+
+function percent(value) {
+  return value === null || value === undefined ? "—" : (value * 100).toFixed(value >= 0.995 || value === 0 ? 0 : 1) + "%";
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) return "—";
+  return ms < 1000 ? t("{value} 毫秒", { value: Math.round(ms) }) : t("{value} 秒", { value: (ms / 1000).toFixed(ms < 10000 ? 1 : 0) });
+}
+
+function renderUsage() {
+  if (!usageData && !usageLoading) loadUsage();
+  const range = h("select", { "aria-label": t("時間範圍"), onchange: (event) => { usageHours = Number(event.target.value); usageData = null; loadUsage(); } },
+    [[1, t("最近 1 小時")], [24, t("最近 24 小時")], [168, t("最近 7 天")], [720, t("最近 30 天")]].map(([value, label]) =>
+      h("option", { value: String(value), selected: value === usageHours, text: label })));
+  const head = pageHead(sectionTitle("使用記錄"), t("每一輪對話的模型、token 用量、快取命中與耗時；只記數字，不記對話內容。最近的錯誤在「總覽」。"),
+    range,
+    h("button", { type: "button", class: "icon-button", title: t("重新整理"), "aria-label": t("重新整理使用記錄"), onclick: () => loadUsage() }, icon("refresh")));
+  if (!usageData) return [head, h("div", { class: "panel" }, h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("讀取中…")))];
+  if (usageData.error) return [head, h("div", { class: "panel" }, h("div", { class: "empty", text: serverText(usageData.error) }))];
+  const total = usageData.summary.total;
+  const cards = h("div", { class: "cards" },
+    card(t("請求"), formatNumber(total.requests), t("失敗 {count}", { count: formatNumber(total.failed) })),
+    card(t("輸入 tokens"), formatTokens(total.input), t("快取命中 {rate} · 快取寫入 {write}", { rate: percent(total.cacheHitRate), write: formatTokens(total.cacheWrite) })),
+    card(t("輸出 tokens"), formatTokens(total.output), t("其中推理 {value}", { value: formatTokens(total.reasoning) })),
+    card(t("平均耗時"), total.requests ? formatDuration(total.durationMs / total.requests) : "—", t("每一輪從送出到結束")));
+  const parts = [head, cards];
+  if (total.requests === 0) {
+    parts.push(h("div", { class: "panel" }, h("div", { class: "empty", text: t("這段時間沒有使用記錄。") })));
+    return parts;
+  }
+  const num = (value) => h("td", { class: "nowrap num", text: value });
+  parts.push(h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("各模型") })),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出"), t("平均耗時")].map((label) => h("th", { text: label })))),
+      h("tbody", {}, usageData.summary.models.map((item) => h("tr", {},
+        h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(item.model) }),
+          h("span", { class: "faint mono", text: item.route === "custom" ? (item.provider || "") : t("官方") }))),
+        num(formatNumber(item.requests) + (item.failed ? " / " + t("失敗 {count}", { count: item.failed }) : "")),
+        num(formatTokens(item.input)), num(percent(item.cacheHitRate)), num(formatTokens(item.cacheWrite)),
+        num(formatTokens(item.output)), num(formatDuration(item.avgDurationMs)))))))));
+  const entries = usageData.entries.slice(0, 150);
+  parts.push(h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("最近的請求") })),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出"), t("耗時")].map((label) => h("th", { text: label })))),
+      h("tbody", {}, entries.map((entry) => h("tr", {},
+        h("td", { class: "nowrap mono", text: formatTime(entry.at) }),
+        h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(entry.model) }),
+          entry.background ? h("span", { class: "chip", text: backgroundKindLabel(entry.background) }) : null)),
+        h("td", {}, h("span", { class: "chip " + (entry.status === "completed" ? "green" : entry.status === "failed" ? "rose" : ""),
+          text: entry.status === "completed" ? t("完成") : entry.status === "failed" ? (entry.error || t("失敗")) : t("未完成") })),
+        num(entry.hasUsage ? formatTokens(entry.input) : "—"),
+        num(entry.hasUsage && entry.input ? percent(entry.cached / entry.input) : "—"),
+        num(entry.hasUsage ? formatTokens(entry.output) : "—"),
+        num(formatDuration(entry.durationMs)))))))));
+  parts.push(h("div", { class: "note mono", text: usageData.logPath || "" }));
+  return parts;
+}
+
+// 背景任務模型：不常用，預設收合成一行，只顯示目前設定；展開後才顯示兩個下拉選單。
+let backgroundPanelOpen = false;
+
+function renderBackgroundModelPanel(models, blocked) {
+  const current = state.backgroundModels || {};
+  const handled = Number(state.router && state.router.stats && state.router.stats.backgroundRerouted) || 0;
+  const name = (slug) => {
+    if (!slug) return t("官方");
+    const model = models.find((item) => item.slug === slug);
+    return model ? model.displayName : t("官方");
+  };
+  const summary = t("標題等：{light} · 記憶整理：{memory}", { light: name(current.light), memory: name(current.memory) });
+  const toggle = h("button", { type: "button", class: "button small", "aria-expanded": String(backgroundPanelOpen),
+    onclick: () => { backgroundPanelOpen = !backgroundPanelOpen; renderView(); } },
+  backgroundPanelOpen ? t("收合") : t("設定"));
+  const bar = h("div", { class: "compact-bar" },
+    h("span", { class: "compact-title", text: t("背景任務模型") }),
+    h("span", { class: "compact-summary", text: summary }),
+    toggle);
+  if (!backgroundPanelOpen) return h("div", { class: "panel compact" }, bar);
+  const selector = (kind, label) => {
+    const value = current[kind] || "";
+    const missing = Boolean(value) && !models.some((model) => model.slug === value);
+    return h("label", { class: "field" }, h("span", { text: label }),
+      h("select", { disabled: blocked, onchange: (event) => runJob("set-background-model", { kind, model: event.target.value || null }, { title: t("設定背景任務模型") }) },
+        h("option", { value: "", selected: !value || missing, text: t("官方模型（Codex 預設）") }),
+        models.map((model) => h("option", { value: model.slug, selected: model.slug === value, text: model.displayName }))),
+      missing ? h("span", { class: "hint warn", text: t("原本選的模型已刪除，目前使用官方模型。") }) : null);
+  };
+  return h("div", { class: "panel compact" }, bar,
+    h("div", { class: "panel-body stack" },
+      paragraph(t("Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。"), "note"),
+      h("div", { class: "field-row" },
+        selector("light", t("任務標題、後續建議、分支描述")),
+        selector("memory", t("記憶整理（會呼叫工具、內容較長，用量較多）"))),
+      (current.light || current.memory) && handled ? paragraph(t("已改由第三方模型處理 {count} 個背景任務。", { count: formatNumber(handled) }), "note") : null,
+      paragraph(t("只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。"), "note")));
 }
 
 function contextCell(model) {
@@ -2631,6 +2844,7 @@ function renderSettings() {
   const blocked = writeBlocked();
   return [
     pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
+    renderQuotaModePanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
     renderDiagnosticsPanel(),
@@ -2722,6 +2936,55 @@ async function exportDiagnostics(mode) {
     diagnosticsBusy = false;
     renderView();
   }
+}
+
+// API Key 模式：和 Codex 官方的 API Key 登入相同，切成本機產生的 Key 讓第三方模型不必登入 ChatGPT 也能用，
+// 帳號額度用完、桌面版鎖住發送按鈕時也能照常發送。
+function renderQuotaModePanel(blocked) {
+  const quota = state && state.installed ? state.quotaMode : null;
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
+  if (!quota) {
+    panel.append(h("div", { class: "panel-body setting-body" }, paragraph(t("請先添加第三方模型。"), "muted")));
+    return panel;
+  }
+  const on = quota.enabled;
+  const noModels = !quota.customModelCount;
+  const ownKey = !on && quota.login === "apikey";
+  panel.append(h("div", { class: "panel-body setting-body" },
+    h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
+    paragraph(t("和 Codex 官方的 API Key 登入相同：Codex 改用本機產生的 API Key 登入，不需要 ChatGPT 帳號也能使用第三方模型。ChatGPT 帳號額度用完、{app} 鎖住發送按鈕時，開啟後第三方模型也能照常發送；選到官方模型時會直接提示目前不可用。", { app: desktopName() }), "muted"),
+    on && quota.previousLogin === "none"
+      ? paragraph(t("安裝時 Codex 沒有登入帳號，因此預設開啟。要改用 ChatGPT 帳號時按「關閉並登入 ChatGPT」，會帶你到瀏覽器登入。"), "note")
+      : paragraph(t("原本的任務都會保留：打開任務後在模型選單改選第三方模型即可接續。關閉後 ChatGPT 登入會原樣還原，不需要重新登入。"), "note"),
+    on && quota.since ? paragraph(t("開啟於 {time}", { time: formatTime(quota.since) }), "note") : null,
+    quota.consistent ? null : paragraph(t("Codex 目前的登入方式與這個模式不一致（可能在 Codex 裡重新登入過）。請重新開啟或關閉一次。"), "note warn"),
+    !on && quota.login === "none" ? paragraph(t("Codex 目前沒有登入帳號；開啟後不必登入也能使用第三方模型，或直接登入 ChatGPT 帳號。"), "note warn") : null,
+    ownKey ? paragraph(t("Codex 目前以您自己的 OpenAI API Key 登入，請先在 Codex 登出後再開啟。"), "note") : null,
+    !on && noModels ? paragraph(t("請先添加第三方模型。"), "note warn") : null,
+    h("div", { class: "actions" }, on
+      ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => confirmQuotaMode(false, quota.previousLogin) }, icon("power"),
+        quota.previousLogin === "none" ? t("關閉並登入 ChatGPT") : t("關閉 API Key 模式"))
+      : h("button", { type: "button", class: "button primary", disabled: blocked || noModels || ownKey, onclick: () => confirmQuotaMode(true) }, icon("power"), t("開啟 API Key 模式")),
+      !on && quota.login === "none"
+        ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => runJob("chatgpt-login", {}, { title: t("登入 ChatGPT 帳號") }) }, icon("key"), t("登入 ChatGPT 帳號"))
+        : null)));
+  return panel;
+}
+
+function confirmQuotaMode(enabled, previousLogin = null) {
+  const app = desktopName();
+  confirmDialog({
+    title: enabled ? t("開啟 API Key 模式") : t("關閉 API Key 模式"),
+    confirmLabel: enabled ? t("開啟") : previousLogin === "none" ? t("關閉並登入 ChatGPT") : t("關閉"),
+    body: enabled
+      ? [paragraph(t("開啟後會重新啟動 {app}，進行中的任務會中斷，重新打開後可以接續。", { app })),
+        paragraph(t("開啟期間，官方模型與需要 ChatGPT 帳號的 Codex 功能（例如雲端任務、官方網頁搜尋）暫停使用。"), "note")]
+      : paragraph(previousLogin === "none"
+        ? t("會先開啟瀏覽器，請用 ChatGPT 帳號登入 Codex；登入成功後才關閉 API Key 模式並重新啟動 {app}。登入失敗或取消時不會改動任何設定，原本的任務都會保留。", { app })
+        : t("關閉後會重新啟動 {app}，還原 ChatGPT 登入，官方模型恢復可用；原本的任務都會保留。", { app })),
+  }).then((ok) => {
+    if (ok) runJob("set-quota-mode", { enabled }, { title: enabled ? t("開啟 API Key 模式") : t("關閉 API Key 模式") });
+  });
 }
 
 function renderGlobalContextPanel(blocked) {
@@ -2896,6 +3159,9 @@ function jobTitle(type, fallback) {
     "add-backup-key": t("新增備用 API Key"), "remove-backup-key": t("移除備用 API Key"),
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
+    "set-quota-mode": t("切換 API Key 模式"),
+    "set-background-model": t("設定背景任務模型"),
+    "chatgpt-login": t("登入 ChatGPT 帳號"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
     "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
     uninstall: t("解除安裝"),

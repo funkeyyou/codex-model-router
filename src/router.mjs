@@ -1,6 +1,7 @@
 import http from "node:http";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
 import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
@@ -351,6 +352,8 @@ const catalogRequests = new Map();
 export async function refreshOfficialCatalog(requestHeaders, searchParams, fetchImpl = fetch) {
   const current = () => JSON.parse(readFileSync(settings.catalogPath, "utf8"));
   if (!catalogRefreshEnabled) return current();
+  // API Key 模式的本機 Key 不能送去 chatgpt.com；清單用路由器現有的目錄即可。
+  if (isQuotaModeRequest(requestHeaders)) return current();
   const incoming = new Headers(requestHeaders);
   const authorization = incoming.get("authorization");
   if (!authorization?.startsWith("Bearer ")) return current();
@@ -654,6 +657,7 @@ function prepareHistory(key, input, previousId = null) {
 }
 
 function rememberHistoryEvent(history, event) {
+  if (history?.usage) recordUsageEvent(history.usage, event);
   if (!history || history.completed || history.disabled) return;
   const replayable = (item) => item && typeof item === "object" &&
     (item.type !== "reasoning" || item.encrypted_content);
@@ -795,6 +799,12 @@ const stats = {
   heartbeats: 0,
   authProbeFailures: 0,
   authProbeGraceUsed: 0,
+  quotaModeRequests: 0,
+  quotaModeOfficialBlocked: 0,
+  backgroundRerouted: 0,
+  backgroundReroutedByKind: {},
+  usageRecords: 0,
+  usageLogFailures: 0,
   upstreamErrorCloses: 0,
   statefulFallbacks: 0,
   responseFailedSent: 0,
@@ -887,6 +897,193 @@ const stats = {
   lastError: null,
 };
 const validatedAuthDigests = new Map();
+
+// --- API Key 模式 -------------------------------------------------------------
+//
+// ChatGPT 帳號額度用完時，桌面版會把本機任務的發送按鈕整個鎖住，連第三方模型也不能用。
+// 這個模式由安裝器把 Codex 暫時切成 API Key 登入，Key 是本機隨機產生、只有路由器認得的
+// 一把；quota-mode.json 只存它的 SHA-256。帶這把 Key 的請求：第三方模型照常轉送，
+// 官方模型與官方直通端點一律在本機擋下，Key 本身絕不轉發給 chatgpt.com。
+// 檔案依修改時間重讀，開關模式不必重新啟動路由器。
+const quotaModePath = join(routerDirectory, "quota-mode.json");
+let quotaModeCache = { mtimeMs: null, digest: null };
+
+function quotaModeDigest() {
+  let mtimeMs;
+  try { mtimeMs = statSync(quotaModePath).mtimeMs; }
+  catch { quotaModeCache = { mtimeMs: null, digest: null }; return null; }
+  if (mtimeMs !== quotaModeCache.mtimeMs) {
+    let digest = null;
+    try {
+      const state = JSON.parse(readFileSync(quotaModePath, "utf8"));
+      if (state?.enabled === true && /^[0-9a-f]{64}$/.test(state.keySha256 || "")) digest = state.keySha256;
+    } catch { /* 損壞或寫到一半：當成未啟用，下次修改時間變了再讀。 */ }
+    quotaModeCache = { mtimeMs, digest };
+  }
+  return quotaModeCache.digest;
+}
+
+export function isQuotaModeRequest(headers) {
+  const digest = quotaModeDigest();
+  if (!digest) return false;
+  const authorization = headers?.authorization;
+  if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) return false;
+  const actual = createHash("sha256").update(authorization.slice(7)).digest();
+  return timingSafeEqual(actual, Buffer.from(digest, "hex"));
+}
+
+const QUOTA_MODE_OFFICIAL_MESSAGE =
+  "目前是「API Key 模式」：官方模型需要 ChatGPT 帳號登入，暫時無法使用。請在模型選單改選第三方模型繼續這個任務；" +
+  "要使用官方模型，到「自訂模型管理」→ 設定，關閉 API Key 模式（並登入 ChatGPT 帳號）。";
+
+function rejectQuotaModeOfficial() {
+  stats.quotaModeOfficialBlocked += 1;
+  return new RouterRequestError(403, "quota_mode_official_unavailable", QUOTA_MODE_OFFICIAL_MESSAGE, "routing");
+}
+
+// --- 模型使用記錄 ---------------------------------------------------------------
+//
+// 每一輪結束（完成、未完成或失敗）時記一筆：時間、模型、供應商、背景任務種類、耗時，以及
+// 上游回報的 token 用量（輸入、快取命中、快取寫入、輸出、推理）。和「最近的錯誤」分開存放，
+// 回頭排查用量或快取命中率時不必翻錯誤記錄。只記數字與識別，不記提示詞或回覆內容。
+const usageLogPath = join(routerDirectory, "usage.jsonl");
+const usageLogMaxBytes = 5 * 1024 * 1024;
+
+function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind }) {
+  const thread = requestHeaders?.["thread-id"] || requestHeaders?.["session-id"];
+  return {
+    startedAt: Date.now(), model: typeof model === "string" ? model.slice(0, 160) : null,
+    route, provider, transport, backgroundKind,
+    thread: typeof thread === "string" ? thread.slice(0, 64) : null, recorded: false,
+  };
+}
+
+const usageNumber = (value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.round(Number(value)) : 0);
+
+export function usageRecord(context, event, now = Date.now()) {
+  const status = event?.type === "response.completed" ? "completed"
+    : event?.type === "response.incomplete" ? "incomplete"
+    : event?.type === "response.failed" ? "failed" : null;
+  if (!status) return null;
+  const usage = event.response?.usage || null;
+  return {
+    at: new Date(now).toISOString(),
+    model: context.model,
+    upstreamModel: typeof event.response?.model === "string" ? event.response.model.slice(0, 160) : null,
+    route: context.route, provider: context.provider, transport: context.transport,
+    background: context.backgroundKind, thread: context.thread, status,
+    durationMs: Math.max(0, now - context.startedAt),
+    input: usageNumber(usage?.input_tokens),
+    cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
+    cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
+    output: usageNumber(usage?.output_tokens),
+    reasoning: usageNumber(usage?.output_tokens_details?.reasoning_tokens),
+    hasUsage: Boolean(usage),
+    ...(status === "failed" && event.response?.error?.code ? { error: String(event.response.error.code).slice(0, 80) } : {}),
+  };
+}
+
+function recordUsageEvent(context, event) {
+  if (context.recorded || settings.usageLog === false) return;
+  const record = usageRecord(context, event);
+  if (!record) return;
+  context.recorded = true;
+  stats.usageRecords += 1;
+  try {
+    try {
+      if (statSync(usageLogPath).size > usageLogMaxBytes) renameSync(usageLogPath, usageLogPath + ".1");
+    } catch { /* 檔案還不存在。 */ }
+    appendFileSync(usageLogPath, JSON.stringify(record) + "\n", { mode: 0o600 });
+  } catch {
+    stats.usageLogFailures += 1;
+  }
+}
+
+// --- 背景任務改用第三方模型 ---------------------------------------------------
+//
+// 不論使用者選了哪個模型，Codex 都會固定用官方小模型跑幾種背景任務（任務標題、後續建議、
+// 分支描述、記憶整理），因此第三方模型使用者仍在消耗 ChatGPT 額度，API Key 模式下則直接被擋。
+// 使用者在管理頁選了代答模型時，路由器只辨認這些背景任務固定的開頭提示詞，把它們改送該模型；
+// 使用者手動選官方模型的一般對話不受影響。background-model.json 依修改時間重讀，不必重新啟動。
+const backgroundModelPath = join(routerDirectory, "background-model.json");
+let backgroundModelCache = { mtimeMs: null, light: null, memory: null };
+
+export const BACKGROUND_TASK_PATTERNS = [
+  ["title", /^You are a helpful assistant\. You will be presented with a user prompt, and your job is to provide a short title/],
+  ["suggestions", /^#\s*Overview\s+Generate 0 to 3 hyperpersonalized suggestions/],
+  ["fork-description", /^You are in a fork of an existing Codex thread\.\s*Fill the structured description/],
+  ["memory", /^##\s*Memory Writing Agent/],
+  ["memory", /^Consolidate the supplied rollout summaries into `memory_summary\.md`/],
+];
+
+// background-model.json：light 處理任務標題、後續建議與分支描述；memory 處理記憶整理。
+// 兩者分開設定，記憶整理會呼叫工具、內容長，適合選另一個模型。舊格式 { model } 視為 light。
+function backgroundModelSetting() {
+  let mtimeMs;
+  try { mtimeMs = statSync(backgroundModelPath).mtimeMs; }
+  catch { backgroundModelCache = { mtimeMs: null, light: null, memory: null }; return backgroundModelCache; }
+  if (mtimeMs !== backgroundModelCache.mtimeMs) {
+    const valid = (value) => (typeof value === "string" && value.startsWith("custom/") ? value : null);
+    let light = null;
+    let memory = null;
+    try {
+      const value = JSON.parse(readFileSync(backgroundModelPath, "utf8")) || {};
+      light = valid(value.light ?? value.model);
+      memory = valid(value.memory);
+    } catch { /* 損壞或寫到一半：當成未設定。 */ }
+    backgroundModelCache = { mtimeMs, light, memory };
+  }
+  return backgroundModelCache;
+}
+
+function backgroundModelFor(kind) {
+  const setting = backgroundModelSetting();
+  return kind === "memory" ? setting.memory : setting.light;
+}
+
+function firstPromptTexts(body) {
+  const texts = [];
+  if (typeof body?.instructions === "string") texts.push(body.instructions);
+  const input = Array.isArray(body?.input) ? body.input : typeof body?.input === "string" ? [body.input] : [];
+  for (const item of input) {
+    if (typeof item === "string") { texts.push(item); break; }
+    if (item?.type && item.type !== "message") continue;
+    if (item?.role !== "user") continue;
+    const content = typeof item.content === "string" ? [{ text: item.content }] : Array.isArray(item.content) ? item.content : [];
+    const part = content.find((entry) => typeof entry?.text === "string");
+    if (part) texts.push(part.text);
+    break;
+  }
+  return texts.map((text) => text.trimStart());
+}
+
+export function backgroundTaskKind(body) {
+  if (typeof body?.model !== "string" || body.model.startsWith("custom/")) return null;
+  for (const text of firstPromptTexts(body)) {
+    for (const [kind, pattern] of BACKGROUND_TASK_PATTERNS) if (pattern.test(text)) return kind;
+  }
+  return null;
+}
+
+// 回傳要使用的請求內容：背景任務且已選代答模型（路由仍存在）時換成該模型，其他原樣回傳。
+// 改送後的請求以 Symbol 標記原本的背景任務種類（JSON 序列化不會帶出），供使用記錄辨識。
+const BACKGROUND_KIND = Symbol("backgroundKind");
+export function applyBackgroundModel(body) {
+  const kind = backgroundTaskKind(body);
+  if (!kind) return body;
+  const target = backgroundModelFor(kind);
+  if (!target || !routeMap.has(target)) return body;
+  stats.backgroundRerouted += 1;
+  stats.backgroundReroutedByKind[kind] = (stats.backgroundReroutedByKind[kind] || 0) + 1;
+  return { ...body, model: target, [BACKGROUND_KIND]: kind };
+}
+
+// 重試也不會好的路由器錯誤：以 response.failed + invalid_prompt 回給 Codex，它會直接顯示訊息，
+// 不會先「重新連線 1/5…5/5」再退回 HTTPS 又重試一輪。
+const CODEX_FATAL_ROUTER_CODES = new Set(["quota_mode_official_unavailable"]);
+export function codexFailureCode(code) {
+  return CODEX_FATAL_ROUTER_CODES.has(code) ? "invalid_prompt" : code;
+}
 // 驗證探測只是用來證明呼叫端是已登入的 Codex。chatgpt.com 暫時連不上（網路、代理、
 // 官方故障）時，不該連帶讓中轉模型也不能用——那正是最需要中轉當備援的時候。
 // 同一組憑證在寬限期內真的驗證成功過，探測遇到網路錯誤或 401/403 以外的失敗就放行；
@@ -964,6 +1161,11 @@ function contextProvider(context) {
 function recordRouterError(error, context = {}, countFailure = true) {
   const details = describeRouterError(error);
   const requestId = randomBytes(8).toString("hex");
+  // API Key 模式擋下官方模型是預期中的狀態，不算錯誤；只計數，管理頁頂部的提示會顯示總數。
+  if (details.code === "quota_mode_official_unavailable") {
+    process.stderr.write(`model-router-quota-blocked:${typeof context.model === "string" ? context.model.slice(0, 80) : "-"}\n`);
+    return { ...details, requestId };
+  }
   const official = details.phase === "auth_probe" || context.route !== "custom";
   const provider = official ? null : contextProvider(context);
   const upstreamRoot = official ? officialBase : provider?.apiRoot;
@@ -1401,6 +1603,8 @@ function allowDuringAuthOutage(headers, reason) {
 }
 
 async function validateOfficialAuth(requestHeaders, signal) {
+  // API Key 模式的本機 Key 本身就是「呼叫端是這台電腦的 Codex」的證明，不能拿去 chatgpt.com 探測。
+  if (isQuotaModeRequest(requestHeaders)) return true;
   if (hasValidatedAuth(requestHeaders)) return true;
   if (!authDigest(requestHeaders)) {
     throw new RouterRequestError(401, "chatgpt_auth_required", "需要 ChatGPT 身份驗證。", "auth_probe");
@@ -1530,6 +1734,7 @@ export function rewriteCustomBody(body, route) {
 //
 // 這裡不自己驗證身分，原樣轉送即可：官方後端本來就會自己判斷。
 async function proxyToOfficial(request, response, incomingUrl) {
+  if (isQuotaModeRequest(request.headers)) throw rejectQuotaModeOfficial();
   const body = decodeRequestBody(await readRequestBody(request), request.headers["content-encoding"]);
   const controller = new AbortController();
   response.on("close", () => { if (!response.writableFinished) controller.abort(); });
@@ -1669,8 +1874,14 @@ export async function fetchModelUpstream(
   signal,
   meta = {},
 ) {
+  meta.backgroundKind = body?.[BACKGROUND_KIND] ?? backgroundTaskKind(body);
+  body = applyBackgroundModel(body);
   const route = chooseRoute(requestHeaders, body);
   const isCustom = route != null;
+  if (isQuotaModeRequest(requestHeaders)) {
+    stats.quotaModeRequests += 1;
+    if (!isCustom) throw rejectQuotaModeOfficial();
+  }
   const provider = isCustom && route.transport !== "claude-cli" ? providerForRoute(route) : null;
   rememberRoute(requestHeaders, route);
 
@@ -1694,6 +1905,13 @@ export async function fetchModelUpstream(
     }
   }
   meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
+  // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
+  meta.history = meta.history || { disabled: true };
+  meta.history.usage = usageContext({
+    requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
+    provider: route?.transport === "claude-cli" ? "claude-cli" : provider?.id ?? null,
+    transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null,
+  });
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
@@ -3003,6 +3221,11 @@ async function tryUpstreamWebSocketTurn(
   const buildPayload = (chain) => {
     let outgoing = { ...message };
     history = fullInput ? prepareHistory(historyKey, fullInput, previousId) : null;
+    history = history || { disabled: true };
+    history.usage = usageContext({
+      requestHeaders: request.headers, model: message?.model, route: "official", provider: null,
+      transport: "upstream-websocket", backgroundKind: null,
+    });
     if (chain) {
       stats.upstreamWebSocketIncremental += 1;
     } else {
@@ -3068,7 +3291,7 @@ export function isPrewarmRequest(message) {
   return message?.type === "response.create" && message.generate === false;
 }
 
-function answerPrewarmLocally(request, socket, message, connectionState, { stale = false } = {}) {
+function answerPrewarmLocally(request, socket, message, connectionState, { stale = false, quotaBlocked = false } = {}) {
   const createdAt = Math.floor(Date.now() / 1000);
   const response = {
     id: `${PREWARM_ID_PREFIX}${randomBytes(12).toString("hex")}`,
@@ -3082,7 +3305,9 @@ function answerPrewarmLocally(request, socket, message, connectionState, { stale
     usage: null,
   };
   const completed = { ...response, status: "completed", completed_at: createdAt };
-  if (stale) {
+  if (quotaBlocked) {
+    // API Key 模式下打開官方模型的任務：預熱不算錯誤，等真的送出訊息才回報。
+  } else if (stale) {
     // 任務仍記著已刪除的模型：打開任務本身不算錯誤，等真的送出訊息才回報 404。
     stats.stalePrewarms += 1;
     stats.lastStalePrewarmModel = message.model.slice(0, 160);
@@ -3116,6 +3341,7 @@ export async function handleWebSocketResponseInner(
   abortController,
   connectionState = null,
 ) {
+  message = applyBackgroundModel(message);
   const prewarm = isPrewarmRequest(message);
   let route;
   try {
@@ -3126,6 +3352,10 @@ export async function handleWebSocketResponseInner(
       return;
     }
     throw error;
+  }
+  if (prewarm && route == null && isQuotaModeRequest(request.headers)) {
+    answerPrewarmLocally(request, socket, message, connectionState, { quotaBlocked: true });
+    return;
   }
 
   // 官方路由優先走上游 WebSocket；只有它支援連線內的 previous_response_id 接續。
@@ -3316,17 +3546,20 @@ function handleWebSocketUpgrade(request, socket, head) {
             route: typeof message?.model === "string" && message.model.startsWith("custom/") ? "custom" : "official",
           });
           const messageText = `${detail.message}（診斷 ID：${detail.requestId}）`;
-          sendWebSocketJson(socket, {
-            type: "error",
-            error: {
-              type: "router_error",
-              code: detail.code,
-              message: messageText,
-            },
-          });
+          const fatal = codexFailureCode(detail.code) !== detail.code;
+          if (!fatal) {
+            sendWebSocketJson(socket, {
+              type: "error",
+              error: {
+                type: "router_error",
+                code: detail.code,
+                message: messageText,
+              },
+            });
+          }
           // 網路層例外（fetch failed / terminated）同樣要送終止事件，
           // 否則 Codex 會停在「思考中」直到 idle timeout 才重試。
-          sendResponseFailed(socket, detail.code, messageText);
+          sendResponseFailed(socket, codexFailureCode(detail.code), messageText);
           if (detail.code === "router_history_unavailable") {
             stats.statefulFallbacks += 1;
             closeWebSocket(socket, 1011, "history unavailable");
@@ -3464,7 +3697,12 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     const detail = recordRouterError(error, request.routerContext);
-    if (!response.headersSent) {
+    if (!response.headersSent && codexFailureCode(detail.code) !== detail.code &&
+        /\/responses(?:$|[/?])/.test(request.url || "")) {
+      const event = responseFailedEvent(codexFailureCode(detail.code), `${detail.message}（診斷 ID：${detail.requestId}）`);
+      response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+      response.end("event: response.failed\ndata: " + JSON.stringify(event) + "\n\n");
+    } else if (!response.headersSent) {
       writeJson(response, detail.status, {
         error: {
           message: `${detail.message}（診斷 ID：${detail.requestId}）`,

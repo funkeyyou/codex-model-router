@@ -104,3 +104,9 @@ export async function loadRouterWith(overrides) {
   const dir = extractTo({ ...FIXTURE_SETTINGS, ...overrides });
   return import(pathToFileURL(join(dir, "router.mjs")).href);
 }
+
+// 同 loadRouterWith，另外回傳模組所在目錄，供測試擺放路由器在執行期讀的檔案（例如 quota-mode.json）。
+export async function loadRouterInDir(overrides) {
+  const dir = extractTo({ ...FIXTURE_SETTINGS, ...overrides });
+  return { dir, router: await import(pathToFileURL(join(dir, "router.mjs")).href) };
+}

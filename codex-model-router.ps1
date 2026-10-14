@@ -145,7 +145,7 @@ if ($commandArguments.Count -eq 0 -and -not [Console]::IsInputRedirected) {
 exit $exitCode
 <#
 __CODEX_MODEL_ROUTER_INSTALLER_JS__
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -175,7 +175,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.33.0";
+const INSTALLER_VERSION = "1.34.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2252,6 +2252,8 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // 路由器讀取的每一個可調設定都要列在這裡；test/settings-keys.test.mjs 會核對。
 export const preservedSettingKeys = [
   "claudeCli",
+  // false 時路由器不寫 usage.jsonl（使用記錄）。
+  "usageLog",
   "authProbeGraceMs",
   "captureDir",
   "catalogRefresh",
@@ -3382,14 +3384,32 @@ async function waitForHealth(port) {
   fail(`路由器健康檢查失敗：${lastError?.message || "未知錯誤"}`);
 }
 
+// 回傳 Codex 目前的登入方式：chatgpt、quota（本工具的 API Key 模式）或 none（尚未登入，
+// 安裝完成後會自動開啟 API Key 模式）。使用者自己的 OpenAI API Key 登入無法通過路由器的身份驗證，直接拒絕。
 function verifyLogin() {
-  if (testMode) return;
+  if (testMode) return "chatgpt";
+  if (codexLogin() === "quota") return "quota";
   const result = shell(codexBin, ["login", "status"], {
     allowFailure: true,
     env: { ...env, CODEX_HOME: codexHome },
   });
-  if (result.status !== 0 || !/ChatGPT/i.test(`${result.stdout}\n${result.stderr}`)) {
-    fail("安裝前必須先使用 ChatGPT 帳號登入 Codex。" );
+  const text = `${result.stdout}\n${result.stderr}`;
+  if (result.status === 0 && /ChatGPT/i.test(text)) return "chatgpt";
+  if (/not logged in/i.test(text)) return "none";
+  fail("Codex 目前以您自己的 OpenAI API Key 登入，路由器無法辨識這種登入。請先在 Codex 登出，或改用 ChatGPT 帳號登入後再試。");
+}
+
+// 安裝時沒有登入任何帳號：預設開啟 API Key 模式，第三方模型不必登入 ChatGPT 也能用。
+async function enableApiKeyModeIfLoggedOut(login) {
+  if (login !== "none" || testMode) return false;
+  console.log("\n偵測到 Codex 尚未登入帳號，正在開啟 API Key 模式…");
+  try {
+    await enableQuotaMode({ allowLoggedOut: true });
+    return true;
+  } catch (error) {
+    console.error(`API Key 模式未能開啟：${error.message}`);
+    console.error("可以稍後在管理頁「設定」重新開啟，或先在 Codex 以 ChatGPT 帳號登入。");
+    return false;
   }
 }
 
@@ -3672,7 +3692,7 @@ async function install(preset = null) {
   const existingManifest = readManifest();
   if (existingManifest?.version) assertInstallerNotOlder(existingManifest.version);
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
-  verifyLogin();
+  const login = verifyLogin();
   // 在問任何問題、寫任何檔案之前先確認背景服務起得來。
   if (isWindows && !testMode) assertScriptHostAvailable();
 
@@ -3882,7 +3902,8 @@ async function install(preset = null) {
         value: `http://127.0.0.1:${port}/v1`,
       },
       // 讓 Codex 每次啟動向 /models 拉取；固定檔案會停用遠端清單刷新。
-      { keyPath: "model_catalog_json", value: null },
+      // API Key 模式例外：API Key 登入時 Codex 不會拉 /models，要繼續讀路由器的目錄。
+      { keyPath: "model_catalog_json", value: quotaModeEnabled() ? catalogPath : null },
       { keyPath: `model_providers.${PROVIDER_ID}`, value: null },
     ]);
     configChanged = true;
@@ -4006,7 +4027,9 @@ async function install(preset = null) {
   if (existsSync(managerRecordPath)) rmSync(managerRecordPath, { force: true });
   // 網頁首次設定不能在終端提問；中轉生圖改由管理頁的「生圖」頁設定。
   if (!preset) await offerInstalledRelayImagegen();
-  return { added: routes.map(summarizeRoute), backupKeys: backupResult, restartDesktop: true };
+  // bare 安裝此時還沒有模型；由呼叫端寫入 Claude 訂閱模型後再開啟。
+  const apiKeyMode = preset?.bare ? false : await enableApiKeyModeIfLoggedOut(login);
+  return { added: routes.map(summarizeRoute), backupKeys: backupResult, apiKeyMode, restartDesktop: true };
 }
 
 // 首次安裝失敗時封存已寫入的檔案。網頁首次設定的管理頁本身也在這個目錄
@@ -5086,7 +5109,8 @@ async function update() {
   if (!codexBin) fail("此次更新需要 Codex CLI 讀取及遷移舊版模型目錄設定，請先確認 Codex 已安裝。");
   const userConfig = await readUserConfig();
   const previousCatalogPath = userConfig.config.model_catalog_json;
-  const migrateCatalog = isManagedCatalogPath(previousCatalogPath, catalogPath);
+  // API Key 模式靠這個目錄讓第三方模型出現在選單，模式開著時不遷移。
+  const migrateCatalog = !quotaModeEnabled() && isManagedCatalogPath(previousCatalogPath, catalogPath);
   // 舊版的已知資料夾偵測從未成功；只修正仍停在預設值的設定。
   const migratedOutputDir = isWindows
     ? migratedImageOutputDir(plan.settings.imageOutputDir, windowsDownloadsDir(), join(homeDir, "Downloads"))
@@ -5215,6 +5239,7 @@ async function update() {
     console.error(`路由器已更新，中轉生圖技能保持原狀：${error.message}`);
   }
   printManagerLauncher(await installManagerLauncher());
+  await restartRunningManagerAfterUpdate();
   console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
@@ -5880,6 +5905,11 @@ async function rollback() {
 // 還原 Codex 配置、停止並移除路由器服務、封存檔案；終端與管理頁共用。
 // deferArchive：安裝目錄留到管理頁結束後再搬，因為管理程式自己還在裡面執行。
 async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
+  // 先把 ChatGPT 登入搬回原位；安裝目錄封存後備份就不在原處了。
+  if (quotaModeEnabled() || codexLogin() === "quota") {
+    console.log("正在關閉 API Key 模式並還原原本的登入…");
+    await disableQuotaMode({ quiet: true });
+  }
   // 安裝目錄稍後會整個封存，要刪的 Key 得先讀出來。
   const providers = installedProviders(readSettingsIfExists(), manifest);
   let backupKeys = [];
@@ -6263,6 +6293,25 @@ async function managerAlive(lock) {
     return response.ok;
   } catch {
     return false;
+  }
+}
+
+// 從終端更新時，已開著的網頁管理介面仍在跑舊程式（只有頁面會讀到新版），新功能的
+// 按鈕因此不會出現。請它以已安裝的新版重新啟動；網址與權杖不變，進行中的操作會被拒絕而保留。
+async function restartRunningManagerAfterUpdate() {
+  const lock = readManagerLock();
+  if (!lock || lock.pid === process.pid || !(await managerAlive(lock))) return;
+  try {
+    const response = await fetchWithTimeout(`http://127.0.0.1:${lock.port}/api/restart`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-router-manager-token": lock.token },
+      body: "{}",
+    }, 3000);
+    console.log(response.ok
+      ? "已讓開著的網頁管理介面改用新版本重新啟動，重新整理頁面即可。"
+      : "網頁管理介面還有操作在進行，未自動重新啟動；完成後請從頁面結束管理頁再重新開啟。");
+  } catch {
+    console.log("無法通知開著的網頁管理介面，請從頁面結束管理頁再重新開啟。");
   }
 }
 
@@ -6696,6 +6745,8 @@ async function managerState() {
     officialModelCount: catalogModels.filter((model) => !String(model.slug).startsWith("custom/")).length,
     providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
+    quotaMode: quotaModeStatus(),
+    backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
     imagegen,
     claudeCli: {
@@ -6791,7 +6842,10 @@ function readFileTail(path, maxBytes = 256 * 1024) {
 function managerRecentErrors() {
   if (!existsSync(logPath)) return { entries: [], logPath };
   try {
-    return { entries: parseRouterLog(readFileTail(logPath)), logPath };
+    // 舊版把 API Key 模式擋下官方模型也記成錯誤；那是預期中的狀態，不顯示。
+    const entries = parseRouterLog(readFileTail(logPath))
+      .filter((entry) => entry?.code !== "quota_mode_official_unavailable");
+    return { entries, logPath };
   } catch (error) {
     return { entries: [], logPath, error: `無法讀取記錄檔：${error.message}` };
   }
@@ -7598,6 +7652,374 @@ async function managerSetGlobalContext({ value } = {}) {
   return { changed: true, value: target, backupDir: result.backupDir, restartDesktop: true };
 }
 
+// --- API Key 模式 ---------------------------------------------------------------
+//
+// 和 Codex 官方的「API Key 登入」相同的登入方式。ChatGPT 帳號額度用完時，桌面版會鎖住本機任務的
+// 發送按鈕，連第三方模型也不能送；這個鎖只在「以 ChatGPT 帳號登入」時生效。開啟時：
+//   1. 有 ChatGPT 登入就把 Codex 的 auth.json 原封不動搬到路由器目錄備份；沒有登入（安裝時預設）就不用；
+//   2. 換成本機隨機產生的 API Key，路由器只放行它對第三方模型的請求；
+//   3. 讓 Codex 讀路由器的模型目錄（API Key 登入時 Codex 不會向 /models 拉清單）。
+// 任務記錄都在本機（model_provider 仍是 openai），切換前後同一批任務照常出現、可接續。
+// 關閉時把備份搬回原位，不需要重新登入；原本就沒有登入的，回到未登入狀態。
+// 內部檔名與工作類型沿用 quota-mode，舊版開啟的狀態升級後照常可用。
+const quotaModePath = join(installRoot, "quota-mode.json");
+const quotaAuthBackupPath = join(installRoot, "quota-mode-chatgpt-auth.json");
+const codexAuthPath = join(codexHome, "auth.json");
+export const QUOTA_MODE_KEY_PREFIX = "sk-codex-router-quota-";
+
+export function quotaKeyDigest(key) {
+  return createHash("sha256").update(String(key)).digest("hex");
+}
+
+// chatgpt：ChatGPT 帳號登入；quota：本工具的 API Key 模式；apikey：使用者自己的 API Key；none：沒有登入檔。
+export function classifyCodexAuth(auth, keySha256 = null) {
+  if (!auth || typeof auth !== "object") return "none";
+  const key = typeof auth.OPENAI_API_KEY === "string" && auth.OPENAI_API_KEY ? auth.OPENAI_API_KEY : null;
+  if (key && keySha256 && quotaKeyDigest(key) === keySha256) return "quota";
+  if (auth.auth_mode !== "apikey" && typeof auth.tokens?.refresh_token === "string" && auth.tokens.refresh_token) {
+    return "chatgpt";
+  }
+  return key ? "apikey" : "none";
+}
+
+export function quotaModeAuthFile(key) {
+  return { auth_mode: "apikey", OPENAI_API_KEY: key, tokens: null, last_refresh: null };
+}
+
+function readJsonIfExists(path) {
+  if (!existsSync(path)) return null;
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function readQuotaMode() {
+  try { return readJsonIfExists(quotaModePath); } catch { return null; }
+}
+
+function quotaModeEnabled() {
+  return readQuotaMode()?.enabled === true;
+}
+
+function codexLogin(state = readQuotaMode()) {
+  try { return classifyCodexAuth(readJsonIfExists(codexAuthPath), state?.keySha256); }
+  catch { return "unreadable"; }
+}
+
+function writeFileAtomicRaw(path, content, mode = 0o600) {
+  const temporaryPath = `${path}.tmp-${process.pid}`;
+  writeFileSync(temporaryPath, content, { mode });
+  renameSync(temporaryPath, path);
+  chmodSync(path, mode);
+}
+
+function quotaModeStatus() {
+  const state = readQuotaMode();
+  const enabled = state?.enabled === true;
+  const login = codexLogin(state);
+  const settings = readSettingsIfExists();
+  return {
+    enabled,
+    since: enabled && typeof state.enabledAt === "string" ? state.enabledAt : null,
+    login,
+    // 開啟前的登入方式：chatgpt 關閉時還原 ChatGPT 登入；none 關閉後回到未登入。
+    previousLogin: enabled ? (state.previousLogin === "none" ? "none" : "chatgpt") : null,
+    // 模式開著但登入檔被改回其他登入（例如在 Codex 裡重新登入），或反過來。
+    consistent: enabled ? login === "quota" : login !== "quota",
+    backupPresent: existsSync(quotaAuthBackupPath),
+    customModelCount: Array.isArray(settings.routes) ? settings.routes.length : 0,
+  };
+}
+
+async function assertRouterConfigured(port) {
+  const config = (await readUserConfig()).config;
+  const targetUrls = [`http://127.0.0.1:${port}/v1`, `http://localhost:${port}/v1`];
+  if ((config.model_provider && config.model_provider !== "openai") ||
+      !targetUrls.includes(String(config.openai_base_url || "").replace(/\/$/, ""))) {
+    fail("Codex 目前沒有指向這個路由器，請先確認供應商與 Base URL 設定；未改動配置。");
+  }
+  if (config.model_catalog_json && !isManagedCatalogPath(config.model_catalog_json, catalogPath)) {
+    fail("目前使用自行指定的 model_catalog_json，請先確認該目錄設定；未改動配置。");
+  }
+  return config;
+}
+
+export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
+  const { settings, manifest } = requireInstallation();
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  const current = readQuotaMode();
+  const login = codexLogin(current);
+  if (current?.enabled === true && login === "quota") {
+    console.log("已經是 API Key 模式。");
+    return { changed: false, enabled: true };
+  }
+  if (login === "unreadable") fail("無法讀取 Codex 的登入檔（auth.json），未改動任何設定。");
+  if (login === "apikey") fail("Codex 目前以您自己的 OpenAI API Key 登入，請先在 Codex 登出後再開啟。");
+  if (login === "none") {
+    // auth.json 不存在但 CLI 顯示已登入：登入資訊存在系統鑰匙圈，無法安全切換。
+    if (verifyLogin() !== "none") fail("Codex 的 ChatGPT 登入資訊存放在系統鑰匙圈，API Key 模式無法自動切換與還原。");
+    if (!allowLoggedOut) fail("Codex 目前沒有登入帳號。");
+  }
+  if (!settings.routes.length) fail("尚未添加任何第三方模型。請先新增供應商與模型。");
+  const port = Number(settings.port ?? manifest.port);
+  await waitForHealth(port);
+  const config = await assertRouterConfigured(port);
+  const user = await readUserConfig();
+  const catalogAdded = !config.model_catalog_json;
+  const backupDir = join(backupsRoot, `api-key-mode-on-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(user.filePath, join(backupDir, "config.toml"));
+
+  // 原始位元組原封不動地保存，不經過解析再序列化，關閉時才能完整還原。
+  const original = login === "chatgpt" ? readFileSync(codexAuthPath) : null;
+  const key = QUOTA_MODE_KEY_PREFIX + randomBytes(24).toString("hex");
+  let catalogWritten = false;
+  let authWritten = false;
+  try {
+    if (original) {
+      console.log("正在備份 ChatGPT 登入檔…");
+      writeFileAtomicRaw(quotaAuthBackupPath, original);
+      if (!readFileSync(quotaAuthBackupPath).equals(original)) fail("ChatGPT 登入檔備份驗證失敗。");
+    }
+    writeJsonAtomic(quotaModePath, {
+      enabled: true, keySha256: quotaKeyDigest(key), enabledAt: new Date().toISOString(), catalogAdded,
+      previousLogin: original ? "chatgpt" : "none",
+    });
+    if (catalogAdded) {
+      console.log("正在讓 Codex 改讀路由器的模型目錄…");
+      catalogWritten = true;
+      await writeConfigEdits([{ keyPath: "model_catalog_json", value: catalogPath }]);
+      const verified = (await readUserConfig()).config.model_catalog_json;
+      if (!isManagedCatalogPath(verified, catalogPath)) fail("模型目錄設定驗證失敗。");
+    }
+    console.log("正在切換為 API Key 登入（本機產生的 Key，只有路由器認得）…");
+    authWritten = true;
+    writeJsonAtomic(codexAuthPath, quotaModeAuthFile(key));
+    const account = await codexRpc("account/read", { refreshToken: false });
+    if (account?.account?.type !== "apiKey") fail("Codex 沒有讀到新的登入方式。");
+    const expected = settings.routes.map((route) => route.pickerSlug);
+    const listed = await codexRpc("model/list", { includeHidden: true },
+      (result) => expected.every((slug) => result?.data?.some((model) => model.id === slug)));
+    const missing = expected.filter((slug) => !listed.data.some((model) => model.id === slug));
+    if (missing.length) fail(`模型選單缺少第三方模型：${missing.join("、")}`);
+  } catch (error) {
+    console.error("開啟失敗，正在還原…");
+    if (authWritten) {
+      if (original) writeFileAtomicRaw(codexAuthPath, original);
+      else rmSync(codexAuthPath, { force: true });
+    }
+    if (catalogWritten) {
+      try { await writeConfigEdits([{ keyPath: "model_catalog_json", value: null }]); }
+      catch { console.error(`模型目錄設定還原失敗，原配置備份：${join(backupDir, "config.toml")}`); }
+    }
+    rmSync(quotaModePath, { force: true });
+    rmSync(quotaAuthBackupPath, { force: true });
+    throw error;
+  }
+  console.log("已開啟 API Key 模式：第三方模型可以照常發送，官方模型暫停使用。");
+  console.log("原本的任務都會保留，打開後在模型選單改選第三方模型即可接續。");
+  return { changed: true, enabled: true, backupDir, restartDesktop: true };
+}
+
+export async function disableQuotaMode({ quiet = false } = {}) {
+  const state = readQuotaMode();
+  const login = codexLogin(state);
+  if (state?.enabled !== true && login !== "quota") {
+    if (!quiet) console.log("API Key 模式沒有開啟。");
+    return { changed: false, enabled: false };
+  }
+  if (login === "unreadable") fail("無法讀取 Codex 的登入檔（auth.json），未改動任何設定。");
+  if (login === "apikey") {
+    fail(`Codex 目前改用了其他 API Key 登入，為避免覆蓋未自動還原。原本的 ChatGPT 登入檔備份在：${quotaAuthBackupPath}`);
+  }
+  const backupDir = join(backupsRoot, `api-key-mode-off-${timestamp()}`);
+  ensureDirectory(backupDir);
+  let user = null;
+  if (codexBin) {
+    user = await readUserConfig();
+    copyIfExists(user.filePath, join(backupDir, "config.toml"));
+  }
+  const wasLoggedOut = state?.previousLogin === "none" && !existsSync(quotaAuthBackupPath);
+  if (login === "quota" || login === "none") {
+    if (wasLoggedOut) {
+      // 開啟前本來就沒有登入：移走本機 Key，回到未登入狀態（檔案搬進備份目錄，不直接刪除）。
+      if (existsSync(codexAuthPath)) renameSync(codexAuthPath, join(backupDir, "auth.json"));
+      if (!quiet) console.log("已移除本機 API Key 登入；Codex 會回到未登入狀態，可以改用 ChatGPT 帳號登入。");
+    } else {
+      let backup = null;
+      try { backup = readJsonIfExists(quotaAuthBackupPath); } catch { /* 下面統一回報 */ }
+      if (classifyCodexAuth(backup) !== "chatgpt") {
+        fail(`找不到可用的 ChatGPT 登入檔備份（${quotaAuthBackupPath}），未改動任何設定。可以在 Codex 裡重新以 ChatGPT 登入。`);
+      }
+      console.log("正在還原 ChatGPT 登入…");
+      // 同一個檔案系統內搬移：不留下第二份權杖。
+      renameSync(quotaAuthBackupPath, codexAuthPath);
+      chmodSync(codexAuthPath, 0o600);
+    }
+  } else {
+    console.log("Codex 已經重新以 ChatGPT 登入，保留目前的登入。");
+    rmSync(quotaAuthBackupPath, { force: true });
+  }
+  if (state?.catalogAdded !== false && user && isManagedCatalogPath(user.config.model_catalog_json, catalogPath)) {
+    await writeConfigEdits([{ keyPath: "model_catalog_json", value: null }]);
+  }
+  rmSync(quotaModePath, { force: true });
+  if (!quiet) console.log(wasLoggedOut && login !== "chatgpt"
+    ? "已關閉 API Key 模式。登入 ChatGPT 帳號後，官方與第三方模型都能使用；原本的任務都會保留。"
+    : "已關閉 API Key 模式，官方模型恢復可用；原本的任務都會保留。");
+  return { changed: true, enabled: false, backupDir, restartDesktop: true };
+}
+
+// --- 背景任務模型 ----------------------------------------------------------------
+//
+// Codex 固定用官方小模型跑背景任務；選了代答模型時，路由器把它們改送第三方模型，不再消耗
+// ChatGPT 額度，API Key 模式下也能照常運作。分兩組設定：light（任務標題、後續建議、分支描述）
+// 與 memory（記憶整理，會呼叫工具、內容長）。路由器依修改時間重讀，不必重新啟動。
+const backgroundModelPath = join(installRoot, "background-model.json");
+export const BACKGROUND_MODEL_KINDS = ["light", "memory"];
+
+function readBackgroundModels() {
+  const valid = (value) => (typeof value === "string" && value.startsWith("custom/") ? value : null);
+  try {
+    const value = readJsonIfExists(backgroundModelPath) || {};
+    return { light: valid(value.light ?? value.model), memory: valid(value.memory) };
+  } catch { return { light: null, memory: null }; }
+}
+
+async function managerSetBackgroundModel({ kind, model } = {}) {
+  assertManagerWritable();
+  const { settings } = requireInstallation();
+  if (!BACKGROUND_MODEL_KINDS.includes(kind)) fail("未知的背景任務種類。");
+  const target = model === null || model === "" || model === undefined ? null : String(model);
+  if (target && !settings.routes.some((route) => route.pickerSlug === target)) {
+    fail("找不到這個自訂模型，請重新整理管理頁。");
+  }
+  const current = readBackgroundModels();
+  if (current[kind] === target) {
+    console.log("設定沒有變更。");
+    return { changed: false, ...current };
+  }
+  const next = { ...current, [kind]: target };
+  const label = kind === "memory" ? "記憶整理" : "任務標題、後續建議與分支描述";
+  if (next.light || next.memory) {
+    writeJsonAtomic(backgroundModelPath, { light: next.light, memory: next.memory, updatedAt: new Date().toISOString() });
+  } else {
+    rmSync(backgroundModelPath, { force: true });
+  }
+  console.log(target ? `${label}改用 ${target}，不必重新啟動。` : `${label}改回 Codex 預設的官方模型。`);
+  return { changed: true, ...next };
+}
+
+// --- 模型使用記錄 ----------------------------------------------------------------
+//
+// 路由器每一輪結束時把用量寫進 usage.jsonl（超過 5 MB 輪替成 usage.jsonl.1）。管理頁讀最近的
+// 記錄並彙整：各模型的請求數、token、快取命中率與耗時。只有數字與識別，沒有對話內容。
+const usageLogPath = join(installRoot, "usage.jsonl");
+
+export function summarizeUsage(records) {
+  const byModel = new Map();
+  const total = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0 };
+  for (const record of records) {
+    const key = record.model || "-";
+    const entry = byModel.get(key) || { model: key, provider: record.provider || null, route: record.route || null,
+      requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0, background: 0 };
+    for (const target of [entry, total]) {
+      target.requests += 1;
+      for (const field of ["input", "cached", "cacheWrite", "output", "reasoning", "durationMs"]) target[field] += Number(record[field]) || 0;
+      if (record.status === "failed") target.failed += 1;
+    }
+    if (record.background) entry.background += 1;
+    byModel.set(key, entry);
+  }
+  const rate = (item) => (item.input > 0 ? item.cached / item.input : null);
+  return {
+    total: { ...total, cacheHitRate: rate(total) },
+    models: [...byModel.values()].map((item) => ({ ...item, cacheHitRate: rate(item),
+      avgDurationMs: item.requests ? Math.round(item.durationMs / item.requests) : null }))
+      .sort((left, right) => right.input + right.output - (left.input + left.output)),
+  };
+}
+
+function managerUsage({ limit = 300, sinceHours = 24 } = {}) {
+  const records = [];
+  for (const path of [usageLogPath + ".1", usageLogPath]) {
+    if (!existsSync(path)) continue;
+    let text;
+    try { text = readFileTail(path, 2 * 1024 * 1024); } catch { continue; }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try { records.push(JSON.parse(line)); } catch { /* 寫到一半的行 */ }
+    }
+  }
+  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), 24 * 30);
+  const since = Date.now() - hours * 3600 * 1000;
+  const recent = records.filter((record) => Date.parse(record.at) >= since);
+  const cap = Math.min(Math.max(Number(limit) || 300, 1), 2000);
+  return { sinceHours: hours, summary: summarizeUsage(recent), entries: recent.slice(-cap).reverse(), logPath: usageLogPath };
+}
+
+async function managerSetQuotaMode({ enabled } = {}) {
+  assertManagerWritable();
+  if (typeof enabled !== "boolean") fail("請指定要開啟或關閉 API Key 模式。");
+  if (enabled) return enableQuotaMode();
+  // 開啟前本來就沒有登入：先帶使用者登入 ChatGPT，登入成功才關閉模式；
+  // 登入失敗或取消時什麼都不改，第三方模型照常可用。
+  if (readQuotaMode()?.previousLogin === "none" && !existsSync(quotaAuthBackupPath)) {
+    await loginCodexWithChatgpt();
+  }
+  return disableQuotaMode();
+}
+
+// 以 Codex 官方的 codex login 登入 ChatGPT：開啟瀏覽器授權，成功後由 Codex 自己寫入 auth.json。
+async function loginCodexWithChatgpt() {
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  console.log("正在開啟瀏覽器，請用 ChatGPT 帳號登入 Codex（最多等 10 分鐘）…");
+  console.log("瀏覽器沒有自動開啟時，請打開下面顯示的網址。");
+  const status = await new Promise((resolvePromise) => {
+    const child = spawn(codexBin, ["login"], {
+      stdio: ["ignore", "pipe", "pipe"], env: { ...env, CODEX_HOME: codexHome }, windowsHide: true,
+    });
+    const relay = (chunk) => {
+      for (const line of chunk.toString("utf8").split(/\r?\n/)) if (line.trim()) console.log(terminalSafeText(line, 400));
+    };
+    child.stdout.on("data", relay);
+    child.stderr.on("data", relay);
+    const timer = setTimeout(() => child.kill(), 10 * 60 * 1000);
+    child.on("error", () => { clearTimeout(timer); resolvePromise(-1); });
+    child.on("close", (code) => { clearTimeout(timer); resolvePromise(code); });
+  });
+  if (status !== 0 || codexLogin() !== "chatgpt") {
+    fail("沒有完成 ChatGPT 登入，API Key 模式維持開啟，第三方模型照常可用。可以稍後再試一次。");
+  }
+  console.log("已登入 ChatGPT 帳號。");
+}
+
+async function managerChatgptLogin() {
+  assertManagerWritable();
+  if (quotaModeEnabled()) return managerSetQuotaMode({ enabled: false });
+  if (verifyLogin() === "chatgpt") {
+    console.log("Codex 已經以 ChatGPT 帳號登入。");
+    return { changed: false };
+  }
+  await loginCodexWithChatgpt();
+  return { changed: true, restartDesktop: true };
+}
+
+async function configureQuotaMode(subcommand) {
+  const action = String(subcommand || "status").toLowerCase();
+  if (action === "on" || action === "enable") {
+    const result = await enableQuotaMode();
+    if (result.changed) await restartDesktopAfter({});
+  } else if (action === "off" || action === "disable") {
+    const result = await disableQuotaMode();
+    if (result.changed) await restartDesktopAfter({});
+  } else if (action === "status") {
+    const status = quotaModeStatus();
+    console.log(`API Key 模式：${status.enabled ? "已開啟" : "未開啟"}${status.since ? `（${status.since}）` : ""}`);
+    if (!status.consistent) console.log("注意：Codex 目前的登入方式與模式狀態不一致，請重新開啟或關閉一次。");
+  } else {
+    fail("用法：api-key-mode [on|off|status]");
+  }
+}
+
 // 與 loadBundledCatalog 相同，但不阻塞管理頁回應其他請求。
 async function readBundledCatalogAsync() {
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -7792,7 +8214,7 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, fir
     if (readManifest()) fail("路由器已經安裝，請重新整理管理頁。");
     if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   } else assertManagerWritable();
-  await withCodexLock(() => verifyLogin());
+  const login = await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
   if (defaults.contextWindow > 1000000) fail("Claude CLI 模型的上下文上限最多 1,000,000。");
   const requested = Array.isArray(models) ? [...new Set(models.map((model) => String(model).trim()))].filter(Boolean) : [];
@@ -7830,7 +8252,8 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, fir
   console.log(`已添加：${claudeCliDisplayNames(plan, added).join("、")}`);
   console.log(`上下文 ${defaults.contextWindow.toLocaleString("en-US")}，輸出 ${defaults.maxOutputTokens.toLocaleString("en-US")}（超過模型上限時 Claude CLI 會自動壓到上限）。`);
   console.log(`備份：${backupDir}`);
-  return { added, failures: tested.failures, backupDir, restartDesktop: true };
+  const apiKeyMode = firstInstall ? await enableApiKeyModeIfLoggedOut(login) : false;
+  return { added, failures: tested.failures, backupDir, apiKeyMode, restartDesktop: true };
 }
 
 // 管理頁的「解除安裝」：與終端的 rollback 相同，只是不問問題；安裝目錄等管理頁結束後再封存。
@@ -7891,6 +8314,7 @@ function managerOperations() {
       imagegen: () => relayImagegenStatus(),
       "claude-cli": () => managerClaudeCliStatus(),
       "claude-cli-models": () => managerClaudeCliModels(),
+      usage: (params) => managerUsage(params || {}),
       "provider-preview": (params) => managerProviderPreview(params),
       diagnostics: () => managerDiagnostics(),
     },
@@ -7918,6 +8342,9 @@ function managerOperations() {
       "apply-update": job("套用新版本", managerApplyLocalUpdate),
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
+      "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
+      "set-background-model": job("設定背景任務模型", managerSetBackgroundModel),
+      "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
       "imagegen-setup": job("偵測並啟用中轉生圖", managerImagegenSetup),
       "imagegen-disable": job("停用中轉生圖", managerImagegenDisable),
       "claude-cli-install": job("安裝 Claude CLI", managerClaudeCliInstall),
@@ -8289,6 +8716,7 @@ function help() {
   ${basename(scriptPath || "codex-model-router.command")} add
   ${basename(scriptPath || "codex-model-router.command")} remove
   ${basename(scriptPath || "codex-model-router.command")} providers [add|edit|remove|key|backup]
+  ${basename(scriptPath || "codex-model-router.command")} api-key-mode [on|off|status]   （API Key 模式：不登入 ChatGPT 或帳號額度用完時，第三方模型照常發送）
   ${basename(scriptPath || "codex-model-router.command")} claude-cli [status|login]
   ${basename(scriptPath || "codex-model-router.command")} hidden-models
   ${basename(scriptPath || "codex-model-router.command")} context-1m
@@ -8466,6 +8894,7 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     else if (action === "repair-models") await repairModels();
     else if (action === "claude-cli") await configureClaudeCli(requestedAction ? process.argv[3] : null);
     else if (action === "context-1m") await configureMillionTokenContext();
+    else if (["api-key-mode", "apikey-mode", "quota-mode", "quota"].includes(action)) await configureQuotaMode(process.argv[3]);
     else if (action === "imagegen" || action === "relay-imagegen") await configureRelayImagegen();
     else if (action === "imagegen-disable") {
       const backup = join(backupsRoot, `imagegen-disabled-${timestamp()}`);
@@ -8499,6 +8928,7 @@ __CODEX_MODEL_ROUTER_ROUTER_JS__
 import http from "node:http";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
 import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
@@ -8849,6 +9279,8 @@ const catalogRequests = new Map();
 export async function refreshOfficialCatalog(requestHeaders, searchParams, fetchImpl = fetch) {
   const current = () => JSON.parse(readFileSync(settings.catalogPath, "utf8"));
   if (!catalogRefreshEnabled) return current();
+  // API Key 模式的本機 Key 不能送去 chatgpt.com；清單用路由器現有的目錄即可。
+  if (isQuotaModeRequest(requestHeaders)) return current();
   const incoming = new Headers(requestHeaders);
   const authorization = incoming.get("authorization");
   if (!authorization?.startsWith("Bearer ")) return current();
@@ -9152,6 +9584,7 @@ function prepareHistory(key, input, previousId = null) {
 }
 
 function rememberHistoryEvent(history, event) {
+  if (history?.usage) recordUsageEvent(history.usage, event);
   if (!history || history.completed || history.disabled) return;
   const replayable = (item) => item && typeof item === "object" &&
     (item.type !== "reasoning" || item.encrypted_content);
@@ -9293,6 +9726,12 @@ const stats = {
   heartbeats: 0,
   authProbeFailures: 0,
   authProbeGraceUsed: 0,
+  quotaModeRequests: 0,
+  quotaModeOfficialBlocked: 0,
+  backgroundRerouted: 0,
+  backgroundReroutedByKind: {},
+  usageRecords: 0,
+  usageLogFailures: 0,
   upstreamErrorCloses: 0,
   statefulFallbacks: 0,
   responseFailedSent: 0,
@@ -9385,6 +9824,193 @@ const stats = {
   lastError: null,
 };
 const validatedAuthDigests = new Map();
+
+// --- API Key 模式 -------------------------------------------------------------
+//
+// ChatGPT 帳號額度用完時，桌面版會把本機任務的發送按鈕整個鎖住，連第三方模型也不能用。
+// 這個模式由安裝器把 Codex 暫時切成 API Key 登入，Key 是本機隨機產生、只有路由器認得的
+// 一把；quota-mode.json 只存它的 SHA-256。帶這把 Key 的請求：第三方模型照常轉送，
+// 官方模型與官方直通端點一律在本機擋下，Key 本身絕不轉發給 chatgpt.com。
+// 檔案依修改時間重讀，開關模式不必重新啟動路由器。
+const quotaModePath = join(routerDirectory, "quota-mode.json");
+let quotaModeCache = { mtimeMs: null, digest: null };
+
+function quotaModeDigest() {
+  let mtimeMs;
+  try { mtimeMs = statSync(quotaModePath).mtimeMs; }
+  catch { quotaModeCache = { mtimeMs: null, digest: null }; return null; }
+  if (mtimeMs !== quotaModeCache.mtimeMs) {
+    let digest = null;
+    try {
+      const state = JSON.parse(readFileSync(quotaModePath, "utf8"));
+      if (state?.enabled === true && /^[0-9a-f]{64}$/.test(state.keySha256 || "")) digest = state.keySha256;
+    } catch { /* 損壞或寫到一半：當成未啟用，下次修改時間變了再讀。 */ }
+    quotaModeCache = { mtimeMs, digest };
+  }
+  return quotaModeCache.digest;
+}
+
+export function isQuotaModeRequest(headers) {
+  const digest = quotaModeDigest();
+  if (!digest) return false;
+  const authorization = headers?.authorization;
+  if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) return false;
+  const actual = createHash("sha256").update(authorization.slice(7)).digest();
+  return timingSafeEqual(actual, Buffer.from(digest, "hex"));
+}
+
+const QUOTA_MODE_OFFICIAL_MESSAGE =
+  "目前是「API Key 模式」：官方模型需要 ChatGPT 帳號登入，暫時無法使用。請在模型選單改選第三方模型繼續這個任務；" +
+  "要使用官方模型，到「自訂模型管理」→ 設定，關閉 API Key 模式（並登入 ChatGPT 帳號）。";
+
+function rejectQuotaModeOfficial() {
+  stats.quotaModeOfficialBlocked += 1;
+  return new RouterRequestError(403, "quota_mode_official_unavailable", QUOTA_MODE_OFFICIAL_MESSAGE, "routing");
+}
+
+// --- 模型使用記錄 ---------------------------------------------------------------
+//
+// 每一輪結束（完成、未完成或失敗）時記一筆：時間、模型、供應商、背景任務種類、耗時，以及
+// 上游回報的 token 用量（輸入、快取命中、快取寫入、輸出、推理）。和「最近的錯誤」分開存放，
+// 回頭排查用量或快取命中率時不必翻錯誤記錄。只記數字與識別，不記提示詞或回覆內容。
+const usageLogPath = join(routerDirectory, "usage.jsonl");
+const usageLogMaxBytes = 5 * 1024 * 1024;
+
+function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind }) {
+  const thread = requestHeaders?.["thread-id"] || requestHeaders?.["session-id"];
+  return {
+    startedAt: Date.now(), model: typeof model === "string" ? model.slice(0, 160) : null,
+    route, provider, transport, backgroundKind,
+    thread: typeof thread === "string" ? thread.slice(0, 64) : null, recorded: false,
+  };
+}
+
+const usageNumber = (value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.round(Number(value)) : 0);
+
+export function usageRecord(context, event, now = Date.now()) {
+  const status = event?.type === "response.completed" ? "completed"
+    : event?.type === "response.incomplete" ? "incomplete"
+    : event?.type === "response.failed" ? "failed" : null;
+  if (!status) return null;
+  const usage = event.response?.usage || null;
+  return {
+    at: new Date(now).toISOString(),
+    model: context.model,
+    upstreamModel: typeof event.response?.model === "string" ? event.response.model.slice(0, 160) : null,
+    route: context.route, provider: context.provider, transport: context.transport,
+    background: context.backgroundKind, thread: context.thread, status,
+    durationMs: Math.max(0, now - context.startedAt),
+    input: usageNumber(usage?.input_tokens),
+    cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
+    cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
+    output: usageNumber(usage?.output_tokens),
+    reasoning: usageNumber(usage?.output_tokens_details?.reasoning_tokens),
+    hasUsage: Boolean(usage),
+    ...(status === "failed" && event.response?.error?.code ? { error: String(event.response.error.code).slice(0, 80) } : {}),
+  };
+}
+
+function recordUsageEvent(context, event) {
+  if (context.recorded || settings.usageLog === false) return;
+  const record = usageRecord(context, event);
+  if (!record) return;
+  context.recorded = true;
+  stats.usageRecords += 1;
+  try {
+    try {
+      if (statSync(usageLogPath).size > usageLogMaxBytes) renameSync(usageLogPath, usageLogPath + ".1");
+    } catch { /* 檔案還不存在。 */ }
+    appendFileSync(usageLogPath, JSON.stringify(record) + "\n", { mode: 0o600 });
+  } catch {
+    stats.usageLogFailures += 1;
+  }
+}
+
+// --- 背景任務改用第三方模型 ---------------------------------------------------
+//
+// 不論使用者選了哪個模型，Codex 都會固定用官方小模型跑幾種背景任務（任務標題、後續建議、
+// 分支描述、記憶整理），因此第三方模型使用者仍在消耗 ChatGPT 額度，API Key 模式下則直接被擋。
+// 使用者在管理頁選了代答模型時，路由器只辨認這些背景任務固定的開頭提示詞，把它們改送該模型；
+// 使用者手動選官方模型的一般對話不受影響。background-model.json 依修改時間重讀，不必重新啟動。
+const backgroundModelPath = join(routerDirectory, "background-model.json");
+let backgroundModelCache = { mtimeMs: null, light: null, memory: null };
+
+export const BACKGROUND_TASK_PATTERNS = [
+  ["title", /^You are a helpful assistant\. You will be presented with a user prompt, and your job is to provide a short title/],
+  ["suggestions", /^#\s*Overview\s+Generate 0 to 3 hyperpersonalized suggestions/],
+  ["fork-description", /^You are in a fork of an existing Codex thread\.\s*Fill the structured description/],
+  ["memory", /^##\s*Memory Writing Agent/],
+  ["memory", /^Consolidate the supplied rollout summaries into `memory_summary\.md`/],
+];
+
+// background-model.json：light 處理任務標題、後續建議與分支描述；memory 處理記憶整理。
+// 兩者分開設定，記憶整理會呼叫工具、內容長，適合選另一個模型。舊格式 { model } 視為 light。
+function backgroundModelSetting() {
+  let mtimeMs;
+  try { mtimeMs = statSync(backgroundModelPath).mtimeMs; }
+  catch { backgroundModelCache = { mtimeMs: null, light: null, memory: null }; return backgroundModelCache; }
+  if (mtimeMs !== backgroundModelCache.mtimeMs) {
+    const valid = (value) => (typeof value === "string" && value.startsWith("custom/") ? value : null);
+    let light = null;
+    let memory = null;
+    try {
+      const value = JSON.parse(readFileSync(backgroundModelPath, "utf8")) || {};
+      light = valid(value.light ?? value.model);
+      memory = valid(value.memory);
+    } catch { /* 損壞或寫到一半：當成未設定。 */ }
+    backgroundModelCache = { mtimeMs, light, memory };
+  }
+  return backgroundModelCache;
+}
+
+function backgroundModelFor(kind) {
+  const setting = backgroundModelSetting();
+  return kind === "memory" ? setting.memory : setting.light;
+}
+
+function firstPromptTexts(body) {
+  const texts = [];
+  if (typeof body?.instructions === "string") texts.push(body.instructions);
+  const input = Array.isArray(body?.input) ? body.input : typeof body?.input === "string" ? [body.input] : [];
+  for (const item of input) {
+    if (typeof item === "string") { texts.push(item); break; }
+    if (item?.type && item.type !== "message") continue;
+    if (item?.role !== "user") continue;
+    const content = typeof item.content === "string" ? [{ text: item.content }] : Array.isArray(item.content) ? item.content : [];
+    const part = content.find((entry) => typeof entry?.text === "string");
+    if (part) texts.push(part.text);
+    break;
+  }
+  return texts.map((text) => text.trimStart());
+}
+
+export function backgroundTaskKind(body) {
+  if (typeof body?.model !== "string" || body.model.startsWith("custom/")) return null;
+  for (const text of firstPromptTexts(body)) {
+    for (const [kind, pattern] of BACKGROUND_TASK_PATTERNS) if (pattern.test(text)) return kind;
+  }
+  return null;
+}
+
+// 回傳要使用的請求內容：背景任務且已選代答模型（路由仍存在）時換成該模型，其他原樣回傳。
+// 改送後的請求以 Symbol 標記原本的背景任務種類（JSON 序列化不會帶出），供使用記錄辨識。
+const BACKGROUND_KIND = Symbol("backgroundKind");
+export function applyBackgroundModel(body) {
+  const kind = backgroundTaskKind(body);
+  if (!kind) return body;
+  const target = backgroundModelFor(kind);
+  if (!target || !routeMap.has(target)) return body;
+  stats.backgroundRerouted += 1;
+  stats.backgroundReroutedByKind[kind] = (stats.backgroundReroutedByKind[kind] || 0) + 1;
+  return { ...body, model: target, [BACKGROUND_KIND]: kind };
+}
+
+// 重試也不會好的路由器錯誤：以 response.failed + invalid_prompt 回給 Codex，它會直接顯示訊息，
+// 不會先「重新連線 1/5…5/5」再退回 HTTPS 又重試一輪。
+const CODEX_FATAL_ROUTER_CODES = new Set(["quota_mode_official_unavailable"]);
+export function codexFailureCode(code) {
+  return CODEX_FATAL_ROUTER_CODES.has(code) ? "invalid_prompt" : code;
+}
 // 驗證探測只是用來證明呼叫端是已登入的 Codex。chatgpt.com 暫時連不上（網路、代理、
 // 官方故障）時，不該連帶讓中轉模型也不能用——那正是最需要中轉當備援的時候。
 // 同一組憑證在寬限期內真的驗證成功過，探測遇到網路錯誤或 401/403 以外的失敗就放行；
@@ -9462,6 +10088,11 @@ function contextProvider(context) {
 function recordRouterError(error, context = {}, countFailure = true) {
   const details = describeRouterError(error);
   const requestId = randomBytes(8).toString("hex");
+  // API Key 模式擋下官方模型是預期中的狀態，不算錯誤；只計數，管理頁頂部的提示會顯示總數。
+  if (details.code === "quota_mode_official_unavailable") {
+    process.stderr.write(`model-router-quota-blocked:${typeof context.model === "string" ? context.model.slice(0, 80) : "-"}\n`);
+    return { ...details, requestId };
+  }
   const official = details.phase === "auth_probe" || context.route !== "custom";
   const provider = official ? null : contextProvider(context);
   const upstreamRoot = official ? officialBase : provider?.apiRoot;
@@ -9899,6 +10530,8 @@ function allowDuringAuthOutage(headers, reason) {
 }
 
 async function validateOfficialAuth(requestHeaders, signal) {
+  // API Key 模式的本機 Key 本身就是「呼叫端是這台電腦的 Codex」的證明，不能拿去 chatgpt.com 探測。
+  if (isQuotaModeRequest(requestHeaders)) return true;
   if (hasValidatedAuth(requestHeaders)) return true;
   if (!authDigest(requestHeaders)) {
     throw new RouterRequestError(401, "chatgpt_auth_required", "需要 ChatGPT 身份驗證。", "auth_probe");
@@ -10028,6 +10661,7 @@ export function rewriteCustomBody(body, route) {
 //
 // 這裡不自己驗證身分，原樣轉送即可：官方後端本來就會自己判斷。
 async function proxyToOfficial(request, response, incomingUrl) {
+  if (isQuotaModeRequest(request.headers)) throw rejectQuotaModeOfficial();
   const body = decodeRequestBody(await readRequestBody(request), request.headers["content-encoding"]);
   const controller = new AbortController();
   response.on("close", () => { if (!response.writableFinished) controller.abort(); });
@@ -10167,8 +10801,14 @@ export async function fetchModelUpstream(
   signal,
   meta = {},
 ) {
+  meta.backgroundKind = body?.[BACKGROUND_KIND] ?? backgroundTaskKind(body);
+  body = applyBackgroundModel(body);
   const route = chooseRoute(requestHeaders, body);
   const isCustom = route != null;
+  if (isQuotaModeRequest(requestHeaders)) {
+    stats.quotaModeRequests += 1;
+    if (!isCustom) throw rejectQuotaModeOfficial();
+  }
   const provider = isCustom && route.transport !== "claude-cli" ? providerForRoute(route) : null;
   rememberRoute(requestHeaders, route);
 
@@ -10192,6 +10832,13 @@ export async function fetchModelUpstream(
     }
   }
   meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
+  // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
+  meta.history = meta.history || { disabled: true };
+  meta.history.usage = usageContext({
+    requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
+    provider: route?.transport === "claude-cli" ? "claude-cli" : provider?.id ?? null,
+    transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null,
+  });
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
@@ -11501,6 +12148,11 @@ async function tryUpstreamWebSocketTurn(
   const buildPayload = (chain) => {
     let outgoing = { ...message };
     history = fullInput ? prepareHistory(historyKey, fullInput, previousId) : null;
+    history = history || { disabled: true };
+    history.usage = usageContext({
+      requestHeaders: request.headers, model: message?.model, route: "official", provider: null,
+      transport: "upstream-websocket", backgroundKind: null,
+    });
     if (chain) {
       stats.upstreamWebSocketIncremental += 1;
     } else {
@@ -11566,7 +12218,7 @@ export function isPrewarmRequest(message) {
   return message?.type === "response.create" && message.generate === false;
 }
 
-function answerPrewarmLocally(request, socket, message, connectionState, { stale = false } = {}) {
+function answerPrewarmLocally(request, socket, message, connectionState, { stale = false, quotaBlocked = false } = {}) {
   const createdAt = Math.floor(Date.now() / 1000);
   const response = {
     id: `${PREWARM_ID_PREFIX}${randomBytes(12).toString("hex")}`,
@@ -11580,7 +12232,9 @@ function answerPrewarmLocally(request, socket, message, connectionState, { stale
     usage: null,
   };
   const completed = { ...response, status: "completed", completed_at: createdAt };
-  if (stale) {
+  if (quotaBlocked) {
+    // API Key 模式下打開官方模型的任務：預熱不算錯誤，等真的送出訊息才回報。
+  } else if (stale) {
     // 任務仍記著已刪除的模型：打開任務本身不算錯誤，等真的送出訊息才回報 404。
     stats.stalePrewarms += 1;
     stats.lastStalePrewarmModel = message.model.slice(0, 160);
@@ -11614,6 +12268,7 @@ export async function handleWebSocketResponseInner(
   abortController,
   connectionState = null,
 ) {
+  message = applyBackgroundModel(message);
   const prewarm = isPrewarmRequest(message);
   let route;
   try {
@@ -11624,6 +12279,10 @@ export async function handleWebSocketResponseInner(
       return;
     }
     throw error;
+  }
+  if (prewarm && route == null && isQuotaModeRequest(request.headers)) {
+    answerPrewarmLocally(request, socket, message, connectionState, { quotaBlocked: true });
+    return;
   }
 
   // 官方路由優先走上游 WebSocket；只有它支援連線內的 previous_response_id 接續。
@@ -11814,17 +12473,20 @@ function handleWebSocketUpgrade(request, socket, head) {
             route: typeof message?.model === "string" && message.model.startsWith("custom/") ? "custom" : "official",
           });
           const messageText = `${detail.message}（診斷 ID：${detail.requestId}）`;
-          sendWebSocketJson(socket, {
-            type: "error",
-            error: {
-              type: "router_error",
-              code: detail.code,
-              message: messageText,
-            },
-          });
+          const fatal = codexFailureCode(detail.code) !== detail.code;
+          if (!fatal) {
+            sendWebSocketJson(socket, {
+              type: "error",
+              error: {
+                type: "router_error",
+                code: detail.code,
+                message: messageText,
+              },
+            });
+          }
           // 網路層例外（fetch failed / terminated）同樣要送終止事件，
           // 否則 Codex 會停在「思考中」直到 idle timeout 才重試。
-          sendResponseFailed(socket, detail.code, messageText);
+          sendResponseFailed(socket, codexFailureCode(detail.code), messageText);
           if (detail.code === "router_history_unavailable") {
             stats.statefulFallbacks += 1;
             closeWebSocket(socket, 1011, "history unavailable");
@@ -11962,7 +12624,12 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     const detail = recordRouterError(error, request.routerContext);
-    if (!response.headersSent) {
+    if (!response.headersSent && codexFailureCode(detail.code) !== detail.code &&
+        /\/responses(?:$|[/?])/.test(request.url || "")) {
+      const event = responseFailedEvent(codexFailureCode(detail.code), `${detail.message}（診斷 ID：${detail.requestId}）`);
+      response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+      response.end("event: response.failed\ndata: " + JSON.stringify(event) + "\n\n");
+    } else if (!response.headersSent) {
       writeJson(response, detail.status, {
         error: {
           message: `${detail.message}（診斷 ID：${detail.requestId}）`,
@@ -16279,6 +16946,7 @@ td.tight, th.tight { width: 1%; white-space: nowrap; }
 .chip.amber { background: rgba(245, 158, 11, .12); border-color: rgba(245, 158, 11, .32); color: #fde68a; }
 .chip.green { background: rgba(34, 197, 94, .12); border-color: rgba(34, 197, 94, .32); color: #bbf7d0; }
 .chip.rose { background: rgba(244, 63, 94, .12); border-color: rgba(244, 63, 94, .32); color: #fecdd3; }
+td.num { font-variant-numeric: tabular-nums; }
 
 .banner { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 10px; margin-bottom: 16px; border: 1px solid; font-size: 13.5px; }
 .banner svg { width: 18px; height: 18px; flex: none; }
@@ -16379,6 +17047,12 @@ input[type=checkbox] { width: 16px; height: 16px; accent-color: #22d3ee; cursor:
 .field { display: grid; gap: 6px; align-content: start; }
 .field > span { color: var(--muted); font-size: 12.5px; }
 .field .hint { color: var(--faint); font-size: 12px; }
+.field .hint.warn { color: #fde68a; }
+.panel.compact .compact-bar { display: flex; align-items: center; gap: 12px; padding: 10px 18px; }
+.panel.compact .compact-title { font-weight: 600; font-size: 13.5px; white-space: nowrap; }
+.panel.compact .compact-summary { color: var(--muted); font-size: 12.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel.compact .panel-body { border-top: 1px solid var(--border); }
+.field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
 input[type=text], input[type=password], input[type=number], input[type=search], input[type=url], select { width: 100%; padding: 9px 11px; border-radius: 10px; border: 1px solid var(--border-strong); background: #0d1528; color: var(--text); font: inherit; }
 input::placeholder { color: #4b5b75; }
 input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7); box-shadow: 0 0 0 3px rgba(56, 189, 248, .15); }
@@ -16872,6 +17546,71 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "修改前會自動備份；不需要重新啟動路由器，重新啟動 {app} 後生效。": "A backup is made first. No router restart needed; takes effect after restarting {app}.",
 "全域上下文必須是 16,000～4,000,000 之間的整數。": "Global context must be an integer between 16,000 and 4,000,000.",
 "設定全域上下文": "Set global context",
+"API Key 模式": "API key mode",
+"已開啟": "On",
+"未開啟": "Off",
+"開啟 API Key 模式": "Turn on API key mode",
+"關閉 API Key 模式": "Turn off API key mode",
+"切換 API Key 模式": "Switch API key mode",
+"和 Codex 官方的 API Key 登入相同：Codex 改用本機產生的 API Key 登入，不需要 ChatGPT 帳號也能使用第三方模型。ChatGPT 帳號額度用完、{app} 鎖住發送按鈕時，開啟後第三方模型也能照常發送；選到官方模型時會直接提示目前不可用。": "Works like Codex's official API key sign-in: Codex signs in with a locally generated API key, so third-party models work without a ChatGPT account. When your ChatGPT usage runs out and {app} locks the Send button, turning this on lets third-party models send as usual; picking an official model shows a clear “unavailable” message instead.",
+"原本的任務都會保留：打開任務後在模型選單改選第三方模型即可接續。關閉後 ChatGPT 登入會原樣還原，不需要重新登入。": "All existing tasks stay: open a task and pick a third-party model to continue it. Turning this off restores your ChatGPT sign-in exactly as before, no need to sign in again.",
+"安裝時 Codex 沒有登入帳號，因此預設開啟。要改用 ChatGPT 帳號時按「關閉並登入 ChatGPT」，會帶你到瀏覽器登入。": "Turned on by default because Codex wasn't signed in during setup. To switch to a ChatGPT account, choose “Turn off and sign in to ChatGPT” and your browser will take you through sign-in.",
+"Codex 目前沒有登入帳號；開啟後不必登入也能使用第三方模型，或直接登入 ChatGPT 帳號。": "Codex isn't signed in. Turn this on to use third-party models without signing in, or sign in with a ChatGPT account.",
+"開啟於 {time}": "Turned on at {time}",
+"Codex 目前的登入方式與這個模式不一致（可能在 Codex 裡重新登入過）。請重新開啟或關閉一次。": "Codex's current sign-in doesn't match this mode (you may have signed in again inside Codex). Turn the mode on or off once more.",
+"Codex 目前以您自己的 OpenAI API Key 登入，請先在 Codex 登出後再開啟。": "Codex is signed in with your own OpenAI API key. Sign out in Codex first, then turn this on.",
+"請先添加第三方模型。": "Add a third-party model first.",
+"開啟後會重新啟動 {app}，進行中的任務會中斷，重新打開後可以接續。": "{app} will restart; running tasks are interrupted and can be continued after it reopens.",
+"開啟期間，官方模型與需要 ChatGPT 帳號的 Codex 功能（例如雲端任務、官方網頁搜尋）暫停使用。": "While it's on, official models and Codex features that need a ChatGPT account (such as cloud tasks and official web search) are paused.",
+"關閉後會重新啟動 {app}，還原 ChatGPT 登入，官方模型恢復可用；原本的任務都會保留。": "{app} will restart and your ChatGPT sign-in is restored, so official models work again; all existing tasks stay.",
+"會先開啟瀏覽器，請用 ChatGPT 帳號登入 Codex；登入成功後才關閉 API Key 模式並重新啟動 {app}。登入失敗或取消時不會改動任何設定，原本的任務都會保留。": "Your browser opens first so you can sign in to Codex with a ChatGPT account. API key mode turns off and {app} restarts only after sign-in succeeds; if sign-in fails or is cancelled, nothing changes. All existing tasks stay.",
+"關閉並登入 ChatGPT": "Turn off and sign in to ChatGPT",
+"登入 ChatGPT 帳號": "Sign in with ChatGPT",
+"開啟": "Turn on",
+"關閉": "Turn off",
+"API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送。": "API key mode is on: official models are paused, third-party models send as usual.",
+"前往設定": "Open settings",
+"背景任務模型": "Background task model",
+"標題等：{light} · 記憶整理：{memory}": "Titles etc.: {light} · Memory: {memory}",
+"收合": "Collapse",
+"任務標題": "Task title",
+"後續建議": "Follow-up suggestions",
+"分支描述": "Fork description",
+"記憶整理": "Memory consolidation",
+"{value} 毫秒": "{value} ms",
+"{value} 秒": "{value} s",
+"時間範圍": "Time range",
+"最近 1 小時": "Last hour",
+"最近 24 小時": "Last 24 hours",
+"最近 7 天": "Last 7 days",
+"最近 30 天": "Last 30 days",
+"每一輪對話的模型、token 用量、快取命中與耗時；只記數字，不記對話內容。最近的錯誤在「總覽」。": "Model, token usage, cache hits and duration for every turn. Only numbers are recorded, never conversation content. Recent errors are on Overview.",
+"重新整理使用記錄": "Refresh usage",
+"失敗 {count}": "{count} failed",
+"輸入 tokens": "Input tokens",
+"快取命中 {rate} · 快取寫入 {write}": "Cache hits {rate} · cache writes {write}",
+"輸出 tokens": "Output tokens",
+"其中推理 {value}": "{value} reasoning",
+"平均耗時": "Average duration",
+"每一輪從送出到結束": "Per turn, from send to finish",
+"這段時間沒有使用記錄。": "No usage recorded in this period.",
+"各模型": "By model",
+"輸入": "Input",
+"快取命中": "Cache hits",
+"快取寫入": "Cache writes",
+"官方": "Official",
+"最近的請求": "Recent requests",
+"耗時": "Duration",
+"未完成": "Incomplete",
+"原本選的模型已刪除，目前使用官方模型。": "The previously selected model was deleted; official models are used for now.",
+"Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。": "Whichever model you pick, Codex runs a few background tasks on small official models. They use your ChatGPT usage and are blocked in API key mode. Pick a third-party model to handle them instead.",
+"任務標題、後續建議、分支描述": "Task titles, follow-up suggestions, fork descriptions",
+"記憶整理（會呼叫工具、內容較長，用量較多）": "Memory consolidation (calls tools and is longer, so it uses more)",
+"只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。": "Only these background tasks' fixed prompts are recognized; conversations where you pick an official model yourself aren't affected. Changes apply immediately, no restart needed.",
+"官方模型（Codex 預設）": "Official models (Codex default)",
+"已改由第三方模型處理 {count} 個背景任務。": "{count} background tasks handled by the third-party model so far.",
+"設定背景任務模型": "Set background task model",
+"API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送（已擋下 {count} 個官方模型請求）。": "API key mode is on: official models are paused, third-party models send as usual ({count} official-model requests blocked).",
 "移除全域上下文": "Remove global context",
 "移除後每個模型改用自己的上下文：官方模型使用 Codex 內建值，自訂模型使用模型頁的設定。修改前會自動備份。": "Each model then uses its own context: official models use Codex's built-in values, custom models use the Models page settings. A backup is made first.",
 "隱藏的官方模型": "Hidden official models",
@@ -17060,7 +17799,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Models",
 "供應商": "Providers",
 "生圖": "Images",
-"設定": "Settings"
+"設定": "Settings",
+"使用記錄": "Usage"
 },
 "enErrors": {
 "provider_not_configured": "The provider for this model isn't configured. Run the installer's update, or delete and re-add the model.",
@@ -17166,8 +17906,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -17464,6 +18204,7 @@ const ICONS = {
   info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5"/><path d="M12 7.6h.01"/>',
   external: '<path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
   image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="m20.5 16-5-5-8.5 8.5"/>',
+  usage: '<path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M3.5 20.5h17"/>',
   settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   chevronRight: '<path d="m9 6 6 6-6 6"/>',
   claude: '<path d="M12 3v5.5M12 15.5V21M3 12h5.5M15.5 12H21M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>',
@@ -17691,6 +18432,7 @@ function writeBlocked() {
 
 const VIEWS = [
   { id: "overview", label: () => sectionTitle("總覽"), icon: "overview" },
+  { id: "usage", label: () => sectionTitle("使用記錄"), icon: "usage" },
   { id: "models", label: () => sectionTitle("模型"), icon: "models" },
   { id: "providers", label: () => sectionTitle("供應商"), icon: "providers" },
   { id: "imagegen", label: () => sectionTitle("生圖"), icon: "image" },
@@ -17754,6 +18496,13 @@ function renderBanners() {
     items.push(banner("error", "alert", t("與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。")));
   }
   if (state && state.writeBlocked) items.push(banner("warn", "alert", serverText(state.writeBlocked)));
+  if (state && state.installed && state.quotaMode && state.quotaMode.enabled) {
+    const blockedCount = Number(state.router && state.router.stats && state.router.stats.quotaModeOfficialBlocked) || 0;
+    items.push(banner("warn", "power", blockedCount
+      ? t("API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送（已擋下 {count} 個官方模型請求）。", { count: formatNumber(blockedCount) })
+      : t("API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送。"),
+      h("button", { type: "button", class: "button small", onclick: () => switchView("settings") }, t("前往設定"))));
+  }
   if (pendingDesktopRestart && state && state.installed) {
     const canRestart = state.desktop && state.desktop.canRestart;
     items.push(banner("info", "info",
@@ -17781,6 +18530,7 @@ function renderView() {
     return;
   }
   if (currentView === "models") view.replaceChildren(...renderModels());
+  else if (currentView === "usage") view.replaceChildren(...renderUsage());
   else if (currentView === "providers") view.replaceChildren(...renderProviders());
   else if (currentView === "imagegen") view.replaceChildren(...renderImagegen());
   else if (currentView === "settings") view.replaceChildren(...renderSettings());
@@ -18001,6 +18751,7 @@ function renderModels() {
       h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")))));
     return parts;
   }
+  parts.push(renderBackgroundModelPanel(models, blocked));
 
   const allChecked = models.every((model) => selected.has(model.slug));
   const headerBox = h("input", {
@@ -18015,6 +18766,135 @@ function renderModels() {
       h("th", { class: "col-effort", text: t("推理強度") }), h("th", { text: t("上下文") }), h("th", { text: t("輸出") }), h("th", { class: "tight" }))),
     h("tbody", {}, rows)))));
   return parts;
+}
+
+// ---- 使用記錄 -------------------------------------------------------------------
+// 與「最近的錯誤」分開：每一輪的模型、token 用量、快取命中與耗時，方便回頭排查用量與快取情況。
+let usageData = null;
+let usageHours = 24;
+let usageLoading = false;
+
+function backgroundKindLabel(kind) {
+  const labels = { title: t("任務標題"), suggestions: t("後續建議"), "fork-description": t("分支描述"), memory: t("記憶整理") };
+  return labels[kind] || kind;
+}
+
+async function loadUsage() {
+  if (usageLoading) return;
+  usageLoading = true;
+  renderView();
+  try {
+    usageData = await api("/api/query", { method: "POST", body: { type: "usage", params: { sinceHours: usageHours, limit: 300 } } });
+  } catch (error) {
+    usageData = { error: error.message };
+  } finally {
+    usageLoading = false;
+    renderView();
+  }
+}
+
+function modelLabel(slug) {
+  const model = (state.models || []).find((item) => item.slug === slug);
+  return model ? model.displayName : slug || "—";
+}
+
+function percent(value) {
+  return value === null || value === undefined ? "—" : (value * 100).toFixed(value >= 0.995 || value === 0 ? 0 : 1) + "%";
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) return "—";
+  return ms < 1000 ? t("{value} 毫秒", { value: Math.round(ms) }) : t("{value} 秒", { value: (ms / 1000).toFixed(ms < 10000 ? 1 : 0) });
+}
+
+function renderUsage() {
+  if (!usageData && !usageLoading) loadUsage();
+  const range = h("select", { "aria-label": t("時間範圍"), onchange: (event) => { usageHours = Number(event.target.value); usageData = null; loadUsage(); } },
+    [[1, t("最近 1 小時")], [24, t("最近 24 小時")], [168, t("最近 7 天")], [720, t("最近 30 天")]].map(([value, label]) =>
+      h("option", { value: String(value), selected: value === usageHours, text: label })));
+  const head = pageHead(sectionTitle("使用記錄"), t("每一輪對話的模型、token 用量、快取命中與耗時；只記數字，不記對話內容。最近的錯誤在「總覽」。"),
+    range,
+    h("button", { type: "button", class: "icon-button", title: t("重新整理"), "aria-label": t("重新整理使用記錄"), onclick: () => loadUsage() }, icon("refresh")));
+  if (!usageData) return [head, h("div", { class: "panel" }, h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("讀取中…")))];
+  if (usageData.error) return [head, h("div", { class: "panel" }, h("div", { class: "empty", text: serverText(usageData.error) }))];
+  const total = usageData.summary.total;
+  const cards = h("div", { class: "cards" },
+    card(t("請求"), formatNumber(total.requests), t("失敗 {count}", { count: formatNumber(total.failed) })),
+    card(t("輸入 tokens"), formatTokens(total.input), t("快取命中 {rate} · 快取寫入 {write}", { rate: percent(total.cacheHitRate), write: formatTokens(total.cacheWrite) })),
+    card(t("輸出 tokens"), formatTokens(total.output), t("其中推理 {value}", { value: formatTokens(total.reasoning) })),
+    card(t("平均耗時"), total.requests ? formatDuration(total.durationMs / total.requests) : "—", t("每一輪從送出到結束")));
+  const parts = [head, cards];
+  if (total.requests === 0) {
+    parts.push(h("div", { class: "panel" }, h("div", { class: "empty", text: t("這段時間沒有使用記錄。") })));
+    return parts;
+  }
+  const num = (value) => h("td", { class: "nowrap num", text: value });
+  parts.push(h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("各模型") })),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出"), t("平均耗時")].map((label) => h("th", { text: label })))),
+      h("tbody", {}, usageData.summary.models.map((item) => h("tr", {},
+        h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(item.model) }),
+          h("span", { class: "faint mono", text: item.route === "custom" ? (item.provider || "") : t("官方") }))),
+        num(formatNumber(item.requests) + (item.failed ? " / " + t("失敗 {count}", { count: item.failed }) : "")),
+        num(formatTokens(item.input)), num(percent(item.cacheHitRate)), num(formatTokens(item.cacheWrite)),
+        num(formatTokens(item.output)), num(formatDuration(item.avgDurationMs)))))))));
+  const entries = usageData.entries.slice(0, 150);
+  parts.push(h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("最近的請求") })),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出"), t("耗時")].map((label) => h("th", { text: label })))),
+      h("tbody", {}, entries.map((entry) => h("tr", {},
+        h("td", { class: "nowrap mono", text: formatTime(entry.at) }),
+        h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(entry.model) }),
+          entry.background ? h("span", { class: "chip", text: backgroundKindLabel(entry.background) }) : null)),
+        h("td", {}, h("span", { class: "chip " + (entry.status === "completed" ? "green" : entry.status === "failed" ? "rose" : ""),
+          text: entry.status === "completed" ? t("完成") : entry.status === "failed" ? (entry.error || t("失敗")) : t("未完成") })),
+        num(entry.hasUsage ? formatTokens(entry.input) : "—"),
+        num(entry.hasUsage && entry.input ? percent(entry.cached / entry.input) : "—"),
+        num(entry.hasUsage ? formatTokens(entry.output) : "—"),
+        num(formatDuration(entry.durationMs)))))))));
+  parts.push(h("div", { class: "note mono", text: usageData.logPath || "" }));
+  return parts;
+}
+
+// 背景任務模型：不常用，預設收合成一行，只顯示目前設定；展開後才顯示兩個下拉選單。
+let backgroundPanelOpen = false;
+
+function renderBackgroundModelPanel(models, blocked) {
+  const current = state.backgroundModels || {};
+  const handled = Number(state.router && state.router.stats && state.router.stats.backgroundRerouted) || 0;
+  const name = (slug) => {
+    if (!slug) return t("官方");
+    const model = models.find((item) => item.slug === slug);
+    return model ? model.displayName : t("官方");
+  };
+  const summary = t("標題等：{light} · 記憶整理：{memory}", { light: name(current.light), memory: name(current.memory) });
+  const toggle = h("button", { type: "button", class: "button small", "aria-expanded": String(backgroundPanelOpen),
+    onclick: () => { backgroundPanelOpen = !backgroundPanelOpen; renderView(); } },
+  backgroundPanelOpen ? t("收合") : t("設定"));
+  const bar = h("div", { class: "compact-bar" },
+    h("span", { class: "compact-title", text: t("背景任務模型") }),
+    h("span", { class: "compact-summary", text: summary }),
+    toggle);
+  if (!backgroundPanelOpen) return h("div", { class: "panel compact" }, bar);
+  const selector = (kind, label) => {
+    const value = current[kind] || "";
+    const missing = Boolean(value) && !models.some((model) => model.slug === value);
+    return h("label", { class: "field" }, h("span", { text: label }),
+      h("select", { disabled: blocked, onchange: (event) => runJob("set-background-model", { kind, model: event.target.value || null }, { title: t("設定背景任務模型") }) },
+        h("option", { value: "", selected: !value || missing, text: t("官方模型（Codex 預設）") }),
+        models.map((model) => h("option", { value: model.slug, selected: model.slug === value, text: model.displayName }))),
+      missing ? h("span", { class: "hint warn", text: t("原本選的模型已刪除，目前使用官方模型。") }) : null);
+  };
+  return h("div", { class: "panel compact" }, bar,
+    h("div", { class: "panel-body stack" },
+      paragraph(t("Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。"), "note"),
+      h("div", { class: "field-row" },
+        selector("light", t("任務標題、後續建議、分支描述")),
+        selector("memory", t("記憶整理（會呼叫工具、內容較長，用量較多）"))),
+      (current.light || current.memory) && handled ? paragraph(t("已改由第三方模型處理 {count} 個背景任務。", { count: formatNumber(handled) }), "note") : null,
+      paragraph(t("只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。"), "note")));
 }
 
 function contextCell(model) {
@@ -18800,6 +19680,7 @@ function renderSettings() {
   const blocked = writeBlocked();
   return [
     pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
+    renderQuotaModePanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
     renderDiagnosticsPanel(),
@@ -18891,6 +19772,55 @@ async function exportDiagnostics(mode) {
     diagnosticsBusy = false;
     renderView();
   }
+}
+
+// API Key 模式：和 Codex 官方的 API Key 登入相同，切成本機產生的 Key 讓第三方模型不必登入 ChatGPT 也能用，
+// 帳號額度用完、桌面版鎖住發送按鈕時也能照常發送。
+function renderQuotaModePanel(blocked) {
+  const quota = state && state.installed ? state.quotaMode : null;
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
+  if (!quota) {
+    panel.append(h("div", { class: "panel-body setting-body" }, paragraph(t("請先添加第三方模型。"), "muted")));
+    return panel;
+  }
+  const on = quota.enabled;
+  const noModels = !quota.customModelCount;
+  const ownKey = !on && quota.login === "apikey";
+  panel.append(h("div", { class: "panel-body setting-body" },
+    h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
+    paragraph(t("和 Codex 官方的 API Key 登入相同：Codex 改用本機產生的 API Key 登入，不需要 ChatGPT 帳號也能使用第三方模型。ChatGPT 帳號額度用完、{app} 鎖住發送按鈕時，開啟後第三方模型也能照常發送；選到官方模型時會直接提示目前不可用。", { app: desktopName() }), "muted"),
+    on && quota.previousLogin === "none"
+      ? paragraph(t("安裝時 Codex 沒有登入帳號，因此預設開啟。要改用 ChatGPT 帳號時按「關閉並登入 ChatGPT」，會帶你到瀏覽器登入。"), "note")
+      : paragraph(t("原本的任務都會保留：打開任務後在模型選單改選第三方模型即可接續。關閉後 ChatGPT 登入會原樣還原，不需要重新登入。"), "note"),
+    on && quota.since ? paragraph(t("開啟於 {time}", { time: formatTime(quota.since) }), "note") : null,
+    quota.consistent ? null : paragraph(t("Codex 目前的登入方式與這個模式不一致（可能在 Codex 裡重新登入過）。請重新開啟或關閉一次。"), "note warn"),
+    !on && quota.login === "none" ? paragraph(t("Codex 目前沒有登入帳號；開啟後不必登入也能使用第三方模型，或直接登入 ChatGPT 帳號。"), "note warn") : null,
+    ownKey ? paragraph(t("Codex 目前以您自己的 OpenAI API Key 登入，請先在 Codex 登出後再開啟。"), "note") : null,
+    !on && noModels ? paragraph(t("請先添加第三方模型。"), "note warn") : null,
+    h("div", { class: "actions" }, on
+      ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => confirmQuotaMode(false, quota.previousLogin) }, icon("power"),
+        quota.previousLogin === "none" ? t("關閉並登入 ChatGPT") : t("關閉 API Key 模式"))
+      : h("button", { type: "button", class: "button primary", disabled: blocked || noModels || ownKey, onclick: () => confirmQuotaMode(true) }, icon("power"), t("開啟 API Key 模式")),
+      !on && quota.login === "none"
+        ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => runJob("chatgpt-login", {}, { title: t("登入 ChatGPT 帳號") }) }, icon("key"), t("登入 ChatGPT 帳號"))
+        : null)));
+  return panel;
+}
+
+function confirmQuotaMode(enabled, previousLogin = null) {
+  const app = desktopName();
+  confirmDialog({
+    title: enabled ? t("開啟 API Key 模式") : t("關閉 API Key 模式"),
+    confirmLabel: enabled ? t("開啟") : previousLogin === "none" ? t("關閉並登入 ChatGPT") : t("關閉"),
+    body: enabled
+      ? [paragraph(t("開啟後會重新啟動 {app}，進行中的任務會中斷，重新打開後可以接續。", { app })),
+        paragraph(t("開啟期間，官方模型與需要 ChatGPT 帳號的 Codex 功能（例如雲端任務、官方網頁搜尋）暫停使用。"), "note")]
+      : paragraph(previousLogin === "none"
+        ? t("會先開啟瀏覽器，請用 ChatGPT 帳號登入 Codex；登入成功後才關閉 API Key 模式並重新啟動 {app}。登入失敗或取消時不會改動任何設定，原本的任務都會保留。", { app })
+        : t("關閉後會重新啟動 {app}，還原 ChatGPT 登入，官方模型恢復可用；原本的任務都會保留。", { app })),
+  }).then((ok) => {
+    if (ok) runJob("set-quota-mode", { enabled }, { title: enabled ? t("開啟 API Key 模式") : t("關閉 API Key 模式") });
+  });
 }
 
 function renderGlobalContextPanel(blocked) {
@@ -19065,6 +19995,9 @@ function jobTitle(type, fallback) {
     "add-backup-key": t("新增備用 API Key"), "remove-backup-key": t("移除備用 API Key"),
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
+    "set-quota-mode": t("切換 API Key 模式"),
+    "set-background-model": t("設定背景任務模型"),
+    "chatgpt-login": t("登入 ChatGPT 帳號"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
     "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
     uninstall: t("解除安裝"),
