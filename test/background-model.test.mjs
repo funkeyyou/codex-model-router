@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync, statSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { loadRouterInDir } from "./helpers/payloads.mjs";
 
@@ -61,6 +61,21 @@ test("記憶整理與其他背景任務分開設定", async (t) => {
   assert.equal(router.applyBackgroundModel(title).model, "custom/owo-gpt");
   assert.equal(router.applyBackgroundModel(memory), memory);
   assert.equal(twoRoutes.length, 2);
+});
+
+test("大小相同、修改時間也相同的改寫一樣會生效（Windows 同一時間刻度內的連續寫入）", async (t) => {
+  const { router, dir } = await setup(t);
+  const path = join(dir, "background-model.json");
+  const before = JSON.stringify({ light: null, memory: "custom/owo-gpt" });
+  const after = JSON.stringify({ light: "custom/owo-gpt", memory: null });
+  assert.equal(before.length, after.length);
+  const title = { model: "gpt-6-luna", input: userText(titlePrompt) };
+  writeFileSync(path, before);
+  const { atime, mtime } = statSync(path);
+  assert.equal(router.applyBackgroundModel(title), title);
+  writeFileSync(path, after);
+  utimesSync(path, atime, mtime);
+  assert.equal(router.applyBackgroundModel(title).model, "custom/owo-gpt");
 });
 
 test("使用記錄：完成、失敗與沒有用量的終止事件都記成一筆，非終止事件不記", async (t) => {

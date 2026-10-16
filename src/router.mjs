@@ -904,23 +904,28 @@ const validatedAuthDigests = new Map();
 // 這個模式由安裝器把 Codex 暫時切成 API Key 登入，Key 是本機隨機產生、只有路由器認得的
 // 一把；quota-mode.json 只存它的 SHA-256。帶這把 Key 的請求：第三方模型照常轉送，
 // 官方模型與官方直通端點一律在本機擋下，Key 本身絕不轉發給 chatgpt.com。
-// 檔案依修改時間重讀，開關模式不必重新啟動路由器。
+// 檔案每次比對內容，開關模式不必重新啟動路由器。
 const quotaModePath = join(routerDirectory, "quota-mode.json");
-// 只比修改時間不夠：Windows 上同一個時間刻度內的兩次寫入看起來一樣，因此連大小與檔案識別一起比。
-const fileStamp = (info) => [info.mtimeMs, info.ctimeMs, info.size, info.ino].join(":");
-let quotaModeCache = { mtimeMs: null, digest: null };
+
+// quota-mode.json 與 background-model.json 都只有幾十個位元組，直接比內容最可靠：Windows 上
+// 同一個時間刻度內寫入、大小又剛好相同的兩個版本，修改時間、大小與檔案識別全都一樣，只比 stat
+// 會漏掉變更。讀一次只要幾微秒；內容沒變就沿用上次的解析結果。
+function readSettingFile(path) {
+  try { return readFileSync(path, "utf8"); } catch { return null; }
+}
+
+let quotaModeCache = { raw: null, digest: null };
 
 function quotaModeDigest() {
-  let mtimeMs;
-  try { mtimeMs = fileStamp(statSync(quotaModePath)); }
-  catch { quotaModeCache = { mtimeMs: null, digest: null }; return null; }
-  if (mtimeMs !== quotaModeCache.mtimeMs) {
+  const raw = readSettingFile(quotaModePath);
+  if (raw === null) { quotaModeCache = { raw: null, digest: null }; return null; }
+  if (raw !== quotaModeCache.raw) {
     let digest = null;
     try {
-      const state = JSON.parse(readFileSync(quotaModePath, "utf8"));
+      const state = JSON.parse(raw);
       if (state?.enabled === true && /^[0-9a-f]{64}$/.test(state.keySha256 || "")) digest = state.keySha256;
-    } catch { /* 損壞或寫到一半：當成未啟用，下次修改時間變了再讀。 */ }
-    quotaModeCache = { mtimeMs, digest };
+    } catch { /* 損壞或寫到一半：當成未啟用，內容變了再解析。 */ }
+    quotaModeCache = { raw, digest };
   }
   return quotaModeCache.digest;
 }
@@ -1006,9 +1011,9 @@ function recordUsageEvent(context, event) {
 // 不論使用者選了哪個模型，Codex 都會固定用官方小模型跑幾種背景任務（任務標題、後續建議、
 // 分支描述、記憶整理），因此第三方模型使用者仍在消耗 ChatGPT 額度，API Key 模式下則直接被擋。
 // 使用者在管理頁選了代答模型時，路由器只辨認這些背景任務固定的開頭提示詞，把它們改送該模型；
-// 使用者手動選官方模型的一般對話不受影響。background-model.json 依修改時間重讀，不必重新啟動。
+// 使用者手動選官方模型的一般對話不受影響。background-model.json 每次比對內容，不必重新啟動。
 const backgroundModelPath = join(routerDirectory, "background-model.json");
-let backgroundModelCache = { mtimeMs: null, light: null, memory: null };
+let backgroundModelCache = { raw: null, light: null, memory: null };
 
 export const BACKGROUND_TASK_PATTERNS = [
   ["title", /^You are a helpful assistant\. You will be presented with a user prompt, and your job is to provide a short title/],
@@ -1021,19 +1026,18 @@ export const BACKGROUND_TASK_PATTERNS = [
 // background-model.json：light 處理任務標題、後續建議與分支描述；memory 處理記憶整理。
 // 兩者分開設定，記憶整理會呼叫工具、內容長，適合選另一個模型。舊格式 { model } 視為 light。
 function backgroundModelSetting() {
-  let mtimeMs;
-  try { mtimeMs = fileStamp(statSync(backgroundModelPath)); }
-  catch { backgroundModelCache = { mtimeMs: null, light: null, memory: null }; return backgroundModelCache; }
-  if (mtimeMs !== backgroundModelCache.mtimeMs) {
+  const raw = readSettingFile(backgroundModelPath);
+  if (raw === null) { backgroundModelCache = { raw: null, light: null, memory: null }; return backgroundModelCache; }
+  if (raw !== backgroundModelCache.raw) {
     const valid = (value) => (typeof value === "string" && value.startsWith("custom/") ? value : null);
     let light = null;
     let memory = null;
     try {
-      const value = JSON.parse(readFileSync(backgroundModelPath, "utf8")) || {};
+      const value = JSON.parse(raw) || {};
       light = valid(value.light ?? value.model);
       memory = valid(value.memory);
     } catch { /* 損壞或寫到一半：當成未設定。 */ }
-    backgroundModelCache = { mtimeMs, light, memory };
+    backgroundModelCache = { raw, light, memory };
   }
   return backgroundModelCache;
 }

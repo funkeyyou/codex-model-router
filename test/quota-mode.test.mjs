@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync, statSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { loadPayloads, loadRouterInDir } from "./helpers/payloads.mjs";
@@ -121,6 +121,25 @@ test("其他 Key 即使開啟模式也不能冒用", async (t) => {
   assert.equal(router.isQuotaModeRequest({ authorization: `Bearer ${localKey}` }), true);
   assert.equal(router.isQuotaModeRequest({ authorization: "Bearer sk-other" }), false);
   assert.equal(router.isQuotaModeRequest({}), false);
+});
+
+test("換成新的本機 Key 時大小與修改時間都沒變，也會讀到新狀態", async (t) => {
+  useTestKey(t);
+  const { dir, router } = await loadRouterInDir({ upstreamWebSocket: false, routes: [customRoute] });
+  const quotaPath = join(dir, "quota-mode.json");
+  t.after(() => rmSync(quotaPath, { force: true }));
+  const nextKey = "sk-codex-router-quota-" + "cd".repeat(24);
+  const nextDigest = createHash("sha256").update(nextKey).digest("hex");
+  const before = JSON.stringify({ enabled: true, keySha256: digest });
+  const after = JSON.stringify({ enabled: true, keySha256: nextDigest });
+  assert.equal(before.length, after.length);
+  writeFileSync(quotaPath, before);
+  const { atime, mtime } = statSync(quotaPath);
+  assert.equal(router.isQuotaModeRequest({ authorization: `Bearer ${localKey}` }), true);
+  writeFileSync(quotaPath, after);
+  utimesSync(quotaPath, atime, mtime);
+  assert.equal(router.isQuotaModeRequest({ authorization: `Bearer ${localKey}` }), false);
+  assert.equal(router.isQuotaModeRequest({ authorization: `Bearer ${nextKey}` }), true);
 });
 
 test("classifyCodexAuth 區分 ChatGPT 登入、本工具的本機 Key 與使用者自己的 API Key", () => {
