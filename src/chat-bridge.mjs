@@ -11,13 +11,12 @@
 
 import {
   COMPACTION_PROMPT,
-  COMPACTION_REPLAY_PREFIX,
   bridgeInputError,
   collectToolDefinitions,
   agentMessageText,
   codexErrorFromUpstream,
   compactCodeModeDescription,
-  decodeCompaction,
+  compactionReplayText,
   encodeCompaction,
   flattenTools,
   flattenTopLevelSchema,
@@ -411,10 +410,10 @@ export function toChatRequest(body, route) {
 
       case "compaction":
       case "context_compaction": {
-        const summary = decodeCompaction(item.encrypted_content);
-        if (summary) {
+        const replay = compactionReplayText(item.encrypted_content);
+        if (replay) {
           closeToolGroup();
-          pushUser([{ type: "text", text: `${COMPACTION_REPLAY_PREFIX}${summary}` }]);
+          pushUser([{ type: "text", text: replay }]);
         }
         break;
       }

@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.34.1";
+const INSTALLER_VERSION = "1.34.2";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -12919,6 +12919,14 @@ export const CLAUDE_CODEX_GUIDANCE = [
   "Your text is the main way the user follows your work. Before your first tool call, say in one sentence what you're about to do. While working, give a short update when you find something important, change direction, or hit a blocker, and don't run through a long series of tool calls in silence. Keep each update to one or two complete sentences that make sense to someone catching up, and don't narrate your internal deliberation.",
 ].join("\n");
 
+// Codex 用 GPT 模型跑多代理時，代理之間的內容由 OpenAI 加密（encrypted_content），
+// 只有原模型的後端解得開，轉譯層與其他模型都讀不到，也沒有明文副本。整輪擋下會讓
+// 「GPT 沒額度、改用 Claude 接手」的對話永遠無法繼續，所以改成保留明文標頭、
+// 把加密段換成明確的說明，讓模型知道這裡缺了內容而不是當成空白。
+export const ENCRYPTED_AGENT_PAYLOAD_NOTICE =
+  "[Encrypted payload omitted: this inter-agent content was encrypted by the OpenAI model that produced it and cannot be read by the current model. " +
+  "Do not guess what it said. Rely on the visible conversation and tool results; if the missing content matters, say so and ask for it to be restated in plain text.]";
+
 // Codex protocol AgentMessage: inter-agent input, not this assistant's reply
 // or a tool result. Keep provenance and every plaintext block in order.
 export function agentMessageText(item) {
@@ -12926,9 +12934,7 @@ export function agentMessageText(item) {
     throw bridgeInputError("agent_message 欄位不完整，無法安全轉譯；請提供明文工作摘要。");
   }
   const parts = item.content.map((part) => {
-    if (part?.type === "encrypted_content") {
-      throw bridgeInputError("agent_message 包含無法解密的跨 Agent 訊息；請由來源 Agent 提供明文摘要，或改用原模型繼續。");
-    }
+    if (part?.type === "encrypted_content") return ENCRYPTED_AGENT_PAYLOAD_NOTICE;
     if (part?.type !== "input_text" || typeof part.text !== "string") {
       throw bridgeInputError("agent_message 包含不支援的內容格式，無法安全省略；請提供明文工作摘要。");
     }
@@ -13345,6 +13351,20 @@ export function decodeCompaction(encrypted) {
   return null;
 }
 
+// 在 GPT 模型下壓縮的摘要由 OpenAI 加密，只有官方後端讀得懂。以前這種項目會被
+// 靜默略過，模型只看到壓縮前使用者的訊息，卻不知道中間少了一段摘要。
+export const FOREIGN_COMPACTION_NOTICE =
+  "[Earlier context was compacted while another model was in use. That summary is encrypted and cannot be read by the current model, " +
+  "so the work done before this point is only partly visible (mostly the user's messages). Do not assume details that are not shown; " +
+  "if earlier results matter, re-check them with tools or ask the user.]";
+
+// 還原壓縮項目給模型看的文字：本轉譯層產生的摘要原樣還原，其他來源的加密摘要換成說明。
+export function compactionReplayText(encrypted) {
+  const summary = decodeCompaction(encrypted);
+  if (summary) return `${COMPACTION_REPLAY_PREFIX}${summary}`;
+  return typeof encrypted === "string" && encrypted ? FOREIGN_COMPACTION_NOTICE : null;
+}
+
 // route 可傳字串（僅模型名）或路由物件（含探測到的 maxOutputTokens）。
 export function toAnthropicRequest(body, route) {
   const upstreamModel = typeof route === "string" ? route : route?.upstreamModel;
@@ -13546,8 +13566,8 @@ export function toAnthropicRequest(body, route) {
       // 前一次壓縮的產物，會一直跟著後續每一輪回來；還原成文字才不會遺失上下文。
       case "compaction":
       case "context_compaction": {
-        const summary = decodeCompaction(item.encrypted_content);
-        if (summary) push("user", { type: "text", text: `${COMPACTION_REPLAY_PREFIX}${summary}` });
+        const replay = compactionReplayText(item.encrypted_content);
+        if (replay) push("user", { type: "text", text: replay });
         break;
       }
 
@@ -14280,13 +14300,12 @@ __CODEX_MODEL_ROUTER_CHAT_JS__
 
 import {
   COMPACTION_PROMPT,
-  COMPACTION_REPLAY_PREFIX,
   bridgeInputError,
   collectToolDefinitions,
   agentMessageText,
   codexErrorFromUpstream,
   compactCodeModeDescription,
-  decodeCompaction,
+  compactionReplayText,
   encodeCompaction,
   flattenTools,
   flattenTopLevelSchema,
@@ -14680,10 +14699,10 @@ export function toChatRequest(body, route) {
 
       case "compaction":
       case "context_compaction": {
-        const summary = decodeCompaction(item.encrypted_content);
-        if (summary) {
+        const replay = compactionReplayText(item.encrypted_content);
+        if (replay) {
           closeToolGroup();
-          pushUser([{ type: "text", text: `${COMPACTION_REPLAY_PREFIX}${summary}` }]);
+          pushUser([{ type: "text", text: replay }]);
         }
         break;
       }
