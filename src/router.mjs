@@ -861,6 +861,8 @@ const stats = {
   lastClaudeCliFastState: null,
   lastClaudeCliFastDisabledReason: null,
   chatTranslatedRequests: 0,
+  codexShapeChatFallbacks: 0,
+  lastCodexShapeChatFallback: null,
   chatToolOutputsMerged: 0,
   chatLateToolOutputs: 0,
   chatPlaceholderToolResults: 0,
@@ -1196,8 +1198,31 @@ function recordUpstreamFailure(upstream, context) {
   const code = status === 401 || status === 403 ? "upstream_auth_rejected"
     : status === 429 ? "upstream_rate_limited" : "upstream_http_error";
   recordRouterError(new RouterRequestError(
-    status, code, `上游服務返回 HTTP ${status}。`, "upstream", status,
+    status, code, `上游服務返回 HTTP ${status}${context?.detail ? `：${context.detail}` : ""}。`, "upstream", status,
   ), context);
+}
+
+// --- 上游不認得 Codex 專有工具格式時改走 Chat 轉譯 --------------------------------
+//
+// Codex 現在把工具放在 input 的 additional_tools 項目裡，用 namespace 分組，Code Mode
+// 的 exec 又是 custom（自由格式）工具。OpenAI 認得這些，但部分 Responses 相容上游
+// （例如 xAI）只接受 function 工具，整輪 422。Chat 轉譯層本來就會攤平 namespace、
+// 把 custom 模擬成單一字串參數的 function，所以遇到這種拒絕就改用 Chat 轉譯重送，
+// 並記住這條路由，之後直接走 Chat。新加的模型由安裝器探測時就分流。
+const chatFallbackRoutes = new Set();
+
+export function usesCodexToolShapes(body) {
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const tools = Array.isArray(body?.tools) ? body.tools : [];
+  return tools.some((tool) => tool?.type === "namespace" || tool?.type === "custom") ||
+    input.some((item) => item?.type === "additional_tools" || item?.type === "custom_tool_call" ||
+      item?.type === "custom_tool_call_output" || (item?.type === "function_call" && item.namespace));
+}
+
+const CODEX_SHAPE_TERMS = /additional_tools|custom_tool_call|\bnamespace\b|[`"']custom[`"']|\bcustom\b(?= tool| item| variant)|type:?\s*custom\b/i;
+const SHAPE_REJECTION_TERMS = /unknown|unsupported|not supported|invalid|expected one of|deserializ|unrecognized/i;
+export function codexShapeRejected(status, text) {
+  return (status === 400 || status === 422) && CODEX_SHAPE_TERMS.test(text || "") && SHAPE_REJECTION_TERMS.test(text || "");
 }
 
 function writeJson(response, status, payload) {
@@ -2004,11 +2029,11 @@ export async function fetchModelUpstream(
     }
     const budget = budgetToolImages(outboundBodyObject);
     recordImageBudget(budget);
-    if (route.translate === "chat") {
+    const sendChat = async (chatRoute) => {
       // 只有 /chat/completions 的模型：本機轉譯成 Chat Completions，回應再轉回 Responses 事件。
       // 圖片預算先在 Responses 形狀上做，舊的工具截圖與其他路由用同一套規則縮減。
       const { request: chatRequest, freeform, toolTargets, compaction,
-        toolOutputsMerged, lateToolOutputs, placeholderToolResults } = toChatRequest(budget.request, route);
+        toolOutputsMerged, lateToolOutputs, placeholderToolResults } = toChatRequest(budget.request, chatRoute);
       stats.chatToolOutputsMerged += toolOutputsMerged;
       stats.chatLateToolOutputs += lateToolOutputs;
       stats.chatPlaceholderToolResults += placeholderToolResults;
@@ -2035,7 +2060,9 @@ export async function fetchModelUpstream(
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
       return translated;
-    }
+    };
+    if (route.translate === "chat") return sendChat(route);
+    if (chatFallbackRoutes.has(route.pickerSlug)) return sendChat({ ...route, translate: "chat" });
     outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {
       return oversizeResponse(outboundBody.length);
@@ -2049,6 +2076,24 @@ export async function fetchModelUpstream(
       { model: route.upstreamModel },
     );
     stats.lastCustomStatus = upstream.status;
+    if (upstream.status === 400 || upstream.status === 422) {
+      // 讀出錯誤內容才能判斷，也讓錯誤記錄寫出上游實際說了什麼。
+      const text = await upstream.text();
+      if (usesCodexToolShapes(budget.request) && codexShapeRejected(upstream.status, text)) {
+        chatFallbackRoutes.add(route.pickerSlug);
+        stats.codexShapeChatFallbacks += 1;
+        stats.lastCodexShapeChatFallback = { model: body?.model ?? null, provider: provider?.id ?? null, at: new Date().toISOString() };
+        return sendChat({ ...route, translate: "chat" });
+      }
+      const headers = new Headers(upstream.headers);
+      headers.delete("content-encoding");
+      headers.delete("content-length");
+      const rebuilt = new Response(text, { status: upstream.status, statusText: upstream.statusText, headers });
+      // 不記錄上游原文（可能帶到請求內容），只寫辨識出的原因。
+      recordUpstreamFailure(rebuilt, { transport: meta.transport, route: "custom", model: body?.model, provider,
+        detail: codexShapeRejected(upstream.status, text) ? "上游不接受 Codex 的工具格式（additional_tools、namespace 或 custom 工具）" : null });
+      return rebuilt;
+    }
     recordUpstreamFailure(upstream, { transport: meta.transport, route: "custom", model: body?.model, provider });
     return upstream;
   }

@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.34.2";
+const INSTALLER_VERSION = "1.34.3";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1445,6 +1445,37 @@ async function probeModel(apiRoot, apiKey, model, log = consoleProbeLog) {
   } catch (error) {
     log.line(`暫時不可用（${error instanceof Error ? error.message : String(error)}）`);
     return { supported: false, efforts: [], stripReasoning: false, transientEfforts, transient: true };
+  }
+}
+
+// Codex 實際送出的工具格式：input 裡的 additional_tools 項目、namespace 分組，以及 Code Mode
+// 的 custom（自由格式）工具 exec。簡單的文字探測測不出上游認不認得這些（例如 xAI 只收
+// function 工具），結果模型加進去後第一輪就 422。
+export const CODEX_TOOL_SHAPE_INPUT = [
+  { type: "additional_tools", role: "developer", tools: [{ type: "namespace", name: "functions", description: "Tools.", tools: [
+    { type: "custom", name: "exec", description: "Run code.", format: { type: "grammar", syntax: "lark", definition: "start: /[\\s\\S]+/" } },
+  ] }] },
+  { type: "message", role: "user", content: [{ type: "input_text", text: "Reply with exactly OK." }] },
+];
+
+// 回傳 "supported"、"unsupported"（上游拒收這些格式）或 "unknown"（這次問不到）。
+export async function probeCodexToolShapes(send, log = consoleProbeLog) {
+  log.write("  Codex 工具格式  ");
+  try {
+    const result = await send({ input: CODEX_TOOL_SHAPE_INPUT });
+    if (result.ok) {
+      log.line("支持");
+      return "supported";
+    }
+    if (result.status === 400 || result.status === 422) {
+      log.line(`不支持（HTTP ${result.status}）`);
+      return "unsupported";
+    }
+    log.line(`暫時無法確認（HTTP ${result.status}），先沿用 Responses`);
+    return "unknown";
+  } catch (error) {
+    log.line(`暫時無法確認（${error instanceof Error ? error.message : String(error)}），先沿用 Responses`);
+    return "unknown";
   }
 }
 
@@ -3485,27 +3516,27 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
   }
 
   const probe = await probeModel(discovery.apiRoot, apiKey, model, log);
+  const chatRouteFor = (chat) => ({
+    pickerSlug: pickerSlug(model, providerId),
+    upstreamModel: model,
+    displayName: withDefaultModelPrefix({ upstreamModel: model, providerId }).displayName || model,
+    providerHost: new URL(discovery.apiRoot).host,
+    ...(providerId !== DEFAULT_PROVIDER_ID ? { providerId } : {}),
+    efforts: chat.efforts,
+    stripReasoning: chat.efforts.length === 0,
+    contextWindow: null,
+    translate: "chat",
+    chatTools: chat.tools,
+    chatStreamOptions: chat.streamOptions,
+    ...fastFieldsFromProbe(chat.fastProbe),
+  });
   if (!probe.supported && !probe.transient) {
     // 只有 /chat/completions 的模型（DeepSeek、通義千問、GLM、Kimi、Ollama、vLLM 等）
     // 改走本機轉譯。
     log.line("  改探 Chat Completions（本機轉譯成 Codex 的 Responses 格式）");
     const chat = await probeChatModel(discovery.apiRoot, apiKey, model, log);
     if (chat.supported) {
-      const route = {
-        pickerSlug: pickerSlug(model, providerId),
-        upstreamModel: model,
-        displayName: withDefaultModelPrefix({ upstreamModel: model, providerId }).displayName || model,
-        providerHost: new URL(discovery.apiRoot).host,
-        ...(providerId !== DEFAULT_PROVIDER_ID ? { providerId } : {}),
-        efforts: chat.efforts,
-        stripReasoning: chat.efforts.length === 0,
-        contextWindow: null,
-        translate: "chat",
-        chatTools: chat.tools,
-        chatStreamOptions: chat.streamOptions,
-        ...fastFieldsFromProbe(chat.fastProbe),
-      };
-      return { route, transient: false, transientEfforts: [] };
+      return { route: chatRouteFor(chat), transient: false, transientEfforts: [] };
     }
     log.line(
       chat.transient
@@ -3523,6 +3554,14 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
     };
   }
   const probeEffort = probe.stripReasoning ? null : (probe.efforts.includes("low") ? "low" : probe.efforts[0] ?? null);
+  const shapes = await probeCodexToolShapes(
+    (extra) => testResponse(discovery.apiRoot, apiKey, model, probeEffort, extra), log);
+  if (shapes === "unsupported") {
+    log.line("  Responses 端點不接受 Codex 的工具格式，改探 Chat Completions（本機轉譯）");
+    const chat = await probeChatModel(discovery.apiRoot, apiKey, model, log);
+    if (chat.supported) return { route: chatRouteFor(chat), transient: false, transientEfforts: [] };
+    log.line("  Chat Completions 也不可用，沿用 Responses；帶工具的對話可能會被上游拒絕。");
+  }
   const fastProbe = await probeServiceTier(
     (tier) => testResponse(discovery.apiRoot, apiKey, model, probeEffort, { service_tier: tier }), log);
   const route = {

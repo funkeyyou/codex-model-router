@@ -1,6 +1,15 @@
 {
-  "latest": "1.34.2",
+  "latest": "1.34.3",
   "releases": [
+    {
+      "version": "1.34.3",
+      "date": "2026-10-19",
+      "changes": [
+        "修正：xAI（Grok）等 Responses 相容上游在 Codex 裡第一輪就 422（unknown item type \"additional_tools\"）。Codex 現在把工具放在 additional_tools 裡、用 namespace 分組，Code Mode 的 exec 又是自由格式工具；這些上游只接受一般 function 工具。路由器遇到這種拒絕時，這一輪自動改用 Chat Completions 轉譯重送，並記住這個模型，之後直接走 Chat。已經加好的 Grok 更新後就能用，不需要刪掉重加。",
+        "添加模型時，Responses 探測多送一個帶 Codex 實際工具格式的短請求；上游不接受、但 Chat Completions 可用時，直接設定為 Chat 轉譯。OpenAI 相容的中轉不受影響，仍走 Responses。",
+        "上游因為工具格式拒絕請求時，「最近的錯誤」會寫出原因，不再只顯示 HTTP 狀態碼。"
+      ]
+    },
     {
       "version": "1.34.2",
       "date": "2026-10-18",
