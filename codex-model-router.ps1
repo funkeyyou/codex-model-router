@@ -175,7 +175,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.34.3";
+const INSTALLER_VERSION = "1.34.4";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -198,7 +198,9 @@ const EFFORT_DESCRIPTIONS = {
 
 const env = process.env;
 const requestedAction = process.argv[2]?.toLowerCase() ?? null;
-const scriptPath = env.CODEX_MODEL_ROUTER_SCRIPT_PATH;
+// 外殼傳來的是 $0，照 README 執行 `bash codex-model-router.sh` 時只是相對路徑；背景管理程序
+// 由 launchd 啟動，工作目錄不同，相對路徑會找不到檔案。一開始就轉成絕對路徑。
+const scriptPath = env.CODEX_MODEL_ROUTER_SCRIPT_PATH ? resolve(env.CODEX_MODEL_ROUTER_SCRIPT_PATH) : undefined;
 const nodeBin = env.CODEX_MODEL_ROUTER_NODE_BIN;
 const homeDir = env.HOME || homedir();
 const codexHome = resolve(env.CODEX_HOME || join(homeDir, ".codex"));
