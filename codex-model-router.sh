@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.34.5";
+const INSTALLER_VERSION = "1.35.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5207,6 +5207,9 @@ async function update() {
   else if (previousCatalogPath) console.log("注意：保留了您自行設定的 model_catalog_json；該設定會停用啟動時同步模型清單。");
   console.log(`備份：${backupDir}`);
   if (serviceWarning) console.log(`\n注意：${serviceWarning}`);
+  try { migrateKeysmithGptOnly(); } catch (error) {
+    console.error(`Keysmith GPT-only migration: ${error.message}`);
+  }
   try { refreshRelayImagegen(); } catch (error) {
     console.error(`路由器已更新，中轉生圖技能保持原狀：${error.message}`);
   }
@@ -6723,6 +6726,7 @@ async function managerState() {
     providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     quotaMode: quotaModeStatus(),
+    keysmith: keysmithStatus(),
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
     imagegen,
@@ -8094,6 +8098,76 @@ async function managerImagegenSetup({ providerId, models } = {}) {
   };
 }
 
+// Optional request-time profiles. Fetch only pinned text; never run either upstream installer.
+export const KEYSMITH_SOURCES = [
+  { family: "gpt", repo: "codex-keysmith", commit: "cfcd96eb727c324ee8649170c43aaa632ff53cb3", path: "examples/gpt-overlay.md", sha256: "7d306ae69d831dad21ed54252b563e173877eeebc0bc92e81970849a7ab8ac4a" },
+  { family: null, repo: "codex-keysmith", commit: "cfcd96eb727c324ee8649170c43aaa632ff53cb3", path: "LICENSE",
+    sha256: "3606450b38624daef7664208bf1dfa1bc3d3a47fd0044bfece6b560d6b85ef05" },
+];
+
+export async function downloadKeysmithProfiles({ fetchImpl = fetchWithTimeout, sources = KEYSMITH_SOURCES } = {}) {
+  const prompts = { gpt: "" };
+  const licenses = {};
+  for (const source of sources) {
+    const url = `https://raw.githubusercontent.com/Jia-Ethan/${source.repo}/${source.commit}/${source.path}`;
+    const response = await fetchImpl(url, { redirect: "error" }, 15000);
+    if (!response.ok) throw new Error(`Keysmith HTTP ${response.status}`);
+    const text = await response.text();
+    if (!text.trim() || Buffer.byteLength(text) > 32000 || createHash("sha256").update(text).digest("hex") !== source.sha256) {
+      throw new Error("Keysmith SHA256 mismatch");
+    }
+    if (source.family) prompts[source.family] = [prompts[source.family], text].filter(Boolean).join("\n\n");
+    else licenses[source.repo] = text;
+  }
+  return { schema: 1, enabled: false, prompts, licenses, sources };
+}
+
+function keysmithStatus() {
+  try {
+    const config = JSON.parse(readFileSync(join(installRoot, "keysmith.json"), "utf8"));
+    return { enabled: config.enabled === true };
+  } catch { return { enabled: false }; }
+}
+
+export function migrateKeysmithGptOnly({ root = installRoot, backupRoot = backupsRoot } = {}) {
+  const path = join(root, "keysmith.json");
+  if (!existsSync(path)) return null;
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  const next = { ...config };
+  if (config.prompts && typeof config.prompts === "object") next.prompts = typeof config.prompts.gpt === "string" ? { gpt: config.prompts.gpt } : {};
+  if (Array.isArray(config.sources)) next.sources = config.sources.filter(source => source?.repo === "codex-keysmith");
+  if (config.licenses && typeof config.licenses === "object") next.licenses = config.licenses["codex-keysmith"] ? { "codex-keysmith": config.licenses["codex-keysmith"] } : {};
+  if (JSON.stringify(config) === JSON.stringify(next)) return null;
+  const backupDir = join(backupRoot, `keysmith-gpt-only-${timestamp()}-${randomUUID()}`);
+  ensureDirectory(backupDir);
+  if (!copyIfExists(path, join(backupDir, "keysmith.json"))) fail("Keysmith backup failed");
+  writeJsonAtomic(path, next);
+  return { backupDir, enabled: next.enabled === true };
+}
+
+export async function setKeysmithEnabled(enabled, { root = installRoot, backupRoot = backupsRoot, fetchImpl } = {}) {
+  if (typeof enabled !== "boolean") fail("Keysmith enabled must be boolean");
+  const path = join(root, "keysmith.json");
+  let previous = null;
+  if (existsSync(path)) previous = readFileSync(path, "utf8");
+  // Refresh only when enabling; failure leaves the old state untouched. Disabling works offline.
+  const config = enabled ? await downloadKeysmithProfiles({ fetchImpl }) : { schema: 1, enabled: false };
+  config.enabled = enabled;
+  if (previous !== null) {
+    const backupDir = join(backupRoot, `keysmith-${timestamp()}-${randomUUID()}`);
+    ensureDirectory(backupDir);
+    if (!copyIfExists(path, join(backupDir, "keysmith.json"))) fail("Keysmith backup failed");
+  }
+  writeJsonAtomic(path, config);
+  return { enabled };
+}
+
+async function managerSetKeysmith({ enabled } = {}) {
+  assertManagerWritable();
+  requireInstallation();
+  return setKeysmithEnabled(enabled);
+}
+
 async function managerImagegenDisable() {
   assertManagerWritable();
   const backup = disableRelayImagegen();
@@ -8320,6 +8394,7 @@ function managerOperations() {
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
       "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
+      "set-keysmith": job("Keysmith", managerSetKeysmith),
       "set-background-model": job("設定背景任務模型", managerSetBackgroundModel),
       "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
       "imagegen-setup": job("偵測並啟用中轉生圖", managerImagegenSetup),
@@ -8926,6 +9001,32 @@ import { toChatRequest, bridgeChatStream, isChatReasoning } from "./chat-bridge.
 const routerDirectory = dirname(fileURLToPath(import.meta.url));
 const settingsPath = join(routerDirectory, "settings.json");
 const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+// Kept outside conversation history and read per turn, so switching it off needs no service restart.
+const keysmithPath = join(routerDirectory, "keysmith.json");
+export function keysmithFamily(body, route = null) {
+  const model = String(route?.upstreamModel || body?.model || "").split("/").pop();
+  if (/^(?:gpt(?:-|$)|chatgpt(?:-|$)|o[134](?:-|$))/i.test(model)) return "gpt";
+  return null;
+}
+
+export function readKeysmithConfig(path = keysmithPath) {
+  try {
+    if (statSync(path).size > 64 * 1024) return null;
+    const config = JSON.parse(readFileSync(path, "utf8"));
+    if (config.enabled !== true || typeof config.prompts?.gpt !== "string") return null;
+    return config;
+  } catch { return null; }
+}
+
+export function applyKeysmith(body, route = null, config = readKeysmithConfig()) {
+  const family = keysmithFamily(body, route);
+  // Even legacy configs with a Claude profile may only affect GPT models.
+  const prompt = config?.enabled === true && family === "gpt" ? config.prompts?.gpt : null;
+  if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 32000) return body;
+  const personalized = prompt.replace(/^The operator is Ethan\. Address him as Ethan\.\r?\n?/m, "");
+  // Append instructions only; never rewrite tool calls, user messages or encrypted history.
+  return { ...body, instructions: [body.instructions, personalized].filter(value => typeof value === "string" && value).join("\n\n") };
+}
 const listenHost = "127.0.0.1";
 const listenPort = Number(settings.port);
 const officialBase = String(settings.officialBaseUrl).replace(/\/$/, "");
@@ -10857,6 +10958,7 @@ export async function fetchModelUpstream(
 
   // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
   effectiveBody = stripRouterImageArtifacts(effectiveBody);
+  effectiveBody = applyKeysmith(effectiveBody, route);
 
   let outboundBodyObject = isCustom
     ? rewriteCustomBody(effectiveBody, route)
@@ -12191,7 +12293,7 @@ async function tryUpstreamWebSocketTurn(
     const sanitized = stripRouterImageArtifacts(stripBridgeArtifacts({ input: outgoing.input }));
     outgoing.input = sanitized.input;
     outgoing.type = "response.create";
-    return outgoing;
+    return applyKeysmith(outgoing);
   };
 
   const forward = (event) => {
@@ -17286,6 +17388,13 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Model",
 "供應商": "Provider",
 "設定": "Set",
+"Keysmith": "Keysmith",
+"依模型套用 Keysmith 指令": "Apply Keysmith instructions by model",
+"只有 GPT 模型使用 codex-keysmith；Claude（含 CLI 訂閱）與其他模型不附加任何 Keysmith 指令。": "Only GPT models use codex-keysmith. Claude (including CLI subscriptions) and all other models receive no Keysmith instructions.",
+"預設關閉。首次開啟會從 GitHub 下載固定版本的提示詞並核對 SHA256，不執行外部安裝器，也不修改全域指令。": "Off by default. Enabling downloads pinned prompts from GitHub and verifies SHA256, without running external installers or changing global instructions.",
+"下一輪請求生效，不必重新啟動。關閉後停止附加，但不會移除先前回答或摘要中的影響；需要完全還原時請開新對話。": "Takes effect on the next request without restarting. Turning it off stops adding instructions, but cannot undo effects in earlier replies or summaries; start a new chat for a clean context.",
+"這是提示詞適配，並非原專案的完整安裝；模型仍可能拒答。已移除固定稱呼，保留原始輸出格式。": "This adapts the prompt rather than installing the full project; models may still refuse requests. The fixed name is removed and the original output format is retained.",
+"codex-keysmith 專案": "codex-keysmith project",
 "有新版本": "Update available",
 "有新版本，點擊查看": "Update available. Click for details",
 "版本資訊": "Version info",
@@ -19747,6 +19856,7 @@ function renderSettings() {
   return [
     pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
+    renderKeysmithPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
     renderDiagnosticsPanel(),
@@ -19842,6 +19952,33 @@ async function exportDiagnostics(mode) {
 
 // API Key 模式：和 Codex 官方的 API Key 登入相同，切成本機產生的 Key 讓第三方模型不必登入 ChatGPT 也能用，
 // 帳號額度用完、桌面版鎖住發送按鈕時也能照常發送。
+function renderKeysmithPanel(blocked) {
+  const on = state.keysmith && state.keysmith.enabled === true;
+  const title = t("依模型套用 Keysmith 指令");
+  const details = [
+    t("只有 GPT 模型使用 codex-keysmith；Claude（含 CLI 訂閱）與其他模型不附加任何 Keysmith 指令。"),
+    t("預設關閉。首次開啟會從 GitHub 下載固定版本的提示詞並核對 SHA256，不執行外部安裝器，也不修改全域指令。"),
+    t("下一輪請求生效，不必重新啟動。關閉後停止附加，但不會移除先前回答或摘要中的影響；需要完全還原時請開新對話。"),
+    t("這是提示詞適配，並非原專案的完整安裝；模型仍可能拒答。已移除固定稱呼，保留原始輸出格式。"),
+  ];
+  return h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("Keysmith") })),
+    h("div", { class: "panel-body setting-body" },
+      h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
+      ...details.map(text => paragraph(text, "muted")),
+      h("div", { class: "actions" },
+        h("a", { href: "https://github.com/Jia-Ethan/codex-keysmith", target: "_blank", rel: "noreferrer", text: t("codex-keysmith 專案") })),
+      h("label", { class: "check-line" },
+        h("input", { type: "checkbox", role: "switch", "aria-label": title, checked: on, disabled: blocked,
+          onchange: event => {
+            event.target.checked = on;
+            const enabled = !on;
+            if (!enabled) return runJob("set-keysmith", { enabled }, { title: t("Keysmith") });
+            confirmDialog({ title, confirmLabel: t("開啟"), body: details.map(text => paragraph(text)) })
+              .then(ok => { if (ok) runJob("set-keysmith", { enabled }, { title: t("Keysmith") }); });
+          } }), h("span", { text: title }))));
+}
+
 function renderQuotaModePanel(blocked) {
   const quota = state && state.installed ? state.quotaMode : null;
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
@@ -20062,6 +20199,7 @@ function jobTitle(type, fallback) {
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "set-quota-mode": t("切換 API Key 模式"),
+    "set-keysmith": t("Keysmith"),
     "set-background-model": t("設定背景任務模型"),
     "chatgpt-login": t("登入 ChatGPT 帳號"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),

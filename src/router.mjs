@@ -22,6 +22,32 @@ import { toChatRequest, bridgeChatStream, isChatReasoning } from "./chat-bridge.
 const routerDirectory = dirname(fileURLToPath(import.meta.url));
 const settingsPath = join(routerDirectory, "settings.json");
 const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+// Kept outside conversation history and read per turn, so switching it off needs no service restart.
+const keysmithPath = join(routerDirectory, "keysmith.json");
+export function keysmithFamily(body, route = null) {
+  const model = String(route?.upstreamModel || body?.model || "").split("/").pop();
+  if (/^(?:gpt(?:-|$)|chatgpt(?:-|$)|o[134](?:-|$))/i.test(model)) return "gpt";
+  return null;
+}
+
+export function readKeysmithConfig(path = keysmithPath) {
+  try {
+    if (statSync(path).size > 64 * 1024) return null;
+    const config = JSON.parse(readFileSync(path, "utf8"));
+    if (config.enabled !== true || typeof config.prompts?.gpt !== "string") return null;
+    return config;
+  } catch { return null; }
+}
+
+export function applyKeysmith(body, route = null, config = readKeysmithConfig()) {
+  const family = keysmithFamily(body, route);
+  // Even legacy configs with a Claude profile may only affect GPT models.
+  const prompt = config?.enabled === true && family === "gpt" ? config.prompts?.gpt : null;
+  if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 32000) return body;
+  const personalized = prompt.replace(/^The operator is Ethan\. Address him as Ethan\.\r?\n?/m, "");
+  // Append instructions only; never rewrite tool calls, user messages or encrypted history.
+  return { ...body, instructions: [body.instructions, personalized].filter(value => typeof value === "string" && value).join("\n\n") };
+}
 const listenHost = "127.0.0.1";
 const listenPort = Number(settings.port);
 const officialBase = String(settings.officialBaseUrl).replace(/\/$/, "");
@@ -1953,6 +1979,7 @@ export async function fetchModelUpstream(
 
   // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
   effectiveBody = stripRouterImageArtifacts(effectiveBody);
+  effectiveBody = applyKeysmith(effectiveBody, route);
 
   let outboundBodyObject = isCustom
     ? rewriteCustomBody(effectiveBody, route)
@@ -3287,7 +3314,7 @@ async function tryUpstreamWebSocketTurn(
     const sanitized = stripRouterImageArtifacts(stripBridgeArtifacts({ input: outgoing.input }));
     outgoing.input = sanitized.input;
     outgoing.type = "response.create";
-    return outgoing;
+    return applyKeysmith(outgoing);
   };
 
   const forward = (event) => {

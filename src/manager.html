@@ -384,6 +384,13 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Model",
 "供應商": "Provider",
 "設定": "Set",
+"Keysmith": "Keysmith",
+"依模型套用 Keysmith 指令": "Apply Keysmith instructions by model",
+"只有 GPT 模型使用 codex-keysmith；Claude（含 CLI 訂閱）與其他模型不附加任何 Keysmith 指令。": "Only GPT models use codex-keysmith. Claude (including CLI subscriptions) and all other models receive no Keysmith instructions.",
+"預設關閉。首次開啟會從 GitHub 下載固定版本的提示詞並核對 SHA256，不執行外部安裝器，也不修改全域指令。": "Off by default. Enabling downloads pinned prompts from GitHub and verifies SHA256, without running external installers or changing global instructions.",
+"下一輪請求生效，不必重新啟動。關閉後停止附加，但不會移除先前回答或摘要中的影響；需要完全還原時請開新對話。": "Takes effect on the next request without restarting. Turning it off stops adding instructions, but cannot undo effects in earlier replies or summaries; start a new chat for a clean context.",
+"這是提示詞適配，並非原專案的完整安裝；模型仍可能拒答。已移除固定稱呼，保留原始輸出格式。": "This adapts the prompt rather than installing the full project; models may still refuse requests. The fixed name is removed and the original output format is retained.",
+"codex-keysmith 專案": "codex-keysmith project",
 "有新版本": "Update available",
 "有新版本，點擊查看": "Update available. Click for details",
 "版本資訊": "Version info",
@@ -2845,6 +2852,7 @@ function renderSettings() {
   return [
     pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
+    renderKeysmithPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
     renderDiagnosticsPanel(),
@@ -2940,6 +2948,33 @@ async function exportDiagnostics(mode) {
 
 // API Key 模式：和 Codex 官方的 API Key 登入相同，切成本機產生的 Key 讓第三方模型不必登入 ChatGPT 也能用，
 // 帳號額度用完、桌面版鎖住發送按鈕時也能照常發送。
+function renderKeysmithPanel(blocked) {
+  const on = state.keysmith && state.keysmith.enabled === true;
+  const title = t("依模型套用 Keysmith 指令");
+  const details = [
+    t("只有 GPT 模型使用 codex-keysmith；Claude（含 CLI 訂閱）與其他模型不附加任何 Keysmith 指令。"),
+    t("預設關閉。首次開啟會從 GitHub 下載固定版本的提示詞並核對 SHA256，不執行外部安裝器，也不修改全域指令。"),
+    t("下一輪請求生效，不必重新啟動。關閉後停止附加，但不會移除先前回答或摘要中的影響；需要完全還原時請開新對話。"),
+    t("這是提示詞適配，並非原專案的完整安裝；模型仍可能拒答。已移除固定稱呼，保留原始輸出格式。"),
+  ];
+  return h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("Keysmith") })),
+    h("div", { class: "panel-body setting-body" },
+      h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
+      ...details.map(text => paragraph(text, "muted")),
+      h("div", { class: "actions" },
+        h("a", { href: "https://github.com/Jia-Ethan/codex-keysmith", target: "_blank", rel: "noreferrer", text: t("codex-keysmith 專案") })),
+      h("label", { class: "check-line" },
+        h("input", { type: "checkbox", role: "switch", "aria-label": title, checked: on, disabled: blocked,
+          onchange: event => {
+            event.target.checked = on;
+            const enabled = !on;
+            if (!enabled) return runJob("set-keysmith", { enabled }, { title: t("Keysmith") });
+            confirmDialog({ title, confirmLabel: t("開啟"), body: details.map(text => paragraph(text)) })
+              .then(ok => { if (ok) runJob("set-keysmith", { enabled }, { title: t("Keysmith") }); });
+          } }), h("span", { text: title }))));
+}
+
 function renderQuotaModePanel(blocked) {
   const quota = state && state.installed ? state.quotaMode : null;
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
@@ -3160,6 +3195,7 @@ function jobTitle(type, fallback) {
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "set-quota-mode": t("切換 API Key 模式"),
+    "set-keysmith": t("Keysmith"),
     "set-background-model": t("設定背景任務模型"),
     "chatgpt-login": t("登入 ChatGPT 帳號"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
