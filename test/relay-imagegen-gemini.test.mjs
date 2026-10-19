@@ -110,7 +110,7 @@ test("命令：舊版路由器（健康檢查沒有 geminiImageRequests）時不
   const f = commandFixture(t, { [banana]: "gemini" });
   let sent = 0;
   await assert.rejects(imagegen.runRelayImagegen(["generate", "--prompt", "貓", "--out", join(f.dir, "a.png")], { configPath: f.configPath,
-    fetchImpl: async (url) => { if (String(url).endsWith("/healthz")) return Response.json({ status: "ok", stats: { imageRequests: 0 } }); sent++; } }), /update/);
+    fetchImpl: async (url) => { if (String(url).endsWith("/healthz")) return Response.json({ status: "ok", stats: { imageRequests: 0 } }); sent++; } }), /更新路由器/);
   assert.equal(sent, 0);
 });
 

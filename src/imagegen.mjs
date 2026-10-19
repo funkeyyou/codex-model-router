@@ -448,6 +448,22 @@ async function discoverGptImages({ candidates, onProbe = () => {}, ...options } 
   return { apiMode: null, models: [], checks };
 }
 
+// 連不到本機路由器時，最常見的原因是 Codex 沙盒封鎖網路（連 127.0.0.1 也擋）；
+// 其次才是路由器沒在執行。錯誤訊息要讓 AI 知道可以申請提升權限重跑，也讓使用者知道怎麼改設定。
+export const SANDBOX_NETWORK_HINT = "若是 Codex 沙盒擋住網路（未使用「完整存取權」時預設如此）：AI 可以申請提升權限（核准）重跑同一個命令；" +
+  "或請使用者把 Codex 的權限切到「完整存取權」，或改用「代我核准」讓提升權限的請求自動審核，然後重試。";
+export const ROUTER_OUTDATED_MESSAGE = "本機路由器有回應，但版本不支援這個生圖介面；請從路由器管理頁更新路由器後重試。沒有送出生圖請求。";
+
+export function routerUnreachableMessage(error, port) {
+  const code = error?.cause?.code || error?.code;
+  if (code === "ECONNREFUSED") {
+    return `連不上本機路由器（127.0.0.1:${port} 拒絕連線），沒有送出生圖請求。路由器可能沒在執行：請從管理頁啟動或重開路由器。` +
+      `若確定路由器正在執行，${SANDBOX_NETWORK_HINT}`;
+  }
+  return `連不上本機路由器（127.0.0.1:${port}${code ? `，${code}` : ""}），沒有送出生圖請求。最常見的原因是 Codex 沙盒封鎖了網路。` +
+    `${SANDBOX_NETWORK_HINT}若已是完整存取權仍失敗，請從管理頁確認路由器正在執行。`;
+}
+
 export async function runRelayImagegen(args, {
   configPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "config.json"),
   fetchImpl = globalThis.fetch,
@@ -531,13 +547,16 @@ export async function runRelayImagegen(args, {
   if (options.dryRun) return { dryRun: true, model, upstreamModel, apiMode, endpoint, out, inputImages: inputs.length };
   mkdirSync(dirname(out), { recursive: true });
   let health;
+  let healthResponse;
   try {
-    const response = await fetchImpl(`${origin}/healthz`, { signal: AbortSignal.timeout(5000), redirect: "error" });
-    health = await response.json();
-    if (!response.ok || health?.status !== "ok" || typeof health.stats?.imageRequests !== "number" ||
+    healthResponse = await fetchImpl(`${origin}/healthz`, { signal: AbortSignal.timeout(5000), redirect: "error" });
+  } catch (error) { throw new Error(routerUnreachableMessage(error, port)); }
+  try {
+    health = await healthResponse.json();
+    if (!healthResponse.ok || health?.status !== "ok" || typeof health.stats?.imageRequests !== "number" ||
         (apiMode === "ark-task" && typeof health.stats?.arkImageRequests !== "number") ||
         (nativeGemini && typeof health.stats?.geminiImageRequests !== "number")) throw new Error("health");
-  } catch { throw new Error("本機圖片路由不可用；請從路由器選單檢查狀態或執行 update，沒有送出生圖請求。"); }
+  } catch { throw new Error(ROUTER_OUTDATED_MESSAGE); }
   if (nativeGemini) {
     const headers = { "content-type": "application/json", ...providerHeaders };
     const signal = AbortSignal.timeout(timeout * 1000);

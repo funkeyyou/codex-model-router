@@ -195,7 +195,7 @@ test("舊路由器未支援 Ark 時在付費提交前提示 update", async (t) =
   let calls = 0;
   await assert.rejects(imagegen.runRelayImagegen(f.args, { configPath: f.config, fetchImpl: async (url) => {
     calls++; assert.ok(url.endsWith("/healthz")); return Response.json({ status: "ok", stats: { imageRequests: 0 } });
-  } }), /update.*沒有送出/);
+  } }), /更新路由器.*沒有送出/);
   assert.equal(calls, 1);
 });
 

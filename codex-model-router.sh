@@ -106,7 +106,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.34.4";
+const INSTALLER_VERSION = "1.34.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5415,6 +5415,11 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
     `${command} generate --model MODEL --prompt-file 'prompt.txt' --out 'output.png'`,
     `${command} edit --model MODEL --prompt-file 'prompt.txt' --image 'reference.png' --out 'output-v2.png'`,
     "```", "",
+    "## 權限", "",
+    "generate 與 edit 會連到 127.0.0.1 的本機路由器。Codex 沙盒在非「完整存取權」時會封鎖網路，連本機也擋；list 與 --dry-run 不連網，不受影響。",
+    "目前若在沙盒中且網路受限，直接以提升權限執行 generate／edit（申請核准，理由寫「連本機路由器生圖」），不要先在沙盒裡試一次。",
+    "命令回報「連不上本機路由器」時，先以提升權限重跑同一個命令；無法申請提升權限時，告訴使用者：把 Codex 權限切到「完整存取權」，或改用「代我核准」讓提升權限的請求自動審核，然後重試。",
+    "這類失敗發生在送出生圖請求之前，重跑不會重複計費。", "",
     "--image 可重複提供；--quality 支援 auto、low、medium、high，兩個 2.5 模型另支援 xhigh、max。",
     "--size 可用 auto 或 WIDTHxHEIGHT；--background 可用 auto、opaque、transparent；--output-format 可用 png、jpeg、webp。",
     "list 回傳 apiMode=ark-task 時，使用已偵測到的 Ark 任務介面：size、quality 保持 auto，background 只能 auto 或 opaque。命令會省略不支援的欄位、以 JSON 傳送參考圖、查詢任務並下載結果；不要自行取得 API Key。",
@@ -15741,6 +15746,22 @@ async function discoverGptImages({ candidates, onProbe = () => {}, ...options } 
   return { apiMode: null, models: [], checks };
 }
 
+// 連不到本機路由器時，最常見的原因是 Codex 沙盒封鎖網路（連 127.0.0.1 也擋）；
+// 其次才是路由器沒在執行。錯誤訊息要讓 AI 知道可以申請提升權限重跑，也讓使用者知道怎麼改設定。
+export const SANDBOX_NETWORK_HINT = "若是 Codex 沙盒擋住網路（未使用「完整存取權」時預設如此）：AI 可以申請提升權限（核准）重跑同一個命令；" +
+  "或請使用者把 Codex 的權限切到「完整存取權」，或改用「代我核准」讓提升權限的請求自動審核，然後重試。";
+export const ROUTER_OUTDATED_MESSAGE = "本機路由器有回應，但版本不支援這個生圖介面；請從路由器管理頁更新路由器後重試。沒有送出生圖請求。";
+
+export function routerUnreachableMessage(error, port) {
+  const code = error?.cause?.code || error?.code;
+  if (code === "ECONNREFUSED") {
+    return `連不上本機路由器（127.0.0.1:${port} 拒絕連線），沒有送出生圖請求。路由器可能沒在執行：請從管理頁啟動或重開路由器。` +
+      `若確定路由器正在執行，${SANDBOX_NETWORK_HINT}`;
+  }
+  return `連不上本機路由器（127.0.0.1:${port}${code ? `，${code}` : ""}），沒有送出生圖請求。最常見的原因是 Codex 沙盒封鎖了網路。` +
+    `${SANDBOX_NETWORK_HINT}若已是完整存取權仍失敗，請從管理頁確認路由器正在執行。`;
+}
+
 export async function runRelayImagegen(args, {
   configPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "config.json"),
   fetchImpl = globalThis.fetch,
@@ -15824,13 +15845,16 @@ export async function runRelayImagegen(args, {
   if (options.dryRun) return { dryRun: true, model, upstreamModel, apiMode, endpoint, out, inputImages: inputs.length };
   mkdirSync(dirname(out), { recursive: true });
   let health;
+  let healthResponse;
   try {
-    const response = await fetchImpl(`${origin}/healthz`, { signal: AbortSignal.timeout(5000), redirect: "error" });
-    health = await response.json();
-    if (!response.ok || health?.status !== "ok" || typeof health.stats?.imageRequests !== "number" ||
+    healthResponse = await fetchImpl(`${origin}/healthz`, { signal: AbortSignal.timeout(5000), redirect: "error" });
+  } catch (error) { throw new Error(routerUnreachableMessage(error, port)); }
+  try {
+    health = await healthResponse.json();
+    if (!healthResponse.ok || health?.status !== "ok" || typeof health.stats?.imageRequests !== "number" ||
         (apiMode === "ark-task" && typeof health.stats?.arkImageRequests !== "number") ||
         (nativeGemini && typeof health.stats?.geminiImageRequests !== "number")) throw new Error("health");
-  } catch { throw new Error("本機圖片路由不可用；請從路由器選單檢查狀態或執行 update，沒有送出生圖請求。"); }
+  } catch { throw new Error(ROUTER_OUTDATED_MESSAGE); }
   if (nativeGemini) {
     const headers = { "content-type": "application/json", ...providerHeaders };
     const signal = AbortSignal.timeout(timeout * 1000);
@@ -17948,8 +17972,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",

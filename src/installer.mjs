@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.34.4";
+const INSTALLER_VERSION = "1.34.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5337,6 +5337,11 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
     `${command} generate --model MODEL --prompt-file 'prompt.txt' --out 'output.png'`,
     `${command} edit --model MODEL --prompt-file 'prompt.txt' --image 'reference.png' --out 'output-v2.png'`,
     "```", "",
+    "## 權限", "",
+    "generate 與 edit 會連到 127.0.0.1 的本機路由器。Codex 沙盒在非「完整存取權」時會封鎖網路，連本機也擋；list 與 --dry-run 不連網，不受影響。",
+    "目前若在沙盒中且網路受限，直接以提升權限執行 generate／edit（申請核准，理由寫「連本機路由器生圖」），不要先在沙盒裡試一次。",
+    "命令回報「連不上本機路由器」時，先以提升權限重跑同一個命令；無法申請提升權限時，告訴使用者：把 Codex 權限切到「完整存取權」，或改用「代我核准」讓提升權限的請求自動審核，然後重試。",
+    "這類失敗發生在送出生圖請求之前，重跑不會重複計費。", "",
     "--image 可重複提供；--quality 支援 auto、low、medium、high，兩個 2.5 模型另支援 xhigh、max。",
     "--size 可用 auto 或 WIDTHxHEIGHT；--background 可用 auto、opaque、transparent；--output-format 可用 png、jpeg、webp。",
     "list 回傳 apiMode=ark-task 時，使用已偵測到的 Ark 任務介面：size、quality 保持 auto，background 只能 auto 或 opaque。命令會省略不支援的欄位、以 JSON 傳送參考圖、查詢任務並下載結果；不要自行取得 API Key。",
