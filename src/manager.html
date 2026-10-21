@@ -222,6 +222,16 @@ input::placeholder { color: #4b5b75; }
 input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7); box-shadow: 0 0 0 3px rgba(56, 189, 248, .15); }
 .button:focus-visible, .nav-item:focus-visible, .icon-button:focus-visible, .version-badge:focus-visible, .link-button:focus-visible, .type-option:focus-visible { outline: 2px solid rgba(56, 189, 248, .65); outline-offset: 2px; }
 .check-list { border: 1px solid var(--border); border-radius: 10px; max-height: 330px; overflow: auto; background: #0e1629; }
+.session-row { width: 100%; border: 0; border-bottom: 1px solid var(--border); background: transparent; color: inherit; padding: 12px 14px; text-align: left; cursor: pointer; }
+.session-row:last-child { border-bottom: 0; }
+.session-row:hover { background: rgba(255,255,255,.035); }
+.session-row-title { font-weight: 650; margin-bottom: 4px; }
+.session-row-meta { color: var(--muted); font-size: 12px; }
+.diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.diff-pane { min-width: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: #0b1220; }
+.diff-label { padding: 7px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 650; }
+.diff-text { margin: 0; padding: 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word; font: inherit; font-size: 13px; }
+@media (max-width: 720px) { .diff-grid { grid-template-columns: 1fr; } }
 .check-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .check-row:last-child { border-bottom: 0; }
 .check-row:hover { background: #121d35; }
@@ -392,6 +402,43 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。": "Other models may not work properly while enabled, especially Claude (including CLI subscriptions). Turn this feature off before using those models.",
 "已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。": "The fixed name is removed and the original output format is retained. Models may still refuse requests.",
 "codex-keysmith 專案": "codex-keysmith project",
+"會話清理": "Session cleaner",
+"掃描歷史會話中的拒絕回覆，批次改寫助手訊息並移除 Reasoning／Thinking 紀錄。": "Scan historical chats for refusal responses, batch-rewrite assistant messages, and remove Reasoning/Thinking records.",
+"套用前會顯示逐項差異並建立完整備份；同時同步 Codex 桌面端的會話投影。進行中的會話不允許修改。": "Shows every change and creates a complete backup before applying it, while syncing the Codex desktop chat projection. Active chats cannot be modified.",
+"管理歷史會話": "Manage chat history",
+"修改前": "Before",
+"修改後（安全兜底）": "After (safe fallback)",
+"修改後": "After",
+"正在掃描最近的會話…": "Scanning recent chats…",
+"找不到可讀取的歷史會話。": "No readable chat history was found.",
+"只顯示最近的會話。選擇後可以預覽偵測結果、改寫全部或部分拒絕回覆，並清除推理紀錄。": "Only recent chats are shown. Select one to preview detections, rewrite all or selected refusals, and clear reasoning records.",
+"{time} · 拒絕 {refusals} · 助手回覆 {messages} · 推理 {reasoning}": "{time} · refusals {refusals} · assistant messages {messages} · reasoning {reasoning}",
+"正在讀取會話…": "Loading chat…",
+"明確拒絕": "Strong refusal",
+"疑似拒絕": "Possible refusal",
+"沒有偵測到拒絕回覆；仍可單獨移除推理紀錄。": "No refusal response was detected; reasoning records can still be removed on their own.",
+"兩級偵測只選出可能的拒絕回覆；套用前仍會顯示完整差異。": "Two-stage detection only selects possible refusal responses; the full diff is still shown before changes are applied.",
+"移除這個會話的推理紀錄（{count} 筆）": "Remove reasoning records from this chat ({count})",
+"使用既有供應商模型依對話脈絡改寫": "Rewrite from chat context using an existing provider model",
+"AI 改寫模型": "AI rewrite model",
+"AI 預覽會呼叫所選供應商，可能產生少量費用；失敗或問號亂碼會自動改用安全兜底文字。": "AI preview calls the selected provider and may incur a small charge. Failures or question-mark mojibake automatically use the safe fallback text.",
+"目前沒有可用的 OpenAI 相容模型，將使用安全兜底文字。": "No compatible OpenAI model is available. Safe fallback text will be used.",
+"找到 {count} 份可還原備份。": "Found {count} restorable backups.",
+"還原備份": "Restore backup",
+"請至少選擇一項變更。": "Select at least one change.",
+"AI 改寫預覽": "AI rewrite preview",
+"將移除 {count} 筆 Reasoning／Thinking 紀錄。": "This will remove {count} Reasoning/Thinking records.",
+"確認會話變更": "Confirm chat changes",
+"建立備份並套用": "Back up and apply",
+"清理會話": "Clean chat",
+"返回": "Back",
+"預覽變更": "Preview changes",
+"還原會話備份": "Restore chat backup",
+"還原會覆蓋目前的清理結果；如果會話在清理後又有新內容，系統會拒絕覆寫。": "Restoring overwrites the current cleaning result. The restore is rejected if the chat has new unmanaged content after cleaning.",
+"將還原 {time} 建立的備份。": "Restore the backup created at {time}.",
+"還原會話": "Restore chat",
+"改寫 {replaced} · 移除推理 {reasoning}{restored}": "rewritten {replaced} · reasoning removed {reasoning}{restored}",
+" · 曾還原": " · previously restored",
 "有新版本": "Update available",
 "有新版本，點擊查看": "Update available. Click for details",
 "版本資訊": "Version info",
@@ -1078,8 +1125,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝给统绑经维网缀紧绪线编缓缩总绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幫幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕絡給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脈脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧帮几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝络给统绑经维网缀紧绪线编缓缩总绘继续义联声听脉脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -1371,6 +1418,7 @@ const ICONS = {
   key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 8.5-8.5"/><path d="m17 6 2.5 2.5M14.5 8.5 16.5 10.5"/>',
   power: '<path d="M12 3.5v8"/><path d="M6.6 6.6a7.5 7.5 0 1 0 10.8 0"/>',
   restart: '<path d="M20 12a8 8 0 1 1-2.4-5.7L20 8.6"/><path d="M20 4v4.6h-4.6"/>',
+  undo: '<path d="M9 7 4 12l5 5"/><path d="M4 12h9a6 6 0 0 1 6 6"/>',
   close: '<path d="M6 6l12 12M18 6 6 18"/>',
   alert: '<path d="M12 9.5v4"/><path d="M12 17h.01"/><path d="M10.3 4 2.7 17.2A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-2.8L13.7 4a2 2 0 0 0-3.4 0Z"/>',
   info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5"/><path d="M12 7.6h.01"/>',
@@ -2854,6 +2902,7 @@ function renderSettings() {
     pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
     renderKeysmithPanel(blocked),
+    renderSessionCleanerPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
     renderDiagnosticsPanel(),
@@ -2975,6 +3024,131 @@ function renderKeysmithPanel(blocked) {
             confirmDialog({ title, confirmLabel: t("開啟"), body: details.map(text => paragraph(text)) })
               .then(ok => { if (ok) runJob("set-keysmith", { enabled }, { title: t("Keysmith") }); });
           } }), h("span", { text: title }))));
+}
+
+function renderSessionCleanerPanel(blocked) {
+  return h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("會話清理") })),
+    h("div", { class: "panel-body setting-body" },
+      paragraph(t("掃描歷史會話中的拒絕回覆，批次改寫助手訊息並移除 Reasoning／Thinking 紀錄。"), "muted"),
+      paragraph(t("套用前會顯示逐項差異並建立完整備份；同時同步 Codex 桌面端的會話投影。進行中的會話不允許修改。"), "note"),
+      h("div", { class: "actions" },
+        h("button", { type: "button", class: "button primary", disabled: blocked, onclick: openSessionCleaner },
+          icon("edit"), t("管理歷史會話")))));
+}
+
+async function sessionCleanerQuery(params = {}) {
+  return api("/api/query", { method: "POST", body: { type: "session-cleaner", params } });
+}
+
+function sessionDiff(before, after, fallback = false) {
+  return h("div", { class: "diff-grid" },
+    h("div", { class: "diff-pane" }, h("div", { class: "diff-label", text: t("修改前") }), h("pre", { class: "diff-text", text: before })),
+    h("div", { class: "diff-pane" }, h("div", { class: "diff-label", text: fallback ? t("修改後（安全兜底）") : t("修改後") }),
+      h("pre", { class: "diff-text", text: after })));
+}
+
+async function openSessionCleaner() {
+  const modal = openModal({ title: t("會話清理"), wide: true, body: h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("正在掃描最近的會話…")) });
+  modal.setFoot(h("button", { type: "button", class: "button", text: t("關閉"), onclick: () => modal.close() }));
+  let overview;
+  try { overview = await sessionCleanerQuery(); }
+  catch (error) { modal.setBody(paragraph(error.message, "note warn")); return; }
+  const sessions = overview.sessions || [];
+  if (!sessions.length) {
+    modal.setBody(h("div", { class: "empty", text: t("找不到可讀取的歷史會話。") }));
+    return;
+  }
+  const showList = () => {
+    const rows = sessions.map((session) => h("button", {
+      type: "button", class: "session-row", onclick: () => showSession(session.path),
+    },
+    h("div", { class: "session-row-title", text: session.title || session.path }),
+    h("div", { class: "session-row-meta", text: t("{time} · 拒絕 {refusals} · 助手回覆 {messages} · 推理 {reasoning}", {
+      time: formatTime(session.modifiedAt), refusals: session.refusalCount,
+      messages: session.assistantCount, reasoning: session.reasoningCount,
+    }) })));
+    modal.setTitle(t("會話清理"));
+    modal.setBody(
+      paragraph(t("只顯示最近的會話。選擇後可以預覽偵測結果、改寫全部或部分拒絕回覆，並清除推理紀錄。"), "muted"),
+      h("div", { class: "check-list" }, rows));
+    modal.setFoot(h("span", { class: "grow" }),
+      h("button", { type: "button", class: "button", text: t("關閉"), onclick: () => modal.close() }));
+  };
+  const showSession = async (path) => {
+    modal.setBody(h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("正在讀取會話…")));
+    let detail;
+    try { detail = await sessionCleanerQuery({ session: path }); }
+    catch (error) { modal.setBody(paragraph(error.message, "note warn")); return; }
+    const session = detail.session;
+    const refusals = (session.messages || []).filter((message) => message.refusal);
+    const selected = new Set(refusals.map((message) => message.key));
+    const removeReasoning = h("input", { type: "checkbox", checked: session.reasoningCount + session.thinkingBlockCount > 0 });
+    const useAi = h("input", { type: "checkbox", checked: (detail.models || []).length > 0, disabled: (detail.models || []).length === 0 });
+    const model = h("select", { disabled: !useAi.checked }, (detail.models || []).map((item) =>
+      h("option", { value: item.slug, text: item.name + " · " + item.providerId })));
+    useAi.addEventListener("change", () => { model.disabled = !useAi.checked; });
+    const selectionList = h("div", { class: "check-list" }, refusals.length ? refusals.map((message) => {
+      const box = h("input", { type: "checkbox", checked: true });
+      box.addEventListener("change", () => box.checked ? selected.add(message.key) : selected.delete(message.key));
+      return h("label", { class: "check-row option-row" }, box,
+        h("div", { class: "pick-text" }, h("div", { class: "model-name" },
+          h("span", { text: message.refusal === "strong" ? t("明確拒絕") : t("疑似拒絕") }),
+          message.id ? h("span", { class: "faint mono", text: message.id }) : null),
+        h("div", { class: "note", text: message.text.slice(0, 300) })));
+    }) : h("div", { class: "empty", text: t("沒有偵測到拒絕回覆；仍可單獨移除推理紀錄。") }));
+    const backups = detail.backups || [];
+    modal.setTitle(session.title || t("會話清理"));
+    modal.setBody(
+      paragraph(t("兩級偵測只選出可能的拒絕回覆；套用前仍會顯示完整差異。"), "muted"),
+      selectionList,
+      h("label", { class: "check-line" }, removeReasoning,
+        h("span", { text: t("移除這個會話的推理紀錄（{count} 筆）", { count: session.reasoningCount + session.thinkingBlockCount }) })),
+      h("label", { class: "check-line" }, useAi, h("span", { text: t("使用既有供應商模型依對話脈絡改寫") })),
+      h("label", { class: "field" }, h("span", { text: t("AI 改寫模型") }), model,
+        h("span", { class: "hint", text: (detail.models || []).length ? t("AI 預覽會呼叫所選供應商，可能產生少量費用；失敗或問號亂碼會自動改用安全兜底文字。")
+          : t("目前沒有可用的 OpenAI 相容模型，將使用安全兜底文字。") })),
+      backups.length ? h("div", { class: "actions" }, h("span", { class: "note", text: t("找到 {count} 份可還原備份。", { count: backups.length }) }),
+        h("button", { type: "button", class: "button", onclick: () => openSessionRestore(session, backups, modal) }, icon("undo"), t("還原備份"))) : null);
+    const preview = async () => {
+      const keys = [...selected];
+      if (!keys.length && !removeReasoning.checked) { toast(t("請至少選擇一項變更。"), "error"); return; }
+      let replacements = keys.map((key) => ({ key, before: refusals.find((item) => item.key === key)?.text || "", text: detail.fallback, fallback: true }));
+      if (keys.length && useAi.checked) {
+        const view = await runJob("session-cleaner-preview", { session: session.path, expectedHash: session.hash, keys, modelSlug: model.value }, { title: t("AI 改寫預覽") });
+        if (!view || view.status !== "succeeded") return;
+        replacements = view.result.replacements || [];
+      }
+      const changes = [
+        ...replacements.map((item) => sessionDiff(item.before, item.text, item.fallback)),
+        removeReasoning.checked ? banner("warn", "trash", t("將移除 {count} 筆 Reasoning／Thinking 紀錄。", { count: session.reasoningCount + session.thinkingBlockCount })) : null,
+      ].filter(Boolean);
+      const ok = await confirmDialog({ title: t("確認會話變更"), danger: true, confirmLabel: t("建立備份並套用"), body: changes });
+      if (!ok) return;
+      const view = await runJob("session-cleaner-apply", { session: session.path, expectedHash: session.hash,
+        replacements: replacements.map((item) => ({ key: item.key, text: item.text })), removeReasoning: removeReasoning.checked }, { title: t("清理會話") });
+      if (view?.status === "succeeded") modal.close();
+    };
+    modal.setFoot(h("button", { type: "button", class: "button", text: t("返回"), onclick: showList }), h("span", { class: "grow" }),
+      h("button", { type: "button", class: "button primary", text: t("預覽變更"), onclick: preview }));
+  };
+  showList();
+}
+
+function openSessionRestore(session, backups, parentModal) {
+  const modal = openModal({ title: t("還原會話備份"), body: [
+    paragraph(t("還原會覆蓋目前的清理結果；如果會話在清理後又有新內容，系統會拒絕覆寫。"), "note warn"),
+    h("div", { class: "check-list" }, backups.map((backup) => h("button", { type: "button", class: "session-row", onclick: async () => {
+      const ok = await confirmDialog({ title: t("還原會話備份"), danger: true, confirmLabel: t("還原"),
+        body: paragraph(t("將還原 {time} 建立的備份。", { time: formatTime(backup.createdAt) })) });
+      if (!ok) return;
+      const view = await runJob("session-cleaner-restore", { backupId: backup.id }, { title: t("還原會話") });
+      if (view?.status === "succeeded") { modal.close(); parentModal.close(); }
+    } }, h("div", { class: "session-row-title", text: formatTime(backup.createdAt) }),
+    h("div", { class: "session-row-meta", text: t("改寫 {replaced} · 移除推理 {reasoning}{restored}", {
+      replaced: backup.replaced, reasoning: backup.removedReasoning, restored: backup.restoredAt ? t(" · 曾還原") : "" }) }))))
+  ] });
+  modal.setFoot(h("button", { type: "button", class: "button", text: t("關閉"), onclick: () => modal.close() }));
 }
 
 function renderQuotaModePanel(blocked) {
@@ -3198,6 +3372,8 @@ function jobTitle(type, fallback) {
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "set-quota-mode": t("切換 API Key 模式"),
     "set-keysmith": t("Keysmith"),
+    "session-cleaner-preview": t("AI 改寫預覽"), "session-cleaner-apply": t("清理會話"),
+    "session-cleaner-restore": t("還原會話"),
     "set-background-model": t("設定背景任務模型"),
     "chatgpt-login": t("登入 ChatGPT 帳號"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),

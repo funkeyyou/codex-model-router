@@ -92,6 +92,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 - [疑難排解與健康檢查](docs/troubleshooting.zh-TW.md)
 - [Claude Code 訂閱路由](docs/claude-cli-experimental.md)
 - [Keysmith 全域開關](docs/keysmith.md)：原版全域指令載入；使用 Claude 等其他模型前請先關閉
+- [會話清理](docs/session-cleaner.md)：批次改寫歷史拒絕回覆、移除推理紀錄、同步桌面投影並備份還原
 - [開發與發布](docs/development.zh-TW.md)
 - [版本更新內容](https://github.com/funkeyyou/codex-model-router/releases)
 
