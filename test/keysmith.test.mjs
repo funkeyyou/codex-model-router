@@ -119,7 +119,12 @@ test("real Codex config RPC adopts original, toggles off, and preserves unrelate
     import { readFileSync } from 'node:fs';
     const installer = await import(${JSON.stringify(pathToFileURL(join(dir, "installer.mjs")).href)});
     const before = await installer.keysmithStatus();
-    assert.equal(before.external, true, JSON.stringify(before));
+    if (!before.external) {
+      const raw = await installer.codexRpc('config/read', { includeLayers: true, cwd: null });
+      const layers = raw.layers?.map(layer => ({ name: layer.name, instructions: layer.config?.model_instructions_file }));
+      assert.fail(JSON.stringify({ before, layers, home: process.env.CODEX_HOME,
+        direct: installer.originalKeysmithInstall(process.env.CODEX_HOME, './gpt-overlay.md') !== null }));
+    }
     await installer.setKeysmithEnabled(true);
     assert.equal((await installer.keysmithStatus()).enabled, true);
     await installer.setKeysmithEnabled(false);
