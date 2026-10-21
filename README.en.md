@@ -90,7 +90,7 @@ You can also run commands from the folder containing the installer: `bash codex-
 - Complete reference in Chinese: [简体中文](docs/guide.md) · [繁體中文](docs/guide.zh-TW.md)
 - Troubleshooting and health checks in Chinese: [简体中文](docs/troubleshooting.md) · [繁體中文](docs/troubleshooting.zh-TW.md)
 - [Releases and changelogs](https://github.com/funkeyyou/codex-model-router/releases)
-- [Optional Keysmith switch](docs/keysmith.md) (Traditional Chinese): GPT-only prompts; Claude is unaffected, off by default
+- [Global Keysmith switch](docs/keysmith.md) (Traditional Chinese): original global instruction loading; disable before using Claude or other affected models
 
 When [reporting an issue](https://github.com/funkeyyou/codex-model-router/issues), include your OS, desktop/CLI version, router version, and redacted error output. Do not include API keys or login tokens.
 

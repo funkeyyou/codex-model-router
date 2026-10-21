@@ -385,11 +385,12 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "供應商": "Provider",
 "設定": "Set",
 "Keysmith": "Keysmith",
-"依模型套用 Keysmith 指令": "Apply Keysmith instructions by model",
-"只有 GPT 模型使用 codex-keysmith；Claude（含 CLI 訂閱）與其他模型不附加任何 Keysmith 指令。": "Only GPT models use codex-keysmith. Claude (including CLI subscriptions) and all other models receive no Keysmith instructions.",
-"預設關閉。首次開啟會從 GitHub 下載固定版本的提示詞並核對 SHA256，不執行外部安裝器，也不修改全域指令。": "Off by default. Enabling downloads pinned prompts from GitHub and verifies SHA256, without running external installers or changing global instructions.",
-"下一輪請求生效，不必重新啟動。關閉後停止附加，但不會移除先前回答或摘要中的影響；需要完全還原時請開新對話。": "Takes effect on the next request without restarting. Turning it off stops adding instructions, but cannot undo effects in earlier replies or summaries; start a new chat for a clean context.",
-"這是提示詞適配，並非原專案的完整安裝；模型仍可能拒答。已移除固定稱呼，保留原始輸出格式。": "This adapts the prompt rather than installing the full project; models may still refuse requests. The fixed name is removed and the original output format is retained.",
+"啟用 Keysmith 全域模式": "Enable global Keysmith mode",
+"使用 Keysmith 全域指令，套用至 Codex 的新對話。": "Use global Keysmith instructions for new Codex chats.",
+"預設關閉。從 GitHub 下載固定版本並核對 SHA256，或接管已核對的原版安裝。修改前備份，關閉時還原原本的指令設定。": "Off by default. Downloads a pinned version with SHA256 verification or adopts a verified original installation. Backs up before changes and restores the previous instruction setting when disabled.",
+"切換後請完全退出並重新開啟 Codex，再建立新對話。舊對話與摘要可能仍保留先前指令的影響。": "After toggling, quit Codex completely, reopen it and start a new chat. Existing chats and summaries may retain effects of earlier instructions.",
+"啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。": "Other models may not work properly while enabled, especially Claude (including CLI subscriptions). Turn this feature off before using those models.",
+"已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。": "The fixed name is removed and the original output format is retained. Models may still refuse requests.",
 "codex-keysmith 專案": "codex-keysmith project",
 "有新版本": "Update available",
 "有新版本，點擊查看": "Update available. Click for details",
@@ -2950,18 +2951,19 @@ async function exportDiagnostics(mode) {
 // 帳號額度用完、桌面版鎖住發送按鈕時也能照常發送。
 function renderKeysmithPanel(blocked) {
   const on = state.keysmith && state.keysmith.enabled === true;
-  const title = t("依模型套用 Keysmith 指令");
+  const title = t("啟用 Keysmith 全域模式");
   const details = [
-    t("只有 GPT 模型使用 codex-keysmith；Claude（含 CLI 訂閱）與其他模型不附加任何 Keysmith 指令。"),
-    t("預設關閉。首次開啟會從 GitHub 下載固定版本的提示詞並核對 SHA256，不執行外部安裝器，也不修改全域指令。"),
-    t("下一輪請求生效，不必重新啟動。關閉後停止附加，但不會移除先前回答或摘要中的影響；需要完全還原時請開新對話。"),
-    t("這是提示詞適配，並非原專案的完整安裝；模型仍可能拒答。已移除固定稱呼，保留原始輸出格式。"),
+    t("使用 Keysmith 全域指令，套用至 Codex 的新對話。"),
+    t("預設關閉。從 GitHub 下載固定版本並核對 SHA256，或接管已核對的原版安裝。修改前備份，關閉時還原原本的指令設定。"),
+    t("切換後請完全退出並重新開啟 Codex，再建立新對話。舊對話與摘要可能仍保留先前指令的影響。"),
+    t("啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。"),
+    t("已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。"),
   ];
   return h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: t("Keysmith") })),
     h("div", { class: "panel-body setting-body" },
       h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
-      ...details.map(text => paragraph(text, "muted")),
+      ...details.map((text, index) => paragraph(text, index === 3 ? "note warn" : "muted")),
       h("div", { class: "actions" },
         h("a", { href: "https://github.com/Jia-Ethan/codex-keysmith", target: "_blank", rel: "noreferrer", text: t("codex-keysmith 專案") })),
       h("label", { class: "check-line" },

@@ -28,7 +28,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.35.0";
+const INSTALLER_VERSION = "1.36.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5807,6 +5807,8 @@ async function rollback() {
 // 還原 Codex 配置、停止並移除路由器服務、封存檔案；終端與管理頁共用。
 // deferArchive：安裝目錄留到管理頁結束後再搬，因為管理程式自己還在裡面執行。
 async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
+  const keysmith = readKeysmithRecord(installRoot);
+  if (keysmith?.mode === "global") await setKeysmithEnabled(false);
   // 先把 ChatGPT 登入搬回原位；安裝目錄封存後備份就不在原處了。
   if (quotaModeEnabled() || codexLogin() === "quota") {
     console.log("正在關閉 API Key 模式並還原原本的登入…");
@@ -6648,7 +6650,7 @@ async function managerState() {
     providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     quotaMode: quotaModeStatus(),
-    keysmith: keysmithStatus(),
+    keysmith: await keysmithStatus(),
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
     imagegen,
@@ -8020,7 +8022,7 @@ async function managerImagegenSetup({ providerId, models } = {}) {
   };
 }
 
-// Optional request-time profiles. Fetch only pinned text; never run either upstream installer.
+// Optional global profile. Fetch only pinned text; never run an upstream installer.
 export const KEYSMITH_SOURCES = [
   { family: "gpt", repo: "codex-keysmith", commit: "cfcd96eb727c324ee8649170c43aaa632ff53cb3", path: "examples/gpt-overlay.md", sha256: "7d306ae69d831dad21ed54252b563e173877eeebc0bc92e81970849a7ab8ac4a" },
   { family: null, repo: "codex-keysmith", commit: "cfcd96eb727c324ee8649170c43aaa632ff53cb3", path: "LICENSE",
@@ -8044,11 +8046,45 @@ export async function downloadKeysmithProfiles({ fetchImpl = fetchWithTimeout, s
   return { schema: 1, enabled: false, prompts, licenses, sources };
 }
 
-function keysmithStatus() {
+function readKeysmithRecord(root) {
+  const path = join(root, "keysmith.json");
+  if (!existsSync(path)) return null;
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function sameInstructionPath(value, target, home) {
+  if (typeof value !== "string") return false;
+  const normalized = path => process.platform === "win32" ? path.toLowerCase() : path;
+  return normalized(resolve(home, value)) === normalized(resolve(home, target));
+}
+
+// Recognize only an unchanged, manifest-owned upstream installation. Unknown files stay user-owned.
+export function originalKeysmithInstall(home, current) {
   try {
-    const config = JSON.parse(readFileSync(join(installRoot, "keysmith.json"), "utf8"));
-    return { enabled: config.enabled === true };
-  } catch { return { enabled: false }; }
+    const manifestPath = join(home, ".codex-keysmith-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (manifest.md?.path !== "gpt-overlay.md" || !sameInstructionPath(current, join(home, "gpt-overlay.md"), home)) return null;
+    const text = readFileSync(join(home, "gpt-overlay.md"), "utf8");
+    if (createHash("sha256").update(text).digest("hex") !== manifest.md?.after?.sha256) return null;
+    const backupName = manifest.config?.backup;
+    if (typeof backupName !== "string" || basename(backupName) !== backupName) return null;
+    const before = readFileSync(join(home, backupName), "utf8");
+    // If the original had another instruction file, don't guess its TOML value or erase it.
+    if (/^\s*model_instructions_file\s*=/m.test(before)) return null;
+    return { text, manifestPath };
+  } catch { return null; }
+}
+
+export async function keysmithStatus({ root = installRoot, home = codexHome, readConfig = readUserConfig } = {}) {
+  try {
+    const user = await readConfig();
+    const current = user.config.model_instructions_file;
+    const record = readKeysmithRecord(root);
+    const managed = record?.mode === "global" && sameInstructionPath(current, join(root, "keysmith-global.md"), home);
+    const external = originalKeysmithInstall(home, current);
+    return { enabled: Boolean(managed || external), mode: "global", external: Boolean(external),
+      consistent: managed ? existsSync(join(root, "keysmith-global.md")) : true };
+  } catch { return { enabled: false, mode: "global", error: "Keysmith config could not be read" }; }
 }
 
 export function migrateKeysmithGptOnly({ root = installRoot, backupRoot = backupsRoot } = {}) {
@@ -8067,21 +8103,63 @@ export function migrateKeysmithGptOnly({ root = installRoot, backupRoot = backup
   return { backupDir, enabled: next.enabled === true };
 }
 
-export async function setKeysmithEnabled(enabled, { root = installRoot, backupRoot = backupsRoot, fetchImpl } = {}) {
+export async function setKeysmithEnabled(enabled, { root = installRoot, home = codexHome, backupRoot = backupsRoot,
+  fetchImpl, readConfig = readUserConfig, writeConfig = writeConfigEdits } = {}) {
   if (typeof enabled !== "boolean") fail("Keysmith enabled must be boolean");
   const path = join(root, "keysmith.json");
-  let previous = null;
-  if (existsSync(path)) previous = readFileSync(path, "utf8");
-  // Refresh only when enabling; failure leaves the old state untouched. Disabling works offline.
-  const config = enabled ? await downloadKeysmithProfiles({ fetchImpl }) : { schema: 1, enabled: false };
-  config.enabled = enabled;
-  if (previous !== null) {
-    const backupDir = join(backupRoot, `keysmith-${timestamp()}-${randomUUID()}`);
-    ensureDirectory(backupDir);
-    if (!copyIfExists(path, join(backupDir, "keysmith.json"))) fail("Keysmith backup failed");
+  const promptPath = join(root, "keysmith-global.md");
+  const user = await readConfig();
+  const current = user.config.model_instructions_file ?? null;
+  const record = readKeysmithRecord(root);
+  const managed = record?.mode === "global" && sameInstructionPath(current, promptPath, home);
+  const external = originalKeysmithInstall(home, current);
+  if (enabled && managed && existsSync(promptPath)) return { enabled: true, mode: "global", restartDesktop: true };
+  if (!enabled && !managed && !external && record?.mode !== "global" && !record?.enabled) return { enabled: false, mode: "global" };
+  // Fetch before any writes. Preserve the original source and license alongside the active copy.
+  const profile = enabled ? external ? { prompts: { gpt: external.text }, adoptedOriginal: true }
+    : await downloadKeysmithProfiles({ fetchImpl }) : null;
+  const previousValue = enabled ? managed ? record.previousValue ?? null : external ? null : current : null;
+  const nextValue = enabled ? promptPath : managed ? record.previousValue ?? null : external ? null : current;
+  if (((await readConfig()).config.model_instructions_file ?? null) !== current) throw new Error("Keysmith config changed; retry");
+  const backupDir = join(backupRoot, `keysmith-global-${timestamp()}-${randomUUID()}`);
+  ensureDirectory(backupDir);
+  for (const [file, name] of [[path, "keysmith.json"], [promptPath, "keysmith-global.md"], [user.filePath, "config.toml"],
+    ...(external ? [[external.manifestPath, "upstream-manifest.json"], [join(home, "gpt-overlay.md"), "upstream-overlay.md"]] : [])]) {
+    if (file && existsSync(file) && !copyIfExists(file, join(backupDir, name))) fail("Keysmith backup failed");
   }
-  writeJsonAtomic(path, config);
-  return { enabled };
+  writeJsonAtomic(join(backupDir, "recovery.json"), { previousValue: current, target: nextValue });
+  let changed = false;
+  try {
+    // Disable old running routers before changing global instructions, avoiding double injection.
+    writeJsonAtomic(path, enabled ? { ...profile, schema: 2, mode: "global", enabled: false, globalEnabled: false,
+      previousValue, backupDir } : { ...(record || {}), enabled: false });
+    if (enabled) {
+      const temporaryPath = `${promptPath}.tmp-${process.pid}`;
+      try {
+        writeFileSync(temporaryPath, profile.prompts.gpt.replace(/^The operator is Ethan\. Address him as Ethan\.\r?\n?/m, ""), { mode: 0o600 });
+        renameSync(temporaryPath, promptPath);
+      } finally { rmSync(temporaryPath, { force: true }); }
+    }
+    changed = true;
+    await writeConfig([{ keyPath: "model_instructions_file", value: nextValue }]);
+    const verified = (await readConfig()).config.model_instructions_file ?? null;
+    if (nextValue === null ? verified !== null : !sameInstructionPath(verified, nextValue, home)) throw new Error("Keysmith config verification failed");
+    writeJsonAtomic(path, { ...(enabled ? profile : {}), schema: 2, mode: "global", enabled: false,
+      globalEnabled: enabled, previousValue: enabled ? previousValue : null, backupDir });
+    // Archive only known upstream ownership metadata; keep the original Markdown file untouched.
+    if (external) renameSync(external.manifestPath, join(backupDir, "adopted-upstream-manifest.json"));
+  } catch (error) {
+    if (changed) {
+      try { await writeConfig([{ keyPath: "model_instructions_file", value: current }]); }
+      catch { throw new Error(`Keysmith rollback failed; recovery: ${backupDir}`, { cause: error }); }
+    }
+    for (const [file, name] of [[path, "keysmith.json"], [promptPath, "keysmith-global.md"]]) {
+      if (existsSync(join(backupDir, name))) copyFileSync(join(backupDir, name), file);
+      else rmSync(file, { force: true });
+    }
+    throw error;
+  }
+  return { enabled, mode: "global", backupDir, restartDesktop: true };
 }
 
 async function managerSetKeysmith({ enabled } = {}) {

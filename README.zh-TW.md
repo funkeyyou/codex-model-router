@@ -91,7 +91,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 - [完整說明](docs/guide.zh-TW.md)：網頁管理頁、升級細節、多家供應商、Chat Completions 模型、中轉生圖、相容性與運作細節
 - [疑難排解與健康檢查](docs/troubleshooting.zh-TW.md)
 - [Claude Code 訂閱路由](docs/claude-cli-experimental.md)
-- [Keysmith 自選開關](docs/keysmith.md)：只對 GPT 附加指令，Claude 不套用，預設關閉
+- [Keysmith 全域開關](docs/keysmith.md)：原版全域指令載入；使用 Claude 等其他模型前請先關閉
 - [開發與發布](docs/development.zh-TW.md)
 - [版本更新內容](https://github.com/funkeyyou/codex-model-router/releases)
 
