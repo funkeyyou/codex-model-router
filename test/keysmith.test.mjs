@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
@@ -95,6 +95,17 @@ test("disable restores previous instruction setting and preserves later manual e
   f.config.model_instructions_file = "/user/new.md";
   await installer.setKeysmithEnabled(false, f.options);
   assert.equal(f.config.model_instructions_file, "/user/new.md");
+});
+test("filesystem aliases resolve to the same original and managed instruction paths", async t => {
+  const f = fixture(t); original(f);
+  const alias = join(f.home, "alias");
+  symlinkSync(f.root, alias, process.platform === "win32" ? "junction" : "dir");
+  writeFileSync(f.prompt, source);
+  writeFileSync(f.path, JSON.stringify({ mode: "global", previousValue: null }));
+  f.config.model_instructions_file = join(alias, "keysmith-global.md");
+  assert.equal((await installer.keysmithStatus(f.options)).enabled, true);
+  await installer.setKeysmithEnabled(false, f.options);
+  assert.equal(f.config.model_instructions_file, null);
 });
 test("pinned download verifies prompt and license; network failure leaves config untouched", async t => {
   const sources = [
