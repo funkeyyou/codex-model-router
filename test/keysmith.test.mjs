@@ -72,6 +72,18 @@ test("failed config write rolls back legacy record and prompt; ownership metadat
   assert.equal(existsSync(f.prompt), false);
   assert.ok(existsSync(join(f.home, ".codex-keysmith-manifest.json")));
 });
+test("Windows native extended-length paths match an original global installation", { skip: process.platform !== "win32" }, async t => {
+  const f = fixture(t); original(f);
+  const extended = "\\\\?\\" + join(f.home, "gpt-overlay.md");
+  f.config.model_instructions_file = extended;
+  assert.ok(installer.originalKeysmithInstall(f.home, extended));
+  await installer.setKeysmithEnabled(true, f.options);
+  assert.equal(f.config.model_instructions_file, f.prompt);
+  const options = { ...f.options, readConfig: async () => ({
+    ...(await f.options.readConfig()), config: { ...f.config, model_instructions_file: "\\\\?\\" + f.prompt },
+  }) };
+  assert.equal((await installer.keysmithStatus(options)).enabled, true);
+});
 test("disable restores previous instruction setting and preserves later manual edits", async t => {
   const f = fixture(t);
   writeFileSync(f.prompt, source);
@@ -106,7 +118,8 @@ test("real Codex config RPC adopts original, toggles off, and preserves unrelate
     import assert from 'node:assert/strict';
     import { readFileSync } from 'node:fs';
     const installer = await import(${JSON.stringify(pathToFileURL(join(dir, "installer.mjs")).href)});
-    assert.equal((await installer.keysmithStatus()).external, true);
+    const before = await installer.keysmithStatus();
+    assert.equal(before.external, true, JSON.stringify(before));
     await installer.setKeysmithEnabled(true);
     assert.equal((await installer.keysmithStatus()).enabled, true);
     await installer.setKeysmithEnabled(false);
