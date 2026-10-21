@@ -10,6 +10,7 @@
 - **多家供应商**：可同时接入多家，API Key 各自加密保存（macOS 钥匙串／Windows DPAPI）。
 - **网页管理页**：在浏览器里增删模型、管理供应商和 API Key、一键更新。
 - **可选功能**：中转 API 生图、Claude Code 订阅路由。
+- **Claude Desktop 接入**：在「Claude → Claude 客户端」一键配置第三方 Claude API 模型，也可一键回退。设置自动备份，聊天和其他偏好保留；暂不支持在 Claude 客户端使用 GPT 或 CLI 订阅路由。[使用说明](docs/claude-desktop.md)
 
 ## 安装
 
@@ -46,7 +47,7 @@ curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/ma
 大部分操作都能在网页管理页完成，任选一种方式打开：
 
 - Codex 里的「自定义模型管理」入口（名称跟随 Codex 界面语言；安装后需重启 Codex 一次才会出现）
-- 「Codex 模型路由器」快捷方式（Windows 在开始菜单，macOS 在 `~/Applications`）
+- 「模型路由器」快捷方式（Windows 在开始菜单，macOS 在 `~/Applications`）
 - 运行 `ui` 命令
 
 <img src="docs/images/codex-manager-entry-zh-Hans.png" alt="Codex 侧边栏「更多」菜单中的自定义模型管理入口" width="300">

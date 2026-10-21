@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.37.0";
+const INSTALLER_VERSION = "1.38.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -220,6 +220,9 @@ const routerPath = join(installRoot, "router.mjs");
 const bridgePath = join(installRoot, "claude-bridge.mjs");
 const chatBridgePath = join(installRoot, "chat-bridge.mjs");
 const claudeCliPath = join(installRoot, "claude-cli.mjs");
+const claudeDesktopPath = join(installRoot, "claude-desktop.mjs");
+const claudeDesktopConfigPath = join(installRoot, "claude-desktop.json");
+const claudeDesktopBackupPath = join(backupsRoot, "claude-desktop-active.json");
 const settingsPath = join(installRoot, "settings.json");
 const catalogPath = join(installRoot, "models.json");
 // 備用 API Key 清單（只有鑰匙圈項目名稱與 Key 末四碼，沒有 Key 本身）。路由器依修改時間重讀。
@@ -545,16 +548,20 @@ function writeBridgeSources() {
   chmodSync(chatBridgePath, 0o600);
   writeFileSync(claudeCliPath, loadClaudeCliSource(), { mode: 0o600 });
   chmodSync(claudeCliPath, 0o600);
+  writeFileSync(claudeDesktopPath, loadClaudeDesktopSource(), { mode: 0o600 });
+  chmodSync(claudeDesktopPath, 0o600);
 }
 
 function backupChatBridge(directory) {
   copyIfExists(chatBridgePath, join(directory, "chat-bridge.mjs"));
   copyIfExists(claudeCliPath, join(directory, "claude-cli.mjs"));
+  copyIfExists(claudeDesktopPath, join(directory, "claude-desktop.mjs"));
 }
 
 function restoreChatBridge(directory) {
   if (!copyIfExists(join(directory, "chat-bridge.mjs"), chatBridgePath)) rmSync(chatBridgePath, { force: true });
   if (!copyIfExists(join(directory, "claude-cli.mjs"), claudeCliPath)) rmSync(claudeCliPath, { force: true });
+  if (!copyIfExists(join(directory, "claude-desktop.mjs"), claudeDesktopPath)) rmSync(claudeDesktopPath, { force: true });
 }
 
 export function loadImagegenSource(sourcePath = scriptPath) {
@@ -570,8 +577,17 @@ export function loadClaudeCliSource(sourcePath = scriptPath) {
   const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
   const marker = "\n__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__\n";
   const start = source.indexOf(marker);
-  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_MANAGER_JS__");
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_CLAUDE_DESKTOP_JS__");
   if (start < 0 || end <= start) fail("安裝器中缺少 Claude CLI 轉接程式碼。");
+  return source.slice(start + marker.length, end) + "\n";
+}
+
+export function loadClaudeDesktopSource(sourcePath = scriptPath) {
+  const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_CLAUDE_DESKTOP_JS__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_MANAGER_JS__");
+  if (start < 0 || end <= start) fail("Missing Claude Desktop gateway payload.");
   return source.slice(start + marker.length, end) + "\n";
 }
 
@@ -763,7 +779,7 @@ function storeApiKeyValue(service, baseUrl, value) {
     return;
   }
 
-  storeMacosApiKey(service, `Codex 模型路由器：${new URL(baseUrl).host}`, apiKey);
+  storeMacosApiKey(service, `模型路由器：${new URL(baseUrl).host}`, apiKey);
 }
 
 export function storeMacosApiKey(service, label, apiKey, run = spawnSync, keychain = null) {
@@ -2908,7 +2924,7 @@ async function codexRpcOnce(method, params, acceptResult, binary, home) {
       params: {
         clientInfo: {
           name: "codex_model_router_installer",
-          title: "Codex 模型路由器安裝器",
+          title: "模型路由器安裝器",
           version: INSTALLER_VERSION,
         },
       },
@@ -3185,7 +3201,7 @@ function taskXmlDocument() {
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Codex 模型路由器（本機回送代理）</Description>
+    <Description>模型路由器（本機回送代理）</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -3740,7 +3756,7 @@ async function install(preset = null) {
   // 在問任何問題、寫任何檔案之前先確認背景服務起得來。
   if (isWindows && !testMode) assertScriptHostAvailable();
 
-  printHeading(existingManifest ? "重新配置 Codex 模型路由器" : "安裝 Codex 模型路由器");
+  printHeading(existingManifest ? "重新配置 模型路由器" : "安裝 模型路由器");
   // 重新配置只改主要供應商（第一家）；其他供應商與它們的模型原樣保留。
   const existingSettings = existingManifest ? readSettingsIfExists() : {};
   const existingProviders = installedProviders(existingSettings, existingManifest);
@@ -4099,7 +4115,7 @@ async function addModels() {
   verifyLogin();
 
   if (!manifest) {
-    fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
+    fail("當前 CODEX_HOME 尚未安裝 模型路由器，請先選擇「安裝或重新配置」。");
   }
   if (!existsSync(settingsPath)) {
     fail("找不到 settings.json，安裝可能已損壞，請改用「安裝或重新配置」。");
@@ -4357,7 +4373,7 @@ export function planRemoveProvider(manifest, settings, catalog, providerId) {
 
 function requireInstallation() {
   const manifest = readManifest();
-  if (!manifest) fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
+  if (!manifest) fail("當前 CODEX_HOME 尚未安裝 模型路由器，請先選擇「安裝或重新配置」。");
   if (manifest.version) assertInstallerNotOlder(manifest.version);
   if (!existsSync(settingsPath) || !existsSync(catalogPath)) {
     fail("找不到 settings.json 或 models.json，安裝可能已損壞，請改用「安裝或重新配置」。");
@@ -5112,7 +5128,7 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
 
 const UPDATE_FAILURES = {
   "not-installed":
-    "當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。",
+    "當前 CODEX_HOME 尚未安裝 模型路由器，請先選擇「安裝或重新配置」。",
   "missing-settings":
     "找不到 settings.json，安裝可能已損壞，請改用「安裝或重新配置」。",
   "no-routes":
@@ -5306,7 +5322,7 @@ function requireHiddenModelsInstallation() {
   const manifest = readManifest();
   if (manifest?.version) assertInstallerNotOlder(manifest.version);
   if (!manifest) {
-    fail("當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。");
+    fail("當前 CODEX_HOME 尚未安裝 模型路由器，請先選擇「安裝或重新配置」。");
   }
   if (!existsSync(settingsPath)) {
     fail("找不到 settings.json，安裝可能已損壞，請改用「安裝或重新配置」。");
@@ -5858,11 +5874,11 @@ async function repairModels() {
 async function status() {
   const manifest = readManifest();
   if (!manifest) {
-    console.log("當前 CODEX_HOME 尚未安裝 Codex 模型路由器。" );
+    console.log("當前 CODEX_HOME 尚未安裝 模型路由器。" );
     process.exitCode = 1;
     return;
   }
-  printHeading("Codex 模型路由器狀態");
+  printHeading("模型路由器狀態");
   const settings = readSettingsIfExists();
   const providers = installedProviders(settings, manifest);
   const routes = Array.isArray(settings.routes) ? settings.routes : (manifest.routes || []);
@@ -5941,7 +5957,7 @@ async function rollback() {
     else console.log("沒有可回退的安裝。" );
     return;
   }
-  printHeading("回退 Codex 模型路由器");
+  printHeading("回退 模型路由器");
   console.log("只會還原由安裝器管理的 Codex 配置項。" );
   console.log(`完整配置備份：${manifest.configBackup}`);
   if (!(await confirm("是否繼續？", true))) return;
@@ -5957,6 +5973,10 @@ async function rollback() {
 // 還原 Codex 配置、停止並移除路由器服務、封存檔案；終端與管理頁共用。
 // deferArchive：安裝目錄留到管理頁結束後再搬，因為管理程式自己還在裡面執行。
 async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
+  if (existsSync(claudeDesktopBackupPath)) {
+    const desktop = await importClaudeDesktopModule();
+    if (desktop.integrationStatus(claudeDesktopBackupPath)?.status !== "restored") await managerRestoreClaudeDesktop();
+  }
   const keysmith = readKeysmithRecord(installRoot);
   if (keysmith?.mode === "global") await setKeysmithEnabled(false);
   // 先把 ChatGPT 登入搬回原位；安裝目錄封存後備份就不在原處了。
@@ -6078,7 +6098,7 @@ const releaseDownloadBase = (env.CODEX_MODEL_ROUTER_RELEASE_DOWNLOAD_URL || `${M
   .replace(/\/+$/, "");
 const MANAGER_IDLE_MS = 20 * 60 * 1000;
 const MANAGER_DRAFT_TTL_MS = 30 * 60 * 1000;
-const MANAGER_SHORTCUT_NAME = "Codex 模型路由器";
+const MANAGER_SHORTCUT_NAME = "模型路由器";
 const managerInstallerName = isWindows ? "codex-model-router.ps1" : "codex-model-router.sh";
 const managerInstallerPath = join(installRoot, managerInstallerName);
 const managerLockPath = join(installRoot, "manager.json");
@@ -6145,7 +6165,7 @@ export function managerCommandFile({ installer, launchEnv = {} }) {
   const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
   return [
     "#!/bin/bash",
-    "# Codex 模型路由器：雙擊開啟網頁管理介面。由安裝器產生，刪除不影響路由器運作。",
+    "# 模型路由器：雙擊開啟網頁管理介面。由安裝器產生，刪除不影響路由器運作。",
     ...Object.entries(launchEnv).map(([name, value]) => `export ${name}=${quote(value)}`),
     `exec /bin/bash ${quote(installer)} ui`,
     "",
@@ -6183,7 +6203,7 @@ export function windowsShortcutScript({ shortcut, launcher, workingDirectory }) 
     "$link.TargetPath = Join-Path $env:SystemRoot 'System32\\wscript.exe'",
     `$link.Arguments = ${psQuote(argumentsText)}`,
     `$link.WorkingDirectory = ${psQuote(workingDirectory)}`,
-    `$link.Description = ${psQuote("開啟 Codex 模型路由器的網頁管理介面")}`,
+    `$link.Description = ${psQuote("開啟 模型路由器的網頁管理介面")}`,
     "$link.Save()",
     "Move-Item -LiteralPath $temporary -Destination $path -Force",
     "} finally {",
@@ -6231,6 +6251,13 @@ async function installManagerLauncher() {
       writeFileSync(shortcut, managerCommandFile({ installer: managerInstallerPath, launchEnv }), { mode: 0o755 });
       chmodSync(shortcut, 0o755);
     }
+    // Archive the legacy shortcut after the replacement is installed.
+    const legacy = join(dirname(shortcut), `Codex 模型路由器${isWindows ? ".lnk" : ".command"}`);
+    if (existsSync(legacy)) {
+      const backup = join(backupsRoot, `manager-shortcut-${timestamp()}`);
+      ensureDirectory(backup);
+      renameSync(legacy, join(backup, basename(legacy)));
+    }
     return { ok: true, shortcut, desktop };
   } catch (error) {
     return { ok: false, desktop, message: `無法建立網頁管理介面的捷徑（${error.message}）` };
@@ -6268,7 +6295,7 @@ async function installManagerMcpEntry() {
     // 回退資料寫在完整安裝的 install.json；只裝管理頁時寫在 manager-install.json。
     const recordPath = readManifest() ? manifestPath : managerRecordPath;
     const manifest = readManifest() || readManagerRecord();
-    if (!manifest) fail("請先安裝 Codex 模型路由器。");
+    if (!manifest) fail("請先安裝 模型路由器。");
     // 入口程式改變時，MCP 設定的識別也改變，客戶端不能繼續使用先前的連線快取。
     const revision = createHash("sha256").update(loadManagerEntrySource()).digest("hex").slice(0, 12);
     const installed = managerMcpConfig({ revision });
@@ -6298,7 +6325,7 @@ async function installManagerMcpEntry() {
 }
 
 async function setupManagerEntry() {
-  if (!readManifest() && !readManagerRecord()) fail("請先安裝 Codex 模型路由器或網頁管理頁。");
+  if (!readManifest() && !readManagerRecord()) fail("請先安裝 模型路由器或網頁管理頁。");
   const result = await installManagerLauncher();
   printManagerLauncher(result);
   if (!result.ok || result.desktop?.ok === false) fail("管理頁入口未完整安裝，請依上方訊息處理。");
@@ -6668,6 +6695,7 @@ async function routerHealth(port) {
     const health = await response.json();
     return {
       ok: health.status === "ok", status: health.status ?? null, version: health.version ?? null,
+      claudeDesktopGateway: health.claudeDesktopGateway === true,
       uptimeSeconds: health.uptimeSeconds ?? null, stats: health.stats || {},
       keyPools: health.keyPools && typeof health.keyPools === "object" ? health.keyPools : {},
     };
@@ -9077,6 +9105,80 @@ function scheduleInstallArchive(archiveDir) {
   child.unref();
 }
 
+let claudeDesktopModule;
+async function importClaudeDesktopModule() {
+  claudeDesktopModule ??= import(`data:text/javascript;base64,${Buffer.from(loadClaudeDesktopSource()).toString("base64")}`);
+  return claudeDesktopModule;
+}
+
+export async function managerClaudeDesktop({ connection = false } = {}) {
+  const mod = await importClaudeDesktopModule();
+  const settings = readSettingsIfExists() || {};
+  const config = mod.readDesktopConfig(claudeDesktopConfigPath);
+  const models = mod.desktopModels(settings).data;
+  const health = await routerHealth(Number(settings.port));
+  const integration = mod.integrationStatus(claudeDesktopBackupPath);
+  let automatic = null;
+  if (!connection) {
+    try { automatic = await mod.detectDesktop(); }
+    catch { automatic = { available: false, reason: "無法確認 Claude 的安裝位置或管理政策，請使用手動連線設定。" }; }
+  }
+  return {
+    enabled: Boolean(config), ready: health.ok && health.claudeDesktopGateway,
+    connected: Boolean(integration && integration.status !== "restored"),
+    automatic: automatic ? { available: automatic.available, reason: automatic.reason || null } : null,
+    models: models.map((model) => ({ id: model.id, name: model.display_name })),
+    baseUrl: settings.port ? `http://127.0.0.1:${settings.port}/claude` : null,
+    ...(connection && config ? { connection: mod.desktopConnection(settings, config) } : {}),
+  };
+}
+
+export async function managerSetClaudeDesktop({ enabled } = {}) {
+  if (typeof enabled !== "boolean") fail("Invalid Claude Desktop gateway setting.");
+  const mod = await importClaudeDesktopModule();
+  const integration = mod.integrationStatus(claudeDesktopBackupPath);
+  if (!enabled && integration && integration.status !== "restored") fail("請使用一鍵回退，還原 Claude 設定後再停用接入。");
+  const current = mod.readDesktopConfig(claudeDesktopConfigPath);
+  if (enabled) {
+    const state = await managerClaudeDesktop();
+    if (!state.models.length) fail("請先添加使用 Anthropic Messages 介面的 Claude API 模型。");
+    if (!state.ready) fail("請先更新並啟動支援 Claude Desktop 的本機路由器。");
+  }
+  ensureDirectory(installRoot);
+  if (existsSync(claudeDesktopConfigPath)) {
+    const backup = join(backupsRoot, `claude-desktop-${timestamp()}`);
+    ensureDirectory(backup);
+    copyIfExists(claudeDesktopConfigPath, join(backup, "claude-desktop.json"));
+  }
+  // No changes to Claude's account/configuration/history or to Codex's login.
+  writeJsonAtomic(claudeDesktopConfigPath, enabled ? mod.newDesktopConfig(current) : { enabled: false });
+  console.log(enabled ? "Claude Desktop 接入已啟用。請取得連線設定並套用到 Claude 客戶端。" : "Claude Desktop 接入已停用。");
+  return { enabled };
+}
+
+export async function managerConnectClaudeDesktop() {
+  const mod = await importClaudeDesktopModule();
+  const status = await managerClaudeDesktop();
+  if (!status.ready) fail("請先更新並啟動支援 Claude Desktop 的本機路由器。");
+  const info = await mod.detectDesktop();
+  if (!info.available) fail(info.reason);
+  console.log("正在備份並接入 Claude Desktop，將正常關閉並重新開啟客戶端。");
+  const result = await mod.connectDesktop({ directory: info.directory, gatewayPath: claudeDesktopConfigPath,
+    backupPath: claudeDesktopBackupPath, settings: readSettingsIfExists(), lifecycle: mod.desktopLifecycle(info) });
+  console.log("Claude Desktop 已接入並重新啟動，請在模型選單選擇 Claude API 模型。");
+  return result;
+}
+
+export async function managerRestoreClaudeDesktop() {
+  const mod = await importClaudeDesktopModule();
+  const info = await mod.detectDesktop();
+  if (!info.available) fail(info.reason);
+  const result = await mod.restoreDesktop({ directory: info.directory, gatewayPath: claudeDesktopConfigPath,
+    backupPath: claudeDesktopBackupPath, lifecycle: mod.desktopLifecycle(info) });
+  console.log("Claude Desktop 已還原原設定並重新啟動。");
+  return result;
+}
+
 function managerOperations() {
   const job = (title, run) => ({ title, run });
   return {
@@ -9087,6 +9189,8 @@ function managerOperations() {
     providerDraft: (body) => managerProviderDraft(body),
     // 唯讀查詢：不改任何設定、不花額度。
     queries: {
+      "claude-desktop": () => managerClaudeDesktop(),
+      "claude-desktop-connection": () => managerClaudeDesktop({ connection: true }),
       "global-context": () => managerGlobalContext(),
       "hidden-models": () => managerHiddenModels(),
       imagegen: () => relayImagegenStatus(),
@@ -9098,6 +9202,9 @@ function managerOperations() {
       diagnostics: () => managerDiagnostics(),
     },
     jobs: {
+      "set-claude-desktop": job("設定 Claude Desktop 接入", managerSetClaudeDesktop),
+      "connect-claude-desktop": job("一鍵接入 Claude Desktop", managerConnectClaudeDesktop),
+      "restore-claude-desktop": job("一鍵回退 Claude Desktop", managerRestoreClaudeDesktop),
       "repair-models": job("同步與修復模型清單", repairModels),
       "add-models": job("添加模型", managerAddModels),
       "remove-models": job("刪除模型", managerRemoveModels),
@@ -9487,7 +9594,7 @@ function menuNumber(action) {
 }
 
 function help() {
-  console.log(`Codex 模型路由器 ${INSTALLER_VERSION}
+  console.log(`模型路由器 ${INSTALLER_VERSION}
 
 用法：
   ${basename(scriptPath || "codex-model-router.command")}            （不帶指令：開啟網頁管理頁；尚未安裝時在網頁上完成首次設定）
@@ -9523,7 +9630,7 @@ Claude 訂閱（CLI），並可檢查新版本、一鍵更新後重新啟動。�
 介面支援繁體中文、簡體中文與英文，預設跟隨瀏覽器語言（都不符合時用英文），可在頁面左下角切換。
 網址含一次性存取權杖，只接受本機連線；背景執行，不需要保留終端視窗。
 從頁面結束或閒置 20 分鐘會自動退出；ui --foreground 可在終端顯示診斷。
-安裝與更新完成後會建立捷徑（macOS：~/Applications/Codex 模型路由器.command；
+安裝與更新完成後會建立捷徑（macOS：~/Applications/模型路由器.command；
 Windows：開始功能表），雙擊即可開啟。重新開啟支援 MCP Apps 的 Codex 後，也可點擊介面中的
 「自訂模型管理」直接開啟（依版本顯示在頂部或側邊欄）。ui-setup 可單獨修復入口，不重啟路由器。
 
@@ -9568,7 +9675,7 @@ openai 供應商 ID，以保持 Desktop 與手機 Remote 的既有聊天可見�
 }
 
 async function chooseAction() {
-  printHeading("Codex 模型路由器");
+  printHeading("模型路由器");
   MENU_ITEMS.forEach(([, label], index) => console.log(`  ${index + 1}. ${label}`));
   const answer = await ask("請選擇操作", "1");
   const choices = {
@@ -9728,6 +9835,7 @@ import {
   COMPACTION_REPLAY_PREFIX,
 } from "./claude-bridge.mjs";
 import { toChatRequest, bridgeChatStream, isChatReasoning } from "./chat-bridge.mjs";
+import { createDesktopHandler, desktopHeaders, DESKTOP_PREFIX, DESKTOP_CONFIG_FILE, hasDesktopToken } from "./claude-desktop.mjs";
 
 const routerDirectory = dirname(fileURLToPath(import.meta.url));
 const settingsPath = join(routerDirectory, "settings.json");
@@ -11551,10 +11659,10 @@ export async function streamUpstream(upstream, response, history = null, respons
 
 // 單把 Key 的一次請求。上游回 401／403 時重讀這把 Key（可能剛在管理頁換過）；
 // 只有內容真的變了才重送，Key 本身無效時不會白白多打一次。
-async function fetchWithKeySlot(provider, slot, target, headers, body, signal) {
+async function fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder = buildCustomHeaders) {
   const send = (apiKey) => fetch(target, {
     method: "POST",
-    headers: buildCustomHeaders(headers, apiKey, target),
+    headers: headerBuilder(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
@@ -11574,17 +11682,17 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal) {
   return send(reloaded);
 }
 
-async function fetchCustom(provider, target, headers, body, signal, { model = null } = {}) {
+async function fetchCustom(provider, target, headers, body, signal, { model = null, headerBuilder = buildCustomHeaders } = {}) {
   const slots = keySlotsForModel(keySlotsFor(provider), model);
   if (slots[0]?.id !== PRIMARY_KEY_SLOT && model) stats.keyModelRoutes += 1;
-  if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal);
+  if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal, headerBuilder);
   const bySlot = new Map(slots.map((slot) => [slot.id, slot]));
   const order = keyRotation.order(provider.id, slots.map((slot) => slot.id));
   for (let index = 0; index < order.length; index += 1) {
     const slot = bySlot.get(order[index]);
     let upstream;
     try {
-      upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal);
+      upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder);
     } catch (error) {
       // 讀不到這把 Key（被刪掉、密文檔損壞）：當作被拒，換下一把；連線錯誤照常往外拋。
       if (!error?.keyReadFailed || index === order.length - 1) throw error;
@@ -13192,6 +13300,10 @@ function rejectUpgrade(socket, statusLine) {
 }
 
 function handleWebSocketUpgrade(request, socket, head) {
+  if (hasDesktopToken(request.headers)) {
+    rejectUpgrade(socket, "403 Forbidden");
+    return;
+  }
   if (!isLoopbackHost(request.headers.host)) {
     stats.foreignHostRejects += 1;
     rejectUpgrade(socket, "403 Forbidden");
@@ -13393,6 +13505,22 @@ function handleWebSocketUpgrade(request, socket, head) {
   if (head.length > 0) consume(head);
 }
 
+const handleClaudeDesktop = createDesktopHandler({
+  settings, configPath: join(routerDirectory, DESKTOP_CONFIG_FILE), readBody: readRequestBody,
+  fetchUpstream: async (route, path, headers, body, signal) => {
+    const provider = providerForRoute(route);
+    stats.custom += 1;
+    const upstream = await fetchCustom(provider, new URL(provider.apiRoot + path), headers, body, signal,
+      { model: route.upstreamModel, headerBuilder: desktopHeaders });
+    stats.lastCustomStatus = upstream.status;
+    return upstream;
+  },
+  recordUsage: recordUsageEvent,
+  recordError: (error, context) => recordRouterError(new RouterRequestError(error.status, error.code, error.message, "upstream"),
+    context ? { ...context, provider: providerById.get(context.provider) || null }
+      : { transport: "claude-desktop", route: "custom", provider: null }),
+});
+
 const server = http.createServer(async (request, response) => {
   stats.requests += 1;
   request.routerContext = { transport: "http", route: "official" };
@@ -13405,9 +13533,20 @@ const server = http.createServer(async (request, response) => {
   }
   try {
     const incomingUrl = new URL(request.url || "/", `http://${listenHost}:${listenPort}`);
+    if (incomingUrl.pathname === DESKTOP_PREFIX || incomingUrl.pathname.startsWith(DESKTOP_PREFIX + "/")) {
+      await handleClaudeDesktop(request, response, incomingUrl);
+      return;
+    }
+    // The local Desktop credential must never escape to an official/API endpoint,
+    // even after disabling the gateway or if a client uses the wrong base URL.
+    if (hasDesktopToken(request.headers)) {
+      writeJson(response, 403, { error: { type: "authentication_error", message: "Use the Claude Desktop gateway base URL." } });
+      return;
+    }
     if (request.method === "GET" && incomingUrl.pathname === "/healthz") {
       writeJson(response, 200, {
         status: "ok",
+        claudeDesktopGateway: true,
         version: settings.version,
         uptimeSeconds: Math.floor(process.uptime()),
         historyCache: historyCacheInfo(),
@@ -17191,6 +17330,464 @@ export async function fetchClaudeCli(request, configuration, signal, { env: test
     return new Response(stream, { headers: { "content-type": "text/event-stream" } });
   } catch (error) { await cleanup(); throw error; }
 }
+__CODEX_MODEL_ROUTER_CLAUDE_DESKTOP_JS__
+// Native Anthropic ingress for Claude Desktop. No Codex history rewriting here.
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFileSync, existsSync, lstatSync, mkdirSync, writeFileSync, renameSync, unlinkSync, chmodSync, realpathSync } from "node:fs";
+import { once } from "node:events";
+import { dirname, join, win32, posix } from "node:path";
+import { homedir, userInfo } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify, isDeepStrictEqual } from "node:util";
+
+const execute = promisify(execFile);
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function desktopDirectories({ platform = process.platform, home = homedir(), localAppData = process.env.LOCALAPPDATA } = {}) {
+  if (platform === "darwin") return posix.join(home, "Library", "Application Support", "Claude-3p");
+  if (platform === "win32") return win32.join(localAppData || win32.join(home, "AppData", "Local"), "Claude-3p");
+  throw new Error("Claude Desktop 自動接入目前僅支援 macOS 與 Windows。");
+}
+
+export async function detectDesktop({ platform = process.platform, home = homedir(), run = execute } = {}) {
+  const directory = desktopDirectories({ platform, home });
+  if (process.env.CLAUDE_USER_DATA_DIR) return { directory, available: false, reason: "Claude 使用自訂資料目錄，請改用手動連線設定。" };
+  if (platform === "darwin") {
+    const app = ["/Applications/Claude.app", join(home, "Applications", "Claude.app")].find(existsSync);
+    if (!app) return { directory, available: false, reason: "未找到 Claude 桌面客戶端。" };
+    const policies = ["/Library/Managed Preferences/com.anthropic.claudefordesktop.plist",
+      `/Library/Managed Preferences/${userInfo().username}/com.anthropic.claudefordesktop.plist`];
+    if (policies.some(existsSync)) return { directory, available: false, reason: "Claude 由組織政策管理，不能自動覆寫。" };
+    return { directory, available: true, app, platform };
+  }
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "if ((Test-Path 'HKLM:\\SOFTWARE\\Policies\\Claude') -or (Test-Path 'HKCU:\\SOFTWARE\\Policies\\Claude')) { Write-Output '{\"managed\":true}'; exit }",
+    "$paths=@((Join-Path $env:LOCALAPPDATA 'AnthropicClaude\\Claude.exe'),(Join-Path $env:LOCALAPPDATA 'Programs\\Claude\\Claude.exe'))",
+    "$exe=$paths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1",
+    "$id=Get-StartApps | Where-Object { $_.Name -eq 'Claude' -and $_.AppID -match '^(Claude_|AnthropicPBC.Claude_)' } | Select-Object -First 1 -ExpandProperty AppID",
+    "@{app=$exe; appId=$id} | ConvertTo-Json -Compress",
+  ].join("\n");
+  const { stdout } = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 10000 });
+  const info = JSON.parse(stdout.trim());
+  return { directory, ...info, platform, available: !info.managed && Boolean(info.app || info.appId),
+    reason: info.managed ? "Claude 由組織政策管理，不能自動覆寫。" : !info.app && !info.appId ? "未找到 Claude 桌面客戶端。" : null };
+}
+
+export function desktopLifecycle(info, { run = execute, wait = pause, timeoutMs = 30000 } = {}) {
+  const ps = (text) => run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", text], { windowsHide: true, timeout: timeoutMs + 5000 });
+  const osa = (text) => run("/usr/bin/osascript", ["-e", text], { timeout: timeoutMs + 5000 });
+  const application = `application ${JSON.stringify(info.app || "")}`;
+  const running = async () => info.platform === "darwin"
+    ? (await osa(`${application} is running`)).stdout.trim() === "true"
+    : (await ps("if(Get-Process -Name Claude -ErrorAction SilentlyContinue){'true'}else{'false'}")).stdout.trim() === "true";
+  const until = async (expected) => {
+    const deadline = Date.now() + timeoutMs;
+    do { if (await running() === expected) return; await wait(300); } while (Date.now() < deadline);
+    throw new Error(expected ? "Claude 未能重新啟動。" : "Claude 尚未退出，未修改設定。請先結束任務並關閉 Claude。");
+  };
+  return {
+    async stop() {
+      const wasRunning = await running();
+      if (wasRunning) {
+        if (info.platform === "darwin") await osa(`tell ${application} to quit`);
+        else await ps("Get-Process -Name Claude -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowHandle -ne 0} | ForEach-Object { [void]$_.CloseMainWindow() }");
+        await until(false);
+      }
+      return wasRunning;
+    },
+    async start() {
+      if (info.platform === "darwin") await run("/usr/bin/open", [info.app], { timeout: 10000 });
+      else if (info.app) await ps(`Start-Process -FilePath '${info.app.replaceAll("'", "''")}'`);
+      else {
+        if (!/^(Claude_|AnthropicPBC\.Claude_)[\w.!-]+$/.test(info.appId || "")) throw new Error("Invalid Claude application ID.");
+        await run("explorer.exe", [`shell:AppsFolder\\${info.appId}`], { windowsHide: true, timeout: 10000 });
+      }
+      await until(true);
+    },
+  };
+}
+
+function regularPath(path) {
+  let cursor = path;
+  while (true) {
+    try {
+      const systemAlias = (cursor === "/var" || cursor === "/tmp") && realpathSync(cursor) === "/private" + cursor;
+      if (lstatSync(cursor).isSymbolicLink() && !systemAlias) throw new Error("Claude 設定路徑含符號連結，未修改。");
+    }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    const parent = dirname(cursor);
+    if (cursor === parent) break;
+    cursor = parent;
+  }
+}
+
+function snapshot(path) {
+  regularPath(path);
+  try {
+    const raw = readFileSync(path, "utf8");
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Claude 設定格式無效，未修改。");
+    return { path, raw, value, mode: lstatSync(path).mode & 0o777 };
+  } catch (error) {
+    if (error.code === "ENOENT") return { path, raw: null, value: {}, mode: 0o600 };
+    if (error instanceof SyntaxError) throw new Error("Claude 設定格式無效，未修改。");
+    throw error;
+  }
+}
+
+function putFile(path, raw, mode = 0o600) {
+  regularPath(path);
+  if (raw === null) { if (existsSync(path)) unlinkSync(path); return; }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const temp = path + ".router-" + randomBytes(6).toString("hex");
+  writeFileSync(temp, raw, { mode, flag: "wx" });
+  try { renameSync(temp, path); chmodSync(path, mode); }
+  finally { if (existsSync(temp)) unlinkSync(temp); }
+}
+const encoded = (value) => JSON.stringify(value, null, 2) + "\n";
+const conflict = () => new Error("Claude 設定已被其他操作修改，為避免覆蓋，請先檢查備份與目前設定。");
+
+export function integrationStatus(backupPath) {
+  try { return JSON.parse(readFileSync(backupPath, "utf8")); }
+  catch (error) { if (error.code === "ENOENT") return null; throw new Error("Claude 接入備份無法讀取，未修改設定。"); }
+}
+
+function integrationPaths(directory, id, gatewayPath) {
+  if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid Claude profile ID.");
+  return [join(directory, "configLibrary", id + ".json"), join(directory, "configLibrary", "_meta.json"),
+    join(directory, "claude_desktop_config.json"), gatewayPath];
+}
+
+export function planDesktopRestore(state, { directory, gatewayPath }) {
+  const paths = integrationPaths(directory, state.id, gatewayPath);
+  if (state.schema !== 1 || !Array.isArray(state.files) || state.files.length !== paths.length
+    || state.files.some((file, index) => file.path !== paths[index])) throw new Error("Invalid Claude integration backup.");
+  return state.files.map((file, index) => {
+    const now = snapshot(file.path);
+    if (now.raw === file.before.raw) return { ...now, restore: now.raw };
+    if (isDeepStrictEqual(now.value, file.after)) return { ...now, restore: file.before.raw, mode: file.before.mode };
+    // Preserve unrelated preferences and other newly saved profiles.
+    const next = structuredClone(now.value);
+    const keys = index === 2 ? ["deploymentMode"] : index === 1 ? ["appliedId", "hybridPointer"] : null;
+    if (!keys) throw conflict();
+    for (const key of keys) {
+      if (!isDeepStrictEqual(now.value[key], file.after[key])) throw conflict();
+      if (Object.hasOwn(file.before.value, key)) next[key] = file.before.value[key];
+      else delete next[key];
+    }
+    if (index === 1) {
+      if (!Array.isArray(next.entries)) throw conflict();
+      const owned = next.entries.filter((entry) => entry.id === state.id);
+      if (owned.length !== 1 || !isDeepStrictEqual(owned[0], file.after.entries.find((entry) => entry.id === state.id))) throw conflict();
+      next.entries = next.entries.filter((entry) => entry.id !== state.id);
+      if (!Object.hasOwn(file.before.value, "entries") && !next.entries.length) delete next.entries;
+    }
+    return { ...now, restore: !Object.keys(next).length && file.before.raw === null ? null : encoded(next) };
+  });
+}
+
+function commitFiles(changes) {
+  for (const item of changes) if (snapshot(item.path).raw !== item.raw) throw conflict();
+  const written = [];
+  try {
+    for (const item of changes) {
+      if (snapshot(item.path).raw !== item.raw) throw conflict();
+      putFile(item.path, item.restore, item.mode);
+      written.push(item);
+    }
+  } catch (error) {
+    for (const item of written.reverse()) {
+      if (snapshot(item.path).raw !== item.restore) throw conflict();
+      putFile(item.path, item.raw, item.mode);
+    }
+    throw error;
+  }
+}
+
+export async function connectDesktop({ directory, gatewayPath, backupPath, settings, lifecycle }) {
+  if (integrationStatus(backupPath)?.status !== "restored" && integrationStatus(backupPath)) throw new Error("Claude 已有接入備份，請先回退再重新接入。");
+  if (!desktopRoutes(settings).length) throw new Error("請先添加使用 Anthropic Messages 介面的 Claude API 模型。");
+  const id = randomUUID(), config = newDesktopConfig(readDesktopConfig(gatewayPath));
+  const paths = integrationPaths(directory, id, gatewayPath);
+  const values = (before) => {
+    const meta = structuredClone(before[1].value);
+    if (before[0].raw !== null || (meta.entries !== undefined && (!Array.isArray(meta.entries)
+      || meta.entries.some((entry) => !entry || typeof entry.id !== "string" || typeof entry.name !== "string")))
+      || (before[2].value.deploymentMode !== undefined && !["1p", "3p"].includes(before[2].value.deploymentMode))) {
+      throw new Error("Claude 設定格式無效，未修改。");
+    }
+    meta.entries = [...(meta.entries || []), { id, name: "Model Router" }];
+    meta.appliedId = id;
+    delete meta.hybridPointer;
+    return [desktopConnection(settings, config), meta, { ...before[2].value, deploymentMode: "3p" }, config];
+  };
+  values(paths.map(snapshot)); // Reject corrupt/unknown configurations before closing the app.
+  const wasRunning = await lifecycle.stop();
+  let state;
+  try {
+    const before = paths.map(snapshot), after = values(before);
+    state = { schema: 1, id, status: "prepared", createdAt: new Date().toISOString(),
+      files: before.map((file, index) => ({ path: file.path, before: file, after: after[index] })) };
+    putFile(backupPath, encoded(state));
+    commitFiles(before.map((file, index) => ({ ...file, restore: encoded(after[index]), mode: 0o600 })));
+    state.status = "applied";
+    putFile(backupPath, encoded(state));
+    await lifecycle.start();
+    return { connected: true, restarted: true };
+  } catch (error) {
+    // A start failure can leave a partially started app. Stop before restoring.
+    if (state) {
+      await lifecycle.stop();
+      commitFiles(planDesktopRestore(state, { directory, gatewayPath }));
+      state.status = "restored";
+      putFile(backupPath, encoded(state));
+    }
+    if (wasRunning) await lifecycle.start().catch(() => {});
+    throw error;
+  }
+}
+
+export async function restoreDesktop({ directory, gatewayPath, backupPath, lifecycle }) {
+  const state = integrationStatus(backupPath);
+  if (!state || state.status === "restored") return { restored: true, restarted: false };
+  // Detect conflicts before closing Claude; check again after it exits.
+  planDesktopRestore(state, { directory, gatewayPath });
+  await lifecycle.stop();
+  commitFiles(planDesktopRestore(state, { directory, gatewayPath }));
+  state.status = "restored";
+  putFile(backupPath, encoded(state));
+  await lifecycle.start();
+  return { restored: true, restarted: true };
+}
+
+export const DESKTOP_PREFIX = "/claude";
+export const DESKTOP_TOKEN_PREFIX = "cmr-claude-";
+export const DESKTOP_CONFIG_FILE = "claude-desktop.json";
+
+export function desktopRoutes(settings) {
+  const providers = new Set((settings.providers?.length ? settings.providers : settings.apiRoot ? [{ id: "default" }] : [])
+    .map((provider) => provider.id || "default"));
+  return (settings.routes || []).filter((route) => route.translate === "anthropic"
+    && route.transport !== "claude-cli" && /(?:^|\/)claude-/.test(route.upstreamModel || "")
+    && providers.has(route.providerId || "default"));
+}
+
+export function desktopModels(settings) {
+  const tiers = new Set();
+  const data = desktopRoutes(settings).map((route) => {
+    const tier = /(?:^|\/)claude-(opus|sonnet|haiku|fable|mythos)(?:-|$)/.exec(route.upstreamModel)?.[1];
+    const first = tier && !tiers.has(tier);
+    if (tier) tiers.add(tier);
+    return {
+      id: route.pickerSlug, type: "model", display_name: route.displayName || route.upstreamModel,
+      created_at: "2026-01-01T00:00:00Z",
+      ...(tier ? { anthropic_family_tier: tier, is_family_default: Boolean(first) } : {}),
+    };
+  });
+  // Context values in our catalog can be user overrides, not verified capabilities.
+  // Do not advertise supports_1m from those values.
+  return { data, has_more: false, first_id: data[0]?.id || null, last_id: data.at(-1)?.id || null };
+}
+
+export function readDesktopConfig(path) {
+  try {
+    const config = JSON.parse(readFileSync(path, "utf8"));
+    return config?.enabled === true && /^cmr-claude-[a-f0-9]{48}$/.test(config.token || "") ? config : null;
+  } catch { return null; }
+}
+
+export function newDesktopConfig(previous) {
+  return { enabled: true, token: /^cmr-claude-[a-f0-9]{48}$/.test(previous?.token || "")
+    ? previous.token : DESKTOP_TOKEN_PREFIX + randomBytes(24).toString("hex") };
+}
+
+function requestToken(headers) {
+  return headers["x-api-key"] || (typeof headers.authorization === "string"
+    && headers.authorization.startsWith("Bearer ") ? headers.authorization.slice(7) : "");
+}
+
+export function hasDesktopToken(headers) {
+  return [headers["x-api-key"], headers.authorization].some((value) => typeof value === "string" && value.includes(DESKTOP_TOKEN_PREFIX));
+}
+
+export function desktopAuthorized(headers, config) {
+  if (!config) return false;
+  const token = requestToken(headers);
+  if (typeof token !== "string" || !token) return false;
+  const digest = (value) => createHash("sha256").update(value).digest();
+  return timingSafeEqual(digest(token), digest(config.token));
+}
+
+export function desktopConnection(settings, config) {
+  if (!config) return null;
+  return {
+    inferenceProvider: "gateway", inferenceGatewayBaseUrl: `http://127.0.0.1:${settings.port}${DESKTOP_PREFIX}`,
+    inferenceGatewayApiKey: config.token,
+    modelDiscoveryEnabled: true,
+  };
+}
+
+export function desktopHeaders(incoming, key, target) {
+  const official = new URL(target).hostname.toLowerCase() === "api.anthropic.com";
+  const headers = new Headers(official ? { "x-api-key": key } : { authorization: `Bearer ${key}` });
+  headers.set("content-type", "application/json");
+  headers.set("anthropic-version", incoming["anthropic-version"] || "2023-06-01");
+  for (const name of ["anthropic-beta", "accept", "user-agent"]) {
+    if (typeof incoming[name] === "string") headers.set(name, incoming[name]);
+  }
+  return headers;
+}
+
+function failure(status, code, message) {
+  return Object.assign(new Error(message), { status, code });
+}
+
+export function desktopRoute(settings, model) {
+  const routes = desktopRoutes(settings);
+  const exact = routes.find((route) => route.pickerSlug === model);
+  if (exact) return exact;
+  const matching = routes.filter((route) => route.upstreamModel === model);
+  if (matching.length === 1) return matching[0];
+  // Never silently choose another provider when the same upstream ID exists twice.
+  throw failure(404, "claude_model_not_configured", "Choose a Claude API model from the gateway model list.");
+}
+
+// Only retain usage counters. Large text/image/tool frames are forwarded untouched,
+// but not retained by the observer. Lifecycle and usage frames are small.
+export function desktopUsageObserver() {
+  let buffer = "", skip = false, started = false, stopped = false, failed = false, stopReason = null, usage = null;
+  const decoder = new TextDecoder();
+  const frame = (text) => {
+    const data = text.split("\n").filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart()).join("\n");
+    if (!data) return;
+    try {
+      const event = JSON.parse(data);
+      if (event.type === "message_start") { started = true; usage = { ...event.message?.usage }; }
+      if (event.type === "message_delta") {
+        if (event.usage) usage = { ...usage, ...event.usage };
+        stopReason = event.delta?.stop_reason || stopReason;
+      }
+      if (event.type === "message_stop") stopped = true;
+      if (event.type === "error") failed = true;
+    } catch { /* Non-JSON comments/frames have no usage. */ }
+  };
+  return {
+    push(chunk) {
+      // Normalize CRLF even when the two bytes arrive in separate chunks.
+      buffer += decoder.decode(chunk, { stream: true });
+      let match;
+      while ((match = /\r?\n\r?\n/.exec(buffer))) {
+        if (!skip && match.index <= 64 * 1024) frame(buffer.slice(0, match.index).replaceAll("\r\n", "\n"));
+        buffer = buffer.slice(match.index + match[0].length);
+        skip = false;
+      }
+      if (buffer.length > 64 * 1024) { buffer = buffer.slice(-3); skip = true; }
+    },
+    result() {
+      return { usage, status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
+    },
+  };
+}
+
+export function desktopUsageEvent(result, model, errorCode) {
+  const u = result.usage;
+  const number = (value) => Number.isFinite(value) && value >= 0 ? value : 0;
+  return { type: `response.${result.status}`, response: { model,
+    ...(u ? { usage: {
+      input_tokens: number(u.input_tokens) + number(u.cache_read_input_tokens) + number(u.cache_creation_input_tokens),
+      input_tokens_details: { cached_tokens: number(u.cache_read_input_tokens), cache_write_tokens: number(u.cache_creation_input_tokens) },
+      output_tokens: number(u.output_tokens),
+    } } : {}),
+    ...(errorCode ? { error: { code: errorCode } } : {}),
+  } };
+}
+
+export function createDesktopHandler({ settings, configPath, readBody, fetchUpstream, recordUsage, recordError,
+  timeoutMs = 10 * 60 * 1000 }) {
+  const json = (response, status, body) => {
+    response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+    response.end(JSON.stringify(body));
+  };
+  return async (request, response, url) => {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const closed = () => { if (!response.writableFinished) abort(); };
+    const timer = setTimeout(abort, timeoutMs);
+    timer.unref();
+    request.on("aborted", abort);
+    response.on("close", closed);
+    let context = null, recorded = false, observer = null;
+    const report = (result, code) => {
+      if (!context || recorded) return;
+      recorded = true;
+      recordUsage(context, desktopUsageEvent(result, context.upstreamModel, code));
+    };
+    try {
+      // Electron's net stack also sends Origin / Sec-Fetch-* metadata. The
+      // dedicated key is the authentication boundary, not browser-like headers.
+      // No CORS response or preflight support: unrelated websites cannot read
+      // responses or attach this non-cookie credential without already having it.
+      if (!desktopAuthorized(request.headers, readDesktopConfig(configPath))) throw failure(401, "authentication_error", "Claude Desktop gateway is disabled or its local key is invalid.");
+      const path = url.pathname.slice(DESKTOP_PREFIX.length);
+      if (request.method === "GET" && path === "/v1/models") {
+        json(response, 200, desktopModels(settings)); return;
+      }
+      const countTokens = path === "/v1/messages/count_tokens";
+      if (request.method !== "POST" || (path !== "/v1/messages" && !countTokens)) throw failure(404, "not_found_error", "Unsupported Claude gateway endpoint.");
+      if (request.headers["content-encoding"] && request.headers["content-encoding"] !== "identity") throw failure(415, "invalid_request_error", "Unsupported content encoding.");
+      let body;
+      try { body = JSON.parse((await readBody(request)).toString("utf8")); }
+      catch (error) { if (error.status) throw error; throw failure(400, "invalid_request_error", "Invalid JSON request."); }
+      if (!body || Array.isArray(body) || typeof body !== "object" || typeof body.model !== "string") throw failure(400, "invalid_request_error", "A model is required.");
+      const route = desktopRoute(settings, body.model);
+      context = { startedAt: Date.now(), model: route.pickerSlug, upstreamModel: route.upstreamModel,
+        route: "custom", provider: route.providerId || "default", transport: "claude-desktop", backgroundKind: null, thread: null, recorded: false };
+      const upstream = await fetchUpstream(route, countTokens ? "/messages/count_tokens" : "/messages", request.headers,
+        Buffer.from(JSON.stringify({ ...body, model: route.upstreamModel })), controller.signal);
+      if (!upstream.ok) throw failure(upstream.status >= 400 ? upstream.status : 502, "claude_upstream_error", `Claude upstream returned HTTP ${upstream.status}.`);
+      if (body.stream === true && !countTokens) {
+        if (!upstream.headers.get("content-type")?.includes("text/event-stream") || !upstream.body) throw failure(502, "invalid_upstream_response", "Expected an Anthropic event stream.");
+        response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+        response.flushHeaders();
+        observer = desktopUsageObserver();
+        for await (const chunk of upstream.body) {
+          observer.push(chunk);
+          if (!response.write(chunk)) await once(response, "drain", { signal: controller.signal });
+        }
+        const result = observer.result();
+        if (result.status === "failed") {
+          report(result, "claude_stream_incomplete");
+          throw failure(502, "claude_stream_incomplete", "Claude stream failed or ended before message_stop.");
+        }
+        report(result);
+        response.end();
+      } else {
+        const value = await upstream.json();
+        if (countTokens ? !Number.isFinite(value?.input_tokens) : value?.type !== "message" || !Array.isArray(value.content)) throw failure(502, "invalid_upstream_response", "Invalid Anthropic response.");
+        if (!countTokens) report({ usage: value.usage, status: value.stop_reason === "max_tokens" ? "incomplete" : "completed" });
+        json(response, 200, value);
+      }
+    } catch (error) {
+      const code = controller.signal.aborted ? "claude_request_aborted" : error.code || "claude_gateway_error";
+      report({ ...observer?.result(), status: "failed" }, code);
+      const status = Number.isInteger(error.status) ? error.status : 502;
+      const message = error.status ? error.message : "Claude gateway request failed. Check the router diagnostics.";
+      recordError({ status, code, message }, context);
+      if (!response.destroyed) {
+        const body = { type: "error", error: { type: code, message } };
+        if (response.headersSent) response.end(`event: error\ndata: ${JSON.stringify(body)}\n\n`);
+        else json(response, status, body);
+      }
+    } finally {
+      controller.abort();
+      clearTimeout(timer);
+      request.off("aborted", abort);
+      response.off("close", closed);
+    }
+  };
+}
 __CODEX_MODEL_ROUTER_MANAGER_JS__
 // 網頁管理介面的伺服器端：本機 HTTP、存取權杖、背景工作與輸出擷取。
 //
@@ -17712,7 +18309,7 @@ __CODEX_MODEL_ROUTER_MANAGER_HTML__
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>Codex 模型路由器</title>
+<title>模型路由器</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%230f172a'/%3E%3Cpath d='M11 16h8c4 0 6 2 8 5l2 3c1.5 2.3 3 3.5 6 3.5h2' stroke='%2338bdf8' stroke-width='4.5' fill='none' stroke-linecap='round'/%3E%3Cpath d='M11 32h8c3 0 5-1.5 6.5-3.5' stroke='%233b82f6' stroke-width='4.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 :root {
@@ -17753,7 +18350,8 @@ button { font: inherit; color: inherit; }
 .version-badge:hover { color: var(--text); border-color: var(--border-strong); }
 .version-badge.has-update { background: rgba(245, 158, 11, .14); color: #fde68a; }
 .version-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px rgba(245, 158, 11, .18); }
-.nav { padding: 14px 12px; display: flex; flex-direction: column; gap: 4px; }
+.nav { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; min-height: 0; overflow-y: auto; }
+.nav-group-label { margin: 8px 12px 2px; color: var(--faint); font-size: 11px; font-weight: 700; letter-spacing: .6px; }
 .nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; color: var(--muted); background: none; border: 0; cursor: pointer; text-align: left; font-size: 14.5px; }
 .nav-item:hover { background: #142036; color: var(--text); }
 .nav-item.active { background: #172544; color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
@@ -18035,7 +18633,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
         </svg>
       </div>
       <div>
-        <div class="brand-name" data-i18n="Codex 模型路由器">Codex 模型路由器</div>
+        <div class="brand-name" data-i18n="模型路由器">模型路由器</div>
         <button type="button" class="version-badge" id="version-badge" aria-haspopup="dialog" aria-expanded="false">v—</button>
       </div>
     </div>
@@ -18221,6 +18819,31 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "全域預設模型": "Global default model",
 "未設定（使用官方預設）": "Not set (official default)",
 "全域上下文": "Global context",
+"通用": "General",
+"管理頁與路由器的通用功能。": "General manager and router options.",
+"Claude 桌面客戶端的接入與回退設定。": "Connect Claude Desktop or restore its previous settings.",
+"Claude Desktop 接入": "Claude Desktop integration",
+"一鍵接入 Claude Desktop": "Connect Claude Desktop",
+"一鍵回退 Claude Desktop": "Restore Claude Desktop",
+"手動連線（備用）": "Manual connection (fallback)",
+"接入與回退都會正常關閉並重新啟動 Claude，請先結束進行中的任務。接入前自動備份原設定，回退保留聊天與其他偏好。": "Connecting and restoring both quit and reopen Claude normally. Finish active tasks first. Original settings are backed up; restoring preserves chats and other preferences.",
+"設定 Claude Desktop 接入": "Configure Claude Desktop integration",
+"讓 Claude 桌面客戶端使用這裡的 Claude API 模型。第一版不包含 GPT 與 Claude CLI 訂閱模型。": "Use your Claude API models in Claude Desktop. This first version does not include GPT or Claude CLI subscription models.",
+"請先添加使用 Anthropic Messages 介面的 Claude API 模型。": "First add a Claude API model using the Anthropic Messages interface.",
+"請先更新並啟動支援 Claude Desktop 的本機路由器。": "First update and start the local router with Claude Desktop support.",
+"啟用 Claude Desktop 接入": "Enable Claude Desktop integration",
+"停用 Claude Desktop 接入": "Disable Claude Desktop integration",
+"取得連線設定": "Get connection settings",
+"Claude Desktop 連線設定": "Claude Desktop connection settings",
+"開啟 Claude 的 Help → Troubleshooting → Enable Developer Mode，再進入 Developer → Configure Third-Party Inference。選擇 Gateway，填入下列 Base URL 和 API Key；保留自動探索模型，然後按 Apply Changes。": "In Claude, open Help → Troubleshooting → Enable Developer Mode, then Developer → Configure Third-Party Inference. Select Gateway, enter the Base URL and API key below, leave model discovery enabled, then click Apply Changes.",
+"第三方模式的聊天記錄儲存在本機，與一般 Claude 的雲端聊天不同；既有對話不會自動搬移。": "Third-party mode stores chats locally, separately from regular Claude cloud chats. Existing conversations are not migrated automatically.",
+"這是僅供本機連線的金鑰，不是供應商 API Key。停用會立即撤銷，重新啟用後需要重新複製。": "This key is only for the local gateway, not your provider API key. Disabling revokes it immediately; copy the new key after re-enabling.",
+"可用的 Claude API 模型：{count}": "Available Claude API models: {count}",
+"複製 Base URL": "Copy Base URL",
+"複製本機 API Key": "Copy local API key",
+"已複製連線資料。": "Connection details copied.",
+"無法複製，請手動選取欄位內容。": "Could not copy. Please select the field contents manually.",
+"停用後，Claude 的第三方模式將無法連線。請先結束進行中的任務；要恢復一般 Claude，請在 Claude 客戶端切回原本模式。": "After disabling, Claude's third-party mode cannot connect. Finish active tasks first; switch back to regular mode in Claude to use your account again.",
 "{value} tokens（覆蓋各模型的設定）": "{value} tokens (overrides each model's setting)",
 "未設定（各模型自行決定）": "Not set (each model uses its own)",
 "中轉 API 生圖": "Relay API image generation",
@@ -18311,7 +18934,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "正在收集…": "Collecting…",
 "下載診斷包": "Download diagnostics",
 "解除安裝": "Uninstall",
-"解除安裝 Codex 模型路由器": "Uninstall Codex Model Router",
+"解除安裝 模型路由器": "Uninstall Model Router",
 "還原安裝器改過的 Codex 設定，停止並移除路由器、中轉生圖技能、桌面捷徑與 Codex 裡的「自訂模型管理」入口。": "Restores the Codex settings the installer changed, then stops and removes the router, the relay image skill, the desktop shortcut, and the “Custom Model Manager” entry in Codex.",
 "目前只裝了管理頁：會移除管理頁、桌面捷徑與 Codex 裡的「自訂模型管理」入口。": "Only the manager is installed: this removes the manager, the desktop shortcut, and the “Custom Model Manager” entry in Codex.",
 "安裝檔案會封存到 Codex 的 backups 目錄，不會直接刪除；之後重新執行安裝器即可再次安裝。": "Installed files are archived in Codex's backups folder, not deleted. Run the installer again any time to reinstall.",
@@ -18566,7 +19189,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "注意：{message}": "Note: {message}",
 "更新完成，正在以新版本重新啟動管理頁…": "Update finished. Restarting the manager with the new version…",
 "無法自動重新啟動管理頁：{reason}。請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。": "Couldn't restart the manager automatically: {reason}. Reopen it from “Custom Model Manager” in Codex or with the installer's ui command.",
-"管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。": "The manager hasn't come back yet. Refresh, or reopen the “Codex 模型路由器” shortcut for diagnostics.",
+"管理頁尚未恢復。請重新整理，或重新開啟「模型路由器」捷徑查看診斷。": "The manager hasn't come back yet. Refresh, or reopen the “模型路由器” shortcut for diagnostics.",
 "清單沒有列出的模型 ID，可用逗號分隔": "Model IDs not in the list, separated by commas",
 "搜尋模型 ID": "Search model IDs",
 "搜尋模型": "Search models",
@@ -18702,7 +19325,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "介面語言": "Interface language",
 "自動（{language}）": "Automatic ({language})",
 "無法儲存語言設定：{reason}": "Couldn't save the language setting: {reason}",
-"Codex 模型路由器": "Codex Model Router",
+"模型路由器": "Model Router",
 "缺少存取權杖": "Missing access token",
 "請從 Codex 的「自訂模型管理」或終端機顯示的網址開啟管理頁，也可以重新執行安裝器的 ui 命令。": "Open the manager from “Custom Model Manager” in Codex or the URL shown in the terminal, or run the installer's ui command again.",
 "存取權杖已失效": "Access token expired",
@@ -18726,7 +19349,9 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Models",
 "供應商": "Providers",
 "生圖": "Images",
-"設定": "Settings",
+"通用設定": "General settings",
+"Codex設定": "Codex settings",
+"Claude 客戶端": "Claude Desktop",
 "使用記錄": "Usage"
 },
 "enErrors": {
@@ -18751,6 +19376,24 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "upstream_http_error": "The upstream service returned an HTTP error."
 },
 "enServer": [
+["^Claude Desktop 自動接入目前僅支援 macOS 與 Windows。$", "Automatic Claude Desktop integration currently supports macOS and Windows only."],
+["^Claude 使用自訂資料目錄，請改用手動連線設定。$", "Claude uses a custom data directory. Use the manual connection settings."],
+["^未找到 Claude 桌面客戶端。$", "Claude Desktop was not found."],
+["^Claude 由組織政策管理，不能自動覆寫。$", "Claude is managed by organization policy. Automatic configuration cannot overwrite it."],
+["^無法確認 Claude 的安裝位置或管理政策，請使用手動連線設定。$", "Could not verify Claude's installation or policy. Use the manual connection settings."],
+["^Claude 未能重新啟動。$", "Claude could not be restarted."],
+["^Claude 尚未退出，未修改設定。請先結束任務並關閉 Claude。$", "Claude has not exited; settings were not changed. Finish active tasks and close Claude first."],
+["^Claude 設定路徑含符號連結，未修改。$", "The Claude settings path contains a symlink; nothing was changed."],
+["^Claude 設定格式無效，未修改。$", "Claude settings are invalid; nothing was changed."],
+["^Claude 設定已被其他操作修改，為避免覆蓋，請先檢查備份與目前設定。$", "Claude settings have changed elsewhere. Review the backup and current settings before restoring."],
+["^Claude 接入備份無法讀取，未修改設定。$", "The Claude integration backup could not be read; nothing was changed."],
+["^Claude 已有接入備份，請先回退再重新接入。$", "A Claude integration backup already exists. Restore it before connecting again."],
+["^請使用一鍵回退，還原 Claude 設定後再停用接入。$", "Use Restore Claude Desktop to restore settings before disabling the gateway."],
+["^正在備份並接入 Claude Desktop，將正常關閉並重新開啟客戶端。$", "Backing up and connecting Claude Desktop. The app will quit normally and reopen."],
+["^Claude Desktop 已接入並重新啟動，請在模型選單選擇 Claude API 模型。$", "Claude Desktop is configured and restarted. Select a Claude API model in its model picker."],
+["^Claude Desktop 已還原原設定並重新啟動。$", "Claude Desktop settings were restored and the app restarted."],
+["^Claude Desktop 接入已啟用。請取得連線設定並套用到 Claude 客戶端。$", "Claude Desktop integration enabled. Get the connection settings and apply them in Claude."],
+["^Claude Desktop 接入已停用。$", "Claude Desktop integration disabled."],
 ["^尚未安裝路由器，請先在管理頁完成首次設定。$", "The router isn't installed. Finish the first-time setup in the manager first."],
 ["^路由器已經安裝，請重新整理管理頁。$", "The router is already installed. Reload the manager."],
 ["^路由器已是 (.+)，這個管理頁仍是 (.+)；請關閉管理頁後重新開啟。$", "The router is already $1, but this manager is still $2. Close the manager and open it again."],
@@ -18758,7 +19401,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 ["^未找到 Codex CLI，請先安裝 (.+) 或 Codex CLI。$", "Codex CLI wasn't found. Install $1 or the Codex CLI first."],
 ["^未找到 Codex CLI。$", "Codex CLI wasn't found."],
 ["^沒有可解除安裝的項目。$", "There's nothing installed to uninstall."],
-["^當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。$", "Codex Model Router isn't installed in this CODEX_HOME. Choose “安裝或重新配置” (Install or reconfigure) first."],
+["^當前 CODEX_HOME 尚未安裝 模型路由器，請先選擇「安裝或重新配置」。$", "Model Router isn't installed in this CODEX_HOME. Choose “安裝或重新配置” (Install or reconfigure) first."],
 ["^尚未安裝路由器。$", "The router isn't installed."],
 ["^「(.+)」正在進行中，請等它完成。$", "“$1” is in progress. Wait for it to finish."],
 ["^還有操作正在進行，請等它完成。$", "Another operation is in progress. Wait for it to finish."],
@@ -18833,8 +19476,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幫幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕絡給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脈脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧帮几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝络给统绑经维网缀紧绪线编缓缩总绘继续义联声听脉脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幫幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕絡給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脈脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧帮几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝络给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脉脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -19364,7 +20007,14 @@ const VIEWS = [
   { id: "models", label: () => sectionTitle("模型"), icon: "models" },
   { id: "providers", label: () => sectionTitle("供應商"), icon: "providers" },
   { id: "imagegen", label: () => sectionTitle("生圖"), icon: "image" },
-  { id: "settings", label: () => sectionTitle("設定"), icon: "settings" },
+  { id: "general-settings", label: () => sectionTitle("通用設定"), icon: "settings" },
+  { id: "settings", label: () => sectionTitle("Codex設定"), icon: "settings", group: "codex" },
+  { id: "claude", label: () => sectionTitle("Claude 客戶端"), icon: "claude", group: "claude" },
+];
+const NAV_GROUPS = [
+  { id: "general", label: () => t("通用") },
+  { id: "codex", label: () => "GPT" },
+  { id: "claude", label: () => "Claude" },
 ];
 
 function render() {
@@ -19375,14 +20025,18 @@ function render() {
 
 function renderSidebar() {
   const nav = document.getElementById("nav");
-  nav.replaceChildren(...VIEWS.map((view) => {
+  const navButton = (view) => {
     const count = !state ? null : view.id === "models" ? (state.models || []).length : view.id === "providers" ? (state.providers || []).length : null;
     return h("button", {
       type: "button", class: "nav-item" + (view.id === currentView ? " active" : ""),
       "aria-current": view.id === currentView ? "page" : null,
       onclick: () => switchView(view.id),
     }, icon(view.icon), view.label(), count != null ? h("span", { class: "nav-count", text: String(count) }) : null);
-  }));
+  };
+  nav.replaceChildren(...NAV_GROUPS.flatMap((group) => [
+    h("div", { class: "nav-group-label", role: "heading", "aria-level": "2", text: group.label() }),
+    ...VIEWS.filter((view) => (view.group || "general") === group.id).map(navButton),
+  ]));
 
   const badge = document.getElementById("version-badge");
   const version = (versionInfo && versionInfo.installed) || (state && state.versions && (state.versions.installed || state.versions.manager));
@@ -19454,7 +20108,9 @@ function renderView() {
     return;
   }
   if (!state.installed) {
-    view.replaceChildren(...(currentView === "settings" ? renderSetupSettings() : renderWelcome()));
+    view.replaceChildren(...(currentView === "settings" ? renderSetupSettings()
+      : currentView === "general-settings" ? renderGeneralSettings()
+      : currentView === "claude" ? renderClaudeSettings() : renderWelcome()));
     return;
   }
   if (currentView === "models") view.replaceChildren(...renderModels());
@@ -19462,6 +20118,8 @@ function renderView() {
   else if (currentView === "providers") view.replaceChildren(...renderProviders());
   else if (currentView === "imagegen") view.replaceChildren(...renderImagegen());
   else if (currentView === "settings") view.replaceChildren(...renderSettings());
+  else if (currentView === "general-settings") view.replaceChildren(...renderGeneralSettings());
+  else if (currentView === "claude") view.replaceChildren(...renderClaudeSettings());
   else view.replaceChildren(...renderOverview());
 }
 
@@ -19490,12 +20148,10 @@ function renderWelcome() {
 
 function renderSetupSettings() {
   return [
-    pageHead(sectionTitle("設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
+    pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
     renderGlobalContextPanel(Boolean(state.setupBlocked)),
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
     renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
-    renderDiagnosticsPanel(),
-    renderUninstallPanel(),
   ];
 }
 
@@ -20607,15 +21263,81 @@ function confirmDisableImagegen() {
 function renderSettings() {
   const blocked = writeBlocked();
   return [
-    pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
+    pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
     renderKeysmithPanel(blocked),
     renderSessionCleanerPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
-    renderDiagnosticsPanel(),
-    renderUninstallPanel(),
   ];
+}
+
+function renderGeneralSettings() {
+  return [pageHead(sectionTitle("通用設定"), t("管理頁與路由器的通用功能。")),
+    renderDiagnosticsPanel(), renderUninstallPanel()];
+}
+
+function renderClaudeSettings() {
+  return [pageHead(sectionTitle("Claude 客戶端"), t("Claude 桌面客戶端的接入與回退設定。")),
+    renderClaudeDesktopPanel(writeBlocked())];
+}
+
+function renderClaudeDesktopPanel(blocked) {
+  const entry = ensureQuery("claude-desktop");
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
+    h("h2", { text: t("Claude Desktop 接入") }), refreshButton("claude-desktop", t("重新整理"))));
+  if (!entry.data) { panel.append(queryPlaceholder(entry, "claude-desktop")); return panel; }
+  const data = entry.data;
+  panel.append(h("div", { class: "panel-body setting-body" },
+    h("div", { class: "setting-value", text: data.enabled ? t("已啟用") : t("未啟用") }),
+    paragraph(t("讓 Claude 桌面客戶端使用這裡的 Claude API 模型。第一版不包含 GPT 與 Claude CLI 訂閱模型。"), "muted"),
+    paragraph(t("可用的 Claude API 模型：{count}", { count: data.models.length }), "note"),
+    data.models.length ? h("div", { class: "note", text: data.models.map((model) => model.name).join(" · ") })
+      : paragraph(t("請先添加使用 Anthropic Messages 介面的 Claude API 模型。"), "note"),
+    !data.ready ? paragraph(t("請先更新並啟動支援 Claude Desktop 的本機路由器。"), "note") : null,
+    paragraph(t("第三方模式的聊天記錄儲存在本機，與一般 Claude 的雲端聊天不同；既有對話不會自動搬移。"), "note"),
+    paragraph(t("接入與回退都會正常關閉並重新啟動 Claude，請先結束進行中的任務。接入前自動備份原設定，回退保留聊天與其他偏好。"), "note"),
+    data.automatic?.reason ? paragraph(serverText(data.automatic.reason), "note") : null,
+    h("div", { class: "actions" },
+      !data.connected ? h("button", { type: "button", class: "button primary", disabled: blocked || !data.ready || !data.models.length || !data.automatic?.available,
+        onclick: () => runJob("connect-claude-desktop", {}, { title: t("一鍵接入 Claude Desktop") }) }, t("一鍵接入 Claude Desktop")) : null,
+      data.connected ? h("button", { type: "button", class: "button danger", disabled: blocked,
+        onclick: () => runJob("restore-claude-desktop", {}, { title: t("一鍵回退 Claude Desktop") }) }, t("一鍵回退 Claude Desktop")) : null),
+    h("details", {}, h("summary", { text: t("手動連線（備用）") }), h("div", { class: "actions" },
+      !data.enabled ? h("button", { type: "button", class: "button primary", disabled: blocked || !data.ready || !data.models.length,
+        onclick: async () => {
+          const result = await runJob("set-claude-desktop", { enabled: true }, { title: t("啟用 Claude Desktop 接入") });
+          if (result?.status === "succeeded") openClaudeDesktopConnection();
+        } }, t("啟用 Claude Desktop 接入")) : null,
+      data.enabled ? h("button", { type: "button", class: "button", onclick: openClaudeDesktopConnection }, t("取得連線設定")) : null,
+      data.enabled && !data.connected ? h("button", { type: "button", class: "button danger", disabled: blocked, onclick: () => {
+        confirmDialog({ title: t("停用 Claude Desktop 接入"), danger: true,
+          body: paragraph(t("停用後，Claude 的第三方模式將無法連線。請先結束進行中的任務；要恢復一般 Claude，請在 Claude 客戶端切回原本模式。")) })
+          .then((ok) => { if (ok) runJob("set-claude-desktop", { enabled: false }, { title: t("停用 Claude Desktop 接入") }); });
+      } }, t("停用 Claude Desktop 接入")) : null))));
+  return panel;
+}
+
+async function openClaudeDesktopConnection() {
+  try {
+    const data = await api("/api/query", { method: "POST", body: { type: "claude-desktop-connection" } });
+    if (!data.connection) { reloadQuery("claude-desktop"); return; }
+    const connection = data.connection;
+    const field = (label, value, copyLabel, secret = false) => {
+      const input = h("input", { type: secret ? "password" : "text", value, readOnly: true, autocomplete: "off" });
+      return h("div", { class: "setting-body" }, h("label", {}, label, input),
+        h("button", { type: "button", class: "button", onclick: async () => {
+          try { await navigator.clipboard.writeText(value); toast(t("已複製連線資料。")); }
+          catch { input.type = "text"; input.select(); toast(t("無法複製，請手動選取欄位內容。"), "error"); }
+        } }, copyLabel));
+    };
+    openModal({ title: t("Claude Desktop 連線設定"), body: [
+      paragraph(t("開啟 Claude 的 Help → Troubleshooting → Enable Developer Mode，再進入 Developer → Configure Third-Party Inference。選擇 Gateway，填入下列 Base URL 和 API Key；保留自動探索模型，然後按 Apply Changes。")),
+      field("Base URL", connection.inferenceGatewayBaseUrl, t("複製 Base URL")),
+      field("API Key", connection.inferenceGatewayApiKey, t("複製本機 API Key"), true),
+      paragraph(t("這是僅供本機連線的金鑰，不是供應商 API Key。停用會立即撤銷，重新啟用後需要重新複製。"), "note"),
+    ] });
+  } catch (error) { toast(error.message, "error"); }
 }
 
 // 解除安裝：與終端的「回退配置」相同；還原 Codex 配置、移除路由器與入口，檔案封存不刪除。
@@ -20637,7 +21359,7 @@ function confirmUninstall() {
   const store = state.platform === "win32" ? t("Windows 憑證保護") : t("鑰匙圈");
   const keyBox = h("input", { type: "checkbox", checked: true });
   confirmDialog({
-    title: t("解除安裝 Codex 模型路由器"),
+    title: t("解除安裝 模型路由器"),
     danger: true,
     confirmLabel: t("解除安裝"),
     body: [
@@ -21083,6 +21805,8 @@ function jobTitle(type, fallback) {
     "session-cleaner-preview": t("AI 改寫預覽"), "session-cleaner-apply": t("清理會話"),
     "session-cleaner-restore": t("還原會話"),
     "set-background-model": t("設定背景任務模型"),
+    "set-claude-desktop": t("設定 Claude Desktop 接入"),
+    "connect-claude-desktop": t("一鍵接入 Claude Desktop"), "restore-claude-desktop": t("一鍵回退 Claude Desktop"),
     "chatgpt-login": t("登入 ChatGPT 帳號"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
     "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
@@ -21200,7 +21924,7 @@ async function restartManager({ alreadyRequested = false } = {}) {
       }
     } catch { /* 交接期間短暫無法連線，下次再試 */ }
     if (Date.now() - started > 120000) {
-      message.textContent = t("管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。");
+      message.textContent = t("管理頁尚未恢復。請重新整理，或重新開啟「模型路由器」捷徑查看診斷。");
       message.parentNode.append(h("button", { type: "button", class: "button", text: t("重新整理"), onclick: () => location.reload() }));
       return;
     }
@@ -21973,7 +22697,7 @@ async function setLanguage(value) {
 
 function applyLocale() {
   document.documentElement.lang = locale;
-  document.title = t("Codex 模型路由器");
+  document.title = t("模型路由器");
   for (const node of document.querySelectorAll("[data-i18n]")) node.textContent = t(node.dataset.i18n);
   for (const node of document.querySelectorAll("[data-i18n-aria-label]")) node.setAttribute("aria-label", t(node.dataset.i18nAriaLabel));
   renderLanguagePicker();
@@ -22051,21 +22775,21 @@ export const MANAGER_ENTRY_NAME = "open_model_manager";
 // 入口名稱跟隨 Codex 介面語言：只支援繁中、簡中與英文，其他語言一律用英文。
 export const MANAGER_ENTRY_TEXT = {
   "zh-Hant": {
-    title: "自訂模型管理", description: "開啟此電腦的 Codex 模型路由器管理頁。", reopen: "再次開啟管理頁。",
+    title: "自訂模型管理", description: "開啟此電腦的 模型路由器管理頁。", reopen: "再次開啟管理頁。",
     opening: "正在開啟本機管理頁…", button: "開啟管理頁", hint: "在管理頁中新增模型、管理供應商、調整上下文及檢查更新。",
     connecting: "正在連接本機入口…", opened: "管理頁已在瀏覽器開啟。", noReply: "Codex 未回應，請重新開啟此入口。",
     openFailed: "無法開啟管理頁。", notOpened: "管理頁未能開啟，請重新嘗試。",
     launchFailed: "管理頁啟動失敗，請執行安裝器的 ui 命令查看診斷。", badArgs: "此入口不接受額外參數。",
   },
   "zh-Hans": {
-    title: "自定义模型管理", description: "打开此电脑的 Codex 模型路由器管理页。", reopen: "再次打开管理页。",
+    title: "自定义模型管理", description: "打开此电脑的 模型路由器管理页。", reopen: "再次打开管理页。",
     opening: "正在打开本机管理页…", button: "打开管理页", hint: "在管理页中添加模型、管理供应商、调整上下文及检查更新。",
     connecting: "正在连接本机入口…", opened: "管理页已在浏览器中打开。", noReply: "Codex 未响应，请重新打开此入口。",
     openFailed: "无法打开管理页。", notOpened: "管理页未能打开，请重试。",
     launchFailed: "管理页启动失败，请运行安装器的 ui 命令查看诊断。", badArgs: "此入口不接受额外参数。",
   },
   en: {
-    title: "Custom Model Manager", description: "Open this computer's Codex Model Router manager.", reopen: "Open the manager again.",
+    title: "Custom Model Manager", description: "Open this computer's Model Router manager.", reopen: "Open the manager again.",
     opening: "Opening the local manager…", button: "Open manager", hint: "Add models, manage providers, adjust context, and check for updates in the manager.",
     connecting: "Connecting to the local entry…", opened: "The manager is open in your browser.", noReply: "Codex didn't respond. Reopen this entry.",
     openFailed: "Couldn't open the manager.", notOpened: "The manager didn't open. Please try again.",

@@ -13,21 +13,21 @@ export const MANAGER_ENTRY_NAME = "open_model_manager";
 // 入口名稱跟隨 Codex 介面語言：只支援繁中、簡中與英文，其他語言一律用英文。
 export const MANAGER_ENTRY_TEXT = {
   "zh-Hant": {
-    title: "自訂模型管理", description: "開啟此電腦的 Codex 模型路由器管理頁。", reopen: "再次開啟管理頁。",
+    title: "自訂模型管理", description: "開啟此電腦的 模型路由器管理頁。", reopen: "再次開啟管理頁。",
     opening: "正在開啟本機管理頁…", button: "開啟管理頁", hint: "在管理頁中新增模型、管理供應商、調整上下文及檢查更新。",
     connecting: "正在連接本機入口…", opened: "管理頁已在瀏覽器開啟。", noReply: "Codex 未回應，請重新開啟此入口。",
     openFailed: "無法開啟管理頁。", notOpened: "管理頁未能開啟，請重新嘗試。",
     launchFailed: "管理頁啟動失敗，請執行安裝器的 ui 命令查看診斷。", badArgs: "此入口不接受額外參數。",
   },
   "zh-Hans": {
-    title: "自定义模型管理", description: "打开此电脑的 Codex 模型路由器管理页。", reopen: "再次打开管理页。",
+    title: "自定义模型管理", description: "打开此电脑的 模型路由器管理页。", reopen: "再次打开管理页。",
     opening: "正在打开本机管理页…", button: "打开管理页", hint: "在管理页中添加模型、管理供应商、调整上下文及检查更新。",
     connecting: "正在连接本机入口…", opened: "管理页已在浏览器中打开。", noReply: "Codex 未响应，请重新打开此入口。",
     openFailed: "无法打开管理页。", notOpened: "管理页未能打开，请重试。",
     launchFailed: "管理页启动失败，请运行安装器的 ui 命令查看诊断。", badArgs: "此入口不接受额外参数。",
   },
   en: {
-    title: "Custom Model Manager", description: "Open this computer's Codex Model Router manager.", reopen: "Open the manager again.",
+    title: "Custom Model Manager", description: "Open this computer's Model Router manager.", reopen: "Open the manager again.",
     opening: "Opening the local manager…", button: "Open manager", hint: "Add models, manage providers, adjust context, and check for updates in the manager.",
     connecting: "Connecting to the local entry…", opened: "The manager is open in your browser.", noReply: "Codex didn't respond. Reopen this entry.",
     openFailed: "Couldn't open the manager.", notOpened: "The manager didn't open. Please try again.",

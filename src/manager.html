@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>Codex 模型路由器</title>
+<title>模型路由器</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%230f172a'/%3E%3Cpath d='M11 16h8c4 0 6 2 8 5l2 3c1.5 2.3 3 3.5 6 3.5h2' stroke='%2338bdf8' stroke-width='4.5' fill='none' stroke-linecap='round'/%3E%3Cpath d='M11 32h8c3 0 5-1.5 6.5-3.5' stroke='%233b82f6' stroke-width='4.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 :root {
@@ -45,7 +45,8 @@ button { font: inherit; color: inherit; }
 .version-badge:hover { color: var(--text); border-color: var(--border-strong); }
 .version-badge.has-update { background: rgba(245, 158, 11, .14); color: #fde68a; }
 .version-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px rgba(245, 158, 11, .18); }
-.nav { padding: 14px 12px; display: flex; flex-direction: column; gap: 4px; }
+.nav { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; min-height: 0; overflow-y: auto; }
+.nav-group-label { margin: 8px 12px 2px; color: var(--faint); font-size: 11px; font-weight: 700; letter-spacing: .6px; }
 .nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; color: var(--muted); background: none; border: 0; cursor: pointer; text-align: left; font-size: 14.5px; }
 .nav-item:hover { background: #142036; color: var(--text); }
 .nav-item.active { background: #172544; color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
@@ -327,7 +328,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
         </svg>
       </div>
       <div>
-        <div class="brand-name" data-i18n="Codex 模型路由器">Codex 模型路由器</div>
+        <div class="brand-name" data-i18n="模型路由器">模型路由器</div>
         <button type="button" class="version-badge" id="version-badge" aria-haspopup="dialog" aria-expanded="false">v—</button>
       </div>
     </div>
@@ -513,6 +514,31 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "全域預設模型": "Global default model",
 "未設定（使用官方預設）": "Not set (official default)",
 "全域上下文": "Global context",
+"通用": "General",
+"管理頁與路由器的通用功能。": "General manager and router options.",
+"Claude 桌面客戶端的接入與回退設定。": "Connect Claude Desktop or restore its previous settings.",
+"Claude Desktop 接入": "Claude Desktop integration",
+"一鍵接入 Claude Desktop": "Connect Claude Desktop",
+"一鍵回退 Claude Desktop": "Restore Claude Desktop",
+"手動連線（備用）": "Manual connection (fallback)",
+"接入與回退都會正常關閉並重新啟動 Claude，請先結束進行中的任務。接入前自動備份原設定，回退保留聊天與其他偏好。": "Connecting and restoring both quit and reopen Claude normally. Finish active tasks first. Original settings are backed up; restoring preserves chats and other preferences.",
+"設定 Claude Desktop 接入": "Configure Claude Desktop integration",
+"讓 Claude 桌面客戶端使用這裡的 Claude API 模型。第一版不包含 GPT 與 Claude CLI 訂閱模型。": "Use your Claude API models in Claude Desktop. This first version does not include GPT or Claude CLI subscription models.",
+"請先添加使用 Anthropic Messages 介面的 Claude API 模型。": "First add a Claude API model using the Anthropic Messages interface.",
+"請先更新並啟動支援 Claude Desktop 的本機路由器。": "First update and start the local router with Claude Desktop support.",
+"啟用 Claude Desktop 接入": "Enable Claude Desktop integration",
+"停用 Claude Desktop 接入": "Disable Claude Desktop integration",
+"取得連線設定": "Get connection settings",
+"Claude Desktop 連線設定": "Claude Desktop connection settings",
+"開啟 Claude 的 Help → Troubleshooting → Enable Developer Mode，再進入 Developer → Configure Third-Party Inference。選擇 Gateway，填入下列 Base URL 和 API Key；保留自動探索模型，然後按 Apply Changes。": "In Claude, open Help → Troubleshooting → Enable Developer Mode, then Developer → Configure Third-Party Inference. Select Gateway, enter the Base URL and API key below, leave model discovery enabled, then click Apply Changes.",
+"第三方模式的聊天記錄儲存在本機，與一般 Claude 的雲端聊天不同；既有對話不會自動搬移。": "Third-party mode stores chats locally, separately from regular Claude cloud chats. Existing conversations are not migrated automatically.",
+"這是僅供本機連線的金鑰，不是供應商 API Key。停用會立即撤銷，重新啟用後需要重新複製。": "This key is only for the local gateway, not your provider API key. Disabling revokes it immediately; copy the new key after re-enabling.",
+"可用的 Claude API 模型：{count}": "Available Claude API models: {count}",
+"複製 Base URL": "Copy Base URL",
+"複製本機 API Key": "Copy local API key",
+"已複製連線資料。": "Connection details copied.",
+"無法複製，請手動選取欄位內容。": "Could not copy. Please select the field contents manually.",
+"停用後，Claude 的第三方模式將無法連線。請先結束進行中的任務；要恢復一般 Claude，請在 Claude 客戶端切回原本模式。": "After disabling, Claude's third-party mode cannot connect. Finish active tasks first; switch back to regular mode in Claude to use your account again.",
 "{value} tokens（覆蓋各模型的設定）": "{value} tokens (overrides each model's setting)",
 "未設定（各模型自行決定）": "Not set (each model uses its own)",
 "中轉 API 生圖": "Relay API image generation",
@@ -603,7 +629,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "正在收集…": "Collecting…",
 "下載診斷包": "Download diagnostics",
 "解除安裝": "Uninstall",
-"解除安裝 Codex 模型路由器": "Uninstall Codex Model Router",
+"解除安裝 模型路由器": "Uninstall Model Router",
 "還原安裝器改過的 Codex 設定，停止並移除路由器、中轉生圖技能、桌面捷徑與 Codex 裡的「自訂模型管理」入口。": "Restores the Codex settings the installer changed, then stops and removes the router, the relay image skill, the desktop shortcut, and the “Custom Model Manager” entry in Codex.",
 "目前只裝了管理頁：會移除管理頁、桌面捷徑與 Codex 裡的「自訂模型管理」入口。": "Only the manager is installed: this removes the manager, the desktop shortcut, and the “Custom Model Manager” entry in Codex.",
 "安裝檔案會封存到 Codex 的 backups 目錄，不會直接刪除；之後重新執行安裝器即可再次安裝。": "Installed files are archived in Codex's backups folder, not deleted. Run the installer again any time to reinstall.",
@@ -858,7 +884,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "注意：{message}": "Note: {message}",
 "更新完成，正在以新版本重新啟動管理頁…": "Update finished. Restarting the manager with the new version…",
 "無法自動重新啟動管理頁：{reason}。請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。": "Couldn't restart the manager automatically: {reason}. Reopen it from “Custom Model Manager” in Codex or with the installer's ui command.",
-"管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。": "The manager hasn't come back yet. Refresh, or reopen the “Codex 模型路由器” shortcut for diagnostics.",
+"管理頁尚未恢復。請重新整理，或重新開啟「模型路由器」捷徑查看診斷。": "The manager hasn't come back yet. Refresh, or reopen the “模型路由器” shortcut for diagnostics.",
 "清單沒有列出的模型 ID，可用逗號分隔": "Model IDs not in the list, separated by commas",
 "搜尋模型 ID": "Search model IDs",
 "搜尋模型": "Search models",
@@ -994,7 +1020,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "介面語言": "Interface language",
 "自動（{language}）": "Automatic ({language})",
 "無法儲存語言設定：{reason}": "Couldn't save the language setting: {reason}",
-"Codex 模型路由器": "Codex Model Router",
+"模型路由器": "Model Router",
 "缺少存取權杖": "Missing access token",
 "請從 Codex 的「自訂模型管理」或終端機顯示的網址開啟管理頁，也可以重新執行安裝器的 ui 命令。": "Open the manager from “Custom Model Manager” in Codex or the URL shown in the terminal, or run the installer's ui command again.",
 "存取權杖已失效": "Access token expired",
@@ -1018,7 +1044,9 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Models",
 "供應商": "Providers",
 "生圖": "Images",
-"設定": "Settings",
+"通用設定": "General settings",
+"Codex設定": "Codex settings",
+"Claude 客戶端": "Claude Desktop",
 "使用記錄": "Usage"
 },
 "enErrors": {
@@ -1043,6 +1071,24 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "upstream_http_error": "The upstream service returned an HTTP error."
 },
 "enServer": [
+["^Claude Desktop 自動接入目前僅支援 macOS 與 Windows。$", "Automatic Claude Desktop integration currently supports macOS and Windows only."],
+["^Claude 使用自訂資料目錄，請改用手動連線設定。$", "Claude uses a custom data directory. Use the manual connection settings."],
+["^未找到 Claude 桌面客戶端。$", "Claude Desktop was not found."],
+["^Claude 由組織政策管理，不能自動覆寫。$", "Claude is managed by organization policy. Automatic configuration cannot overwrite it."],
+["^無法確認 Claude 的安裝位置或管理政策，請使用手動連線設定。$", "Could not verify Claude's installation or policy. Use the manual connection settings."],
+["^Claude 未能重新啟動。$", "Claude could not be restarted."],
+["^Claude 尚未退出，未修改設定。請先結束任務並關閉 Claude。$", "Claude has not exited; settings were not changed. Finish active tasks and close Claude first."],
+["^Claude 設定路徑含符號連結，未修改。$", "The Claude settings path contains a symlink; nothing was changed."],
+["^Claude 設定格式無效，未修改。$", "Claude settings are invalid; nothing was changed."],
+["^Claude 設定已被其他操作修改，為避免覆蓋，請先檢查備份與目前設定。$", "Claude settings have changed elsewhere. Review the backup and current settings before restoring."],
+["^Claude 接入備份無法讀取，未修改設定。$", "The Claude integration backup could not be read; nothing was changed."],
+["^Claude 已有接入備份，請先回退再重新接入。$", "A Claude integration backup already exists. Restore it before connecting again."],
+["^請使用一鍵回退，還原 Claude 設定後再停用接入。$", "Use Restore Claude Desktop to restore settings before disabling the gateway."],
+["^正在備份並接入 Claude Desktop，將正常關閉並重新開啟客戶端。$", "Backing up and connecting Claude Desktop. The app will quit normally and reopen."],
+["^Claude Desktop 已接入並重新啟動，請在模型選單選擇 Claude API 模型。$", "Claude Desktop is configured and restarted. Select a Claude API model in its model picker."],
+["^Claude Desktop 已還原原設定並重新啟動。$", "Claude Desktop settings were restored and the app restarted."],
+["^Claude Desktop 接入已啟用。請取得連線設定並套用到 Claude 客戶端。$", "Claude Desktop integration enabled. Get the connection settings and apply them in Claude."],
+["^Claude Desktop 接入已停用。$", "Claude Desktop integration disabled."],
 ["^尚未安裝路由器，請先在管理頁完成首次設定。$", "The router isn't installed. Finish the first-time setup in the manager first."],
 ["^路由器已經安裝，請重新整理管理頁。$", "The router is already installed. Reload the manager."],
 ["^路由器已是 (.+)，這個管理頁仍是 (.+)；請關閉管理頁後重新開啟。$", "The router is already $1, but this manager is still $2. Close the manager and open it again."],
@@ -1050,7 +1096,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 ["^未找到 Codex CLI，請先安裝 (.+) 或 Codex CLI。$", "Codex CLI wasn't found. Install $1 or the Codex CLI first."],
 ["^未找到 Codex CLI。$", "Codex CLI wasn't found."],
 ["^沒有可解除安裝的項目。$", "There's nothing installed to uninstall."],
-["^當前 CODEX_HOME 尚未安裝 Codex 模型路由器，請先選擇「安裝或重新配置」。$", "Codex Model Router isn't installed in this CODEX_HOME. Choose “安裝或重新配置” (Install or reconfigure) first."],
+["^當前 CODEX_HOME 尚未安裝 模型路由器，請先選擇「安裝或重新配置」。$", "Model Router isn't installed in this CODEX_HOME. Choose “安裝或重新配置” (Install or reconfigure) first."],
 ["^尚未安裝路由器。$", "The router isn't installed."],
 ["^「(.+)」正在進行中，請等它完成。$", "“$1” is in progress. Wait for it to finish."],
 ["^還有操作正在進行，請等它完成。$", "Another operation is in progress. Wait for it to finish."],
@@ -1125,8 +1171,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幫幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕絡給統綁經維網綴緊緒線編緩縮總繪繼續義聯聲聽脈脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧帮几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝络给统绑经维网缀紧绪线编缓缩总绘继续义联声听脉脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幫幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細終組結絕絡給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脈脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧帮几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细终组结绝络给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脉脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -1656,7 +1702,14 @@ const VIEWS = [
   { id: "models", label: () => sectionTitle("模型"), icon: "models" },
   { id: "providers", label: () => sectionTitle("供應商"), icon: "providers" },
   { id: "imagegen", label: () => sectionTitle("生圖"), icon: "image" },
-  { id: "settings", label: () => sectionTitle("設定"), icon: "settings" },
+  { id: "general-settings", label: () => sectionTitle("通用設定"), icon: "settings" },
+  { id: "settings", label: () => sectionTitle("Codex設定"), icon: "settings", group: "codex" },
+  { id: "claude", label: () => sectionTitle("Claude 客戶端"), icon: "claude", group: "claude" },
+];
+const NAV_GROUPS = [
+  { id: "general", label: () => t("通用") },
+  { id: "codex", label: () => "GPT" },
+  { id: "claude", label: () => "Claude" },
 ];
 
 function render() {
@@ -1667,14 +1720,18 @@ function render() {
 
 function renderSidebar() {
   const nav = document.getElementById("nav");
-  nav.replaceChildren(...VIEWS.map((view) => {
+  const navButton = (view) => {
     const count = !state ? null : view.id === "models" ? (state.models || []).length : view.id === "providers" ? (state.providers || []).length : null;
     return h("button", {
       type: "button", class: "nav-item" + (view.id === currentView ? " active" : ""),
       "aria-current": view.id === currentView ? "page" : null,
       onclick: () => switchView(view.id),
     }, icon(view.icon), view.label(), count != null ? h("span", { class: "nav-count", text: String(count) }) : null);
-  }));
+  };
+  nav.replaceChildren(...NAV_GROUPS.flatMap((group) => [
+    h("div", { class: "nav-group-label", role: "heading", "aria-level": "2", text: group.label() }),
+    ...VIEWS.filter((view) => (view.group || "general") === group.id).map(navButton),
+  ]));
 
   const badge = document.getElementById("version-badge");
   const version = (versionInfo && versionInfo.installed) || (state && state.versions && (state.versions.installed || state.versions.manager));
@@ -1746,7 +1803,9 @@ function renderView() {
     return;
   }
   if (!state.installed) {
-    view.replaceChildren(...(currentView === "settings" ? renderSetupSettings() : renderWelcome()));
+    view.replaceChildren(...(currentView === "settings" ? renderSetupSettings()
+      : currentView === "general-settings" ? renderGeneralSettings()
+      : currentView === "claude" ? renderClaudeSettings() : renderWelcome()));
     return;
   }
   if (currentView === "models") view.replaceChildren(...renderModels());
@@ -1754,6 +1813,8 @@ function renderView() {
   else if (currentView === "providers") view.replaceChildren(...renderProviders());
   else if (currentView === "imagegen") view.replaceChildren(...renderImagegen());
   else if (currentView === "settings") view.replaceChildren(...renderSettings());
+  else if (currentView === "general-settings") view.replaceChildren(...renderGeneralSettings());
+  else if (currentView === "claude") view.replaceChildren(...renderClaudeSettings());
   else view.replaceChildren(...renderOverview());
 }
 
@@ -1782,12 +1843,10 @@ function renderWelcome() {
 
 function renderSetupSettings() {
   return [
-    pageHead(sectionTitle("設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
+    pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
     renderGlobalContextPanel(Boolean(state.setupBlocked)),
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
     renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
-    renderDiagnosticsPanel(),
-    renderUninstallPanel(),
   ];
 }
 
@@ -2899,15 +2958,81 @@ function confirmDisableImagegen() {
 function renderSettings() {
   const blocked = writeBlocked();
   return [
-    pageHead(sectionTitle("設定"), t("影響所有模型的 Codex 設定。")),
+    pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
     renderKeysmithPanel(blocked),
     renderSessionCleanerPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
-    renderDiagnosticsPanel(),
-    renderUninstallPanel(),
   ];
+}
+
+function renderGeneralSettings() {
+  return [pageHead(sectionTitle("通用設定"), t("管理頁與路由器的通用功能。")),
+    renderDiagnosticsPanel(), renderUninstallPanel()];
+}
+
+function renderClaudeSettings() {
+  return [pageHead(sectionTitle("Claude 客戶端"), t("Claude 桌面客戶端的接入與回退設定。")),
+    renderClaudeDesktopPanel(writeBlocked())];
+}
+
+function renderClaudeDesktopPanel(blocked) {
+  const entry = ensureQuery("claude-desktop");
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
+    h("h2", { text: t("Claude Desktop 接入") }), refreshButton("claude-desktop", t("重新整理"))));
+  if (!entry.data) { panel.append(queryPlaceholder(entry, "claude-desktop")); return panel; }
+  const data = entry.data;
+  panel.append(h("div", { class: "panel-body setting-body" },
+    h("div", { class: "setting-value", text: data.enabled ? t("已啟用") : t("未啟用") }),
+    paragraph(t("讓 Claude 桌面客戶端使用這裡的 Claude API 模型。第一版不包含 GPT 與 Claude CLI 訂閱模型。"), "muted"),
+    paragraph(t("可用的 Claude API 模型：{count}", { count: data.models.length }), "note"),
+    data.models.length ? h("div", { class: "note", text: data.models.map((model) => model.name).join(" · ") })
+      : paragraph(t("請先添加使用 Anthropic Messages 介面的 Claude API 模型。"), "note"),
+    !data.ready ? paragraph(t("請先更新並啟動支援 Claude Desktop 的本機路由器。"), "note") : null,
+    paragraph(t("第三方模式的聊天記錄儲存在本機，與一般 Claude 的雲端聊天不同；既有對話不會自動搬移。"), "note"),
+    paragraph(t("接入與回退都會正常關閉並重新啟動 Claude，請先結束進行中的任務。接入前自動備份原設定，回退保留聊天與其他偏好。"), "note"),
+    data.automatic?.reason ? paragraph(serverText(data.automatic.reason), "note") : null,
+    h("div", { class: "actions" },
+      !data.connected ? h("button", { type: "button", class: "button primary", disabled: blocked || !data.ready || !data.models.length || !data.automatic?.available,
+        onclick: () => runJob("connect-claude-desktop", {}, { title: t("一鍵接入 Claude Desktop") }) }, t("一鍵接入 Claude Desktop")) : null,
+      data.connected ? h("button", { type: "button", class: "button danger", disabled: blocked,
+        onclick: () => runJob("restore-claude-desktop", {}, { title: t("一鍵回退 Claude Desktop") }) }, t("一鍵回退 Claude Desktop")) : null),
+    h("details", {}, h("summary", { text: t("手動連線（備用）") }), h("div", { class: "actions" },
+      !data.enabled ? h("button", { type: "button", class: "button primary", disabled: blocked || !data.ready || !data.models.length,
+        onclick: async () => {
+          const result = await runJob("set-claude-desktop", { enabled: true }, { title: t("啟用 Claude Desktop 接入") });
+          if (result?.status === "succeeded") openClaudeDesktopConnection();
+        } }, t("啟用 Claude Desktop 接入")) : null,
+      data.enabled ? h("button", { type: "button", class: "button", onclick: openClaudeDesktopConnection }, t("取得連線設定")) : null,
+      data.enabled && !data.connected ? h("button", { type: "button", class: "button danger", disabled: blocked, onclick: () => {
+        confirmDialog({ title: t("停用 Claude Desktop 接入"), danger: true,
+          body: paragraph(t("停用後，Claude 的第三方模式將無法連線。請先結束進行中的任務；要恢復一般 Claude，請在 Claude 客戶端切回原本模式。")) })
+          .then((ok) => { if (ok) runJob("set-claude-desktop", { enabled: false }, { title: t("停用 Claude Desktop 接入") }); });
+      } }, t("停用 Claude Desktop 接入")) : null))));
+  return panel;
+}
+
+async function openClaudeDesktopConnection() {
+  try {
+    const data = await api("/api/query", { method: "POST", body: { type: "claude-desktop-connection" } });
+    if (!data.connection) { reloadQuery("claude-desktop"); return; }
+    const connection = data.connection;
+    const field = (label, value, copyLabel, secret = false) => {
+      const input = h("input", { type: secret ? "password" : "text", value, readOnly: true, autocomplete: "off" });
+      return h("div", { class: "setting-body" }, h("label", {}, label, input),
+        h("button", { type: "button", class: "button", onclick: async () => {
+          try { await navigator.clipboard.writeText(value); toast(t("已複製連線資料。")); }
+          catch { input.type = "text"; input.select(); toast(t("無法複製，請手動選取欄位內容。"), "error"); }
+        } }, copyLabel));
+    };
+    openModal({ title: t("Claude Desktop 連線設定"), body: [
+      paragraph(t("開啟 Claude 的 Help → Troubleshooting → Enable Developer Mode，再進入 Developer → Configure Third-Party Inference。選擇 Gateway，填入下列 Base URL 和 API Key；保留自動探索模型，然後按 Apply Changes。")),
+      field("Base URL", connection.inferenceGatewayBaseUrl, t("複製 Base URL")),
+      field("API Key", connection.inferenceGatewayApiKey, t("複製本機 API Key"), true),
+      paragraph(t("這是僅供本機連線的金鑰，不是供應商 API Key。停用會立即撤銷，重新啟用後需要重新複製。"), "note"),
+    ] });
+  } catch (error) { toast(error.message, "error"); }
 }
 
 // 解除安裝：與終端的「回退配置」相同；還原 Codex 配置、移除路由器與入口，檔案封存不刪除。
@@ -2929,7 +3054,7 @@ function confirmUninstall() {
   const store = state.platform === "win32" ? t("Windows 憑證保護") : t("鑰匙圈");
   const keyBox = h("input", { type: "checkbox", checked: true });
   confirmDialog({
-    title: t("解除安裝 Codex 模型路由器"),
+    title: t("解除安裝 模型路由器"),
     danger: true,
     confirmLabel: t("解除安裝"),
     body: [
@@ -3375,6 +3500,8 @@ function jobTitle(type, fallback) {
     "session-cleaner-preview": t("AI 改寫預覽"), "session-cleaner-apply": t("清理會話"),
     "session-cleaner-restore": t("還原會話"),
     "set-background-model": t("設定背景任務模型"),
+    "set-claude-desktop": t("設定 Claude Desktop 接入"),
+    "connect-claude-desktop": t("一鍵接入 Claude Desktop"), "restore-claude-desktop": t("一鍵回退 Claude Desktop"),
     "chatgpt-login": t("登入 ChatGPT 帳號"),
     "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
     "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
@@ -3492,7 +3619,7 @@ async function restartManager({ alreadyRequested = false } = {}) {
       }
     } catch { /* 交接期間短暫無法連線，下次再試 */ }
     if (Date.now() - started > 120000) {
-      message.textContent = t("管理頁尚未恢復。請重新整理，或重新開啟「Codex 模型路由器」捷徑查看診斷。");
+      message.textContent = t("管理頁尚未恢復。請重新整理，或重新開啟「模型路由器」捷徑查看診斷。");
       message.parentNode.append(h("button", { type: "button", class: "button", text: t("重新整理"), onclick: () => location.reload() }));
       return;
     }
@@ -4265,7 +4392,7 @@ async function setLanguage(value) {
 
 function applyLocale() {
   document.documentElement.lang = locale;
-  document.title = t("Codex 模型路由器");
+  document.title = t("模型路由器");
   for (const node of document.querySelectorAll("[data-i18n]")) node.textContent = t(node.dataset.i18n);
   for (const node of document.querySelectorAll("[data-i18n-aria-label]")) node.setAttribute("aria-label", t(node.dataset.i18nAriaLabel));
   renderLanguagePicker();

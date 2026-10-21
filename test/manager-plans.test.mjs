@@ -129,12 +129,12 @@ test("planAddModels 只加新的路由、沿用強制顯示，手動排序時新
 });
 
 test("捷徑位置：macOS 放在 ~/Applications，Windows 放在開始功能表，可由環境變數改到別處", () => {
-  assert.equal(installer.managerShortcutPath("darwin", { home: "/Users/me", directory: "" }), "/Users/me/Applications/Codex 模型路由器.command");
+  assert.equal(installer.managerShortcutPath("darwin", { home: "/Users/me", directory: "" }), "/Users/me/Applications/模型路由器.command");
   assert.equal(installer.managerShortcutPath("win32", { home: "C:\\Users\\me", appData: "C:\\Users\\me\\AppData\\Roaming", directory: "" }),
-    "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Codex 模型路由器.lnk");
+    "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\模型路由器.lnk");
   assert.equal(installer.managerShortcutPath("win32", { home: "C:\\Users\\me", appData: "", directory: "" }),
-    "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Codex 模型路由器.lnk");
-  assert.equal(installer.managerShortcutPath("darwin", { home: "/Users/me", directory: "/tmp/x" }), "/tmp/x/Codex 模型路由器.command");
+    "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\模型路由器.lnk");
+  assert.equal(installer.managerShortcutPath("darwin", { home: "/Users/me", directory: "/tmp/x" }), "/tmp/x/模型路由器.command");
 });
 
 test("macOS 捷徑以 bash 執行安裝器副本的 ui，路徑含空白與引號也安全", { skip: process.platform === "win32" }, (t) => {
@@ -144,7 +144,7 @@ test("macOS 捷徑以 bash 執行安裝器副本的 ui，路徑含空白與引�
   mkdirSync(join(root, "it's here"));
   const output = join(root, "out.txt");
   writeFileSync(installerCopy, "printf '%s|' \"$@\" > \"$OUT\"\nprintf '%s|%s' \"$CODEX_HOME\" \"$CODEX_MODEL_ROUTER_HOME\" >> \"$OUT\"\n");
-  const shortcut = join(root, "Codex 模型路由器.command");
+  const shortcut = join(root, "模型路由器.command");
   const tricky = join(root, "home $(x) \u0060y\u0060");
   const text = installer.managerCommandFile({ installer: installerCopy, launchEnv: { CODEX_HOME: tricky, CODEX_MODEL_ROUTER_HOME: join(root, "r'r") } });
   assert.match(text, /^#!\/bin\/bash\n/);
@@ -158,7 +158,7 @@ test("macOS 捷徑以 bash 執行安裝器副本的 ui，路徑含空白與引�
 
 test("Windows 捷徑以 GUI wscript 執行啟動器，路徑含空白、中文與單引號也安全", () => {
   const plain = installer.windowsShortcutScript({
-    shortcut: "C:\\Users\\me\\Start\\Codex 模型路由器.lnk", launcher: "C:\\Users\\me\\.codex\\model-router\\manager-open.js",
+    shortcut: "C:\\Users\\me\\Start\\模型路由器.lnk", launcher: "C:\\Users\\me\\.codex\\model-router\\manager-open.js",
     workingDirectory: "C:\\Users\\me\\.codex\\model-router",
   });
   assert.ok(plain.includes("$link.Arguments = '//nologo //B //E:jscript \"C:\\Users\\me\\.codex\\model-router\\manager-open.js\"'"), plain);

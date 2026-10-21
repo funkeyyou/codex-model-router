@@ -58,7 +58,7 @@ test("Windows：安裝前的 Windows Script Host 檢查在正常系統上通過"
 test("Windows 英文系統也能建立中文名稱的管理頁捷徑，並清理暫存捷徑", { skip: process.platform !== "win32" }, (t) => {
   const directory = mkdtempSync(join(tmpdir(), "router-shortcut-unicode-"));
   t.after(() => rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
-  const shortcut = join(directory, "Codex 模型路由器.lnk");
+  const shortcut = join(directory, "模型路由器.lnk");
   const launcher = join(directory, "manager-open.js");
   writeFileSync(launcher, "WScript.Quit(0);\r\n");
   const script = installer.windowsShortcutScript({ shortcut, launcher, workingDirectory: directory });
@@ -66,7 +66,7 @@ test("Windows 英文系統也能建立中文名稱的管理頁捷徑，並清理
   assert.equal(existsSync(shortcut), true);
   const bytes = readFileSync(shortcut);
   assert.equal(bytes.readUInt32LE(0), 0x4c, "有效的 Shell Link 標頭");
-  assert.deepEqual(readdirSync(directory).sort(), ["Codex 模型路由器.lnk", "manager-open.js"].sort(), "不能留下暫存捷徑");
+  assert.deepEqual(readdirSync(directory).sort(), ["模型路由器.lnk", "manager-open.js"].sort(), "不能留下暫存捷徑");
 });
 
 test("Windows 管理頁啟動器：真實 WSH 傳遞中文路徑，PowerShell 視窗不可見且開啟後退出", {

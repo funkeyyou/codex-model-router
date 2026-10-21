@@ -395,7 +395,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   const port = reservation.address().port;
   await new Promise((resolve) => reservation.close(resolve));
 
-  for (const name of ["router.mjs", "bridge.mjs", "claude-bridge.mjs", "chat-bridge.mjs", "claude-cli.mjs"]) {
+  for (const name of ["router.mjs", "bridge.mjs", "claude-bridge.mjs", "chat-bridge.mjs", "claude-cli.mjs", "claude-desktop.mjs"]) {
     if (existsSync(join(payloadDir, name))) copyFileSync(join(payloadDir, name), join(runtime, name));
   }
   const routes = [

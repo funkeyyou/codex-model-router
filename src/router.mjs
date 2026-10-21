@@ -18,6 +18,7 @@ import {
   COMPACTION_REPLAY_PREFIX,
 } from "./claude-bridge.mjs";
 import { toChatRequest, bridgeChatStream, isChatReasoning } from "./chat-bridge.mjs";
+import { createDesktopHandler, desktopHeaders, DESKTOP_PREFIX, DESKTOP_CONFIG_FILE, hasDesktopToken } from "./claude-desktop.mjs";
 
 const routerDirectory = dirname(fileURLToPath(import.meta.url));
 const settingsPath = join(routerDirectory, "settings.json");
@@ -1841,10 +1842,10 @@ export async function streamUpstream(upstream, response, history = null, respons
 
 // 單把 Key 的一次請求。上游回 401／403 時重讀這把 Key（可能剛在管理頁換過）；
 // 只有內容真的變了才重送，Key 本身無效時不會白白多打一次。
-async function fetchWithKeySlot(provider, slot, target, headers, body, signal) {
+async function fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder = buildCustomHeaders) {
   const send = (apiKey) => fetch(target, {
     method: "POST",
-    headers: buildCustomHeaders(headers, apiKey, target),
+    headers: headerBuilder(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
@@ -1864,17 +1865,17 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal) {
   return send(reloaded);
 }
 
-async function fetchCustom(provider, target, headers, body, signal, { model = null } = {}) {
+async function fetchCustom(provider, target, headers, body, signal, { model = null, headerBuilder = buildCustomHeaders } = {}) {
   const slots = keySlotsForModel(keySlotsFor(provider), model);
   if (slots[0]?.id !== PRIMARY_KEY_SLOT && model) stats.keyModelRoutes += 1;
-  if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal);
+  if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal, headerBuilder);
   const bySlot = new Map(slots.map((slot) => [slot.id, slot]));
   const order = keyRotation.order(provider.id, slots.map((slot) => slot.id));
   for (let index = 0; index < order.length; index += 1) {
     const slot = bySlot.get(order[index]);
     let upstream;
     try {
-      upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal);
+      upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder);
     } catch (error) {
       // 讀不到這把 Key（被刪掉、密文檔損壞）：當作被拒，換下一把；連線錯誤照常往外拋。
       if (!error?.keyReadFailed || index === order.length - 1) throw error;
@@ -3482,6 +3483,10 @@ function rejectUpgrade(socket, statusLine) {
 }
 
 function handleWebSocketUpgrade(request, socket, head) {
+  if (hasDesktopToken(request.headers)) {
+    rejectUpgrade(socket, "403 Forbidden");
+    return;
+  }
   if (!isLoopbackHost(request.headers.host)) {
     stats.foreignHostRejects += 1;
     rejectUpgrade(socket, "403 Forbidden");
@@ -3683,6 +3688,22 @@ function handleWebSocketUpgrade(request, socket, head) {
   if (head.length > 0) consume(head);
 }
 
+const handleClaudeDesktop = createDesktopHandler({
+  settings, configPath: join(routerDirectory, DESKTOP_CONFIG_FILE), readBody: readRequestBody,
+  fetchUpstream: async (route, path, headers, body, signal) => {
+    const provider = providerForRoute(route);
+    stats.custom += 1;
+    const upstream = await fetchCustom(provider, new URL(provider.apiRoot + path), headers, body, signal,
+      { model: route.upstreamModel, headerBuilder: desktopHeaders });
+    stats.lastCustomStatus = upstream.status;
+    return upstream;
+  },
+  recordUsage: recordUsageEvent,
+  recordError: (error, context) => recordRouterError(new RouterRequestError(error.status, error.code, error.message, "upstream"),
+    context ? { ...context, provider: providerById.get(context.provider) || null }
+      : { transport: "claude-desktop", route: "custom", provider: null }),
+});
+
 const server = http.createServer(async (request, response) => {
   stats.requests += 1;
   request.routerContext = { transport: "http", route: "official" };
@@ -3695,9 +3716,20 @@ const server = http.createServer(async (request, response) => {
   }
   try {
     const incomingUrl = new URL(request.url || "/", `http://${listenHost}:${listenPort}`);
+    if (incomingUrl.pathname === DESKTOP_PREFIX || incomingUrl.pathname.startsWith(DESKTOP_PREFIX + "/")) {
+      await handleClaudeDesktop(request, response, incomingUrl);
+      return;
+    }
+    // The local Desktop credential must never escape to an official/API endpoint,
+    // even after disabling the gateway or if a client uses the wrong base URL.
+    if (hasDesktopToken(request.headers)) {
+      writeJson(response, 403, { error: { type: "authentication_error", message: "Use the Claude Desktop gateway base URL." } });
+      return;
+    }
     if (request.method === "GET" && incomingUrl.pathname === "/healthz") {
       writeJson(response, 200, {
         status: "ok",
+        claudeDesktopGateway: true,
         version: settings.version,
         uptimeSeconds: Math.floor(process.uptime()),
         historyCache: historyCacheInfo(),

@@ -10,6 +10,7 @@ It is a small router that runs on your computer (a local LLM proxy). Official mo
 - **Multiple providers**: connect several at once; each API key is stored encrypted (macOS Keychain / Windows DPAPI).
 - **Web manager**: add or remove models, manage providers and API keys, and update in one click from your browser.
 - **Optional**: relay image generation and Claude Code subscription routing.
+- **Claude Desktop integration**: use “Claude → Claude Desktop” to connect your Claude API models or restore the previous configuration in one click. Settings are backed up; chats and unrelated preferences are preserved. GPT and CLI subscription routes are not supported in Claude Desktop yet. [Setup and limitations](docs/claude-desktop.md)
 
 ## Install
 
@@ -46,7 +47,7 @@ Restart Codex afterwards and the new models appear in the model picker:
 Most tasks can be done in the web manager. Open it from any of:
 
 - the "Custom Model Manager" entry in Codex (named in the Codex display language), which appears after restarting Codex once
-- the "Codex 模型路由器" shortcut (Start menu on Windows, `~/Applications` on macOS)
+- the "模型路由器" shortcut (Start menu on Windows, `~/Applications` on macOS)
 - the `ui` command
 
 <img src="docs/images/codex-manager-entry-en.png" alt="The Custom Model Manager entry in the Codex sidebar More menu" width="300">

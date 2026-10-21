@@ -19,7 +19,7 @@ const sources = readdirSync(new URL("../src/", import.meta.url)).filter((name) =
   .map((name) => readFileSync(new URL("../src/" + name, import.meta.url), "utf8")).join("\n");
 const CJK = /[\u3400-\u9fff\uf900-\ufaff]/u;
 // 英文裡刻意保留的中文：Codex 介面與終端選單上實際顯示的名稱，使用者要照著找。
-const QUOTED_NAMES = /自訂模型管理|Codex 模型路由器|安裝或重新配置|回退配置/g;
+const QUOTED_NAMES = /自訂模型管理|模型路由器|安裝或重新配置|回退配置/g;
 const placeholders = (text) => [...text.matchAll(/\{(\w+)\}/g)].map((match) => match[1]).sort();
 const unquote = (raw) => JSON.parse('"' + raw + '"');
 const keysOf = (name) => new Set([...script.matchAll(new RegExp("(?<![\\w.])" + name + '\\("((?:[^"\\\\]|\\\\.)*)"', "g"))].map((match) => unquote(match[1])));

@@ -11,6 +11,7 @@ import { loadPayloads } from "./helpers/payloads.mjs";
 import { codexBin } from "./helpers/codex-bin.mjs";
 
 const { installer, dir } = await loadPayloads();
+const installerVersion = JSON.parse(readFileSync(new URL("../releases.json", import.meta.url), "utf8")).latest;
 
 const message = (role, id, text) => ({
   type: "response_item",
@@ -109,7 +110,7 @@ test("AI preview uses the configured provider and falls back on question-mark mo
   mkdirSync(root, { recursive: true });
   mkdirSync(sessionDir, { recursive: true });
   const apiRoot = `http://127.0.0.1:${server.address().port}/v1`;
-  writeFileSync(join(root, "install.json"), JSON.stringify({ version: "1.37.0" }));
+  writeFileSync(join(root, "install.json"), JSON.stringify({ version: installerVersion }));
   writeFileSync(join(root, "settings.json"), JSON.stringify({ providers: [{ id: "default", baseUrl: apiRoot, apiRoot,
     keychainService: "test", keychainAccount: "codex" }], routes: [{ pickerSlug: "custom/test", upstreamModel: "test",
     displayName: "Test", providerId: "default", translate: "responses" }] }));
@@ -151,7 +152,7 @@ test("apply and restore keep JSONL and desktop projection in sync with complete 
   const sessionDir = join(home, "sessions", "2026", "10", "21");
   mkdirSync(root, { recursive: true });
   mkdirSync(sessionDir, { recursive: true });
-  writeFileSync(join(root, "install.json"), JSON.stringify({ version: "1.37.0" }));
+  writeFileSync(join(root, "install.json"), JSON.stringify({ version: installerVersion }));
   const threadId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
   const relativePath = `2026/10/21/rollout-2026-10-21T00-00-00-${threadId}.jsonl`;
   const sessionPath = join(home, "sessions", relativePath);
