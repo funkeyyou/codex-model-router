@@ -23,21 +23,38 @@
 **macOS**：在「终端」中运行
 
 ```bash
-(curl -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh || curl -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh) && bash codex-model-router.sh
+curl -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
 ```
 
 **Windows**：在 PowerShell 中运行
 
 ```powershell
-curl.exe -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1
-if ($LASTEXITCODE -ne 0) { curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1 }
-if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 }
+curl.exe -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 }
 ```
+
+推荐使用上方的加速指令；只有加速服务不可用时，才改用下方的 GitHub 直连指令，两者选一即可。
+
+<details>
+<summary>GitHub 直连（加速不可用时使用）</summary>
+
+macOS：
+
+```bash
+curl -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
+```
+
+Windows（PowerShell）：
+
+```powershell
+curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 }
+```
+
+</details>
 
 <details>
 <summary>下载来源与校验说明</summary>
 
-安装、版本检查和管理页下载更新优先使用第三方加速服务 `gh-proxy.com`，失败后自动改为直连 GitHub。仅代理本项目的公开文件，不转发模型请求或 API Key；更新仍检查 SHA-256、安装器格式与版本。代理提供的文件及校验清单经过同一服务，校验不代表独立的发布签名验证。
+安装指令优先推荐第三方加速服务 `gh-proxy.com`，同时提供独立的 GitHub 直连指令。安装器的版本检查和管理页更新会优先使用代理，失败后自动直连 GitHub。仅代理本项目的公开文件，不转发模型请求或 API Key；更新仍检查 SHA-256、安装器格式与版本。代理提供的文件及校验清单经过同一服务，校验不代表独立的发布签名验证。
 
 </details>
 
