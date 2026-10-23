@@ -1,0 +1,46 @@
+name: Sync to GitLab
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitlab-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'funkeyyou/codex-model-router'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # 不執行倉庫程式碼；私鑰只用於這個 GitLab 專案的 deploy key。
+      - name: Sync branches and tags
+        shell: bash
+        env:
+          MIRROR_SSH_KEY: ${{ secrets.GITLAB_MIRROR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$MIRROR_SSH_KEY" || { echo 'Missing GITLAB_MIRROR_SSH_KEY secret'; exit 1; }
+          umask 077
+          mirror_dir=$(mktemp -d "$RUNNER_TEMP/gitlab-mirror.XXXXXXXX")
+          trap 'rm -rf -- "$mirror_dir"' EXIT
+          printf '%s\n' "$MIRROR_SSH_KEY" > "$mirror_dir/key"
+          unset MIRROR_SSH_KEY
+          ssh-keyscan -T 15 -t ed25519 gitlab.com > "$mirror_dir/known_hosts"
+          # 來源：https://gitlab.com/help/instance_configuration
+          fingerprint=$(ssh-keygen -lf "$mirror_dir/known_hosts" -E sha256 | awk '{print $2}')
+          test "$fingerprint" = 'SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8'
+          export GIT_SSH_COMMAND="ssh -i $mirror_dir/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$mirror_dir/known_hosts"
+          git clone --bare https://github.com/funkeyyou/codex-model-router.git "$mirror_dir/repo.git"
+          # 不強制覆寫、不刪除 GitLab 分支；分歧時報錯，保留兩邊資料。
+          git -C "$mirror_dir/repo.git" push --atomic \
+            git@gitlab.com:funkeyyou/codex-model-router.git \
+            'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
