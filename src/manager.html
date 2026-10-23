@@ -395,6 +395,15 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Model",
 "供應商": "Provider",
 "設定": "Set",
+"Keysmith": "Keysmith",
+"啟用 Keysmith 全域模式": "Enable global Keysmith mode",
+"使用 Keysmith 全域指令，套用至 Codex 的新對話。": "Use global Keysmith instructions for new Codex chats.",
+"預設關閉。從 GitHub 下載固定版本並核對 SHA256，或接管已核對的原版安裝。修改前備份，關閉時還原原本的指令設定。": "Off by default. Downloads a pinned version with SHA256 verification or adopts a verified original installation. Backs up before changes and restores the previous instruction setting when disabled.",
+"切換後請完全退出並重新開啟 Codex，再建立新對話。舊對話與摘要可能仍保留先前指令的影響。": "After toggling, quit Codex completely, reopen it and start a new chat. Existing chats and summaries may retain effects of earlier instructions.",
+"啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。": "Other models may not work properly while enabled, especially Claude (including CLI subscriptions). Turn this feature off before using those models.",
+"已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。": "The fixed name is removed and the original output format is retained. Models may still refuse requests.",
+"codex-keysmith 專案": "codex-keysmith project",
+
 "有新版本": "Update available",
 "有新版本，點擊查看": "Update available. Click for details",
 "版本資訊": "Version info",
@@ -2915,6 +2924,7 @@ function renderSettings() {
   return [
     pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
+    renderKeysmithPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
   ];
@@ -3076,6 +3086,34 @@ async function exportDiagnostics(mode) {
 
 // API Key 模式：和 Codex 官方的 API Key 登入相同，切成本機產生的 Key 讓第三方模型不必登入 ChatGPT 也能用，
 // 帳號額度用完、桌面版鎖住發送按鈕時也能照常發送。
+function renderKeysmithPanel(blocked) {
+  const on = state.keysmith && state.keysmith.enabled === true;
+  const title = t("啟用 Keysmith 全域模式");
+  const details = [
+    t("使用 Keysmith 全域指令，套用至 Codex 的新對話。"),
+    t("預設關閉。從 GitHub 下載固定版本並核對 SHA256，或接管已核對的原版安裝。修改前備份，關閉時還原原本的指令設定。"),
+    t("切換後請完全退出並重新開啟 Codex，再建立新對話。舊對話與摘要可能仍保留先前指令的影響。"),
+    t("啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。"),
+    t("已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。"),
+  ];
+  return h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("Keysmith") })),
+    h("div", { class: "panel-body setting-body" },
+      h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
+      ...details.map((text, index) => paragraph(text, index === 3 ? "note warn" : "muted")),
+      h("div", { class: "actions" },
+        h("a", { href: "https://github.com/Jia-Ethan/codex-keysmith", target: "_blank", rel: "noreferrer", text: t("codex-keysmith 專案") })),
+      h("label", { class: "check-line" },
+        h("input", { type: "checkbox", role: "switch", "aria-label": title, checked: on, disabled: blocked,
+          onchange: event => {
+            event.target.checked = on;
+            const enabled = !on;
+            if (!enabled) return runJob("set-keysmith", { enabled }, { title: t("Keysmith") });
+            confirmDialog({ title, confirmLabel: t("開啟"), body: details.map(text => paragraph(text)) })
+              .then(ok => { if (ok) runJob("set-keysmith", { enabled }, { title: t("Keysmith") }); });
+          } }), h("span", { text: title }))));
+}
+
 function renderQuotaModePanel(blocked) {
   const quota = state && state.installed ? state.quotaMode : null;
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
@@ -3296,6 +3334,7 @@ function jobTitle(type, fallback) {
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "set-quota-mode": t("切換 API Key 模式"),
+    "set-keysmith": t("Keysmith"),
     "set-background-model": t("設定背景任務模型"),
     "set-claude-desktop": t("設定 Claude Desktop 接入"),
     "connect-claude-desktop": t("一鍵接入 Claude Desktop"), "restore-claude-desktop": t("一鍵回退 Claude Desktop"),

@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.39.1";
+const INSTALLER_VERSION = "1.39.2";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5266,6 +5266,9 @@ async function update() {
   else if (previousCatalogPath) console.log("注意：保留了您自行設定的 model_catalog_json；該設定會停用啟動時同步模型清單。");
   console.log(`備份：${backupDir}`);
   if (serviceWarning) console.log(`\n注意：${serviceWarning}`);
+  try { migrateKeysmithGptOnly(); } catch (error) {
+    console.error(`Keysmith GPT-only migration: ${error.message}`);
+  }
   try { refreshRelayImagegen(); } catch (error) {
     console.error(`路由器已更新，中轉生圖技能保持原狀：${error.message}`);
   }
@@ -5958,6 +5961,8 @@ export function preserveInstructionFile(config, archiveDir, { root = installRoot
 // 還原 Codex 配置、停止並移除路由器服務、封存檔案；終端與管理頁共用。
 // deferArchive：安裝目錄留到管理頁結束後再搬，因為管理程式自己還在裡面執行。
 async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
+  const keysmith = readKeysmithRecord(installRoot);
+  if (keysmith?.mode === "global") await setKeysmithEnabled(false);
   if (existsSync(claudeDesktopBackupPath)) {
     const desktop = await importClaudeDesktopModule();
     if (desktop.integrationStatus(claudeDesktopBackupPath)?.status !== "restored") await managerRestoreClaudeDesktop();
@@ -6817,6 +6822,7 @@ async function managerState() {
     providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     quotaMode: quotaModeStatus(),
+    keysmith: await keysmithStatus(),
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
     imagegen,
@@ -8188,6 +8194,160 @@ async function managerImagegenSetup({ providerId, models } = {}) {
   };
 }
 
+// Optional global profile. Fetch only pinned text; never run an upstream installer.
+export const KEYSMITH_SOURCES = [
+  { family: "gpt", repo: "codex-keysmith", commit: "cfcd96eb727c324ee8649170c43aaa632ff53cb3", path: "examples/gpt-overlay.md", sha256: "7d306ae69d831dad21ed54252b563e173877eeebc0bc92e81970849a7ab8ac4a" },
+  { family: null, repo: "codex-keysmith", commit: "cfcd96eb727c324ee8649170c43aaa632ff53cb3", path: "LICENSE",
+    sha256: "3606450b38624daef7664208bf1dfa1bc3d3a47fd0044bfece6b560d6b85ef05" },
+];
+
+export async function downloadKeysmithProfiles({ fetchImpl = fetchWithTimeout, sources = KEYSMITH_SOURCES } = {}) {
+  const prompts = { gpt: "" };
+  const licenses = {};
+  for (const source of sources) {
+    const url = `https://raw.githubusercontent.com/Jia-Ethan/${source.repo}/${source.commit}/${source.path}`;
+    const response = await fetchImpl(url, { redirect: "error" }, 15000);
+    if (!response.ok) throw new Error(`Keysmith HTTP ${response.status}`);
+    const text = await response.text();
+    if (!text.trim() || Buffer.byteLength(text) > 32000 || createHash("sha256").update(text).digest("hex") !== source.sha256) {
+      throw new Error("Keysmith SHA256 mismatch");
+    }
+    if (source.family) prompts[source.family] = [prompts[source.family], text].filter(Boolean).join("\n\n");
+    else licenses[source.repo] = text;
+  }
+  return { schema: 1, enabled: false, prompts, licenses, sources };
+}
+
+function readKeysmithRecord(root) {
+  const path = join(root, "keysmith.json");
+  if (!existsSync(path)) return null;
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function sameInstructionPath(value, target, home) {
+  if (typeof value !== "string") return false;
+  const canonical = path => {
+    try { return realpathSync.native(path); } catch {
+      // The managed file may not exist yet, but its parent can still use an 8.3 alias.
+      try { return join(realpathSync.native(dirname(path)), basename(path)); } catch { return path; }
+    }
+  };
+  // Native Codex may return extended-length Windows paths, while Node resolves ordinary paths.
+  const normalized = path => process.platform === "win32"
+    ? path.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\/, "").toLowerCase() : path;
+  return normalized(canonical(resolve(home, value))) === normalized(canonical(resolve(home, target)));
+}
+
+// Recognize only an unchanged, manifest-owned upstream installation. Unknown files stay user-owned.
+export function originalKeysmithInstall(home, current) {
+  try {
+    const manifestPath = join(home, ".codex-keysmith-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (manifest.md?.path !== "gpt-overlay.md" || !sameInstructionPath(current, join(home, "gpt-overlay.md"), home)) return null;
+    const text = readFileSync(join(home, "gpt-overlay.md"), "utf8");
+    if (createHash("sha256").update(text).digest("hex") !== manifest.md?.after?.sha256) return null;
+    const backupName = manifest.config?.backup;
+    if (typeof backupName !== "string" || basename(backupName) !== backupName) return null;
+    const before = readFileSync(join(home, backupName), "utf8");
+    // If the original had another instruction file, don't guess its TOML value or erase it.
+    if (/^\s*model_instructions_file\s*=/m.test(before)) return null;
+    return { text, manifestPath };
+  } catch { return null; }
+}
+
+export async function keysmithStatus({ root = installRoot, home = codexHome, readConfig = readUserConfig } = {}) {
+  try {
+    const user = await readConfig();
+    const current = user.config.model_instructions_file;
+    const record = readKeysmithRecord(root);
+    const managed = record?.mode === "global" && sameInstructionPath(current, join(root, "keysmith-global.md"), home);
+    const external = originalKeysmithInstall(home, current);
+    return { enabled: Boolean(managed || external), mode: "global", external: Boolean(external),
+      consistent: managed ? existsSync(join(root, "keysmith-global.md")) : true };
+  } catch { return { enabled: false, mode: "global", error: "Keysmith config could not be read" }; }
+}
+
+export function migrateKeysmithGptOnly({ root = installRoot, backupRoot = backupsRoot } = {}) {
+  const path = join(root, "keysmith.json");
+  if (!existsSync(path)) return null;
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  const next = { ...config };
+  if (config.prompts && typeof config.prompts === "object") next.prompts = typeof config.prompts.gpt === "string" ? { gpt: config.prompts.gpt } : {};
+  if (Array.isArray(config.sources)) next.sources = config.sources.filter(source => source?.repo === "codex-keysmith");
+  if (config.licenses && typeof config.licenses === "object") next.licenses = config.licenses["codex-keysmith"] ? { "codex-keysmith": config.licenses["codex-keysmith"] } : {};
+  if (JSON.stringify(config) === JSON.stringify(next)) return null;
+  const backupDir = join(backupRoot, `keysmith-gpt-only-${timestamp()}-${randomUUID()}`);
+  ensureDirectory(backupDir);
+  if (!copyIfExists(path, join(backupDir, "keysmith.json"))) fail("Keysmith backup failed");
+  writeJsonAtomic(path, next);
+  return { backupDir, enabled: next.enabled === true };
+}
+
+export async function setKeysmithEnabled(enabled, { root = installRoot, home = codexHome, backupRoot = backupsRoot,
+  fetchImpl, readConfig = readUserConfig, writeConfig = writeConfigEdits } = {}) {
+  if (typeof enabled !== "boolean") fail("Keysmith enabled must be boolean");
+  const path = join(root, "keysmith.json");
+  const promptPath = join(root, "keysmith-global.md");
+  const user = await readConfig();
+  const current = user.config.model_instructions_file ?? null;
+  const record = readKeysmithRecord(root);
+  const managed = record?.mode === "global" && sameInstructionPath(current, promptPath, home);
+  const external = originalKeysmithInstall(home, current);
+  if (enabled && managed && existsSync(promptPath)) return { enabled: true, mode: "global", restartDesktop: true };
+  if (!enabled && !managed && !external && record?.mode !== "global" && !record?.enabled) return { enabled: false, mode: "global" };
+  // Fetch before any writes. Preserve the original source and license alongside the active copy.
+  const profile = enabled ? external ? { prompts: { gpt: external.text }, adoptedOriginal: true }
+    : await downloadKeysmithProfiles({ fetchImpl }) : null;
+  const previousValue = enabled ? managed ? record.previousValue ?? null : external ? null : current : null;
+  const nextValue = enabled ? promptPath : managed ? record.previousValue ?? null : external ? null : current;
+  if (((await readConfig()).config.model_instructions_file ?? null) !== current) throw new Error("Keysmith config changed; retry");
+  const backupDir = join(backupRoot, `keysmith-global-${timestamp()}-${randomUUID()}`);
+  ensureDirectory(backupDir);
+  for (const [file, name] of [[path, "keysmith.json"], [promptPath, "keysmith-global.md"], [user.filePath, "config.toml"],
+    ...(external ? [[external.manifestPath, "upstream-manifest.json"], [join(home, "gpt-overlay.md"), "upstream-overlay.md"]] : [])]) {
+    if (file && existsSync(file) && !copyIfExists(file, join(backupDir, name))) fail("Keysmith backup failed");
+  }
+  writeJsonAtomic(join(backupDir, "recovery.json"), { previousValue: current, target: nextValue });
+  let changed = false;
+  try {
+    // Disable old running routers before changing global instructions, avoiding double injection.
+    writeJsonAtomic(path, enabled ? { ...profile, schema: 2, mode: "global", enabled: false, globalEnabled: false,
+      previousValue, backupDir } : { ...(record || {}), enabled: false });
+    if (enabled) {
+      const temporaryPath = `${promptPath}.tmp-${process.pid}`;
+      try {
+        writeFileSync(temporaryPath, profile.prompts.gpt.replace(/^The operator is Ethan\. Address him as Ethan\.\r?\n?/m, ""), { mode: 0o600 });
+        renameSync(temporaryPath, promptPath);
+      } finally { rmSync(temporaryPath, { force: true }); }
+    }
+    changed = true;
+    await writeConfig([{ keyPath: "model_instructions_file", value: nextValue }]);
+    const verified = (await readConfig()).config.model_instructions_file ?? null;
+    if (nextValue === null ? verified !== null : !sameInstructionPath(verified, nextValue, home)) throw new Error("Keysmith config verification failed");
+    writeJsonAtomic(path, { ...(enabled ? profile : {}), schema: 2, mode: "global", enabled: false,
+      globalEnabled: enabled, previousValue: enabled ? previousValue : null, backupDir });
+    // Archive only known upstream ownership metadata; keep the original Markdown file untouched.
+    if (external) renameSync(external.manifestPath, join(backupDir, "adopted-upstream-manifest.json"));
+  } catch (error) {
+    if (changed) {
+      try { await writeConfig([{ keyPath: "model_instructions_file", value: current }]); }
+      catch { throw new Error(`Keysmith rollback failed; recovery: ${backupDir}`, { cause: error }); }
+    }
+    for (const [file, name] of [[path, "keysmith.json"], [promptPath, "keysmith-global.md"]]) {
+      if (existsSync(join(backupDir, name))) copyFileSync(join(backupDir, name), file);
+      else rmSync(file, { force: true });
+    }
+    throw error;
+  }
+  return { enabled, mode: "global", backupDir, restartDesktop: true };
+}
+
+async function managerSetKeysmith({ enabled } = {}) {
+  assertManagerWritable();
+  requireInstallation();
+  return setKeysmithEnabled(enabled);
+}
+
 async function managerImagegenDisable() {
   assertManagerWritable();
   const backup = disableRelayImagegen();
@@ -8493,6 +8653,7 @@ function managerOperations() {
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
       "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
+      "set-keysmith": job("Keysmith", managerSetKeysmith),
       "set-background-model": job("設定背景任務模型", managerSetBackgroundModel),
       "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
       "imagegen-setup": job("偵測並啟用中轉生圖", managerImagegenSetup),
@@ -17986,6 +18147,15 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "模型": "Model",
 "供應商": "Provider",
 "設定": "Set",
+"Keysmith": "Keysmith",
+"啟用 Keysmith 全域模式": "Enable global Keysmith mode",
+"使用 Keysmith 全域指令，套用至 Codex 的新對話。": "Use global Keysmith instructions for new Codex chats.",
+"預設關閉。從 GitHub 下載固定版本並核對 SHA256，或接管已核對的原版安裝。修改前備份，關閉時還原原本的指令設定。": "Off by default. Downloads a pinned version with SHA256 verification or adopts a verified original installation. Backs up before changes and restores the previous instruction setting when disabled.",
+"切換後請完全退出並重新開啟 Codex，再建立新對話。舊對話與摘要可能仍保留先前指令的影響。": "After toggling, quit Codex completely, reopen it and start a new chat. Existing chats and summaries may retain effects of earlier instructions.",
+"啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。": "Other models may not work properly while enabled, especially Claude (including CLI subscriptions). Turn this feature off before using those models.",
+"已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。": "The fixed name is removed and the original output format is retained. Models may still refuse requests.",
+"codex-keysmith 專案": "codex-keysmith project",
+
 "有新版本": "Update available",
 "有新版本，點擊查看": "Update available. Click for details",
 "版本資訊": "Version info",
@@ -20506,6 +20676,7 @@ function renderSettings() {
   return [
     pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
+    renderKeysmithPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
   ];
@@ -20667,6 +20838,34 @@ async function exportDiagnostics(mode) {
 
 // API Key 模式：和 Codex 官方的 API Key 登入相同，切成本機產生的 Key 讓第三方模型不必登入 ChatGPT 也能用，
 // 帳號額度用完、桌面版鎖住發送按鈕時也能照常發送。
+function renderKeysmithPanel(blocked) {
+  const on = state.keysmith && state.keysmith.enabled === true;
+  const title = t("啟用 Keysmith 全域模式");
+  const details = [
+    t("使用 Keysmith 全域指令，套用至 Codex 的新對話。"),
+    t("預設關閉。從 GitHub 下載固定版本並核對 SHA256，或接管已核對的原版安裝。修改前備份，關閉時還原原本的指令設定。"),
+    t("切換後請完全退出並重新開啟 Codex，再建立新對話。舊對話與摘要可能仍保留先前指令的影響。"),
+    t("啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。"),
+    t("已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。"),
+  ];
+  return h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("Keysmith") })),
+    h("div", { class: "panel-body setting-body" },
+      h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
+      ...details.map((text, index) => paragraph(text, index === 3 ? "note warn" : "muted")),
+      h("div", { class: "actions" },
+        h("a", { href: "https://github.com/Jia-Ethan/codex-keysmith", target: "_blank", rel: "noreferrer", text: t("codex-keysmith 專案") })),
+      h("label", { class: "check-line" },
+        h("input", { type: "checkbox", role: "switch", "aria-label": title, checked: on, disabled: blocked,
+          onchange: event => {
+            event.target.checked = on;
+            const enabled = !on;
+            if (!enabled) return runJob("set-keysmith", { enabled }, { title: t("Keysmith") });
+            confirmDialog({ title, confirmLabel: t("開啟"), body: details.map(text => paragraph(text)) })
+              .then(ok => { if (ok) runJob("set-keysmith", { enabled }, { title: t("Keysmith") }); });
+          } }), h("span", { text: title }))));
+}
+
 function renderQuotaModePanel(blocked) {
   const quota = state && state.installed ? state.quotaMode : null;
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
@@ -20887,6 +21086,7 @@ function jobTitle(type, fallback) {
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "set-quota-mode": t("切換 API Key 模式"),
+    "set-keysmith": t("Keysmith"),
     "set-background-model": t("設定背景任務模型"),
     "set-claude-desktop": t("設定 Claude Desktop 接入"),
     "connect-claude-desktop": t("一鍵接入 Claude Desktop"), "restore-claude-desktop": t("一鍵回退 Claude Desktop"),
