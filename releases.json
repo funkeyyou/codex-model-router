@@ -1,6 +1,15 @@
 {
-  "latest": "1.39.2",
+  "latest": "1.39.3",
   "releases": [
+    {
+      "version": "1.39.3",
+      "date": "2026-10-24",
+      "changes": [
+        "修正：DeepSeek 的 Responses 相容介面可能將 DSML 工具標記當成聊天文字回傳，導致任務停止執行。Codex 專用工具請求現在預先改走 Chat Completions，由本機轉譯為結構化工具呼叫，保留工具名稱、自由格式輸入與工具結果配對。",
+        "修正：DeepSeek 工具往返保留本機 Chat 轉譯層產生的推理內容，並輸出工具前進度標記；純文字、標準工具請求及其他模型維持原路由，壓縮仍由本機封裝唯一 compaction 項目。",
+        "驗證：新增 HTTP 與 WebSocket 工具接續回歸測試；兩個已設定的 DeepSeek 模型均通過 Windows 本機真實 API 工具呼叫與結果回傳測試。"
+      ]
+    },
     {
       "version": "1.39.2",
       "date": "2026-10-24",

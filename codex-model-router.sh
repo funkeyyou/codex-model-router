@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.39.2";
+const INSTALLER_VERSION = "1.39.3";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -10475,6 +10475,16 @@ export function usesCodexToolShapes(body) {
       item?.type === "custom_tool_call_output" || (item?.type === "function_call" && item.namespace));
 }
 
+export function needsDeepseekChat(body, route) {
+  if (route?.translate || !/(?:^|\/)deepseek(?:[-/]|$)/i.test(route?.upstreamModel || "")) return false;
+  const input = Array.isArray(body?.input) ? body.input : [];
+  // 有些 Responses 相容閘道不拒絕 custom/namespace，卻將 DSML 當成一般文字
+  // 回傳。事先轉成標準 function 工具，不能等 400/422 才回退。
+  // 工具往返即使沒有重送定義，也必須保留本轉譯層的 reasoning_content。
+  return usesCodexToolShapes(body) || input.some((item) =>
+    item?.type === "compaction_trigger" || isChatReasoning(item));
+}
+
 const CODEX_SHAPE_TERMS = /additional_tools|custom_tool_call|\bnamespace\b|[`"']custom[`"']|\bcustom\b(?= tool| item| variant)|type:?\s*custom\b/i;
 const SHAPE_REJECTION_TERMS = /unknown|unsupported|not supported|invalid|expected one of|deserializ|unrecognized/i;
 export function codexShapeRejected(status, text) {
@@ -11202,9 +11212,10 @@ export async function fetchModelUpstream(
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
+  const deepseekChat = needsDeepseekChat(effectiveBody, route);
   if (route?.translate !== "anthropic") {
     // Chat Completions 路由在同一輪的工具往返裡要送回自己產生的推理。
-    effectiveBody = stripBridgeArtifacts(effectiveBody, { keepChatReasoning: route?.translate === "chat" });
+    effectiveBody = stripBridgeArtifacts(effectiveBody, { keepChatReasoning: route?.translate === "chat" || deepseekChat });
   }
 
   // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
@@ -11317,12 +11328,7 @@ export async function fetchModelUpstream(
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
       return translated;
     };
-    // DeepSeek 的 Responses 相容閘道可能接受 compaction_trigger，卻只回一般
-    // message。壓縮回合改由本機 chat bridge 產生唯一 compaction 項目，避免
-    // HTTP 200 被誤當成已支援 remote compaction v2；一般聊天仍沿用原路由。
-    const deepseekCompaction = /(?:^|\/)deepseek(?:[-/]|$)/i.test(route.upstreamModel) &&
-      Array.isArray(effectiveBody.input) && effectiveBody.input.some((item) => item?.type === "compaction_trigger");
-    if (route.translate === "chat" || deepseekCompaction) return sendChat(route);
+    if (route.translate === "chat" || deepseekChat) return sendChat(route);
     if (chatFallbackRoutes.has(route.pickerSlug)) return sendChat({ ...route, translate: "chat" });
     outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {

@@ -59,6 +59,73 @@ function mockUpstream(t, reply) {
 
 // --- 路由器 -----------------------------------------------------------------
 
+test("DeepSeek 自動轉譯僅適用 Codex 工具、壓縮與 chat 推理接續", () => {
+  const native = { upstreamModel: "deepseek-v4.1-flash-1017" };
+  assert.equal(router.needsDeepseekChat({ tools: [{ type: "custom", name: "exec" }] }, native), true);
+  assert.equal(router.needsDeepseekChat({ input: [{ type: "additional_tools", tools }] }, native), true);
+  assert.equal(router.needsDeepseekChat({ input: [{ type: "compaction_trigger" }] }, native), true);
+  assert.equal(router.needsDeepseekChat({ tools }, native), false);
+  assert.equal(router.needsDeepseekChat({ input: "hello" }, native), false);
+  for (const route of [{ upstreamModel: "gpt-test" }, { upstreamModel: "not-deepseek" },
+    { ...native, translate: "anthropic" }]) {
+    assert.equal(router.needsDeepseekChat({ tools: [{ type: "custom", name: "exec" }] }, route), false);
+  }
+});
+
+for (const transport of ["HTTP", "WebSocket"]) {
+  test(`${transport}: DeepSeek Code Mode 工具走 chat 並保留命名空間、進度與下一輪推理`, async (t) => {
+    useTestKey(t);
+    const originalFetch = globalThis.fetch;
+    const native = { ...chatRoute, translate: undefined, upstreamModel: "deepseek-flash" };
+    const { instance, origin } = await startRouter(t, { routes: [native] });
+    const sent = mockUpstream(t, (index) => index === 1 ? chatStream([
+      delta({ reasoning_content: "fixture reasoning" }),
+      delta({ content: "先執行測試。" }),
+      delta({ tool_calls: [{ index: 0, id: "call_exec", type: "function",
+        function: { name: "sandbox__exec", arguments: JSON.stringify({ input: "text(2+2);" }) } }] }, "tool_calls"),
+    ]) : chatStream([delta({ content: "結果是 4。" }, "stop")]));
+    const run = async (body) => {
+      if (transport === "HTTP") {
+        const response = await originalFetch(`${origin}/v1/responses`, {
+          method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 200);
+        return parseSse(await response.text());
+      }
+      const socket = socketFor(instance);
+      await instance.handleWebSocketResponseInner({ headers }, socket, new URL("http://localhost/v1/responses"),
+        { ...body, type: "response.create" }, new AbortController(),
+        { session: null, connectionNamespace: "deepseek-tools", upstreamDisabled: true });
+      return socket.events;
+    };
+    const events = await run({ model: native.pickerSlug, stream: true, input: [
+      // 新聊天的任務可能是沒有 call_id 的工具轉送訊息，不可丟棄。
+      { type: "function_call_output", name: "create_thread", output: "請計算 2+2" },
+      { type: "additional_tools", tools: [{ type: "namespace", name: "sandbox", tools: [
+        { type: "custom", name: "exec", description: "Execute JavaScript" },
+      ] }] },
+    ] });
+    assert.equal(sent[0].href, "https://gateway.example/v1/chat/completions");
+    assert.ok(JSON.stringify(sent[0].body.messages).includes("請計算 2+2"));
+    assert.equal(sent[0].body.tools[0].type, "function");
+    const first = events.at(-1).response;
+    assert.equal(events.at(-1).type, "response.completed");
+    assert.equal(first.output.find((item) => item.type === "message").phase, "commentary");
+    const call = first.output.find((item) => item.type === "custom_tool_call");
+    assert.equal(call.namespace, "sandbox");
+    assert.equal(call.name, "exec");
+    assert.equal(call.input, "text(2+2);");
+    assert.match(call.id, /^ctc_/);
+    await run({ model: native.pickerSlug, stream: true, input: [user("請計算 2+2"), ...first.output,
+      { type: "custom_tool_call_output", call_id: call.call_id, output: "4" }] });
+    assert.equal(sent[1].href, "https://gateway.example/v1/chat/completions");
+    const assistant = sent[1].body.messages.find((item) => item.tool_calls);
+    assert.equal(assistant.reasoning_content, "fixture reasoning");
+    assert.equal(sent[1].body.messages.at(-1).role, "tool");
+    assert.equal(sent[1].body.messages.at(-1).content, "4");
+  });
+}
+
 for (const transport of ["HTTP", "WebSocket"]) {
   test(`${transport}: DeepSeek Responses 相容路由的壓縮由 chat bridge 封裝為唯一 compaction`, async (t) => {
     useTestKey(t);
