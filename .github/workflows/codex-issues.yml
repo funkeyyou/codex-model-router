@@ -49,7 +49,7 @@ jobs:
       selected: ${{ steps.prepare.outputs.selected }}
       reasoning_effort: ${{ steps.prepare.outputs.reasoning_effort }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -109,7 +109,7 @@ jobs:
     outputs:
       resolved: ${{ steps.result.outputs.resolved }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -177,7 +177,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -236,7 +236,7 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           token: ${{ steps.bot-token.outputs.token || github.token }}
