@@ -23,14 +23,23 @@
 **macOS**：在「終端機」執行
 
 ```bash
-curl -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
+(curl -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh || curl -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh) && bash codex-model-router.sh
 ```
 
 **Windows**：在 PowerShell 執行
 
 ```powershell
-curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
+curl.exe -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1
+if ($LASTEXITCODE -ne 0) { curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1 }
+if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 }
 ```
+
+<details>
+<summary>下載來源與校驗說明</summary>
+
+安裝、版本檢查和管理頁下載更新優先使用第三方加速服務 `gh-proxy.com`，失敗後自動改為直連 GitHub。僅代理本專案的公開檔案，不轉發模型請求或 API Key；更新仍檢查 SHA-256、安裝器格式與版本。代理提供的檔案及校驗清單經過同一服務，校驗不代表獨立的發布簽章驗證。
+
+</details>
 
 執行後會先安裝網頁管理頁（含捷徑與 Codex 裡的入口，不改動任何模型設定），並在瀏覽器開啟。在管理頁點「連接 API 供應商」，選擇常用供應商或填入 Base URL、API Key，勾選要加入的模型即可完成安裝；選中的模型會先發送測試請求確認可用，可能產生少量費用。不急著加模型的話，也可以先只在「設定」調整全域上下文。已經安裝過的話會直接開啟管理頁。習慣終端操作可以在指令後加上 `menu` 使用終端選單。
 

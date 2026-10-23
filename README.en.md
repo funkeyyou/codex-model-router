@@ -23,14 +23,23 @@ Before you start, you need:
 **macOS**: run in Terminal
 
 ```bash
-curl -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
+(curl -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh || curl -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh) && bash codex-model-router.sh
 ```
 
 **Windows**: run in PowerShell
 
 ```powershell
-curl.exe -fsSL https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1
+curl.exe -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1
+if ($LASTEXITCODE -ne 0) { curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1 }
+if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 }
 ```
+
+<details>
+<summary>Download sources and verification</summary>
+
+Installation, version checks and web manager update downloads try the third-party service `gh-proxy.com` first, then fall back to GitHub directly on failure. Only public files from this project use the proxy; model requests and API keys do not. Updates retain SHA-256, installer format and version checks. Files and checksums pass through the same proxy, so these checks are not independent release signature verification.
+
+</details>
 
 It first installs the web manager (with a shortcut and an entry in Codex; no model settings are changed) and opens it in your browser. Click **Connect an API provider**, pick a common provider or enter a Base URL and API key, and choose the models to add to finish installing. Selected models are tested with real API requests, which may incur small charges. Not ready to add models? You can just adjust the global context under **Settings** for now. If it's already installed, the manager opens directly. To use the terminal menu instead, add `menu` to the command (terminal prompts are currently in Traditional Chinese).
 

@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.38.0";
+const INSTALLER_VERSION = "1.38.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -928,6 +928,55 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   }
 }
 
+// 只代理本專案的公開下載；自訂來源、查詢參數和任何登入憑證都不送給第三方。
+export function publicGithubDownloadUrls(value) {
+  const original = String(value);
+  const url = new URL(original);
+  const repo = "/funkeyyou/codex-model-router/";
+  const allowed = url.protocol === "https:" && !url.username && !url.password &&
+    !url.search && !url.hash && !url.port && (
+    (url.hostname === "github.com" && url.pathname.startsWith(repo) &&
+      /^(raw\/|releases\/download\/)/.test(url.pathname.slice(repo.length))) ||
+    (url.hostname === "raw.githubusercontent.com" && url.pathname.startsWith(repo)));
+  return allowed ? [`https://gh-proxy.com/${original}`, original] : [original];
+}
+
+export async function downloadPublicGithubFile(url, {
+  limit = 16 * 1024 * 1024, timeoutMs = 60000, fetchImpl = fetch, validate = () => {},
+} = {}) {
+  const candidates = publicGithubDownloadUrls(url);
+  for (let index = 0; index < candidates.length; index += 1) {
+    const controller = new AbortController();
+    // 包含本文下載時間，避免收到標頭後串流停住卻永遠不逾時。
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchImpl(candidates[index], {
+        headers: { accept: "application/octet-stream, application/json, text/plain", "user-agent": `codex-model-router/${INSTALLER_VERSION}` },
+        credentials: "omit",
+        signal: controller.signal,
+      });
+      if (!response.ok) fail(`公開檔案下載失敗（HTTP ${response.status}）。`);
+      if (response.headers.get("content-type")?.includes("text/html")) fail("下載來源回傳網頁，並非預期的檔案。");
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of response.body) {
+        size += chunk.length;
+        if (size > limit) fail("下載檔案超過大小限制，已停止下載。");
+        chunks.push(chunk);
+      }
+      const content = Buffer.concat(chunks);
+      validate(content);
+      return content;
+    } catch (error) {
+      // 代理回傳 404 也要嘗試直連，避免代理尚未同步新版本。
+      if (index === candidates.length - 1) throw error;
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
+  }
+}
+
 export function versionParts(value) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(value || "").trim());
   return match ? match.slice(1).map(Number) : null;
@@ -1003,18 +1052,11 @@ async function loadReleaseCatalog({ force = false, maxAgeMs = Infinity } = {}) {
     if (env.CODEX_MODEL_ROUTER_RELEASES_JSON) {
       raw = env.CODEX_MODEL_ROUTER_RELEASES_JSON;
     } else {
-      const response = await fetchWithTimeout(
-        releasesUrl,
-        {
-          headers: {
-            accept: "application/json",
-            "user-agent": `codex-model-router/${INSTALLER_VERSION}`,
-          },
-        },
-        4000,
-      );
-      if (!response.ok) fail(`版本清單回傳 HTTP ${response.status}。`);
-      raw = await response.text();
+      raw = (await downloadPublicGithubFile(releasesUrl, {
+        limit: 128 * 1024,
+        timeoutMs: 4000,
+        validate: (content) => normalizeReleaseCatalog(JSON.parse(content.toString("utf8"))),
+      })).toString("utf8");
     }
     if (Buffer.byteLength(raw, "utf8") > 128 * 1024) {
       fail("版本清單超過大小限制。");
@@ -6504,22 +6546,14 @@ export function verifyInstallerScript(content, version, platform = process.platf
 
 async function downloadReleaseAsset(version, name, limit) {
   const url = `${releaseDownloadBase}/v${version}/${name}`;
-  const response = await fetchWithTimeout(url, {
-    headers: { "user-agent": `codex-model-router/${INSTALLER_VERSION}` },
-  }, 60000);
-  if (!response.ok) {
-    fail(response.status === 404
-      ? `GitHub 上還沒有 v${version} 的發佈檔案（可能仍在建立中），請稍後再試。`
-      : `下載 ${name} 失敗（HTTP ${response.status}）。`);
+  try {
+    return await downloadPublicGithubFile(url, { limit });
+  } catch (error) {
+    if (error.message.includes("HTTP 404")) {
+      fail(`GitHub 上還沒有 v${version} 的發佈檔案（可能仍在建立中），請稍後再試。`);
+    }
+    throw error;
   }
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of response.body) {
-    size += chunk.length;
-    if (size > limit) fail(`${name} 超過大小限制，已停止更新。`);
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
 }
 
 // 由新版安裝器自己執行 update：換掉路由器程式碼、重啟服務、更新安裝器副本與捷徑。
