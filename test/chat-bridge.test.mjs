@@ -211,6 +211,21 @@ async function run(pieces, context = ctx()) {
 }
 const terminal = (events) => events.filter((event) => /^response\.(completed|incomplete|failed)$/.test(event.type));
 
+test("壓縮摘要空白、截斷或改呼叫工具時回明確失敗，不用佔位摘要取代歷史", async () => {
+  for (const chunks of [
+    [delta({ content: " " }, "stop")],
+    [delta({ content: "半段摘要" }, "length")],
+    [delta({ tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: "{}" } }] }, "tool_calls")],
+  ]) {
+    const events = await run(sse(chunks), ctx({ compaction: true }));
+    const [done] = terminal(events);
+    assert.equal(done.type, "response.failed");
+    assert.equal(done.response.error.code, "empty_compaction");
+    assert.equal(events.some((event) => event.item?.type === "compaction"), false);
+    assert.doesNotMatch(JSON.stringify(events), /compaction produced no summary/);
+  }
+});
+
 test("文字串流成一則訊息，用量對到 Responses 的欄位", async () => {
   const events = await run(sse([
     delta({ role: "assistant", content: "" }), delta({ content: "你" }), delta({ content: "好" }, "stop"),
@@ -264,6 +279,12 @@ test("工具呼叫的片段依 index 拼回；namespace 與自由格式工具還
     { id: done.response.output[1].id, type: "custom_tool_call", status: "completed", call_id: "call_b", input: "*** Begin Patch", name: "apply_patch" },
   ]);
   assert.equal(events.filter((event) => event.type === "response.output_item.added").length, 2);
+  assert.match(done.response.output[0].id, /^fc_/);
+  assert.match(done.response.output[1].id, /^ctc_/);
+  const customId = done.response.output[1].id;
+  for (const event of events.filter((event) => event.item_id === customId || event.item?.type === "custom_tool_call")) {
+    assert.equal(event.item_id || event.item.id, customId);
+  }
 });
 
 test("自由格式工具直接給原始內容也接受；以 { 開頭卻不完整的參數則讓這一輪失敗", async () => {

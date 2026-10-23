@@ -595,7 +595,7 @@ export function stripBridgeReasoning(input, { keepChatReasoning = false } = {}) 
 // 工具配對靠的是 call_id，內容因此完整保留。
 export function isBridgeMintedId(value) {
   if (typeof value !== "string") return false;
-  const match = /^(?:msg|fc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
+  const match = /^(?:msg|fc|ctc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
   return match !== null && /[A-Z]/.test(match[1]);
 }
 
@@ -753,6 +753,23 @@ function stripBridgeArtifacts(body, { keepChatReasoning = false } = {}) {
     stats.bridgeCompactionRewritten += recompacted.removed;
   }
   return result;
+}
+
+// 舊轉譯層與部分相容供應商會替 custom_tool_call 填 fc_ id。壓縮會嚴格
+// 驗證項目類型；移除不相符的選填 id，保留 call_id 與工具結果的配對。
+export function normalizeToolCallIds(body) {
+  if (!Array.isArray(body?.input)) return body;
+  let changed = false;
+  const input = body.input.map((item) => {
+    const prefix = item?.type === "custom_tool_call" ? "ctc_"
+      : item?.type === "function_call" ? "fc_" : null;
+    if (!prefix || typeof item.id !== "string" || item.id.startsWith(prefix)) return item;
+    const next = { ...item };
+    delete next.id;
+    changed = true;
+    return next;
+  });
+  return changed ? { ...body, input } : body;
 }
 
 // 本機合成的 view_image 呼叫與它的輸出不能送去上游——那個工具是路由器自己
@@ -1953,7 +1970,7 @@ export async function fetchModelUpstream(
   }
 
   // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
-  effectiveBody = stripRouterImageArtifacts(effectiveBody);
+  effectiveBody = normalizeToolCallIds(stripRouterImageArtifacts(effectiveBody));
 
   let outboundBodyObject = isCustom
     ? rewriteCustomBody(effectiveBody, route)
@@ -2062,7 +2079,12 @@ export async function fetchModelUpstream(
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
       return translated;
     };
-    if (route.translate === "chat") return sendChat(route);
+    // DeepSeek 的 Responses 相容閘道可能接受 compaction_trigger，卻只回一般
+    // message。壓縮回合改由本機 chat bridge 產生唯一 compaction 項目，避免
+    // HTTP 200 被誤當成已支援 remote compaction v2；一般聊天仍沿用原路由。
+    const deepseekCompaction = /(?:^|\/)deepseek(?:[-/]|$)/i.test(route.upstreamModel) &&
+      Array.isArray(effectiveBody.input) && effectiveBody.input.some((item) => item?.type === "compaction_trigger");
+    if (route.translate === "chat" || deepseekCompaction) return sendChat(route);
     if (chatFallbackRoutes.has(route.pickerSlug)) return sendChat({ ...route, translate: "chat" });
     outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {
@@ -3285,7 +3307,7 @@ async function tryUpstreamWebSocketTurn(
       delete outgoing.previous_response_id;
       if (previousId) stats.upstreamWebSocketReplays += 1;
     }
-    const sanitized = stripRouterImageArtifacts(stripBridgeArtifacts({ input: outgoing.input }));
+    const sanitized = normalizeToolCallIds(stripRouterImageArtifacts(stripBridgeArtifacts({ input: outgoing.input })));
     outgoing.input = sanitized.input;
     outgoing.type = "response.create";
     return outgoing;

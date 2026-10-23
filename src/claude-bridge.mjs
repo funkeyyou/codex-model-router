@@ -1311,7 +1311,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           const target = ctx.toolTargets?.get(block.name);
           cur = {
             kind: isFreeform ? "custom_tool" : "function_tool",
-            itemId: randomId("fc_", 54),
+            itemId: randomId(isFreeform ? "ctc_" : "fc_", 54),
             callId: block.id,
             name: target?.name || block.name,
             namespace: target?.namespace || null,

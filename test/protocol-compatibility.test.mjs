@@ -63,6 +63,7 @@ test("Claude JSON fallback preserves text, reasoning signatures, redacted blocks
   assert.equal(response.usage.input_tokens_details.cached_tokens, 5);
   const call = response.output.at(-1);
   assert.equal(call.type, "function_call");
+  assert.match(call.id, /^fc_/);
   assert.equal(call.namespace, "plugin");
   assert.equal(call.name, "lookup");
   assert.equal(call.arguments, '{"query":"天氣"}');
@@ -78,6 +79,10 @@ test("Claude JSON fallback supports custom tool payloads and complete compaction
     { type: "tool_use", id: "call_1", name: "exec", input: { input: "text('ok');" } },
   ], { stop_reason: "tool_use" })), { freeform: new Set(["exec"]) });
   assert.equal(terminals(custom)[0].response.output[0].type, "custom_tool_call");
+  const customId = terminals(custom)[0].response.output[0].id;
+  assert.match(customId, /^ctc_/);
+  assert.equal(custom.find((event) => event.type === "response.output_item.added").item.id, customId);
+  for (const event of custom.filter((event) => event.item_id)) assert.equal(event.item_id, customId);
   assert.equal(terminals(custom)[0].response.output[0].input, "text('ok');");
   const compact = await stream(JSON.stringify(message([{ type: "text", text: "完整摘要" }])), { compaction: true });
   const output = terminals(compact)[0].response.output;

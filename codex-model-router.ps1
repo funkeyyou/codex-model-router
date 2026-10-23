@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.39.0";
+const INSTALLER_VERSION = "1.39.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -9741,7 +9741,7 @@ export function stripBridgeReasoning(input, { keepChatReasoning = false } = {}) 
 // 工具配對靠的是 call_id，內容因此完整保留。
 export function isBridgeMintedId(value) {
   if (typeof value !== "string") return false;
-  const match = /^(?:msg|fc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
+  const match = /^(?:msg|fc|ctc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
   return match !== null && /[A-Z]/.test(match[1]);
 }
 
@@ -9899,6 +9899,23 @@ function stripBridgeArtifacts(body, { keepChatReasoning = false } = {}) {
     stats.bridgeCompactionRewritten += recompacted.removed;
   }
   return result;
+}
+
+// 舊轉譯層與部分相容供應商會替 custom_tool_call 填 fc_ id。壓縮會嚴格
+// 驗證項目類型；移除不相符的選填 id，保留 call_id 與工具結果的配對。
+export function normalizeToolCallIds(body) {
+  if (!Array.isArray(body?.input)) return body;
+  let changed = false;
+  const input = body.input.map((item) => {
+    const prefix = item?.type === "custom_tool_call" ? "ctc_"
+      : item?.type === "function_call" ? "fc_" : null;
+    if (!prefix || typeof item.id !== "string" || item.id.startsWith(prefix)) return item;
+    const next = { ...item };
+    delete next.id;
+    changed = true;
+    return next;
+  });
+  return changed ? { ...body, input } : body;
 }
 
 // 本機合成的 view_image 呼叫與它的輸出不能送去上游——那個工具是路由器自己
@@ -11099,7 +11116,7 @@ export async function fetchModelUpstream(
   }
 
   // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
-  effectiveBody = stripRouterImageArtifacts(effectiveBody);
+  effectiveBody = normalizeToolCallIds(stripRouterImageArtifacts(effectiveBody));
 
   let outboundBodyObject = isCustom
     ? rewriteCustomBody(effectiveBody, route)
@@ -11208,7 +11225,12 @@ export async function fetchModelUpstream(
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
       return translated;
     };
-    if (route.translate === "chat") return sendChat(route);
+    // DeepSeek 的 Responses 相容閘道可能接受 compaction_trigger，卻只回一般
+    // message。壓縮回合改由本機 chat bridge 產生唯一 compaction 項目，避免
+    // HTTP 200 被誤當成已支援 remote compaction v2；一般聊天仍沿用原路由。
+    const deepseekCompaction = /(?:^|\/)deepseek(?:[-/]|$)/i.test(route.upstreamModel) &&
+      Array.isArray(effectiveBody.input) && effectiveBody.input.some((item) => item?.type === "compaction_trigger");
+    if (route.translate === "chat" || deepseekCompaction) return sendChat(route);
     if (chatFallbackRoutes.has(route.pickerSlug)) return sendChat({ ...route, translate: "chat" });
     outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {
@@ -12431,7 +12453,7 @@ async function tryUpstreamWebSocketTurn(
       delete outgoing.previous_response_id;
       if (previousId) stats.upstreamWebSocketReplays += 1;
     }
-    const sanitized = stripRouterImageArtifacts(stripBridgeArtifacts({ input: outgoing.input }));
+    const sanitized = normalizeToolCallIds(stripRouterImageArtifacts(stripBridgeArtifacts({ input: outgoing.input })));
     outgoing.input = sanitized.input;
     outgoing.type = "response.create";
     return outgoing;
@@ -14303,7 +14325,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           const target = ctx.toolTargets?.get(block.name);
           cur = {
             kind: isFreeform ? "custom_tool" : "function_tool",
-            itemId: randomId("fc_", 54),
+            itemId: randomId(isFreeform ? "ctc_" : "fc_", 54),
             callId: block.id,
             name: target?.name || block.name,
             namespace: target?.namespace || null,
@@ -15386,6 +15408,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     entry.name = target?.name || entry.alias;
     entry.namespace = target?.namespace || null;
     entry.freeform = ctx.freeform.has(entry.alias);
+    if (entry.freeform) entry.itemId = randomId("ctc_", 54);
     const identity = entry.namespace ? { name: entry.name, namespace: entry.namespace } : { name: entry.name };
     send({
       type: "response.output_item.added",
@@ -15466,11 +15489,14 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     for (const entry of pending.sort((left, right) => left.index - right.index)) {
       if (!finishToolCall(entry)) return;
     }
+    if (compactionMode && (!compactionText.trim() || pending.length > 0 || (finishReason && finishReason !== "stop"))) {
+      fail({ code: "empty_compaction", message: "Chat 上游未提供完整的壓縮摘要，已停止壓縮並保留原始歷史；請重試，若摘要被截斷請調高模型輸出上限。" });
+      return;
+    }
     done = true;
     if (compactionMode) {
       suppress = false;
-      // 摘要為空也必須送出項目，否則客戶端直接 Fatal。
-      const summary = compactionText.trim() || "(compaction produced no summary)";
+      const summary = compactionText.trim();
       const item = { id: randomId("cmp_", 54), type: "compaction", encrypted_content: encodeCompaction(summary) };
       send({ type: "response.output_item.added", output_index: 0, item: { id: item.id, type: "compaction", encrypted_content: "" } });
       send({ type: "response.output_item.done", output_index: 0, item });

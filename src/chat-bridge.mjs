@@ -732,6 +732,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     entry.name = target?.name || entry.alias;
     entry.namespace = target?.namespace || null;
     entry.freeform = ctx.freeform.has(entry.alias);
+    if (entry.freeform) entry.itemId = randomId("ctc_", 54);
     const identity = entry.namespace ? { name: entry.name, namespace: entry.namespace } : { name: entry.name };
     send({
       type: "response.output_item.added",
@@ -812,11 +813,14 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     for (const entry of pending.sort((left, right) => left.index - right.index)) {
       if (!finishToolCall(entry)) return;
     }
+    if (compactionMode && (!compactionText.trim() || pending.length > 0 || (finishReason && finishReason !== "stop"))) {
+      fail({ code: "empty_compaction", message: "Chat 上游未提供完整的壓縮摘要，已停止壓縮並保留原始歷史；請重試，若摘要被截斷請調高模型輸出上限。" });
+      return;
+    }
     done = true;
     if (compactionMode) {
       suppress = false;
-      // 摘要為空也必須送出項目，否則客戶端直接 Fatal。
-      const summary = compactionText.trim() || "(compaction produced no summary)";
+      const summary = compactionText.trim();
       const item = { id: randomId("cmp_", 54), type: "compaction", encrypted_content: encodeCompaction(summary) };
       send({ type: "response.output_item.added", output_index: 0, item: { id: item.id, type: "compaction", encrypted_content: "" } });
       send({ type: "response.output_item.done", output_index: 0, item });

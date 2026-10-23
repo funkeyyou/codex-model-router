@@ -1,6 +1,15 @@
 {
-  "latest": "1.39.0",
+  "latest": "1.39.1",
   "releases": [
+    {
+      "version": "1.39.1",
+      "date": "2026-10-23",
+      "changes": [
+        "修正：Chat Completions 與 Claude 轉譯層的自訂工具呼叫使用正確的 ctc_ 項目 ID。送出歷史與壓縮請求前移除類型不符的選填 ID，保留工具內容與 call_id 配對，避免 Expected an ID that begins with ctc 錯誤。",
+        "修正：DeepSeek 經 Responses 相容介面壓縮時，可能只回一般訊息，導致 remote compaction v2 expected exactly one compaction output item。現在壓縮回合改走 Chat Completions 並由本機封裝唯一 compaction 項目，一般聊天維持原路由。",
+        "安全：Chat 壓縮若回傳空白、截斷摘要或工具呼叫，會明確失敗並保留原始歷史，不再以佔位摘要宣告成功。HTTP、WebSocket、舊 ID 重播與摘要接續測試通過，並已在 Windows 實際確認 DeepSeek 壓縮成功。"
+      ]
+    },
     {
       "version": "1.39.0",
       "date": "2026-10-23",
