@@ -118,8 +118,6 @@ curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/
 - [完整说明](docs/guide.md)：网页管理页、升级细节、多家供应商、Chat Completions 模型、中转生图、兼容性与运行细节
 - [疑难排解与健康检查](docs/troubleshooting.md)
 - [Claude Code 订阅路由](docs/claude-cli-experimental.md)（繁体中文）
-- [Keysmith 全局开关](docs/keysmith.md)（繁体中文）：原版全局指令加载；使用 Claude 等其他模型前请先关闭
-- [会话清理](docs/session-cleaner.md)（繁体中文）：批量改写历史拒绝回复、移除推理记录、同步桌面投影并备份还原
 - [开发与发布](docs/development.md)
 - [版本更新内容](https://github.com/funkeyyou/codex-model-router/releases)
 

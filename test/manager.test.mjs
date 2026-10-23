@@ -402,14 +402,13 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "apply-update", "chatgpt-login", "claude-cli-add", "claude-cli-install",
     "claude-cli-login", "claude-cli-update", "connect-claude-desktop", "detect-fast", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-claude", "remove-backup-key", "remove-models",
     "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "restore-claude-desktop",
-    "session-cleaner-apply", "session-cleaner-preview", "session-cleaner-restore", "set-background-model", "set-claude-desktop", "set-global-context", "set-hidden-models", "set-keysmith", "set-quota-mode",
+    "set-background-model", "set-claude-desktop", "set-global-context", "set-hidden-models", "set-quota-mode",
     "uninstall", "update"]);
   // 頁面用到的查詢都要是安裝器提供的。
   const queryTypes = new Set([...managerPage.matchAll(/(?:ensureQuery|refreshButton|reloadQuery)\("([a-z-]+)"/g)].map((match) => match[1]));
   for (const match of managerPage.matchAll(/type: "([a-z-]+)" \} \}\)/g)) queryTypes.add(match[1]);
-  queryTypes.add("session-cleaner");
   assert.deepEqual([...queryTypes].sort(), ["claude-cli", "claude-cli-models", "claude-desktop", "claude-desktop-connection", "diagnostics", "global-context", "hidden-models", "imagegen",
-    "provider-preview", "session-cleaner"]);
+    "provider-preview"]);
 });
 
 test("新增模型與新增供應商都提供 Claude 訂閱，並共用 Claude CLI 的準備檢查與確認步驟", () => {

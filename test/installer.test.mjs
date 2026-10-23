@@ -3,7 +3,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer } = await loadPayloads();
@@ -12,6 +14,39 @@ const { versionParts, compareVersions, normalizeReleaseCatalog, releasesBetween,
 
 const ESC = String.fromCharCode(0x1b);
 const BEL = String.fromCharCode(0x07);
+
+test("解除安裝封存安裝目錄後，使用者指令仍有有效副本且不改寫原檔", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "router-instruction-archive-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const root = join(home, "runtime");
+  const archive = join(home, "backup");
+  mkdirSync(root);
+  const file = join(root, "user-instructions.md");
+  writeFileSync(file, "User-owned instructions\n");
+  const config = { model_instructions_file: file, model: "user-model" };
+  const edit = installer.preserveInstructionFile(config, archive, { root, home });
+  assert.equal(edit.keyPath, "model_instructions_file");
+  assert.equal(readFileSync(file, "utf8"), "User-owned instructions\n");
+  assert.equal(config.model_instructions_file, file);
+  renameSync(root, join(archive, "runtime"));
+  assert.equal(readFileSync(edit.value, "utf8"), "User-owned instructions\n");
+  assert.equal(config.model, "user-model");
+});
+
+test("解除安裝不接管安裝目錄以外的指令，未設定或檔案遺失也不建立副本", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "router-external-instructions-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const root = join(home, "runtime");
+  const archive = join(home, "backup");
+  mkdirSync(root);
+  const outside = join(home, "user-instructions.md");
+  writeFileSync(outside, "Keep this file\n");
+  for (const config of [{}, { model_instructions_file: outside }, { model_instructions_file: join(root, "missing.md") }]) {
+    assert.equal(installer.preserveInstructionFile(config, archive, { root, home }), null);
+  }
+  assert.equal(existsSync(archive), false);
+  assert.equal(readFileSync(outside, "utf8"), "Keep this file\n");
+});
 
 // --- 版本比較 ---------------------------------------------------------------
 
