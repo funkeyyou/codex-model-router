@@ -1983,10 +1983,11 @@ export async function fetchModelUpstream(
   // 這一步對每一條路由都要做：view_image 是路由器自己合成的，沒有任何上游認得它。
   effectiveBody = normalizeToolCallIds(stripRouterImageArtifacts(effectiveBody));
 
-  let outboundBodyObject = isCustom
+  const outboundBodyObject = isCustom
     ? rewriteCustomBody(effectiveBody, route)
     : effectiveBody;
-  let outboundBody = Buffer.from(JSON.stringify(outboundBodyObject));
+  // 自訂 Responses 請求由圖片預算產生唯一一份送出的 JSON；不要在這裡先編碼
+  // 一份隨後又被丟棄的完整歷史。清理 bridge 內容與工具 ID 的流程仍完整保留。
 
   stats.lastRoute = isCustom ? "custom" : "official";
   stats.lastProvider = provider?.id ?? null;
@@ -2092,7 +2093,7 @@ export async function fetchModelUpstream(
     };
     if (route.translate === "chat" || deepseekChat) return sendChat(route);
     if (chatFallbackRoutes.has(route.pickerSlug)) return sendChat({ ...route, translate: "chat" });
-    outboundBody = budget.buffer;
+    const outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {
       return oversizeResponse(outboundBody.length);
     }
@@ -2139,7 +2140,7 @@ export async function fetchModelUpstream(
   const upstream = await fetch(targetUrl(false, incomingUrl), {
     method: "POST",
     headers: buildOfficialHeaders(requestHeaders),
-    body: outboundBody.length > 0 ? outboundBody : bodyBuffer, // outboundBody 已含重建結果
+    body: effectiveBody === body && bodyBuffer ? bodyBuffer : Buffer.from(JSON.stringify(outboundBodyObject)),
     redirect: "manual",
     signal,
   });
@@ -2352,7 +2353,7 @@ async function handleResponses(request, response, incomingUrl) {
   const captureId = captureNext(
     typeof body.model === "string" && routeMap.has(body.model) ? "custom-http" : "official-http",
   );
-  captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
+  if (captureId) captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
   const upstream = await fetchModelUpstream(
     request.headers,
     incomingUrl,
@@ -2361,14 +2362,14 @@ async function handleResponses(request, response, incomingUrl) {
     abortController.signal,
     meta,
   );
-  if (meta.anthropicRequest) {
+  if (captureId && meta.anthropicRequest) {
     captureWrite(
       captureId,
       "anthropic-request.json",
       JSON.stringify(meta.anthropicRequest, null, 2),
     );
   }
-  if (meta.chatRequest) captureWrite(captureId, "chat-request.json", JSON.stringify(meta.chatRequest, null, 2));
+  if (captureId && meta.chatRequest) captureWrite(captureId, "chat-request.json", JSON.stringify(meta.chatRequest, null, 2));
   captureWrite(captureId, "upstream-status.txt", `${upstream.status}\n`);
   if (meta.translate && upstream.status >= 200 && upstream.status < 300) {
     await bridgeTranslatedToHttp(upstream, response, meta);
@@ -3473,11 +3474,10 @@ export async function handleWebSocketResponseInner(
       stats.websocketOnlyFieldsStripped += 1;
     }
   }
-  const bodyBuffer = Buffer.from(JSON.stringify(body));
   const captureId = captureNext(
     typeof body.model === "string" && routeMap.has(body.model) ? "custom" : "official",
   );
-  captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
+  if (captureId) captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
   const stopHeartbeat = startWebSocketHeartbeat(socket);
   const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null, transport: "websocket" };
   try {
@@ -3485,15 +3485,15 @@ export async function handleWebSocketResponseInner(
       request.headers,
       incomingUrl,
       body,
-      bodyBuffer,
+      null, // WebSocket 已解析為物件，只在最終轉送時序列化。
       abortController.signal,
       meta,
     );
     stats.websocketResponses += 1;
-    if (meta.anthropicRequest) {
+    if (captureId && meta.anthropicRequest) {
       captureWrite(captureId, "anthropic-request.json", JSON.stringify(meta.anthropicRequest, null, 2));
     }
-    if (meta.chatRequest) captureWrite(captureId, "chat-request.json", JSON.stringify(meta.chatRequest, null, 2));
+    if (captureId && meta.chatRequest) captureWrite(captureId, "chat-request.json", JSON.stringify(meta.chatRequest, null, 2));
     if (meta.translate && upstream.status >= 200 && upstream.status < 300) {
       await bridgeTranslatedToWebSocket(upstream, socket, meta, captureId);
     } else {
