@@ -1,10 +1,10 @@
-# codex-model-router — Multi-model routing for Codex Desktop
+# codex-model-router — Model router for Codex and Claude Desktop
 
 [简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md)
 
-**Add Claude and third-party API models to the Codex Desktop model picker, alongside the official GPT models.** Works on macOS and Windows.
+**Use Claude and third-party API models in Codex Desktop and Claude Desktop.** Add custom models to the Codex model picker alongside the official GPT models, or connect third-party Claude APIs to Claude Desktop in one click. Either app is enough; works on macOS and Windows.
 
-It is a small router that runs on your computer (a local LLM proxy). Official models still go straight to OpenAI; only the custom models you add are sent to the API you configure. Your Codex sign-in, existing chats, and official models are unaffected.
+It is a small router that runs on your computer (a local LLM proxy) with a web manager. In Codex, official models still go straight to OpenAI; only the custom models you add are sent to the API you configure. Your Codex sign-in, existing chats, and official models are unaffected.
 
 - **Supported APIs**: OpenAI Responses API, Anthropic Claude Messages API, and Chat Completions-only endpoints (DeepSeek, Qwen, GLM, Kimi, Gemini, Ollama, vLLM, and more; capabilities are probed during setup).
 - **Multiple providers**: connect several at once; each API key is stored encrypted (macOS Keychain / Windows DPAPI).

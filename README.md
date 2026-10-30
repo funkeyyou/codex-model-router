@@ -1,10 +1,10 @@
-# codex-model-router — Codex 多模型路由工具
+# codex-model-router — 模型路由器（Codex / Claude Desktop）
 
 [简体中文](README.md) · [繁體中文](README.zh-TW.md) · [English](README.en.md)
 
-**在 Codex Desktop 的模型菜单里加入 Claude 和第三方 API 模型，官方 GPT 照常使用。** 支持 macOS 与 Windows。
+**让 Codex Desktop 和 Claude Desktop 都能用上 Claude 与第三方 API 模型。** 在 Codex 的模型菜单里加入自定义模型，官方 GPT 照常使用；也能一键把第三方 Claude API 接入 Claude Desktop。两者择一安装即可，支持 macOS 与 Windows。
 
-它是一个运行在你电脑上的小型路由器（本机 LLM proxy）：选官方模型时，请求照常发往 OpenAI；选你添加的自定义模型时，才发往你设置的 API。Codex 的登录、已有对话和官方模型都不受影响。
+它是一个运行在你电脑上的小型路由器（本机 LLM proxy），附带网页管理页：在 Codex 选官方模型时，请求照常发往 OpenAI；选你添加的自定义模型时，才发往你设置的 API。Codex 的登录、已有对话和官方模型都不受影响。
 
 - **支持的 API**：OpenAI Responses API、Anthropic Claude Messages API，以及只有 Chat Completions 的兼容端点（DeepSeek、Qwen、GLM、Kimi、Gemini、Ollama、vLLM 等，安装时会实际探测能力）。
 - **多家供应商**：可同时接入多家，API Key 各自加密保存（macOS 钥匙串／Windows DPAPI）。
