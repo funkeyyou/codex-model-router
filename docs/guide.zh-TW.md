@@ -300,7 +300,7 @@ DeepSeek、通義千問、GLM、Kimi、Gemini 的 OpenAI 相容介面、Ollama�
 
 ## Claude Code 訂閱路由
 
-「[Claude CLI 訂閱路由](claude-cli-experimental.md)」可從主選單第 7 項或 `claude-cli` 開啟，1.27.0 起也可在網頁管理介面的「新增供應商」或「新增模型」選擇 Claude 訂閱。缺少 CLI 或版本過舊時會先詢問是否安裝／更新，未登入時引導官方登入。
+「[Claude CLI 訂閱路由](claude-cli.md)」可從主選單第 7 項或 `claude-cli` 開啟，1.27.0 起也可在網頁管理介面的「新增供應商」或「新增模型」選擇 Claude 訂閱。缺少 CLI 或版本過舊時會先詢問是否安裝／更新，未登入時引導官方登入。
 
 從 1.26.1 起，優先讀取 Claude CLI 當前模型清單並以編號列出完整版本。輸入 `1` 選一個、`1,3` 複選、`1-3` 選範圍，也支援 `all`、完整模型 ID 及 `cancel` 返回。編號依當次清單排列，已添加的項目會標示；相同版本的別名會合併。
 

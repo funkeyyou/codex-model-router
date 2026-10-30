@@ -118,7 +118,7 @@ bash codex-model-router.sh rollback
 
 ## Claude Code subscription routing
 
-[Claude CLI subscription routing](claude-cli-experimental.md) is available through menu item 7 or the `claude-cli` command, and since v1.27.0 also from Add provider or Add model in the [web manager](#web-manager). It asks before installing or updating Claude Code and guides subscription sign-in when needed.
+[Claude CLI subscription routing](claude-cli.md) is available through menu item 7 or the `claude-cli` command, and since v1.27.0 also from Add provider or Add model in the [web manager](#web-manager). It asks before installing or updating Claude Code and guides subscription sign-in when needed.
 
 Since v1.26.1, the installer reads the CLI's current model list first and shows numbered entries with full model IDs. Enter `1`, `1,3`, `1-3`, or `all`; you can also enter an explicit model ID or `cancel`. Numbers follow the current list order. Aliases resolving to the same version are deduplicated, and previously configured models remain listed.
 

@@ -118,7 +118,7 @@ curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/
 
 - [完整說明](docs/guide.zh-TW.md)：網頁管理頁、升級細節、多家供應商、Chat Completions 模型、中轉生圖、相容性與運作細節
 - [疑難排解與健康檢查](docs/troubleshooting.zh-TW.md)
-- [Claude Code 訂閱路由](docs/claude-cli-experimental.md)
+- [Claude Code 訂閱路由](docs/claude-cli.md)
 - [開發與發布](docs/development.zh-TW.md)
 - [版本更新內容](https://github.com/funkeyyou/codex-model-router/releases)
 
