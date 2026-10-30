@@ -75,7 +75,7 @@ function Find-NodeBinary {
   if ($tooOld.Count -gt 0) {
     throw ("找到的 Node.js 版本過低，需要 v$MinimumNodeVersion 及以上：`n  " + ($tooOld -join "`n  "))
   }
-  throw "未找到 Node.js。請先安裝 Codex 桌面版，或安裝 Node.js v$MinimumNodeVersion 及以上。"
+  throw "未找到 Node.js。請先安裝 Node.js v$MinimumNodeVersion 及以上（建議使用 LTS）；不需要安裝 Codex。"
 }
 
 function Get-EmbeddedSection {
@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.39.4";
+const INSTALLER_VERSION = "1.40.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -481,7 +481,26 @@ function codexCandidates() {
   ];
 }
 
-const codexBin = findExecutable(codexCandidates());
+const codexBin = testMode && env.CODEX_MODEL_ROUTER_TEST_NO_CODEX === "1" ? null : findExecutable(codexCandidates());
+
+// 舊版安裝都接入 Codex；新安裝沒有 Codex 時只建立獨立路由服務。
+// 用持久標記判斷，避免日後安裝 Codex 就意外改寫它的設定。
+export function codexIntegrationEnabled(manifest = readManifest(), available = Boolean(codexBin)) {
+  return manifest ? manifest.codexIntegration !== false : available;
+}
+
+function requireCodex() {
+  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+}
+
+function requireCodexIntegration() {
+  requireCodex();
+  if (readManifest() && !codexIntegrationEnabled()) fail("請先在 Codex設定中連接 Codex。");
+}
+
+function readRoutingUserConfig() {
+  return codexIntegrationEnabled() ? readUserConfig() : Promise.resolve({ config: {}, filePath: null });
+}
 
 function readManifest() {
   if (!existsSync(manifestPath)) return null;
@@ -2460,6 +2479,7 @@ export function catalogTemplates(bundled, current) {
 }
 
 function loadCatalogTemplates() {
+  if (!codexIntegrationEnabled() || !codexBin) return { models: [] };
   const bundled = loadBundledCatalog();
   try { return catalogTemplates(bundled, JSON.parse(readFileSync(catalogPath, "utf8"))); }
   catch { return bundled; }
@@ -2829,7 +2849,12 @@ export function customCatalogEntry(officialModels, route, index) {
     officialModels.find((model) => model.slug === "gpt-5.6-sol") ||
     officialModels.find((model) => model.visibility === "list") ||
     officialModels[0];
-  const entry = structuredClone(exactTemplate || fallbackTemplate);
+  // 獨立模式沒有 Codex 內建目錄，只保留路由器自己的中繼資料，不宣稱官方模型能力。
+  const entry = structuredClone(exactTemplate || fallbackTemplate || {
+    context_window: route.contextWindow || NEW_MODEL_DEFAULTS.contextWindow,
+    max_context_window: route.contextWindow || NEW_MODEL_DEFAULTS.contextWindow,
+    effective_context_window_percent: 95,
+  });
   entry.slug = route.pickerSlug;
   entry.display_name = withDefaultModelPrefix(route).displayName;
   entry.description = `${route.upstreamModel}，由 ${route.providerHost} 提供`;
@@ -2839,7 +2864,7 @@ export function customCatalogEntry(officialModels, route, index) {
     description: EFFORT_DESCRIPTIONS[effort],
   }));
   entry.priority =
-    Math.max(...officialModels.map((model) => Number(model.priority || 0))) +
+    Math.max(0, ...officialModels.map((model) => Number(model.priority || 0))) +
     index +
     1;
   entry.visibility = "list";
@@ -3015,11 +3040,24 @@ export function invalidatePickerCache(home = codexHome, backupDir = null) {
 }
 
 function invalidatePickerCacheAfterFailure() {
+  if (!codexIntegrationEnabled() || !codexBin) return;
   try { invalidatePickerCache(); }
   catch (error) { console.error(`清單快取清理失敗，還原後請重開桌面版：${error.message}`); }
 }
 
 async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
+  if (!codexIntegrationEnabled()) {
+    // 仍驗證已提交的目錄與路由一致；無需借助 Codex 程序或修改其快取。
+    const models = readCatalogIfExists()?.models;
+    const expected = new Set(routes.map(route => route.pickerSlug));
+    if (!Array.isArray(models) || models.length !== expected.size ||
+        new Set(models.map(model => model.slug)).size !== expected.size ||
+        models.some(model => !expected.has(model.slug)) || absent.some(slug => models.some(model => model.slug === slug))) {
+      fail("路由器模型目錄與設定不一致。");
+    }
+    return { data: models.map(model => ({ id: model.slug })) };
+  }
+  requireCodex();
   const expected = routes.map(withDefaultModelPrefix);
   const user = await readUserConfig();
   const repair = planDefaultModelRepair(user.config, routes, previousRoutes);
@@ -3479,6 +3517,12 @@ async function waitForHealth(port) {
 // 回傳 Codex 目前的登入方式：chatgpt、quota（本工具的 API Key 模式）或 none（尚未登入，
 // 安裝完成後會自動開啟 API Key 模式）。使用者自己的 OpenAI API Key 登入無法通過路由器的身份驗證，直接拒絕。
 function verifyLogin() {
+  if (!codexIntegrationEnabled()) return "standalone";
+  return verifyLoginForCodex();
+}
+
+function verifyLoginForCodex() {
+  requireCodex();
   if (testMode) return "chatgpt";
   if (codexLogin() === "quota") return "quota";
   const result = shell(codexBin, ["login", "status"], {
@@ -3791,7 +3835,7 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
 async function install(preset = null) {
   const existingManifest = readManifest();
   if (existingManifest?.version) assertInstallerNotOlder(existingManifest.version);
-  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
+  const useCodex = codexIntegrationEnabled(existingManifest);
   const login = verifyLogin();
   // 在問任何問題、寫任何檔案之前先確認背景服務起得來。
   if (isWindows && !testMode) assertScriptHostAvailable();
@@ -3938,17 +3982,17 @@ async function install(preset = null) {
   );
   const combinedCatalog = { ...bundledCatalog, models: [...officialModels, ...customModels] };
 
-  const userConfig = await readUserConfig();
+  const userConfig = await readRoutingUserConfig();
   // 先前只裝了管理頁：沿用它記下的 Codex 入口回退資料，回退時才能一併還原。
   const entrySource = existingManifest || readManagerRecord();
   const previousConfig =
-    existingManifest?.previousConfig || {
+    existingManifest?.previousConfig || (useCodex ? {
       modelProvider: deepGet(userConfig.config, "model_provider"),
       openaiBaseUrl: deepGet(userConfig.config, "openai_base_url"),
       modelCatalogJson: deepGet(userConfig.config, "model_catalog_json"),
       provider: deepGet(userConfig.config, `model_providers.${PROVIDER_ID}`),
-    };
-  const backupPath = existingManifest?.configBackup || configBackup(userConfig.filePath);
+    } : null);
+  const backupPath = existingManifest?.configBackup || (useCodex ? configBackup(userConfig.filePath) : null);
   const port = existingManifest?.port || (await freePort());
   const routerSource = extractRouterSource();
   let reconfigureBackupDir = null;
@@ -3980,8 +4024,10 @@ async function install(preset = null) {
     // 路由器要靠它重新產生模型目錄；Codex 更新後 bundled 清單才跟得上。
     // codexBinDir 是搜尋目錄：Windows 的 codexBin 指向版本雜湊子目錄，更新後
     // 那支的 mtime 從此凍結，只認它等於偵測不到任何更新。
-    codexBin,
-    codexBinDir: codexBinSearchDir(),
+    codexIntegration: useCodex,
+    catalogRefresh: useCodex,
+    codexBin: useCodex ? codexBin : null,
+    codexBinDir: useCodex ? codexBinSearchDir() : null,
     forceListedModels,
     port,
     routes: allRoutes,
@@ -3995,7 +4041,7 @@ async function install(preset = null) {
     startService();
     removeLegacyLauncher();
     await waitForHealth(port);
-    const writeResult = await writeConfigEdits([
+    const writeResult = useCodex ? await writeConfigEdits([
       { keyPath: "model_provider", value: "openai" },
       {
         keyPath: "openai_base_url",
@@ -4005,8 +4051,8 @@ async function install(preset = null) {
       // API Key 模式例外：API Key 登入時 Codex 不會拉 /models，要繼續讀路由器的目錄。
       { keyPath: "model_catalog_json", value: quotaModeEnabled() ? catalogPath : null },
       { keyPath: `model_providers.${PROVIDER_ID}`, value: null },
-    ]);
-    configChanged = true;
+    ]) : {};
+    configChanged = useCodex;
 
     const manifest = manifestWithProviders({
       version: INSTALLER_VERSION,
@@ -4028,6 +4074,7 @@ async function install(preset = null) {
       logPath,
       port,
       routes: allRoutes,
+      codexIntegration: useCodex,
       previousConfig,
       configBackup: backupPath,
       configVersionAfterInstall: writeResult.version || null,
@@ -4089,7 +4136,7 @@ async function install(preset = null) {
   if (otherRoutes.length > 0) {
     console.log(`其他 ${otherProviders.length} 家供應商的 ${otherRoutes.length} 個模型保持不變。`);
   }
-  console.log(`配置備份：${backupPath}`);
+  if (backupPath) console.log(`配置備份：${backupPath}`);
   if (
     primary?.keychainService &&
     primary.keychainService !== keychainService &&
@@ -4119,9 +4166,11 @@ async function install(preset = null) {
       catch (error) { console.error(`備用 Key 未加入：${error.message}`); }
     }
   } else if (installedPrimary && !testMode) await askBackupKeys(installedPrimary);
-  console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
-  console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。" );
-  console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。" );
+  if (useCodex) {
+    console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
+    console.log("安裝器繼續使用內建 openai 供應商，因此 Remote 中的既有聊天仍會顯示。");
+    console.log("安裝前由其他自訂供應商建立的任務，仍可能需要單獨遷移。");
+  } else console.log("已安裝獨立路由服務。請到「Claude → Claude 客戶端」接入 Claude API 模型；不需要安裝 Codex。");
   console.log(`回退命令：${basename(scriptPath)} rollback`);
   printManagerLauncher(await installManagerLauncher());
   if (existsSync(managerRecordPath)) rmSync(managerRecordPath, { force: true });
@@ -4129,7 +4178,7 @@ async function install(preset = null) {
   if (!preset) await offerInstalledRelayImagegen();
   // bare 安裝此時還沒有模型；由呼叫端寫入 Claude 訂閱模型後再開啟。
   const apiKeyMode = preset?.bare ? false : await enableApiKeyModeIfLoggedOut(login);
-  return { added: routes.map(summarizeRoute), backupKeys: backupResult, apiKeyMode, restartDesktop: true };
+  return { added: routes.map(summarizeRoute), backupKeys: backupResult, apiKeyMode, restartDesktop: useCodex };
 }
 
 // 首次安裝失敗時封存已寫入的檔案。網頁首次設定的管理頁本身也在這個目錄
@@ -4151,7 +4200,6 @@ function archiveFailedInstallRoot(destination) {
 async function addModels() {
   const manifest = readManifest();
   if (manifest?.version) assertInstallerNotOlder(manifest.version);
-  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
 
   if (!manifest) {
@@ -4269,7 +4317,6 @@ async function removeModels() {
   if (!existsSync(routerPath) || !existsSync(bridgePath)) {
     fail("路由器程式檔案不完整，請先執行 update 修復安裝。");
   }
-  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
 
   const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
   const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
@@ -4300,7 +4347,7 @@ async function removeModels() {
   const selectedSlugs = parseSelection(answer, available.length)
     .map(index => available[index].pickerSlug);
   const preview = planRemoveModels(manifest, settings, catalog, selectedSlugs);
-  const userConfig = await readUserConfig();
+  const userConfig = await readRoutingUserConfig();
   const defaultModel = removedDefaultModel(userConfig.config, selectedSlugs);
   console.log("\n即將刪除：");
   for (const route of preview.removed) console.log(`  - ${route.displayName || route.upstreamModel}`);
@@ -4323,7 +4370,7 @@ async function removeModels() {
 // 全域預設模型指向被刪的模型時一併清除，失敗時連同 config.toml 一起還原。
 // expectedDefault：互動流程確認前看到的預設模型；確認期間被改過就停下來，不憑舊資訊動手。
 async function executeRemoveModels(selectedSlugs, { expectedDefault } = {}) {
-  const userConfig = await readUserConfig();
+  const userConfig = await readRoutingUserConfig();
   const defaultModel = removedDefaultModel(userConfig.config, selectedSlugs);
   if (expectedDefault !== undefined && defaultModel !== expectedDefault) {
     fail("全域預設模型在確認期間變更，請重新執行刪除。" );
@@ -4466,6 +4513,11 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
   } catch (error) {
     console.error("\n修改失敗，正在還原之前的配置...");
     const failures = [];
+    // 先撤回依賴新目錄的 Codex 設定，再還原舊目錄。獨立模式的目錄不是 Codex schema，
+    // 先換回它會讓 app-server 連 config/read 都失敗，無法還原 API Key 模式。
+    if (applied && restore) {
+      try { await restore(); } catch (restoreError) { failures.push(restoreError.message); }
+    }
     for (const [target, name] of files) {
       try {
         if (!copyIfExists(join(backupDir, name), target)) failures.push(`找不到 ${name} 備份`);
@@ -4473,9 +4525,6 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
     }
     try { restoreChatBridge(backupDir); }
     catch (restoreError) { failures.push(`chat-bridge.mjs：${restoreError.message}`); }
-    if (applied && restore) {
-      try { await restore(); } catch (restoreError) { failures.push(restoreError.message); }
-    }
     invalidatePickerCacheAfterFailure();
     try {
       restartServiceInPlace();
@@ -4802,7 +4851,6 @@ async function configureClaudeCli(subcommand = null) {
     login: (path) => transport.claudeCliAuth(path, { login: true }), notify: console.log, force: subcommand === "login" });
   console.log("訂閱登入：已登入。");
   if (subcommand === "login") return;
-  if (!codexBin) fail("未找到 Codex CLI。");
   verifyLogin();
   printHeading("連接 Claude 訂閱帳號");
   console.log("正在讀取 Claude CLI 模型清單（不發送推理請求）...");
@@ -4821,7 +4869,7 @@ async function configureClaudeCli(subcommand = null) {
   if (!models) { console.log("未修改路由配置。"); return; }
   const contextWindow = Number(await ask("上下文上限（非自動探測；未知時先用保守值）", "200000"));
   planClaudeCliModels(state, binary, models, contextWindow); // validate before any inference
-  const userConfig = await readUserConfig();
+  const userConfig = await readRoutingUserConfig();
   if (Number(userConfig.config.model_context_window) > contextWindow) {
     console.log(`注意：全域 model_context_window=${userConfig.config.model_context_window} 可能覆蓋此模型的 ${contextWindow} 設定；本功能不修改全域值，請先用短對話測試。`);
   }
@@ -4896,7 +4944,6 @@ function printProviderEdit(plan) {
 // 修改名稱與模型前綴：只改顯示用的欄位與模型目錄，不重新探測、不重啟路由器。
 async function editProvider() {
   const { settings, providers } = requireInstallation();
-  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   printHeading("修改供應商名稱與模型前綴");
   const cliCount = settings.routes.filter((route) => route.transport === "claude-cli").length;
   const options = [
@@ -4957,7 +5004,6 @@ async function askProviderId(baseUrl, takenIds) {
 
 async function addProvider() {
   const { manifest, settings, catalog, providers } = requireInstallation();
-  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   verifyLogin();
   printHeading("新增供應商");
   console.log("每家供應商各自保存 API Key；已有前綴的模型保留原名，無前綴的模型才加供應商名稱。");
@@ -5021,7 +5067,6 @@ async function addProvider() {
 
 async function removeProvider() {
   const { manifest, settings, catalog, providers } = requireInstallation();
-  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   printHeading("移除供應商");
   if (providers.length <= 1) {
     console.log("目前只有一家供應商，無法移除；要整個移除路由器請用「回退配置」。");
@@ -5033,7 +5078,7 @@ async function removeProvider() {
     return;
   }
   const preview = planRemoveProvider(manifest, settings, catalog, chosen.id);
-  const userConfig = await readUserConfig();
+  const userConfig = await readRoutingUserConfig();
   const defaultModel = removedDefaultModel(userConfig.config, preview.removedRoutes.map((route) => route.pickerSlug));
   const imagegen = relayConfig();
   const imagegenAffected = Boolean(imagegen) && (imagegen.providerId ?? DEFAULT_PROVIDER_ID) === chosen.id;
@@ -5068,7 +5113,7 @@ async function executeRemoveProvider(providerId, { expectedDefault } = {}) {
   const { manifest, settings, catalog } = requireInstallation();
   const plan = planRemoveProvider(manifest, settings, catalog, providerId);
   const removedSlugs = plan.removedRoutes.map((route) => route.pickerSlug);
-  const userConfig = await readUserConfig();
+  const userConfig = await readRoutingUserConfig();
   const defaultModel = removedDefaultModel(userConfig.config, removedSlugs);
   if (expectedDefault !== undefined && defaultModel !== expectedDefault) {
     fail("全域預設模型在確認期間變更，請重新執行。");
@@ -5206,8 +5251,9 @@ async function update() {
   const updatedCatalog = refreshCustomSpeedTiers(prefixCatalogDisplayNames(currentCatalog, plan.routes), plan.routes);
   const namesChanged = updatedCatalog !== currentCatalog;
   // 只遷移本工具管理的固定目錄，不移除使用者自行指定的其他目錄。
-  if (!codexBin) fail("此次更新需要 Codex CLI 讀取及遷移舊版模型目錄設定，請先確認 Codex 已安裝。");
-  const userConfig = await readUserConfig();
+  const useCodex = codexIntegrationEnabled(manifest);
+  if (useCodex) requireCodex();
+  const userConfig = await readRoutingUserConfig();
   const previousCatalogPath = userConfig.config.model_catalog_json;
   // API Key 模式靠這個目錄讓第三方模型出現在選單，模式開著時不遷移。
   const migrateCatalog = !quotaModeEnabled() && isManagedCatalogPath(previousCatalogPath, catalogPath);
@@ -5254,11 +5300,11 @@ async function update() {
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
     writeBridgeSources();
-    writeJsonAtomic(settingsPath, { ...plan.settings, codexBin });
+    writeJsonAtomic(settingsPath, { ...plan.settings, codexBin: useCodex ? codexBin : null });
     if (namesChanged) writeJsonAtomic(catalogPath, updatedCatalog);
     writeJsonAtomic(manifestPath, {
       ...plan.manifest,
-      codexBin,
+      codexBin: useCodex ? codexBin : null,
       updatedAt: new Date().toISOString(),
     });
     if (serviceDefinitionUnchanged()) {
@@ -5343,7 +5389,7 @@ async function update() {
   }
   printManagerLauncher(await installManagerLauncher());
   await restartRunningManagerAfterUpdate();
-  console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
+  if (useCodex) console.log(`\n請完全退出並重新打開 ${desktopAppName}。`);
 }
 
 // 可強制顯示的隱藏官方模型：Codex 內建目錄標成 hide 的項目，並標出目前已強制顯示的。
@@ -5890,6 +5936,7 @@ export async function configureMillionTokenContext() {
 }
 
 async function repairModels() {
+  requireCodexIntegration();
   if (managerMode) assertManagerWritable();
   const { settings, manifest } = requireInstallation();
   if (!codexBin) fail("未找到 Codex CLI。");
@@ -6030,14 +6077,16 @@ export function preserveInstructionFile(config, archiveDir, { root = installRoot
 // 還原 Codex 配置、停止並移除路由器服務、封存檔案；終端與管理頁共用。
 // deferArchive：安裝目錄留到管理頁結束後再搬，因為管理程式自己還在裡面執行。
 async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
+  const useCodex = codexIntegrationEnabled(manifest);
+  if (useCodex) requireCodex();
   const keysmith = readKeysmithRecord(installRoot);
-  if (keysmith?.mode === "global") await setKeysmithEnabled(false);
+  if (useCodex && keysmith?.mode === "global") await setKeysmithEnabled(false);
   if (existsSync(claudeDesktopBackupPath)) {
     const desktop = await importClaudeDesktopModule();
     if (desktop.integrationStatus(claudeDesktopBackupPath)?.status !== "restored") await managerRestoreClaudeDesktop();
   }
   // 先把 ChatGPT 登入搬回原位；安裝目錄封存後備份就不在原處了。
-  if (quotaModeEnabled() || codexLogin() === "quota") {
+  if (useCodex && (quotaModeEnabled() || codexLogin() === "quota")) {
     console.log("正在關閉 API Key 模式並還原原本的登入…");
     await disableQuotaMode({ quiet: true });
   }
@@ -6048,8 +6097,8 @@ async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
     const pool = existsSync(keyPoolPath) ? normalizeKeyPoolFile(JSON.parse(readFileSync(keyPoolPath, "utf8"))) : null;
     backupKeys = pool ? Object.values(pool.providers).flat() : [];
   } catch { /* 清單損壞時只刪主 Key。 */ }
-  const edits = rollbackEdits(manifest.previousConfig);
-  const userBeforeRollback = await readUserConfig();
+  const edits = useCodex ? rollbackEdits(manifest.previousConfig) : [];
+  const userBeforeRollback = await readRoutingUserConfig();
   const archiveDir = join(backupsRoot, `rollback-${timestamp()}`);
   const instructionEdit = preserveInstructionFile(userBeforeRollback.config, archiveDir);
   if (instructionEdit) {
@@ -6073,8 +6122,10 @@ async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
     if (entryEdit) edits.push(entryEdit);
     else console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
   }
-  await writeConfigEdits(edits);
-  invalidatePickerCache();
+  if (useCodex) {
+    await writeConfigEdits(edits);
+    invalidatePickerCache();
+  }
   stopService();
   removeServiceRegistration();
 
@@ -6311,7 +6362,7 @@ async function installManagerLauncher() {
   } catch (error) {
     return { ok: false, message: `無法建立管理頁啟動器（${error.message}）` };
   }
-  const desktop = testMode && env.CODEX_MODEL_ROUTER_TEST_MANAGER_ENTRY !== "1" ? null : await installManagerMcpEntry();
+  const desktop = !codexBin || !codexIntegrationEnabled() || (testMode && env.CODEX_MODEL_ROUTER_TEST_MANAGER_ENTRY !== "1") ? null : await installManagerMcpEntry();
   if (testMode && !env.CODEX_MODEL_ROUTER_SHORTCUT_DIR) return { ok: true, shortcut: null, desktop };
   const shortcut = managerShortcutPath();
   try {
@@ -6710,9 +6761,9 @@ async function managerUpdate({ restartDesktop = false } = {}) {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
-  const result = { version: latest, managerRestart: existsSync(managerInstallerPath), restartDesktop: true };
+  const result = { version: latest, managerRestart: existsSync(managerInstallerPath), restartDesktop: codexIntegrationEnabled() };
   // 先由新版管理程序接手，再重啟桌面版；不能在此關掉承載舊程序的 ChatGPT。
-  if (restartDesktop) {
+  if (restartDesktop && codexIntegrationEnabled()) {
     if (!result.managerRestart) fail("路由器已更新，但找不到管理頁安裝器副本，請手動重新開啟桌面版。");
     result.desktopRestartRequested = true;
   }
@@ -6724,8 +6775,8 @@ async function managerApplyLocalUpdate({ restartDesktop = false } = {}) {
   const installed = readManifest()?.version || null;
   if (compareVersions(INSTALLER_VERSION, installed) !== 1) fail("這個管理頁沒有比已安裝的版本新，不需要套用。");
   await update();
-  return { version: INSTALLER_VERSION, managerRestart: true, restartDesktop: true,
-    ...(restartDesktop ? { desktopRestartRequested: true } : {}) };
+  return { version: INSTALLER_VERSION, managerRestart: true, restartDesktop: codexIntegrationEnabled(),
+    ...(restartDesktop && codexIntegrationEnabled() ? { desktopRestartRequested: true } : {}) };
 }
 
 // --- 網頁管理介面的讀取與操作 -----------------------------------------------------
@@ -6736,7 +6787,7 @@ let managerConfigHintsAt = 0;
 // config.toml 裡會影響模型頁顯示的兩個值：全域預設模型與全域上下文。讀它要開一個
 // Codex app-server，因此在背景讀、快取一分鐘。
 function managerConfigHints(force = false) {
-  if (!codexBin) return Promise.resolve(null);
+  if (!codexIntegrationEnabled() || !codexBin) return Promise.resolve(null);
   if (!managerConfigHintsPromise || force || Date.now() - managerConfigHintsAt > 60000) {
     managerConfigHintsAt = Date.now();
     managerConfigHintsPromise = readUserConfig().then(({ config }) => {
@@ -6791,7 +6842,6 @@ function managerWriteGuard() {
   if (comparison != null && comparison > 0) {
     return `這個管理頁是 ${INSTALLER_VERSION}，路由器仍是 ${manifest.version}；請先從左上角的版本選單套用新版本。`;
   }
-  if (!codexBin) return `未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`;
   return null;
 }
 
@@ -6808,9 +6858,10 @@ async function managerState() {
     return {
       installed: false, managerOnly: Boolean(record), platform: process.platform,
       versions: { manager: INSTALLER_VERSION, installed: terminalSafeText(record?.version, 32) || null },
-      setupBlocked: codexBin ? null : `未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`,
+      setupBlocked: null,
+      codex: { available: Boolean(codexBin), connected: false },
       providerPresets: PROVIDER_PRESETS, providers: [], models: [],
-      desktop: { name: desktop?.name || desktopAppName, canRestart: Boolean(desktop) },
+      desktop: { name: desktop?.name || desktopAppName, canRestart: codexIntegrationEnabled() && Boolean(desktop) },
     };
   }
   const settings = readSettingsIfExists();
@@ -6869,6 +6920,7 @@ async function managerState() {
   const shortcut = managerShortcutPath();
   return {
     installed: true,
+    codex: { available: Boolean(codexBin), connected: codexIntegrationEnabled(manifest) },
     platform: process.platform,
     versions: {
       manager: INSTALLER_VERSION,
@@ -6890,8 +6942,8 @@ async function managerState() {
     officialModelCount: catalogModels.filter((model) => !String(model.slug).startsWith("custom/")).length,
     providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
-    quotaMode: quotaModeStatus(),
-    keysmith: await keysmithStatus(),
+    quotaMode: codexIntegrationEnabled() ? quotaModeStatus() : null,
+    keysmith: codexIntegrationEnabled() && codexBin ? await keysmithStatus() : null,
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
     imagegen,
@@ -6900,7 +6952,7 @@ async function managerState() {
       routeCount: routes.filter((route) => route.transport === "claude-cli").length,
       modelPrefix: validModelPrefix(settings.claudeCli?.modelPrefix),
     },
-    desktop: { name: desktop?.name || desktopAppName, canRestart: Boolean(desktop) },
+    desktop: { name: desktop?.name || desktopAppName, canRestart: codexIntegrationEnabled() && Boolean(desktop) },
     paths: {
       codexHome, installRoot, logPath,
       nodeBin: manifest.nodeBin || nodeBin || null,
@@ -6937,7 +6989,7 @@ async function managerVersionInfo({ refresh = false } = {}) {
     releases: catalog ? releasesBetween(catalog, installed).slice(-10) : [],
     releaseUrl: latest ? `${MANAGER_RELEASES_PAGE}/tag/v${latest}` : MANAGER_RELEASES_PAGE,
     releasesUrl: MANAGER_RELEASES_PAGE,
-    canRestartDesktop: Boolean(desktop),
+    canRestartDesktop: codexIntegrationEnabled() && Boolean(desktop),
     desktopName: desktop?.name || desktopAppName,
     checkedAt: catalog ? new Date(releaseCatalogLoadedAt).toISOString() : null,
     error,
@@ -7078,7 +7130,7 @@ export async function collectDiagnostics() {
   let configSummary = null;
   const [health, userConfig, codexVersion, claudeVersion] = await Promise.all([
     manifest ? routerHealthDetail(port) : Promise.resolve(null),
-    codexBin ? Promise.race([readUserConfig().catch((error) => ({ error: error.message })), delay(5000).then(() => ({ error: "逾時" }))])
+    codexBin && codexIntegrationEnabled() ? Promise.race([readUserConfig().catch((error) => ({ error: error.message })), delay(5000).then(() => ({ error: "逾時" }))])
       : Promise.resolve(null),
     diagnosticCommandVersion(codexBin),
     diagnosticCommandVersion(settings?.claudeCli?.binary || null),
@@ -7309,7 +7361,7 @@ async function managerAddModels({ providerId, models, contextWindow, maxOutputTo
     added: plan.added.map(summarizeRoute),
     skipped: selected.filter((model) => !plan.added.some((route) => route.upstreamModel === model)),
     backupDir,
-    restartDesktop: true,
+    restartDesktop: codexIntegrationEnabled(),
   };
 }
 
@@ -7340,7 +7392,7 @@ async function managerRemoveModels({ slugs } = {}) {
   if (defaultModel) console.log("已清除指向已刪模型的全域預設模型設定。");
   console.log(`已刪除 ${plan.removed.length} 個模型。備份：${backupDir}`);
   managerConfigHints(true);
-  return { removed: plan.removed.map(summarizeRoute), defaultCleared: Boolean(defaultModel), backupDir, restartDesktop: true };
+  return { removed: plan.removed.map(summarizeRoute), defaultCleared: Boolean(defaultModel), backupDir, restartDesktop: codexIntegrationEnabled() };
 }
 
 async function managerReorderModels({ slugs } = {}) {
@@ -7354,7 +7406,7 @@ async function managerReorderModels({ slugs } = {}) {
   console.log("正在寫入新的順序（不需要重新啟動路由器）…");
   const backupDir = await commitCatalogChange("reorder-models", plan);
   console.log(`已更新順序。備份：${backupDir}`);
-  return { changed: true, backupDir, restartDesktop: true };
+  return { changed: true, backupDir, restartDesktop: codexIntegrationEnabled() };
 }
 
 async function managerEditModel({ slug, displayName, contextWindow, maxOutputTokens, fast } = {}) {
@@ -7503,7 +7555,7 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
       try { backupResult = await addBackupKeys(provider, backups); }
       catch (error) { console.error(`備用 Key 未加入：${error.message}`); }
     }
-    return { providerId: id, added: newRoutes.map(summarizeRoute), backupDir, backupKeys: backupResult, restartDesktop: true };
+    return { providerId: id, added: newRoutes.map(summarizeRoute), backupDir, backupKeys: backupResult, restartDesktop: codexIntegrationEnabled() };
   } catch (error) {
     // 寫入失敗時把憑證放回原狀，不留下沒有供應商在用的 Key。
     if (!env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
@@ -7519,7 +7571,6 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
 // 網頁首次設定：沿用「新增供應商」查到的模型清單，跑與終端安裝相同的流程。
 async function managerFirstInstall({ draftId, models, contextWindow, maxOutputTokens, backupKeys } = {}) {
   if (readManifest()) fail("路由器已經安裝，請重新整理管理頁。");
-  if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
   const backups = parseBackupKeys(backupKeys ?? []);
@@ -7575,7 +7626,7 @@ async function managerRemoveProvider({ providerId, deleteKey = true } = {}) {
   managerConfigHints(true);
   return {
     removed: plan.removedRoutes.map(summarizeRoute), defaultCleared: Boolean(defaultModel),
-    imagegenDisabled: imagegenAffected, keyDeleted, primary: plan.providers[0]?.id || null, backupDir, restartDesktop: true,
+    imagegenDisabled: imagegenAffected, keyDeleted, primary: plan.providers[0]?.id || null, backupDir, restartDesktop: codexIntegrationEnabled(),
   };
 }
 
@@ -7770,7 +7821,66 @@ async function managerRestartRouter() {
 
 // --- 第二階段：全域上下文、隱藏官方模型、中轉生圖、Claude CLI ------------------------
 
+// 獨立安裝之後才裝 Codex：由使用者明確連接，不因偵測到執行檔就改寫設定。
+async function managerConnectCodex() {
+  assertManagerWritable();
+  requireCodex();
+  const { manifest, settings, catalog } = requireInstallation();
+  if (codexIntegrationEnabled(manifest)) return { changed: false };
+  // 先驗證登入；API Key 登入的既有防護同樣適用。
+  const login = await withCodexLock(() => verifyLoginForCodex());
+  const user = await readUserConfig();
+  const previousConfig = {
+    modelProvider: deepGet(user.config, "model_provider"),
+    openaiBaseUrl: deepGet(user.config, "openai_base_url"),
+    modelCatalogJson: deepGet(user.config, "model_catalog_json"),
+    provider: deepGet(user.config, `model_providers.${PROVIDER_ID}`),
+  };
+  const templates = await withCodexLock(() => loadBundledCatalog());
+  const official = applyForcedVisibility(templates.models, settings.forceListedModels);
+  const entries = new Map(catalog.models.map(model => [model.slug, model]));
+  const custom = settings.routes.map((route, index) => ({
+    ...customCatalogEntry(official, route, index),
+    // 手動名稱與順序保留，其他 Codex 所需能力欄位從內建模板補齊。
+    display_name: entries.get(route.pickerSlug)?.display_name || route.displayName,
+  }));
+  const order = new Map(catalog.models.map((model, index) => [model.slug, index]));
+  custom.sort((a, b) => (order.get(a.slug) ?? Infinity) - (order.get(b.slug) ?? Infinity));
+  const priority = Math.max(0, ...official.map(model => Number(model.priority) || 0));
+  custom.forEach((model, index) => { model.priority = priority + index + 1; });
+  const backup = configBackup(user.filePath);
+  console.log("正在備份 Codex 設定並連接路由器…");
+  let apiKeyMode = false;
+  const backupDir = await commitRouterChange("connect-codex", {
+    settings: { ...settings, codexIntegration: true, catalogRefresh: true, codexBin, codexBinDir: codexBinSearchDir() },
+    manifest: { ...manifest, codexIntegration: true, codexBin, previousConfig, configBackup: backup },
+    catalog: { ...templates, models: [...official, ...custom] },
+    apply: async () => {
+      await writeConfigEdits([
+        { keyPath: "model_provider", value: "openai" },
+        { keyPath: "openai_base_url", value: `http://127.0.0.1:${settings.port}/v1` },
+        { keyPath: "model_catalog_json", value: null },
+        { keyPath: `model_providers.${PROVIDER_ID}`, value: null },
+      ]);
+      // 尚未登入時先啟用 API Key 模式，再驗證 model/list，否則清單不會包含自訂模型。
+      if (login === "none") {
+        apiKeyMode = true;
+        await enableQuotaMode({ allowLoggedOut: true });
+      }
+    },
+    restore: async () => {
+      if (apiKeyMode && quotaModeEnabled()) await disableQuotaMode({ quiet: true });
+      await writeConfigEdits(rollbackEdits(previousConfig));
+    },
+  });
+  printManagerLauncher(await installManagerLauncher());
+  managerConfigHints(true);
+  console.log("已連接 Codex；Claude 接入與既有模型保持不變。");
+  return { changed: true, backupDir, apiKeyMode, restartDesktop: true };
+}
+
 async function managerGlobalContext() {
+  requireCodexIntegration();
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   const { config, filePath } = await readUserConfig();
   const current = deepGet(config, "model_context_window");
@@ -7779,6 +7889,7 @@ async function managerGlobalContext() {
 }
 
 async function managerSetGlobalContext({ value } = {}) {
+  requireCodexIntegration();
   // 全域上下文只改 Codex 的 config.toml，不需要路由器：只裝管理頁時也能調整。
   if (readManifest()) assertManagerWritable();
   else if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -7795,7 +7906,7 @@ async function managerSetGlobalContext({ value } = {}) {
   console.log(target === null ? "已移除全域上下文，各模型改用自己的上下文。" : "已更新全域上下文。");
   console.log(`設定檔：${result.filePath}`);
   console.log(`備份：${result.backupDir}`);
-  return { changed: true, value: target, backupDir: result.backupDir, restartDesktop: true };
+  return { changed: true, value: target, backupDir: result.backupDir, restartDesktop: codexIntegrationEnabled() };
 }
 
 // --- API Key 模式 ---------------------------------------------------------------
@@ -7962,7 +8073,7 @@ export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
   }
   console.log("已開啟 API Key 模式：第三方模型可以照常發送，官方模型暫停使用。");
   console.log("原本的任務都會保留，打開後在模型選單改選第三方模型即可接續。");
-  return { changed: true, enabled: true, backupDir, restartDesktop: true };
+  return { changed: true, enabled: true, backupDir, restartDesktop: codexIntegrationEnabled() };
 }
 
 export async function disableQuotaMode({ quiet = false } = {}) {
@@ -8031,6 +8142,7 @@ function readBackgroundModels() {
 }
 
 async function managerSetBackgroundModel({ kind, model } = {}) {
+  requireCodexIntegration();
   assertManagerWritable();
   const { settings } = requireInstallation();
   if (!BACKGROUND_MODEL_KINDS.includes(kind)) fail("未知的背景任務種類。");
@@ -8103,6 +8215,7 @@ function managerUsage({ limit = 300, sinceHours = 24 } = {}) {
 }
 
 async function managerSetQuotaMode({ enabled } = {}) {
+  requireCodexIntegration();
   assertManagerWritable();
   if (typeof enabled !== "boolean") fail("請指定要開啟或關閉 API Key 模式。");
   if (enabled) return enableQuotaMode();
@@ -8139,6 +8252,7 @@ async function loginCodexWithChatgpt() {
 }
 
 async function managerChatgptLogin() {
+  requireCodexIntegration();
   assertManagerWritable();
   if (quotaModeEnabled()) return managerSetQuotaMode({ enabled: false });
   if (verifyLogin() === "chatgpt") {
@@ -8181,11 +8295,13 @@ async function readBundledCatalogAsync() {
 }
 
 async function managerHiddenModels() {
+  requireCodexIntegration();
   const settings = readSettingsIfExists();
   return { models: hiddenModelChoices(await readBundledCatalogAsync(), settings.forceListedModels) };
 }
 
 async function managerSetHiddenModels({ slugs } = {}) {
+  requireCodexIntegration();
   assertManagerWritable();
   if (!Array.isArray(slugs)) fail("請提供要強制顯示的模型清單。");
   const bundledCatalog = await withCodexLock(() => loadBundledCatalog());
@@ -8204,7 +8320,7 @@ async function managerSetHiddenModels({ slugs } = {}) {
   }
   console.log(result.chosen.length ? `已強制顯示：${result.chosen.join(", ")}` : "已恢復預設，不強制顯示任何隱藏模型。");
   console.log(`備份：${result.backupDir}`);
-  return { changed: true, chosen: result.chosen, backupDir: result.backupDir, restartDesktop: true };
+  return { changed: true, chosen: result.chosen, backupDir: result.backupDir, restartDesktop: codexIntegrationEnabled() };
 }
 
 function relayImagegenStatus() {
@@ -8412,6 +8528,7 @@ export async function setKeysmithEnabled(enabled, { root = installRoot, home = c
 }
 
 async function managerSetKeysmith({ enabled } = {}) {
+  requireCodexIntegration();
   assertManagerWritable();
   requireInstallation();
   return setKeysmithEnabled(enabled);
@@ -8512,7 +8629,6 @@ async function managerClaudeCliLogin({ force = false } = {}) {
 async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, firstInstall = false } = {}) {
   if (firstInstall) {
     if (readManifest()) fail("路由器已經安裝，請重新整理管理頁。");
-    if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
   } else assertManagerWritable();
   const login = await withCodexLock(() => verifyLogin());
   const defaults = normalizeNewModelDefaults({ contextWindow, maxOutputTokens });
@@ -8553,7 +8669,7 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, fir
   console.log(`上下文 ${defaults.contextWindow.toLocaleString("en-US")}，輸出 ${defaults.maxOutputTokens.toLocaleString("en-US")}（超過模型上限時 Claude CLI 會自動壓到上限）。`);
   console.log(`備份：${backupDir}`);
   const apiKeyMode = firstInstall ? await enableApiKeyModeIfLoggedOut(login) : false;
-  return { added, failures: tested.failures, backupDir, apiKeyMode, restartDesktop: true };
+  return { added, failures: tested.failures, backupDir, apiKeyMode, restartDesktop: codexIntegrationEnabled() };
 }
 
 // 管理頁的「解除安裝」：與終端的 rollback 相同，只是不問問題；安裝目錄等管理頁結束後再封存。
@@ -8562,7 +8678,7 @@ async function managerUninstall(params = {}) {
   const manifest = readManifest();
   let result;
   if (manifest) {
-    console.log("正在還原 Codex 配置、停止路由器並移除服務…");
+    console.log(codexIntegrationEnabled(manifest) ? "正在還原 Codex 配置、停止路由器並移除服務…" : "正在停止路由器並移除服務…");
     result = await uninstallRouter(manifest, { deleteKeys: async () => deleteKeys, deferArchive: true });
     if (result.keysDeleted) console.log(`已從${secretStoreLabel}刪除自訂供應商的 API Key。`);
     else console.log(`保留${secretStoreLabel}中的 API Key。`);
@@ -8719,6 +8835,7 @@ function managerOperations() {
       }),
       update: job("更新路由器", managerUpdate),
       "apply-update": job("套用新版本", managerApplyLocalUpdate),
+      "connect-codex": job("連接 Codex", managerConnectCodex),
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
       "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
@@ -9059,7 +9176,7 @@ export function managerBackgroundEnvironment(environment) {
     "CODEX_MODEL_ROUTER_LAUNCH_AGENTS_DIR", "CODEX_MODEL_ROUTER_SHORTCUT_DIR", "CODEX_MODEL_ROUTER_RELEASES_URL",
     "CODEX_MODEL_ROUTER_RELEASE_DOWNLOAD_URL"];
   if (environment.CODEX_MODEL_ROUTER_TEST_MODE === "1") names.push("CODEX_MODEL_ROUTER_TEST_MODE",
-    "CODEX_MODEL_ROUTER_TEST_API_KEY", "CODEX_MODEL_ROUTER_TEST_MODELS", "CODEX_MODEL_ROUTER_RELEASES_JSON", "CODEX_MODEL_ROUTER_DESKTOP_APP");
+    "CODEX_MODEL_ROUTER_TEST_NO_CODEX", "CODEX_MODEL_ROUTER_TEST_API_KEY", "CODEX_MODEL_ROUTER_TEST_MODELS", "CODEX_MODEL_ROUTER_RELEASES_JSON", "CODEX_MODEL_ROUTER_DESKTOP_APP");
   return Object.fromEntries(names.filter((name) => typeof environment[name] === "string").map((name) => [name, environment[name]]));
 }
 
@@ -9212,12 +9329,11 @@ async function chooseAction() {
 async function startManager() {
   const installed = Boolean(readManifest());
   if (!installed) {
-    if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
     if (isWindows && !testMode) assertScriptHostAvailable();
   }
   if (!installed && !readManagerRecord()) {
     printHeading("安裝網頁管理頁");
-    console.log("只安裝管理頁、捷徑與 Codex 裡的入口，不會改動模型設定；之後可在管理頁連接供應商。");
+    console.log("只安裝管理頁與捷徑；偵測到 Codex 時另外建立入口。之後可在管理頁連接供應商，不需要先安裝 Codex。");
     await installManagerOnly();
   } else if (!installed) {
     const record = readManagerRecord();
@@ -18203,6 +18319,13 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 <script type="application/json" id="i18n-data">
 {
 "en": {
+"管理頁與 Claude 接入不需要 Codex。只有 Codex 的全域上下文、隱藏官方模型與帳號模式等功能需要安裝並連接 Codex。": "The manager and Claude integration do not require Codex. Install and connect Codex to use its global context, hidden official models, account mode, and related settings.",
+"已偵測到 Codex，尚未連接這個路由器。": "Codex was detected but is not connected to this router.",
+"未偵測到 Codex。安裝後重新開啟管理頁即可連接。": "Codex was not detected. Install it and reopen the manager to connect.",
+"連接 Codex": "Connect Codex",
+"將備份並修改 Codex 的連線設定，讓 Codex 使用此路由器；Claude 的設定保持不變。": "Codex connection settings will be backed up and updated to use this router. Claude settings will be preserved.",
+"請先連接 API 供應商並添加 Claude API 模型，再回來設定 Claude 客戶端。": "Connect an API provider and add a Claude API model first, then return here to configure Claude Desktop.",
+
 "{days} 天 {hours} 小時": "{days}d {hours}h",
 "{hours} 小時 {minutes} 分": "{hours}h {minutes}m",
 "{minutes} 分鐘": "{minutes} min",
@@ -18247,10 +18370,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "桌面版": "the desktop app",
 "讀取中…": "Loading…",
 "開始使用": "Get started",
-"管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。": "The manager is installed. Connect an API provider or a Claude subscription to use their models from the Codex model picker, or just adjust the global context for now.",
+"管理頁可獨立使用。連接 API 供應商後，可在「Claude → Claude 客戶端」設定 Claude API 模型；已安裝 Codex 時也支援 Codex 接入。": "The manager works independently. Connect an API provider, then set up Claude API models under Claude → Claude Desktop. Codex integration is also available when Codex is installed.",
 "選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。": "Choose an API Key connection (a common provider or your own Base URL), or a Claude subscription signed in with Claude Code.",
-"勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。": "Pick the models to add to Codex. Small test requests confirm they work before the router is installed.",
-"安裝完成後重新啟動 {app}，即可在模型選單選到新模型。": "After installation, restart {app} to see the new models in the picker.",
+"勾選要添加的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。": "Select models to add. Small test requests confirm they work before the router is installed.",
+"模型添加後，請到對應客戶端完成接入；Claude 客戶端目前只支援 Claude API 模型。": "After adding models, connect the client you want to use. Claude Desktop currently supports Claude API models only.",
 "連接供應商": "Connect a provider",
 "調整全域上下文": "Adjust global context",
 "連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。": "Connecting a provider installs the router; you can add more providers, relay image generation and backup keys afterwards. Prefer the terminal? Run the installer with menu to use the terminal menu.",
@@ -18337,7 +18460,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "尚未建立（執行一次 update 會建立）": "Not created yet (running update once creates it)",
 "環境": "Environment",
 "Windows 排程工作": "Windows scheduled task",
-"Codex 選擇器裡的自訂模型，選擇器依這裡的順序顯示。": "Custom models in the Codex model picker, shown in this order.",
+"管理已添加的模型、顯示順序、上下文與輸出設定。": "Manage added models, display order, context windows, and output limits.",
 "刪除所選（{count}）": "Delete selected ({count})",
 "刪除所選": "Delete selected",
 "新增模型": "Add models",
@@ -19481,6 +19604,14 @@ function reconcileModelsState() {
   if (orderDraft && (orderDraft.length !== slugs.size || orderDraft.some((slug) => !slugs.has(slug)))) orderDraft = null;
 }
 
+function codexConnected() {
+  return !state || !state.codex || state.codex.connected;
+}
+
+function codexAvailable() {
+  return !state || !state.codex || state.codex.available;
+}
+
 function writeBlocked() {
   return Boolean(state && (state.writeBlocked || !state.installed));
 }
@@ -19571,7 +19702,7 @@ function renderBanners() {
       : t("API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送。"),
       h("button", { type: "button", class: "button small", onclick: () => switchView("settings") }, t("前往設定"))));
   }
-  if (pendingDesktopRestart && state && state.installed) {
+  if (pendingDesktopRestart && state && state.installed && codexConnected()) {
     const canRestart = state.desktop && state.desktop.canRestart;
     items.push(banner("info", "info",
       canRestart
@@ -19618,24 +19749,25 @@ function pageHead(title, subtitle, ...actions) {
 // 尚未連接供應商（只裝了管理頁）：連接供應商的流程與「新增供應商」相同，最後改成安裝路由器。
 function renderWelcome() {
   const blocked = state.setupBlocked;
-  return [pageHead(t("開始使用"), t("管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。")),
+  return [pageHead(t("開始使用"), t("管理頁可獨立使用。連接 API 供應商後，可在「Claude → Claude 客戶端」設定 Claude API 模型；已安裝 Codex 時也支援 Codex 接入。")),
     h("div", { class: "panel welcome" },
       h("ol", {},
         h("li", { text: t("選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。") }),
-        h("li", { text: t("勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。") }),
-        h("li", { text: t("安裝完成後重新啟動 {app}，即可在模型選單選到新模型。", { app: desktopName() }) })),
+        h("li", { text: t("勾選要添加的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。") }),
+        h("li", { text: t("模型添加後，請到對應客戶端完成接入；Claude 客戶端目前只支援 Claude API 模型。", { app: desktopName() }) })),
       blocked ? paragraph(serverText(blocked), "note warn") : null,
       h("div", { class: "actions" },
         h("button", { type: "button", class: "button primary", disabled: Boolean(blocked), onclick: () => openAddProvider({ firstInstall: true }) },
           icon("plus"), t("連接供應商")),
-        h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("settings"), t("調整全域上下文"))),
+        codexAvailable() ? h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("settings"), t("調整全域上下文")) : null),
       paragraph(t("連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。"), "muted"))];
 }
 
 function renderSetupSettings() {
+  if (!codexAvailable()) return renderCodexConnection();
   return [
     pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
-    renderGlobalContextPanel(Boolean(state.setupBlocked)),
+    renderGlobalContextPanel(!codexAvailable()),
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
     renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
   ];
@@ -19656,7 +19788,7 @@ function renderOverview() {
   const primary = (state.providers || []).find((provider) => provider.primary);
   const canRestart = state.desktop && state.desktop.canRestart;
   const head = pageHead(sectionTitle("總覽"), t("路由器狀態、最近的錯誤與執行環境。"),
-    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked), onclick: () => runJob("repair-models", {}, { title: t("同步與修復模型清單") }) }, icon("refresh"), t("同步與修復模型清單")),
+    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked) || !codexAvailable() || !codexConnected(), onclick: () => runJob("repair-models", {}, { title: t("同步與修復模型清單") }) }, icon("refresh"), t("同步與修復模型清單")),
     h("button", { type: "button", class: "button", onclick: confirmRestartRouter }, icon("restart"), t("重新啟動路由器")),
     canRestart ? h("button", { type: "button", class: "button", onclick: confirmRestartDesktop }, icon("power"), t("重新啟動 {app}", { app: state.desktop.name })) : null);
 
@@ -19792,7 +19924,7 @@ function renderModels() {
   const blocked = writeBlocked();
   const models = orderedModels();
   const dirty = orderDirty();
-  const head = pageHead(sectionTitle("模型"), t("Codex 選擇器裡的自訂模型，選擇器依這裡的順序顯示。"),
+  const head = pageHead(sectionTitle("模型"), t("管理已添加的模型、顯示順序、上下文與輸出設定。"),
     h("button", {
       type: "button", class: "button danger", disabled: blocked || selected.size === 0 || dirty,
       onclick: () => confirmRemoveModels([...selected]),
@@ -19821,7 +19953,7 @@ function renderModels() {
       h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")))));
     return parts;
   }
-  parts.push(renderBackgroundModelPanel(models, blocked));
+  if (codexConnected()) parts.push(renderBackgroundModelPanel(models, blocked));
 
   const allChecked = models.every((model) => selected.has(model.slug));
   const headerBox = h("input", {
@@ -20747,6 +20879,7 @@ function confirmDisableImagegen() {
 // ---- 設定：全域上下文、隱藏的官方模型 --------------------------------------------
 
 function renderSettings() {
+  if (!codexAvailable() || !codexConnected()) return renderCodexConnection();
   const blocked = writeBlocked();
   return [
     pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
@@ -20757,12 +20890,29 @@ function renderSettings() {
   ];
 }
 
+function renderCodexConnection() {
+  return [pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
+    h("div", { class: "panel" }, h("div", { class: "panel-body" },
+      paragraph(t("管理頁與 Claude 接入不需要 Codex。只有 Codex 的全域上下文、隱藏官方模型與帳號模式等功能需要安裝並連接 Codex。")),
+      paragraph(codexAvailable() ? t("已偵測到 Codex，尚未連接這個路由器。") : t("未偵測到 Codex。安裝後重新開啟管理頁即可連接。"), "muted"),
+      codexAvailable() && state.installed ? h("button", { type: "button", class: "button primary", disabled: writeBlocked(), onclick: () => {
+        const modal = openModal({ title: t("連接 Codex") });
+        modal.body.replaceChildren(paragraph(t("將備份並修改 Codex 的連線設定，讓 Codex 使用此路由器；Claude 的設定保持不變。")));
+        modal.footer.replaceChildren(h("button", { type: "button", class: "button primary", onclick: () => {
+          modal.close(); runJob("connect-codex", {}, { title: t("連接 Codex") });
+        } }, t("連接 Codex")));
+      } }, t("連接 Codex")) : null))];
+}
+
 function renderGeneralSettings() {
   return [pageHead(sectionTitle("通用設定"), t("管理頁與路由器的通用功能。")),
     renderDiagnosticsPanel(), renderUninstallPanel()];
 }
 
 function renderClaudeSettings() {
+  if (!state.installed) return [pageHead(sectionTitle("Claude 客戶端"), t("Claude 桌面客戶端的接入與回退設定。")),
+    banner("info", "info", t("請先連接 API 供應商並添加 Claude API 模型，再回來設定 Claude 客戶端。"),
+      h("button", { type: "button", class: "button primary", onclick: () => openAddProvider({ firstInstall: true }) }, t("連接供應商")))];
   return [pageHead(sectionTitle("Claude 客戶端"), t("Claude 桌面客戶端的接入與回退設定。")),
     renderClaudeDesktopPanel(writeBlocked())];
 }

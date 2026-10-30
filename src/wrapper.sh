@@ -45,7 +45,7 @@ fi
 
 NODE_BIN="$(find_node || true)"
 if [[ -z "${NODE_BIN}" ]]; then
-  echo "未找到可用的 Node.js（需要 v${MIN_NODE_MAJOR}.${MIN_NODE_MINOR} 及以上），請先安裝或更新 ChatGPT Desktop 或 Node.js。" >&2
+  echo "未找到可用的 Node.js（需要 v${MIN_NODE_MAJOR}.${MIN_NODE_MINOR} 及以上），請先安裝或更新 Node.js（22.15 以上／建議使用 LTS）；不需要安裝 Codex。" >&2
   exit 1
 fi
 

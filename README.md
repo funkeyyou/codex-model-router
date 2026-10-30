@@ -8,6 +8,7 @@
 
 - **支持的 API**：OpenAI Responses API、Anthropic Claude Messages API，以及只有 Chat Completions 的兼容端点（DeepSeek、Qwen、GLM、Kimi、Gemini、Ollama、vLLM 等，安装时会实际探测能力）。
 - **多家供应商**：可同时接入多家，API Key 各自加密保存（macOS 钥匙串／Windows DPAPI）。
+- **独立安装**：不必安装 Codex；只装 Claude Desktop 也能用。需要 Node.js 22.15 以上。
 - **网页管理页**：在浏览器里增删模型、管理供应商和 API Key、一键更新。
 - **可选功能**：中转 API 生图、Claude Code 订阅路由。
 - **Claude Desktop 接入**：在「Claude → Claude 客户端」一键配置第三方 Claude API 模型，也可一键回退。设置自动备份，聊天和其他偏好保留；暂不支持在 Claude 客户端使用 GPT 或 CLI 订阅路由。[使用说明](docs/claude-desktop.md)
@@ -16,9 +17,9 @@
 
 开始前请准备：
 
-- 已用 ChatGPT 账号登录的 Codex Desktop（ChatGPT Desktop）
-- 供应商的 Base URL 和 API Key
-- macOS，或 Windows 10 1809 以上／Windows 11（需要 Node.js 22.15 以上，桌面版自带的即可，通常不用另外安装）
+- 要使用的客户端：Claude Desktop 或 Codex Desktop（ChatGPT Desktop）；只安装管理页时两者都不是必需
+- 连接 API 模型时准备供应商的 Base URL 和 API Key；只安装管理页可暂不添加
+- macOS，或 Windows 10 1809 以上／Windows 11；需要 Node.js 22.15 以上，建议使用 [Node.js LTS](https://nodejs.org/)。已有 Codex 自带的兼容 Node.js 时也可直接使用
 
 **macOS**：在「终端」中运行
 
@@ -58,7 +59,7 @@ curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/
 
 </details>
 
-运行后会先安装网页管理页（含快捷方式与 Codex 里的入口，不改动任何模型设置），并在浏览器打开。在管理页点「连接 API 供应商」，选择常用供应商或填入 Base URL、API Key，勾选要添加的模型即可完成安装；选中的模型会先发送测试请求确认可用，可能产生少量费用。不急着添加模型的话，也可以先只在「设置」调整全局上下文。已经安装过的话会直接打开管理页。习惯终端操作可以在命令后加上 `menu` 使用终端菜单（提示目前为繁体中文）。
+运行后会先安装网页管理页和快捷方式，并在浏览器打开；检测到 Codex 时才另外建立 Codex 入口，不要求安装 Codex。在管理页点「连接 API 供应商」，选择常用供应商或填入 Base URL、API Key，勾选要添加的模型即可完成安装；选中的模型会先发送测试请求确认可用，可能产生少量费用。只用 Claude 的话，添加 Claude API 模型后，到「Claude → Claude 客户端」一键接入。Codex 的全局上下文等功能需要安装并连接 Codex；独立安装后可在「Codex设置」手动连接。已经安装过的话会直接打开管理页。习惯终端操作可以在命令后加上 `menu` 使用终端菜单（提示目前为繁体中文）。
 
 想固定版本或先校验文件哈希，见[固定版本并验证下载](docs/guide.md#固定版本并验证下载可选)。
 

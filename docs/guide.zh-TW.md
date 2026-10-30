@@ -22,6 +22,8 @@
 - [平台差異](#平台差異)
 - [功能細節](#功能細節)
 
+**獨立安裝**：v1.40.0 起不再依賴 Codex。只用 Claude Desktop 時準備 Node.js 22.15+，安裝管理頁、添加 Claude API 模型後，在「Claude → Claude 客戶端」接入。以下 Codex 相關設定只適用於已安裝並連接 Codex 的環境。
+
 ## 適合哪些使用情境？
 
 - 想在 Codex 中使用 Claude，並保留官方 GPT 模型與既有工作流程。
@@ -44,10 +46,9 @@ Codex 仍使用內建的 `openai` 供應商 ID，所以桌面版與手機 Remote
 
 ## 需求
 
-- 相容 OpenAI 介面的供應商端點
-- **macOS**：Codex Desktop
-- **Windows**：Windows 10 1809 以上或 Windows 11、Codex 桌面版、Node.js v22.15 以上
-  （路由器需要 `node:zlib` 的 zstd 支援；Codex 自帶的 Node 也算數）
+- **macOS / Windows**：Node.js v22.15 以上（建議 LTS；路由器需要 `node:zlib` 的 zstd 支援）。Windows 要求 Windows 10 1809 以上或 Windows 11。
+- **客戶端可選**：Claude Desktop 或 Codex Desktop；不需要為了使用 Claude 而安裝 Codex。已有 Codex 內建的相容 Node.js 也可使用。
+- **API 模型**：供應商的 Base URL 與 API Key，支援的協議包括 Responses、Anthropic Messages 與 Chat Completions。
 
 ## 安裝
 

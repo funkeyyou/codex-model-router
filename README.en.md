@@ -8,6 +8,7 @@ It is a small router that runs on your computer (a local LLM proxy). Official mo
 
 - **Supported APIs**: OpenAI Responses API, Anthropic Claude Messages API, and Chat Completions-only endpoints (DeepSeek, Qwen, GLM, Kimi, Gemini, Ollama, vLLM, and more; capabilities are probed during setup).
 - **Multiple providers**: connect several at once; each API key is stored encrypted (macOS Keychain / Windows DPAPI).
+- **Standalone installation**: Codex is optional. You can use Claude Desktop alone; Node.js 22.15+ is required.
 - **Web manager**: add or remove models, manage providers and API keys, and update in one click from your browser.
 - **Optional**: relay image generation and Claude Code subscription routing.
 - **Claude Desktop integration**: use “Claude → Claude Desktop” to connect your Claude API models or restore the previous configuration in one click. Settings are backed up; chats and unrelated preferences are preserved. GPT and CLI subscription routes are not supported in Claude Desktop yet. [Setup and limitations](docs/claude-desktop.md)
@@ -16,9 +17,9 @@ It is a small router that runs on your computer (a local LLM proxy). Official mo
 
 Before you start, you need:
 
-- Codex Desktop (ChatGPT Desktop) signed in with a ChatGPT account
-- Your provider's Base URL and API key
-- macOS, or Windows 10 1809+ / Windows 11 (Node.js 22.15+ is required; the desktop app's bundled Node.js works, so you usually don't need to install it)
+- The client you want to use: Claude Desktop or Codex Desktop (ChatGPT Desktop). Neither is required to install just the manager
+- Your provider's Base URL and API key when connecting API models; these are optional for manager-only installation
+- macOS, or Windows 10 1809+ / Windows 11, and Node.js 22.15+. [Node.js LTS](https://nodejs.org/) is recommended; a compatible runtime bundled with Codex can also be used
 
 **macOS**: run in Terminal
 
@@ -58,7 +59,7 @@ The recommended installation commands use the third-party service `gh-proxy.com`
 
 </details>
 
-It first installs the web manager (with a shortcut and an entry in Codex; no model settings are changed) and opens it in your browser. Click **Connect an API provider**, pick a common provider or enter a Base URL and API key, and choose the models to add to finish installing. Selected models are tested with real API requests, which may incur small charges. Not ready to add models? You can just adjust the global context under **Settings** for now. If it's already installed, the manager opens directly. To use the terminal menu instead, add `menu` to the command (terminal prompts are currently in Traditional Chinese).
+It first installs the web manager and a shortcut, then opens your browser. A Codex entry is added only when Codex is detected; installing Codex is optional. Click **Connect an API provider**, pick a common provider or enter a Base URL and API key, and choose the models to add to finish installing. Selected models are tested with real API requests, which may incur small charges. For Claude-only use, add Claude API models and connect under **Claude → Claude Desktop**. Global context and other Codex settings require Codex. If you install Codex later, connect it explicitly under **Codex settings**. If it's already installed, the manager opens directly. To use the terminal menu instead, add `menu` to the command (terminal prompts are currently in Traditional Chinese).
 
 For a pinned version, download the installers and `SHA256SUMS` from [Releases](https://github.com/funkeyyou/codex-model-router/releases).
 

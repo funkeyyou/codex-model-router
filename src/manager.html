@@ -376,6 +376,13 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 <script type="application/json" id="i18n-data">
 {
 "en": {
+"管理頁與 Claude 接入不需要 Codex。只有 Codex 的全域上下文、隱藏官方模型與帳號模式等功能需要安裝並連接 Codex。": "The manager and Claude integration do not require Codex. Install and connect Codex to use its global context, hidden official models, account mode, and related settings.",
+"已偵測到 Codex，尚未連接這個路由器。": "Codex was detected but is not connected to this router.",
+"未偵測到 Codex。安裝後重新開啟管理頁即可連接。": "Codex was not detected. Install it and reopen the manager to connect.",
+"連接 Codex": "Connect Codex",
+"將備份並修改 Codex 的連線設定，讓 Codex 使用此路由器；Claude 的設定保持不變。": "Codex connection settings will be backed up and updated to use this router. Claude settings will be preserved.",
+"請先連接 API 供應商並添加 Claude API 模型，再回來設定 Claude 客戶端。": "Connect an API provider and add a Claude API model first, then return here to configure Claude Desktop.",
+
 "{days} 天 {hours} 小時": "{days}d {hours}h",
 "{hours} 小時 {minutes} 分": "{hours}h {minutes}m",
 "{minutes} 分鐘": "{minutes} min",
@@ -420,10 +427,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "桌面版": "the desktop app",
 "讀取中…": "Loading…",
 "開始使用": "Get started",
-"管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。": "The manager is installed. Connect an API provider or a Claude subscription to use their models from the Codex model picker, or just adjust the global context for now.",
+"管理頁可獨立使用。連接 API 供應商後，可在「Claude → Claude 客戶端」設定 Claude API 模型；已安裝 Codex 時也支援 Codex 接入。": "The manager works independently. Connect an API provider, then set up Claude API models under Claude → Claude Desktop. Codex integration is also available when Codex is installed.",
 "選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。": "Choose an API Key connection (a common provider or your own Base URL), or a Claude subscription signed in with Claude Code.",
-"勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。": "Pick the models to add to Codex. Small test requests confirm they work before the router is installed.",
-"安裝完成後重新啟動 {app}，即可在模型選單選到新模型。": "After installation, restart {app} to see the new models in the picker.",
+"勾選要添加的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。": "Select models to add. Small test requests confirm they work before the router is installed.",
+"模型添加後，請到對應客戶端完成接入；Claude 客戶端目前只支援 Claude API 模型。": "After adding models, connect the client you want to use. Claude Desktop currently supports Claude API models only.",
 "連接供應商": "Connect a provider",
 "調整全域上下文": "Adjust global context",
 "連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。": "Connecting a provider installs the router; you can add more providers, relay image generation and backup keys afterwards. Prefer the terminal? Run the installer with menu to use the terminal menu.",
@@ -510,7 +517,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "尚未建立（執行一次 update 會建立）": "Not created yet (running update once creates it)",
 "環境": "Environment",
 "Windows 排程工作": "Windows scheduled task",
-"Codex 選擇器裡的自訂模型，選擇器依這裡的順序顯示。": "Custom models in the Codex model picker, shown in this order.",
+"管理已添加的模型、顯示順序、上下文與輸出設定。": "Manage added models, display order, context windows, and output limits.",
 "刪除所選（{count}）": "Delete selected ({count})",
 "刪除所選": "Delete selected",
 "新增模型": "Add models",
@@ -1654,6 +1661,14 @@ function reconcileModelsState() {
   if (orderDraft && (orderDraft.length !== slugs.size || orderDraft.some((slug) => !slugs.has(slug)))) orderDraft = null;
 }
 
+function codexConnected() {
+  return !state || !state.codex || state.codex.connected;
+}
+
+function codexAvailable() {
+  return !state || !state.codex || state.codex.available;
+}
+
 function writeBlocked() {
   return Boolean(state && (state.writeBlocked || !state.installed));
 }
@@ -1744,7 +1759,7 @@ function renderBanners() {
       : t("API Key 模式已開啟：官方模型暫停使用，第三方模型可以照常發送。"),
       h("button", { type: "button", class: "button small", onclick: () => switchView("settings") }, t("前往設定"))));
   }
-  if (pendingDesktopRestart && state && state.installed) {
+  if (pendingDesktopRestart && state && state.installed && codexConnected()) {
     const canRestart = state.desktop && state.desktop.canRestart;
     items.push(banner("info", "info",
       canRestart
@@ -1791,24 +1806,25 @@ function pageHead(title, subtitle, ...actions) {
 // 尚未連接供應商（只裝了管理頁）：連接供應商的流程與「新增供應商」相同，最後改成安裝路由器。
 function renderWelcome() {
   const blocked = state.setupBlocked;
-  return [pageHead(t("開始使用"), t("管理頁已安裝。連接 API 供應商或 Claude 訂閱帳號，就能在 Codex 的模型選單裡使用它們的模型；不急的話也可以先只調整全域上下文。")),
+  return [pageHead(t("開始使用"), t("管理頁可獨立使用。連接 API 供應商後，可在「Claude → Claude 客戶端」設定 Claude API 模型；已安裝 Codex 時也支援 Codex 接入。")),
     h("div", { class: "panel welcome" },
       h("ol", {},
         h("li", { text: t("選擇 API Key 連接（常用供應商或自填 Base URL），或用 Claude Code 登入的訂閱帳號。") }),
-        h("li", { text: t("勾選要加入 Codex 的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。") }),
-        h("li", { text: t("安裝完成後重新啟動 {app}，即可在模型選單選到新模型。", { app: desktopName() }) })),
+        h("li", { text: t("勾選要添加的模型，會先發送小型測試請求確認可用，通過後才安裝路由器。") }),
+        h("li", { text: t("模型添加後，請到對應客戶端完成接入；Claude 客戶端目前只支援 Claude API 模型。", { app: desktopName() }) })),
       blocked ? paragraph(serverText(blocked), "note warn") : null,
       h("div", { class: "actions" },
         h("button", { type: "button", class: "button primary", disabled: Boolean(blocked), onclick: () => openAddProvider({ firstInstall: true }) },
           icon("plus"), t("連接供應商")),
-        h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("settings"), t("調整全域上下文"))),
+        codexAvailable() ? h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("settings"), t("調整全域上下文")) : null),
       paragraph(t("連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。"), "muted"))];
 }
 
 function renderSetupSettings() {
+  if (!codexAvailable()) return renderCodexConnection();
   return [
     pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
-    renderGlobalContextPanel(Boolean(state.setupBlocked)),
+    renderGlobalContextPanel(!codexAvailable()),
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
     renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
   ];
@@ -1829,7 +1845,7 @@ function renderOverview() {
   const primary = (state.providers || []).find((provider) => provider.primary);
   const canRestart = state.desktop && state.desktop.canRestart;
   const head = pageHead(sectionTitle("總覽"), t("路由器狀態、最近的錯誤與執行環境。"),
-    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked), onclick: () => runJob("repair-models", {}, { title: t("同步與修復模型清單") }) }, icon("refresh"), t("同步與修復模型清單")),
+    h("button", { type: "button", class: "button", disabled: Boolean(state.writeBlocked) || !codexAvailable() || !codexConnected(), onclick: () => runJob("repair-models", {}, { title: t("同步與修復模型清單") }) }, icon("refresh"), t("同步與修復模型清單")),
     h("button", { type: "button", class: "button", onclick: confirmRestartRouter }, icon("restart"), t("重新啟動路由器")),
     canRestart ? h("button", { type: "button", class: "button", onclick: confirmRestartDesktop }, icon("power"), t("重新啟動 {app}", { app: state.desktop.name })) : null);
 
@@ -1965,7 +1981,7 @@ function renderModels() {
   const blocked = writeBlocked();
   const models = orderedModels();
   const dirty = orderDirty();
-  const head = pageHead(sectionTitle("模型"), t("Codex 選擇器裡的自訂模型，選擇器依這裡的順序顯示。"),
+  const head = pageHead(sectionTitle("模型"), t("管理已添加的模型、顯示順序、上下文與輸出設定。"),
     h("button", {
       type: "button", class: "button danger", disabled: blocked || selected.size === 0 || dirty,
       onclick: () => confirmRemoveModels([...selected]),
@@ -1994,7 +2010,7 @@ function renderModels() {
       h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")))));
     return parts;
   }
-  parts.push(renderBackgroundModelPanel(models, blocked));
+  if (codexConnected()) parts.push(renderBackgroundModelPanel(models, blocked));
 
   const allChecked = models.every((model) => selected.has(model.slug));
   const headerBox = h("input", {
@@ -2920,6 +2936,7 @@ function confirmDisableImagegen() {
 // ---- 設定：全域上下文、隱藏的官方模型 --------------------------------------------
 
 function renderSettings() {
+  if (!codexAvailable() || !codexConnected()) return renderCodexConnection();
   const blocked = writeBlocked();
   return [
     pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
@@ -2930,12 +2947,29 @@ function renderSettings() {
   ];
 }
 
+function renderCodexConnection() {
+  return [pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
+    h("div", { class: "panel" }, h("div", { class: "panel-body" },
+      paragraph(t("管理頁與 Claude 接入不需要 Codex。只有 Codex 的全域上下文、隱藏官方模型與帳號模式等功能需要安裝並連接 Codex。")),
+      paragraph(codexAvailable() ? t("已偵測到 Codex，尚未連接這個路由器。") : t("未偵測到 Codex。安裝後重新開啟管理頁即可連接。"), "muted"),
+      codexAvailable() && state.installed ? h("button", { type: "button", class: "button primary", disabled: writeBlocked(), onclick: () => {
+        const modal = openModal({ title: t("連接 Codex") });
+        modal.body.replaceChildren(paragraph(t("將備份並修改 Codex 的連線設定，讓 Codex 使用此路由器；Claude 的設定保持不變。")));
+        modal.footer.replaceChildren(h("button", { type: "button", class: "button primary", onclick: () => {
+          modal.close(); runJob("connect-codex", {}, { title: t("連接 Codex") });
+        } }, t("連接 Codex")));
+      } }, t("連接 Codex")) : null))];
+}
+
 function renderGeneralSettings() {
   return [pageHead(sectionTitle("通用設定"), t("管理頁與路由器的通用功能。")),
     renderDiagnosticsPanel(), renderUninstallPanel()];
 }
 
 function renderClaudeSettings() {
+  if (!state.installed) return [pageHead(sectionTitle("Claude 客戶端"), t("Claude 桌面客戶端的接入與回退設定。")),
+    banner("info", "info", t("請先連接 API 供應商並添加 Claude API 模型，再回來設定 Claude 客戶端。"),
+      h("button", { type: "button", class: "button primary", onclick: () => openAddProvider({ firstInstall: true }) }, t("連接供應商")))];
   return [pageHead(sectionTitle("Claude 客戶端"), t("Claude 桌面客戶端的接入與回退設定。")),
     renderClaudeDesktopPanel(writeBlocked())];
 }

@@ -75,7 +75,7 @@ function Find-NodeBinary {
   if ($tooOld.Count -gt 0) {
     throw ("找到的 Node.js 版本過低，需要 v$MinimumNodeVersion 及以上：`n  " + ($tooOld -join "`n  "))
   }
-  throw "未找到 Node.js。請先安裝 Codex 桌面版，或安裝 Node.js v$MinimumNodeVersion 及以上。"
+  throw "未找到 Node.js。請先安裝 Node.js v$MinimumNodeVersion 及以上（建議使用 LTS）；不需要安裝 Codex。"
 }
 
 function Get-EmbeddedSection {

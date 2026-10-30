@@ -3,6 +3,21 @@
 讓 Claude Desktop 的第三方推理模式使用管理頁已添加的 Claude API 模型。
 第一版只支援已驗證為 Anthropic Messages 介面的 Claude API 路由；GPT、其他模型和 Claude CLI 訂閱不會列入。
 
+## 獨立安裝（不需要 Codex）
+
+從 v1.40.0 起，只有 Claude Desktop 的電腦也能安裝本工具。先安裝 Node.js 22.15 以上（建議 LTS），再執行 README 的 macOS／Windows 安裝指令。
+管理頁與路由服務可獨立執行，不要求 Codex CLI、Codex 登入或 ChatGPT 訂閱。
+資料仍放在 `~/.codex/model-router`（或自訂的 `CODEX_HOME`／`CODEX_MODEL_ROUTER_HOME`）；這只是相容既有安裝的資料路徑，不代表需要安裝 Codex。
+
+1. 在管理頁連接 API 供應商，添加支援 Anthropic Messages 的 Claude API 模型。
+2. 進入「Claude → Claude 客戶端」，按「一鍵接入 Claude Desktop」。
+3. 「一鍵回退 Claude Desktop」只還原 Claude 接入；「通用設定 → 解除安裝」可移除整個工具。
+
+獨立模式的模型／供應商管理、更新與卸載不讀寫 Codex 登入、連線設定或模型快取。
+日後若安裝 Codex，可重新開啟管理頁，到「Codex設定」手動連接；會先備份並驗證，失敗自動還原。
+尚未安裝／連接 Codex 時，Codex 的全域上下文、隱藏官方模型、帳號模式與背景任務設定不啟用。
+Claude Desktop 仍只列出 Claude API 路由，不會因為獨立安裝而支援 GPT 或 Claude CLI 訂閱路由。
+
 ## 使用
 
 1. 更新本機路由器後，開啟管理頁的「Claude → Claude 客戶端」。

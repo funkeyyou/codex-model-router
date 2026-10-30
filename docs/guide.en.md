@@ -15,6 +15,8 @@ Quick install and everyday commands are in the [README](../README.en.md). The co
 - [Model picker shows stale or removed models](#model-picker-shows-stale-or-removed-models)
 - [Development and help](#development-and-help)
 
+**Standalone installation**: Since v1.40.0, Codex is optional. For Claude Desktop alone, install Node.js 22.15+, install the manager, add Claude API models, and connect under **Claude → Claude Desktop**. The Codex-specific settings below apply only when Codex is installed and connected.
+
 ## What it does
 
 A local model router for macOS and Windows. Add your own API providers to the Codex model picker, keep their API keys separate, and switch models without repeatedly changing the global provider configuration.
@@ -31,7 +33,7 @@ Chat Completions support can be useful for compatible DeepSeek, Qwen, GLM, Kimi,
 
 ## Requirements and limits
 
-You need Codex Desktop / ChatGPT Desktop, a Codex login using a ChatGPT account, and your provider's Base URL and API key. The installer requires Node.js 22.15 or newer and can use the desktop app's bundled Node.js when available.
+The manager and router require Node.js 22.15 or newer (LTS recommended) on macOS or Windows 10 1809+ / Windows 11. Codex is optional: Claude Desktop can use Claude API models independently. A compatible runtime bundled with Codex also works. Prepare a provider's Base URL and API key when adding API models.
 
 Provider API usage is billed by the provider. This tool does not supply credits, a Claude subscription, or access to account-restricted native tools. It is an unofficial community project, not affiliated with OpenAI or Anthropic.
 

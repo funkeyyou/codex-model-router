@@ -252,6 +252,33 @@ test("不帶指令執行：先只裝管理頁再開啟，網頁可查詢模型�
   assert.equal(existsSync(runtime), false, "回退後管理頁檔案已封存");
 });
 
+test("沒有 Codex 的首次啟動：背景管理頁、供應商查詢與解除安裝皆可用，Codex設定回報使用條件", { timeout: 60000 }, async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-no-codex-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  const environment = baseEnv(root, runtime, { CODEX_MODEL_ROUTER_TEST_NO_CODEX: "1" });
+  const ui = await startManager(defer, environment, { foreground: false, args: [] });
+  assert.equal((await ui.waitExit())[0], 0, ui.output());
+  const state = (await ui.call("/api/state")).json;
+  assert.deepEqual(state.codex, { available: false, connected: false });
+  assert.equal(state.setupBlocked, null);
+  assert.equal(state.managerOnly, true);
+  assert.equal(existsSync(join(root, "config.toml")), false);
+  assert.equal(existsSync(join(root, "auth.json")), false);
+  const context = await ui.call("/api/query", { method: "POST", body: { type: "global-context" } });
+  assert.equal(context.status, 400);
+  assert.match(context.json.error, /Codex CLI/);
+  const again = await startManager(defer, environment, { foreground: false, args: [] });
+  assert.equal((await again.waitExit())[0], 0, again.output());
+  assert.equal(again.url, ui.url);
+  const removed = await ui.runJob("uninstall", { deleteKeys: false });
+  assert.equal(removed.status, "succeeded", JSON.stringify(removed));
+  for (let attempt = 0; attempt < 300 && existsSync(runtime); attempt += 1) await delay(100);
+  assert.equal(existsSync(runtime), false);
+  assert.equal(existsSync(join(root, "config.toml")), false);
+});
+
 test("管理頁的解除安裝：只裝管理頁時移除入口與捷徑，管理頁自動結束後才封存安裝目錄", { timeout: 60000 }, async (t) => {
   const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-uninstall-"));
