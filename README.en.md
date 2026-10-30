@@ -4,6 +4,19 @@
 
 **Use Claude and third-party API models in Codex Desktop and Claude Desktop.** Add custom models to the Codex model picker alongside the official GPT models, or connect third-party Claude APIs to Claude Desktop in one click. Either app is enough; works on macOS and Windows.
 
+**Install with an AI agent**: copy the prompt below into Codex or Claude (Claude Code) and it will download and run the installer for you.
+
+```text
+Please install codex-model-router (https://github.com/funkeyyou/codex-model-router).
+Check my operating system first, then run the matching command:
+- macOS: curl -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
+- Windows (PowerShell): curl.exe -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 }
+If the download fails, remove the https://gh-proxy.com/ prefix from the URL and retry with a direct GitHub download.
+If it reports that Node.js 22.15 or later is missing, install Node.js LTS for me and retry.
+The installer opens a web manager in my browser. I will enter providers and API keys there myself, so do not ask me for an API key.
+When finished, tell me whether the web manager opened.
+```
+
 It is a small router that runs on your computer (a local LLM proxy) with a web manager. In Codex, official models still go straight to OpenAI; only the custom models you add are sent to the API you configure. Your Codex sign-in, existing chats, and official models are unaffected.
 
 - **Supported APIs**: OpenAI Responses API, Anthropic Claude Messages API, and Chat Completions-only endpoints (DeepSeek, Qwen, GLM, Kimi, Gemini, Ollama, vLLM, and more; capabilities are probed during setup).

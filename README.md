@@ -4,6 +4,19 @@
 
 **让 Codex Desktop 和 Claude Desktop 都能用上 Claude 与第三方 API 模型。** 在 Codex 的模型菜单里加入自定义模型，官方 GPT 照常使用；也能一键把第三方 Claude API 接入 Claude Desktop。两者择一安装即可，支持 macOS 与 Windows。
 
+**交给 AI 安装**：把下面这段话复制给 Codex 或 Claude（Claude Code），它会替你下载并运行安装器。
+
+```text
+请帮我安装 codex-model-router（https://github.com/funkeyyou/codex-model-router）。
+先判断我的系统，再运行对应的命令：
+- macOS：curl -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.sh -o codex-model-router.sh && bash codex-model-router.sh
+- Windows（PowerShell）：curl.exe -fsSL --connect-timeout 10 --max-time 120 https://gh-proxy.com/https://github.com/funkeyyou/codex-model-router/raw/refs/heads/main/codex-model-router.ps1 -o codex-model-router.ps1; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 }
+如果下载失败，去掉网址开头的 https://gh-proxy.com/ 改用 GitHub 直连再试一次。
+如果提示缺少 Node.js 22.15 以上，先帮我安装 Node.js LTS 再重试。
+安装器会在浏览器打开管理页，供应商和 API Key 由我自己在页面里填写，不要向我索取 API Key。
+完成后告诉我管理页是否已经打开。
+```
+
 它是一个运行在你电脑上的小型路由器（本机 LLM proxy），附带网页管理页：在 Codex 选官方模型时，请求照常发往 OpenAI；选你添加的自定义模型时，才发往你设置的 API。Codex 的登录、已有对话和官方模型都不受影响。
 
 - **支持的 API**：OpenAI Responses API、Anthropic Claude Messages API，以及只有 Chat Completions 的兼容端点（DeepSeek、Qwen、GLM、Kimi、Gemini、Ollama、vLLM 等，安装时会实际探测能力）。
