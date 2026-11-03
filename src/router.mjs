@@ -306,6 +306,21 @@ function recordImageBudget(result) {
 // 自訂模型的來源，不再由 model_catalog_json 鎖住 Codex 的模型管理器。
 const catalogRefreshEnabled = settings.catalogRefresh !== false;
 
+// 只調整回傳給選擇器的 visibility，不把隱藏狀態寫進官方目錄備份。
+// 關閉後即使離線也能恢復原清單；沒有可選自訂模型時保留官方選項。
+export function applyOfficialModelVisibility(catalog, hidden = false) {
+  const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
+  if (!hidden || !catalog.models.some(model => isCustom(model) && model.visibility === "list")) return catalog;
+  return { ...catalog, models: catalog.models.map(model =>
+    isCustom(model) ? model : { ...model, visibility: "hide" }) };
+}
+
+function officialModelsHidden() {
+  // 管理頁熱更新這個顯示偏好，既有對話與路由連線不必重啟。
+  try { return JSON.parse(readFileSync(settingsPath, "utf8")).hideOfficialModels === true; }
+  catch { return settings.hideOfficialModels === true; }
+}
+
 // 官方項目整批換新，自訂項目沿用檔案裡既有的那份——那是安裝時探測出來的結果，
 // 路由器沒有重新探測的條件，也不該重複實作 customCatalogEntry（複製一份必然漂移）。
 export function mergeCatalog(freshCatalog, currentCatalog, forceListed = []) {
@@ -3774,7 +3789,8 @@ const server = http.createServer(async (request, response) => {
       stats.models += 1;
       const catalog = await refreshOfficialCatalog(request.headers, incomingUrl.searchParams);
       response.setHeader("cache-control", "no-store");
-      writeJson(response, 200, catalog);
+      writeJson(response, 200, applyOfficialModelVisibility(catalog,
+        !isQuotaModeRequest(request.headers) && officialModelsHidden()));
       return;
     }
     if (

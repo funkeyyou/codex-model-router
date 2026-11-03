@@ -561,6 +561,25 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.equal(contextCleared.value, null, JSON.stringify(contextCleared));
   assert.ok(readdirSync(join(root, "backups", "model-router")).filter((name) => name.startsWith("global-context-")).length >= 2);
 
+  // 帳號模式的官方選項：熱更新並用真實 Codex model/list 驗證，保留登入與原始目錄。
+  const originalAuth = readFileSync(join(root, "auth.json"), "utf8");
+  const originalConfig = readFileSync(join(root, "config.toml"), "utf8");
+  assert.equal((await ui.call("/api/state")).json.hideOfficialModels, false);
+  const invalidVisibility = await ui.runJob("set-official-model-visibility", { hidden: "true" });
+  assert.equal(invalidVisibility.status, "failed");
+  const hideOfficial = await ui.runJob("set-official-model-visibility", { hidden: true });
+  assert.equal(hideOfficial.status, "succeeded", hideOfficial.output);
+  assert.equal(hideOfficial.result.restartDesktop, true);
+  assert.equal((await ui.call("/api/state")).json.hideOfficialModels, true);
+  assert.equal(JSON.parse(readFileSync(catalogPath, "utf8")).models.find(model => model.slug === "gpt-6-sol").visibility, "list");
+  const sameVisibility = await ui.runJob("set-official-model-visibility", { hidden: true });
+  assert.deepEqual([sameVisibility.status, sameVisibility.result.changed], ["succeeded", false]);
+  const showOfficial = await ui.runJob("set-official-model-visibility", { hidden: false });
+  assert.equal(showOfficial.status, "succeeded", showOfficial.output);
+  assert.equal((await ui.call("/api/state")).json.hideOfficialModels, false);
+  assert.equal(readFileSync(join(root, "auth.json"), "utf8"), originalAuth);
+  assert.equal(readFileSync(join(root, "config.toml"), "utf8"), originalConfig);
+
   // 隱藏的官方模型：清單來自 Codex 內建目錄，只列 visibility=hide 的官方模型。
   const hiddenResponse = await query("hidden-models");
   assert.ok(Array.isArray(hiddenResponse.models), JSON.stringify(hiddenResponse));

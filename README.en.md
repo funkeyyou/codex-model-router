@@ -23,6 +23,7 @@ It is a small router that runs on your computer (a local LLM proxy) with a web m
 - **Multiple providers**: connect several at once; each API key is stored encrypted (macOS Keychain / Windows DPAPI).
 - **Standalone installation**: Codex is optional. You can use Claude Desktop alone; Node.js 22.15+ is required.
 - **Web manager**: add or remove models, manage providers and API keys, and update in one click from your browser.
+- **Official model visibility**: hide or restore official models under **Codex settings → Hide official models in the picker** when signed in with ChatGPT. This option is disabled in API key mode.
 - **Optional**: relay image generation and Claude Code subscription routing.
 - **Claude Desktop integration**: use “Claude → Claude Desktop” to connect your Claude API models or restore the previous configuration in one click. Settings are backed up; chats and unrelated preferences are preserved. GPT and CLI subscription routes are not supported in Claude Desktop yet. [Setup and limitations](docs/claude-desktop.md)
 

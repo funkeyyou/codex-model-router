@@ -763,6 +763,13 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "全域上下文必須是 16,000～4,000,000 之間的整數。": "Global context must be an integer between 16,000 and 4,000,000.",
 "設定全域上下文": "Set global context",
 "API Key 模式": "API key mode",
+"隱藏官方模型選項": "Hide official models in the picker",
+"只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。": "In ChatGPT account mode, hide official models from the model picker while keeping your sign-in, existing tasks, and automatic catalog updates. Turn this off to restore them.",
+"此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。": "This does not disable official models; existing tasks and background tasks still use their configured models.",
+"API Key 模式下不適用；切回 ChatGPT 帳號模式後可調整，原本的選擇會保留。": "Not applicable in API key mode. Switch back to ChatGPT account mode to change this setting; your selection is kept.",
+"設定官方模型選項": "Set official model visibility",
+"儲存後請重新啟動 {app}，讓模型選單重新載入。": "Restart {app} after saving to reload the model picker.",
+"已開啟「隱藏官方模型選項」；下列勾選會保留，關閉該開關後才會顯示。": "Hide official models in the picker is on. The selections below are saved and will appear after you turn it off.",
 "已開啟": "On",
 "未開啟": "Off",
 "開啟 API Key 模式": "Turn on API key mode",
@@ -2941,6 +2948,7 @@ function renderSettings() {
   return [
     pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
+    renderOfficialModelVisibilityPanel(blocked),
     renderKeysmithPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
@@ -3179,6 +3187,32 @@ function renderQuotaModePanel(blocked) {
   return panel;
 }
 
+function renderOfficialModelVisibilityPanel(blocked) {
+  const quota = state && state.installed ? state.quotaMode : null;
+  const hidden = state?.hideOfficialModels === true;
+  const apiKeyMode = quota?.enabled === true;
+  const noModels = !quota?.customModelCount;
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
+    h("h2", { text: t("隱藏官方模型選項") })));
+  panel.append(h("div", { class: "panel-body setting-body" },
+    h("label", { class: "check-line" }, h("input", {
+      type: "checkbox", checked: hidden, "aria-label": t("隱藏官方模型選項"),
+      disabled: blocked || !quota || apiKeyMode || (!hidden && noModels),
+      onchange: event => {
+        const value = event.target.checked;
+        event.target.checked = hidden;
+        runJob("set-official-model-visibility", { hidden: value }, { title: t("設定官方模型選項") });
+      },
+    }), h("span", { text: hidden ? t("已開啟") : t("未開啟") })),
+    paragraph(t("只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。"), "muted"),
+    paragraph(t("此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。"), "note"),
+    noModels ? paragraph(t("請先添加第三方模型。"), "note warn") : null,
+    paragraph(apiKeyMode
+      ? t("API Key 模式下不適用；切回 ChatGPT 帳號模式後可調整，原本的選擇會保留。")
+      : t("儲存後請重新啟動 {app}，讓模型選單重新載入。", { app: desktopName() }), "note")));
+  return panel;
+}
+
 function confirmQuotaMode(enabled, previousLogin = null) {
   const app = desktopName();
   confirmDialog({
@@ -3263,6 +3297,9 @@ function renderHiddenModelsPanel(blocked, note = null) {
   const dirty = models.some((model) => hiddenDraft.has(model.slug) !== saved.has(model.slug));
   const body = h("div", { class: "panel-body stack" },
     paragraph(t("Codex 內建目錄把下列模型標成隱藏，預設不會出現在選擇器。能不能用由帳號權限決定：強制顯示後若帳號沒有權限，選用時會失敗，取消勾選即可恢復。"), "muted"));
+  if (state.hideOfficialModels && !state.quotaMode?.enabled) {
+    body.append(paragraph(t("已開啟「隱藏官方模型選項」；下列勾選會保留，關閉該開關後才會顯示。"), "note"));
+  }
   if (models.length === 0) {
     body.append(h("div", { class: "empty", text: t("Codex 內建目錄目前沒有隱藏的官方模型。") }));
   } else {
@@ -3368,6 +3405,7 @@ function jobTitle(type, fallback) {
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "set-quota-mode": t("切換 API Key 模式"),
+    "set-official-model-visibility": t("設定官方模型選項"),
     "set-keysmith": t("Keysmith"),
     "set-background-model": t("設定背景任務模型"),
     "set-claude-desktop": t("設定 Claude Desktop 接入"),

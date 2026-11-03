@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.40.0";
+const INSTALLER_VERSION = "1.41.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2334,7 +2334,7 @@ export function mergeCatalogForForcedModels(
   return { ...freshCatalog, models: [...official, ...renumbered] };
 }
 
-export function validateManagedCatalog(catalog, forceListed = [], customSlugs = []) {
+export function validateManagedCatalog(catalog, forceListed = [], customSlugs = [], hideOfficialModels = false) {
   const models = Array.isArray(catalog?.models) ? catalog.models : [];
   const bySlug = new Map(
     models
@@ -2342,7 +2342,7 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
       .map((model) => [model.slug, model]),
   );
   const hiddenForced = forceListed.filter(
-    (slug) => bySlug.get(slug)?.visibility === "hide",
+    (slug) => !hideOfficialModels && bySlug.get(slug)?.visibility === "hide",
   );
   const missingForced = forceListed.filter((slug) => !bySlug.has(slug));
   const missingCustom = customSlugs.filter((slug) => !bySlug.has(slug));
@@ -2371,6 +2371,7 @@ export const preservedSettingKeys = [
   "closeOnUpstreamError",
   // 網頁管理介面拖曳排序後設為 "manual"：之後新增的模型接在最後，不再依探測清單重排。
   "customModelOrder",
+  "hideOfficialModels",
   "heartbeatIntervalMs",
   "historyTtlMs",
   "maxHistoryBytes",
@@ -5477,6 +5478,7 @@ async function executeHiddenModels(requested, { bundledCatalog = loadBundledCata
       effectiveCatalog,
       chosen,
       customSlugs,
+      settings.hideOfficialModels === true && !quotaModeEnabled(),
     );
     if (!validation.ok) {
       const details = [
@@ -6943,6 +6945,7 @@ async function managerState() {
     providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     quotaMode: codexIntegrationEnabled() ? quotaModeStatus() : null,
+    hideOfficialModels: settings.hideOfficialModels === true,
     keysmith: codexIntegrationEnabled() && codexBin ? await keysmithStatus() : null,
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
@@ -8227,6 +8230,45 @@ async function managerSetQuotaMode({ enabled } = {}) {
   return disableQuotaMode();
 }
 
+async function managerSetOfficialModelsVisibility({ hidden } = {}) {
+  requireCodexIntegration();
+  assertManagerWritable();
+  if (typeof hidden !== "boolean") fail("請指定是否隱藏官方模型。");
+  const { settings, catalog } = requireInstallation();
+  if ((settings.hideOfficialModels === true) === hidden) return { changed: false };
+  if (quotaModeEnabled()) fail("請先關閉 API Key 模式，再設定官方模型選項。");
+  await assertRouterConfigured(settings.port);
+  const user = await readUserConfig();
+  if (user.config.model_catalog_json) fail("目前使用固定模型目錄，請先同步與修復模型清單，再設定官方模型選項。");
+  const customSlugs = catalog.models.filter(model => model.slug.startsWith("custom/") && model.visibility === "list" &&
+    settings.routes.some(route => route.pickerSlug === model.slug)).map(model => model.slug);
+  if (hidden && !customSlugs.length) fail("請先添加第三方模型。");
+  const backupDir = join(backupsRoot, `official-model-visibility-${timestamp()}`);
+  ensureDirectory(backupDir);
+  if (!copyIfExists(settingsPath, join(backupDir, "settings.json"))) fail("無法備份 settings.json，已取消。");
+  try {
+    writeJsonAtomic(settingsPath, { ...settings, hideOfficialModels: hidden });
+    invalidatePickerCache(codexHome, backupDir);
+    // 驗證 Codex 真正讀到的選單；不更改登入、預設模型或聊天內容。
+    await codexRpc("model/list", { includeHidden: true }, result => {
+      if (!hasExpectedModels(result, customSlugs) || !customSlugs.every(slug =>
+        result.data.some(model => model.id === slug && model.hidden === false))) return false;
+      const official = result.data.filter(model => !model.id.startsWith("custom/"));
+      if (!official.length) return false;
+      if (hidden) return official.every(model => model.hidden === true);
+      const entries = new Map((readCatalogIfExists()?.models || []).map(model => [model.slug, model]));
+      return official.every(model => model.hidden === (entries.get(model.id)?.visibility === "hide"));
+    });
+  } catch (error) {
+    copyIfExists(join(backupDir, "settings.json"), settingsPath);
+    invalidatePickerCacheAfterFailure();
+    throw error;
+  }
+  console.log(hidden ? "已隱藏官方模型選項。" : "已恢復官方模型選項。");
+  console.log(`備份：${backupDir}`);
+  return { changed: true, hidden, backupDir, restartDesktop: true };
+}
+
 // 以 Codex 官方的 codex login 登入 ChatGPT：開啟瀏覽器授權，成功後由 Codex 自己寫入 auth.json。
 async function loginCodexWithChatgpt() {
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -8839,6 +8881,7 @@ function managerOperations() {
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
       "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
+      "set-official-model-visibility": job("設定官方模型選項", managerSetOfficialModelsVisibility),
       "set-keysmith": job("Keysmith", managerSetKeysmith),
       "set-background-model": job("設定背景任務模型", managerSetBackgroundModel),
       "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
@@ -9728,6 +9771,21 @@ function recordImageBudget(result) {
 // bundled 快照，也不能跨重啟用 TTL 略過查詢。models.json 保留作為離線回退及
 // 自訂模型的來源，不再由 model_catalog_json 鎖住 Codex 的模型管理器。
 const catalogRefreshEnabled = settings.catalogRefresh !== false;
+
+// 只調整回傳給選擇器的 visibility，不把隱藏狀態寫進官方目錄備份。
+// 關閉後即使離線也能恢復原清單；沒有可選自訂模型時保留官方選項。
+export function applyOfficialModelVisibility(catalog, hidden = false) {
+  const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
+  if (!hidden || !catalog.models.some(model => isCustom(model) && model.visibility === "list")) return catalog;
+  return { ...catalog, models: catalog.models.map(model =>
+    isCustom(model) ? model : { ...model, visibility: "hide" }) };
+}
+
+function officialModelsHidden() {
+  // 管理頁熱更新這個顯示偏好，既有對話與路由連線不必重啟。
+  try { return JSON.parse(readFileSync(settingsPath, "utf8")).hideOfficialModels === true; }
+  catch { return settings.hideOfficialModels === true; }
+}
 
 // 官方項目整批換新，自訂項目沿用檔案裡既有的那份——那是安裝時探測出來的結果，
 // 路由器沒有重新探測的條件，也不該重複實作 customCatalogEntry（複製一份必然漂移）。
@@ -13197,7 +13255,8 @@ const server = http.createServer(async (request, response) => {
       stats.models += 1;
       const catalog = await refreshOfficialCatalog(request.headers, incomingUrl.searchParams);
       response.setHeader("cache-control", "no-store");
-      writeJson(response, 200, catalog);
+      writeJson(response, 200, applyOfficialModelVisibility(catalog,
+        !isQuotaModeRequest(request.headers) && officialModelsHidden()));
       return;
     }
     if (
@@ -18706,6 +18765,13 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "全域上下文必須是 16,000～4,000,000 之間的整數。": "Global context must be an integer between 16,000 and 4,000,000.",
 "設定全域上下文": "Set global context",
 "API Key 模式": "API key mode",
+"隱藏官方模型選項": "Hide official models in the picker",
+"只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。": "In ChatGPT account mode, hide official models from the model picker while keeping your sign-in, existing tasks, and automatic catalog updates. Turn this off to restore them.",
+"此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。": "This does not disable official models; existing tasks and background tasks still use their configured models.",
+"API Key 模式下不適用；切回 ChatGPT 帳號模式後可調整，原本的選擇會保留。": "Not applicable in API key mode. Switch back to ChatGPT account mode to change this setting; your selection is kept.",
+"設定官方模型選項": "Set official model visibility",
+"儲存後請重新啟動 {app}，讓模型選單重新載入。": "Restart {app} after saving to reload the model picker.",
+"已開啟「隱藏官方模型選項」；下列勾選會保留，關閉該開關後才會顯示。": "Hide official models in the picker is on. The selections below are saved and will appear after you turn it off.",
 "已開啟": "On",
 "未開啟": "Off",
 "開啟 API Key 模式": "Turn on API key mode",
@@ -20884,6 +20950,7 @@ function renderSettings() {
   return [
     pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
     renderQuotaModePanel(blocked),
+    renderOfficialModelVisibilityPanel(blocked),
     renderKeysmithPanel(blocked),
     renderGlobalContextPanel(blocked),
     renderHiddenModelsPanel(blocked),
@@ -21122,6 +21189,32 @@ function renderQuotaModePanel(blocked) {
   return panel;
 }
 
+function renderOfficialModelVisibilityPanel(blocked) {
+  const quota = state && state.installed ? state.quotaMode : null;
+  const hidden = state?.hideOfficialModels === true;
+  const apiKeyMode = quota?.enabled === true;
+  const noModels = !quota?.customModelCount;
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
+    h("h2", { text: t("隱藏官方模型選項") })));
+  panel.append(h("div", { class: "panel-body setting-body" },
+    h("label", { class: "check-line" }, h("input", {
+      type: "checkbox", checked: hidden, "aria-label": t("隱藏官方模型選項"),
+      disabled: blocked || !quota || apiKeyMode || (!hidden && noModels),
+      onchange: event => {
+        const value = event.target.checked;
+        event.target.checked = hidden;
+        runJob("set-official-model-visibility", { hidden: value }, { title: t("設定官方模型選項") });
+      },
+    }), h("span", { text: hidden ? t("已開啟") : t("未開啟") })),
+    paragraph(t("只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。"), "muted"),
+    paragraph(t("此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。"), "note"),
+    noModels ? paragraph(t("請先添加第三方模型。"), "note warn") : null,
+    paragraph(apiKeyMode
+      ? t("API Key 模式下不適用；切回 ChatGPT 帳號模式後可調整，原本的選擇會保留。")
+      : t("儲存後請重新啟動 {app}，讓模型選單重新載入。", { app: desktopName() }), "note")));
+  return panel;
+}
+
 function confirmQuotaMode(enabled, previousLogin = null) {
   const app = desktopName();
   confirmDialog({
@@ -21206,6 +21299,9 @@ function renderHiddenModelsPanel(blocked, note = null) {
   const dirty = models.some((model) => hiddenDraft.has(model.slug) !== saved.has(model.slug));
   const body = h("div", { class: "panel-body stack" },
     paragraph(t("Codex 內建目錄把下列模型標成隱藏，預設不會出現在選擇器。能不能用由帳號權限決定：強制顯示後若帳號沒有權限，選用時會失敗，取消勾選即可恢復。"), "muted"));
+  if (state.hideOfficialModels && !state.quotaMode?.enabled) {
+    body.append(paragraph(t("已開啟「隱藏官方模型選項」；下列勾選會保留，關閉該開關後才會顯示。"), "note"));
+  }
   if (models.length === 0) {
     body.append(h("div", { class: "empty", text: t("Codex 內建目錄目前沒有隱藏的官方模型。") }));
   } else {
@@ -21311,6 +21407,7 @@ function jobTitle(type, fallback) {
     "restart-router": t("重新啟動路由器"), "restart-desktop": t("重新啟動桌面版"), update: t("更新路由器"),
     "apply-update": t("套用新版本"), "set-global-context": t("設定全域上下文"), "set-hidden-models": t("設定隱藏的官方模型"),
     "set-quota-mode": t("切換 API Key 模式"),
+    "set-official-model-visibility": t("設定官方模型選項"),
     "set-keysmith": t("Keysmith"),
     "set-background-model": t("設定背景任務模型"),
     "set-claude-desktop": t("設定 Claude Desktop 接入"),

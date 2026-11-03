@@ -87,3 +87,13 @@ test("目錄驗證會同時檢查強制顯示項目與自訂模型是否遺失",
     missingCustom: ["custom/claude"],
   });
 });
+
+test("隱藏所有官方選項時仍可儲存強制顯示偏好，但不能忽略模型遺失", () => {
+  const catalog = { models: [
+    { slug: "gpt-hidden", visibility: "hide" },
+    { slug: "custom/claude", visibility: "list" },
+  ] };
+  assert.equal(validateManagedCatalog(catalog, ["gpt-hidden"], ["custom/claude"], true).ok, true);
+  assert.equal(validateManagedCatalog(catalog, ["gpt-missing"], ["custom/claude"], true).ok, false);
+  assert.equal(validateManagedCatalog(catalog, ["gpt-hidden"], ["custom/missing"], true).ok, false);
+});

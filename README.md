@@ -23,6 +23,7 @@
 - **多家供应商**：可同时接入多家，API Key 各自加密保存（macOS 钥匙串／Windows DPAPI）。
 - **独立安装**：不必安装 Codex；只装 Claude Desktop 也能用。需要 Node.js 22.15 以上。
 - **网页管理页**：在浏览器里增删模型、管理供应商和 API Key、一键更新。
+- **官方模型显示**：在「Codex设置 → 隐藏官方模型选项」整理账号模式的模型菜单，随时恢复；API Key 模式下此功能停用。
 - **可选功能**：中转 API 生图、Claude Code 订阅路由。
 - **Claude Desktop 接入**：在「Claude → Claude 客户端」一键配置第三方 Claude API 模型，也可一键回退。设置自动备份，聊天和其他偏好保留；暂不支持在 Claude 客户端使用 GPT 或 CLI 订阅路由。[使用说明](docs/claude-desktop.md)
 

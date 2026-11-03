@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.40.0";
+const INSTALLER_VERSION = "1.41.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2187,7 +2187,7 @@ export function mergeCatalogForForcedModels(
   return { ...freshCatalog, models: [...official, ...renumbered] };
 }
 
-export function validateManagedCatalog(catalog, forceListed = [], customSlugs = []) {
+export function validateManagedCatalog(catalog, forceListed = [], customSlugs = [], hideOfficialModels = false) {
   const models = Array.isArray(catalog?.models) ? catalog.models : [];
   const bySlug = new Map(
     models
@@ -2195,7 +2195,7 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
       .map((model) => [model.slug, model]),
   );
   const hiddenForced = forceListed.filter(
-    (slug) => bySlug.get(slug)?.visibility === "hide",
+    (slug) => !hideOfficialModels && bySlug.get(slug)?.visibility === "hide",
   );
   const missingForced = forceListed.filter((slug) => !bySlug.has(slug));
   const missingCustom = customSlugs.filter((slug) => !bySlug.has(slug));
@@ -2224,6 +2224,7 @@ export const preservedSettingKeys = [
   "closeOnUpstreamError",
   // 網頁管理介面拖曳排序後設為 "manual"：之後新增的模型接在最後，不再依探測清單重排。
   "customModelOrder",
+  "hideOfficialModels",
   "heartbeatIntervalMs",
   "historyTtlMs",
   "maxHistoryBytes",
@@ -5330,6 +5331,7 @@ async function executeHiddenModels(requested, { bundledCatalog = loadBundledCata
       effectiveCatalog,
       chosen,
       customSlugs,
+      settings.hideOfficialModels === true && !quotaModeEnabled(),
     );
     if (!validation.ok) {
       const details = [
@@ -6796,6 +6798,7 @@ async function managerState() {
     providerPresets: PROVIDER_PRESETS,
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     quotaMode: codexIntegrationEnabled() ? quotaModeStatus() : null,
+    hideOfficialModels: settings.hideOfficialModels === true,
     keysmith: codexIntegrationEnabled() && codexBin ? await keysmithStatus() : null,
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
@@ -8080,6 +8083,45 @@ async function managerSetQuotaMode({ enabled } = {}) {
   return disableQuotaMode();
 }
 
+async function managerSetOfficialModelsVisibility({ hidden } = {}) {
+  requireCodexIntegration();
+  assertManagerWritable();
+  if (typeof hidden !== "boolean") fail("請指定是否隱藏官方模型。");
+  const { settings, catalog } = requireInstallation();
+  if ((settings.hideOfficialModels === true) === hidden) return { changed: false };
+  if (quotaModeEnabled()) fail("請先關閉 API Key 模式，再設定官方模型選項。");
+  await assertRouterConfigured(settings.port);
+  const user = await readUserConfig();
+  if (user.config.model_catalog_json) fail("目前使用固定模型目錄，請先同步與修復模型清單，再設定官方模型選項。");
+  const customSlugs = catalog.models.filter(model => model.slug.startsWith("custom/") && model.visibility === "list" &&
+    settings.routes.some(route => route.pickerSlug === model.slug)).map(model => model.slug);
+  if (hidden && !customSlugs.length) fail("請先添加第三方模型。");
+  const backupDir = join(backupsRoot, `official-model-visibility-${timestamp()}`);
+  ensureDirectory(backupDir);
+  if (!copyIfExists(settingsPath, join(backupDir, "settings.json"))) fail("無法備份 settings.json，已取消。");
+  try {
+    writeJsonAtomic(settingsPath, { ...settings, hideOfficialModels: hidden });
+    invalidatePickerCache(codexHome, backupDir);
+    // 驗證 Codex 真正讀到的選單；不更改登入、預設模型或聊天內容。
+    await codexRpc("model/list", { includeHidden: true }, result => {
+      if (!hasExpectedModels(result, customSlugs) || !customSlugs.every(slug =>
+        result.data.some(model => model.id === slug && model.hidden === false))) return false;
+      const official = result.data.filter(model => !model.id.startsWith("custom/"));
+      if (!official.length) return false;
+      if (hidden) return official.every(model => model.hidden === true);
+      const entries = new Map((readCatalogIfExists()?.models || []).map(model => [model.slug, model]));
+      return official.every(model => model.hidden === (entries.get(model.id)?.visibility === "hide"));
+    });
+  } catch (error) {
+    copyIfExists(join(backupDir, "settings.json"), settingsPath);
+    invalidatePickerCacheAfterFailure();
+    throw error;
+  }
+  console.log(hidden ? "已隱藏官方模型選項。" : "已恢復官方模型選項。");
+  console.log(`備份：${backupDir}`);
+  return { changed: true, hidden, backupDir, restartDesktop: true };
+}
+
 // 以 Codex 官方的 codex login 登入 ChatGPT：開啟瀏覽器授權，成功後由 Codex 自己寫入 auth.json。
 async function loginCodexWithChatgpt() {
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -8692,6 +8734,7 @@ function managerOperations() {
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
       "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
+      "set-official-model-visibility": job("設定官方模型選項", managerSetOfficialModelsVisibility),
       "set-keysmith": job("Keysmith", managerSetKeysmith),
       "set-background-model": job("設定背景任務模型", managerSetBackgroundModel),
       "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
