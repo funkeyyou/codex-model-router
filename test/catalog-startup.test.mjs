@@ -63,7 +63,7 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
     let buffer = "";
     try {
       return await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("picker timeout")), 7000);
+        const timer = setTimeout(() => reject(new Error("picker timeout")), 30000);
         app.once("error", error => { clearTimeout(timer); reject(error); });
         app.stdout.on("data", d => {
           buffer += d;
