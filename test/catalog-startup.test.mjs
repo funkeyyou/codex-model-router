@@ -10,9 +10,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadPayloads } from "./helpers/payloads.mjs";
 import { codexBin } from "./helpers/codex-bin.mjs";
+import { catalogPicker } from "./helpers/catalog-picker.mjs";
 
 const bin = codexBin;
 test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型", { skip: !bin, timeout: 90000 }, async t => {
+  const testStarted = Date.now();
   const root = mkdtempSync(join(tmpdir(), "router-catalog-e2e-"));
   const runtime = join(root, "model-router");
   mkdirSync(runtime);
@@ -56,52 +58,13 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
     service.stderr.on("data", d => { if (d.toString().includes("model-router-ready:")) { clearTimeout(timer); resolve(); } });
     service.once("error", reject);
   });
-  async function picker(expected, migrate = false, afterFirst = null) {
-    const app = spawn(bin, ["app-server"], { env, cwd: root, stdio: ["pipe", "pipe", "ignore"] });
-    const exited = once(app, "exit");
-    const send = m => app.stdin.write(JSON.stringify(m) + "\n");
-    let buffer = "";
-    try {
-      return await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("picker timeout")), 30000);
-        app.once("error", error => { clearTimeout(timer); reject(error); });
-        app.stdout.on("data", d => {
-          buffer += d;
-          let n;
-          while ((n = buffer.indexOf("\n")) >= 0) {
-            const message = JSON.parse(buffer.slice(0, n)); buffer = buffer.slice(n + 1);
-            if (message.id === 1) {
-              send({ method: "initialized" });
-              send(migrate
-                ? { id: 2, method: "config/batchWrite", params: { edits: [{ keyPath: "model_catalog_json", value: null, mergeStrategy: "replace" }], reloadUserConfig: false } }
-                : { id: 2, method: "model/list", params: { includeHidden: true } });
-            }
-            if (message.id === 2) {
-              if (message.error) { clearTimeout(timer); reject(new Error(message.error.message)); }
-              else if (migrate) { clearTimeout(timer); resolve(); }
-              else {
-                const ids = message.result.data.map(m => m.id);
-                // Codex 可先回答磁碟快取並在背景同步。模擬同一程序再次開啟選單，
-                // 不是多重啟一次或以 router 磁碟結果冒充 app-server 的模型列表。
-                const found = Array.isArray(expected)
-                  ? expected.every((slug, index) => ids.includes(slug) &&
-                    (index === 0 || ids.indexOf(expected[index - 1]) < ids.indexOf(slug)))
-                  : ids.includes(expected);
-                if (found && afterFirst) {
-                  const next = afterFirst();
-                  afterFirst = null;
-                  expected = next;
-                  send({ id: 2, method: "model/list", params: { includeHidden: true } });
-                }
-                else if (found) { clearTimeout(timer); resolve(ids); }
-                else setTimeout(() => send({ id: 2, method: "model/list", params: { includeHidden: true } }), 50);
-              }
-            }
-          }
-        });
-        send({ id: 1, method: "initialize", params: { clientInfo: { name: "router_test", version: "1.0.0" } } });
-      });
-    } finally { app.kill(); await exited; }
+  let pickerCall = 0;
+  function picker(expected, migrate = false, afterFirst = null) {
+    return catalogPicker({ bin, env, cwd: root, expected, migrate, afterFirst,
+      report: message => t.diagnostic(message),
+      signal: t.signal, label: `picker #${++pickerCall}`,
+      diagnostic: () => `testElapsed=${Date.now() - testStarted}ms; upstreamQueries=${queries}; offline=${offline}`,
+    });
   }
   // 舊安裝的固定目錄用與 installer 相同的 Codex RPC 移除；其他全域配置保留。
   // Windows 暫存檔也可能短暫被鎖住；沿用正式安裝器的有限次、僅針對 persist 錯誤的重試。
