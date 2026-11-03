@@ -87,7 +87,7 @@ jobs:
         id: result
         run: python3 -I "$RUNNER_TEMP/codex-bot/issue_bot.py" validate-triage "$RUNNER_TEMP/codex-bot/triage"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.prepare.outputs.selected == 'true'
         with:
           name: codex-triage
@@ -158,7 +158,7 @@ jobs:
         id: result
         run: python3 -I "$RUNNER_TEMP/codex-bot/issue_bot.py" package-fix "$RUNNER_TEMP/codex-bot"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: codex-fix
           path: |
