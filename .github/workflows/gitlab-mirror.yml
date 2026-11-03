@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 10
     steps:
       # 不執行倉庫程式碼；私鑰只用於這個 GitLab 專案的 deploy key。
-      - name: Sync branches and tags
+      - name: Sync main and tags
         shell: bash
         env:
           MIRROR_SSH_KEY: ${{ secrets.GITLAB_MIRROR_SSH_KEY }}
@@ -40,7 +40,8 @@ jobs:
           test "$fingerprint" = 'SHA256:eUXGGm1YGsMAS7vkcx6JOJdOGHPem5gQp4taiCfCLB8'
           export GIT_SSH_COMMAND="ssh -i $mirror_dir/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$mirror_dir/known_hosts"
           git clone --bare https://github.com/funkeyyou/codex-model-router.git "$mirror_dir/repo.git"
+          # 僅同步 main 與標籤，避免 Dependabot rebase 的分支阻擋正式版本同步。
           # 不強制覆寫、不刪除 GitLab 分支；分歧時報錯，保留兩邊資料。
           git -C "$mirror_dir/repo.git" push --atomic \
             git@gitlab.com:funkeyyou/codex-model-router.git \
-            'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+            'refs/heads/main:refs/heads/main' 'refs/tags/*:refs/tags/*'
