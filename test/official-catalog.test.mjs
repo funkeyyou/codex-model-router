@@ -124,6 +124,42 @@ test("關閉同步、沒有登入或版本時只讀本地資料", async () => {
   assert.deepEqual(await enabled.refreshOfficialCatalog(headers, new URLSearchParams(), failFetch), original);
 });
 
+test("同步日誌記錄失敗與恢復時間，連續成功不重複寫入，管理頁可還原狀態", async () => {
+  const { r } = await fixture();
+  const writes = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = function (chunk, ...args) {
+    if (String(chunk).startsWith("model-router-catalog-refresh-")) {
+      writes.push(String(chunk));
+      return true;
+    }
+    return originalWrite.call(this, chunk, ...args);
+  };
+  try {
+    await r.refreshOfficialCatalog(headers, query, async () => ok());
+    assert.equal(writes.length, 1, "首次成功解除重啟前的警告");
+    assert.deepEqual(installer.parseRouterLog(writes.join("")), []);
+    await r.refreshOfficialCatalog(headers, query, async () => new Response("secret body", { status: 401 }));
+    await r.refreshOfficialCatalog(headers, query, async () => new Response(null, { status: 503 }));
+    let entries = installer.parseRouterLog(writes.join(""));
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].status, 503);
+    assert.ok(Number.isFinite(Date.parse(entries[0].at)));
+    assert.equal(entries[0].recoveredAt, undefined);
+    await r.refreshOfficialCatalog(headers, query, async () => ok());
+    entries = installer.parseRouterLog(writes.join(""));
+    assert.ok(Number.isFinite(Date.parse(entries[0].recoveredAt)));
+    const count = writes.length;
+    await r.refreshOfficialCatalog(headers, query, async () => ok());
+    assert.equal(writes.length, count);
+    await r.refreshOfficialCatalog(headers, query, async () => new Response(null, { status: 401 }));
+    assert.equal(installer.parseRouterLog(writes.join(""))[0].recoveredAt, undefined);
+    assert.doesNotMatch(writes.join(""), /secret body|Bearer|account-a/);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
 test("升級只移除路由器自己的固定目錄，保留使用者指定目錄", () => {
   const managed = join(tmpdir(), "model-router", "models.json");
   assert.equal(installer.isManagedCatalogPath(managed, managed), true);

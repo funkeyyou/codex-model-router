@@ -147,6 +147,52 @@ function languageModule({ languages = ["en-US"], language = languages[0], prefer
     "\n({ matchLanguage, browserLanguage, t, toSimplified, serverText, logText, joinList, sectionTitle, locale })", context);
 }
 
+test("同步警告的恢復標記與時間在三種語言正確顯示，未恢復時不顯示", () => {
+  const renderer = script.slice(script.indexOf("function routerErrorMessage("), script.indexOf("function renderEnvironmentPanel("));
+  for (const [language, label] of [["zh-TW", "已恢復"], ["zh-CN", "已恢复"], ["en-US", "Recovered"]]) {
+    const languageApi = languageModule({ languages: [language] });
+    const entry = { kind: "catalog-refresh-failed", message: "status=401;using-cache", recoveredAt: "2026-11-04T02:00:00Z" };
+    const context = vm.createContext({ ...languageApi, I18N: data, errorsData: { entries: [entry] },
+      formatTime: value => value || "—", refreshErrors() {}, icon: () => null,
+      h(tag, attrs, ...children) {
+        return { tag, attrs, children, append(...items) { this.children.push(...items); } };
+      },
+    });
+    const render = () => JSON.stringify(vm.runInContext(renderer + "\nrenderErrorsPanel()", context));
+    assert.match(render(), new RegExp(label));
+    assert.match(render(), /2026-11-04T02:00:00Z/);
+    delete entry.recoveredAt;
+    assert.doesNotMatch(render(), new RegExp(label));
+  }
+});
+
+test("歷史錯誤的原因、舊版提示及恢復標記在三種語言正確顯示", () => {
+  const renderer = script.slice(script.indexOf("function routerErrorMessage("), script.indexOf("function renderEnvironmentPanel("));
+  for (const [language, recoveredLabel, reason, legacyLabel] of [
+    ["zh-TW", "已恢復", "快取已過期", "舊版紀錄未保存遺失原因"],
+    ["zh-CN", "已恢复", "缓存已过期", "旧版记录未保存遗失原因"],
+    ["en-US", "Recovered", "The cached history expired", "This older log entry did not record the reason"],
+  ]) {
+    const languageApi = languageModule({ languages: [language] });
+    const entry = { kind: "error", code: "router_history_unavailable", status: 409,
+      message: "history missing", historyReason: "expired", recoveredAt: "2026-11-04T02:00:00Z" };
+    const context = vm.createContext({ ...languageApi, I18N: data, errorsData: { entries: [entry] },
+      formatTime: value => value || "—", refreshErrors() {}, icon: () => null,
+      h(tag, attrs, ...children) {
+        return { tag, attrs, children, append(...items) { this.children.push(...items); } };
+      },
+    });
+    const render = () => JSON.stringify(vm.runInContext(renderer + "\nrenderErrorsPanel()", context));
+    assert.ok(render().includes(reason), language);
+    assert.ok(render().includes(recoveredLabel), language);
+    assert.match(render(), /chip mono green/);
+    delete entry.historyReason;
+    delete entry.recoveredAt;
+    assert.ok(render().includes(legacyLabel), render());
+    assert.ok(!render().includes(recoveredLabel));
+  }
+});
+
 test("依瀏覽器語言的偏好順序選語言：繁中、簡中、英文，其他語言預設英文", () => {
   const { matchLanguage } = languageModule();
   const cases = {

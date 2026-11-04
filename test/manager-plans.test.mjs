@@ -258,6 +258,53 @@ test("路由器記錄只挑出故障相關的行，新的在前，並清掉控�
   assert.equal(installer.parseRouterLog(log, 2).length, 2);
 });
 
+test("同步警告只保留最後一次，合併後才限制筆數；其他錯誤逐筆保留", () => {
+  const failures = Array.from({ length: 80 }, () => "model-router-catalog-refresh-failed:status=401;using-cache");
+  const latest = 'model-router-catalog-refresh-failed:{"at":"2026-11-04T01:00:00.000Z","status":503,"message":"status=503;using-cache"}';
+  const entries = installer.parseRouterLog([
+    "model-router-error:first", ...failures, "model-router-error:second", latest,
+  ].join("\n"), 3);
+  assert.deepEqual(entries.map(entry => entry.message), ["status=503;using-cache", "second", "first"]);
+  assert.equal(entries[0].at, "2026-11-04T01:00:00.000Z");
+  assert.equal(entries[0].recoveredAt, undefined);
+});
+
+test("同步成功標記最後一次警告已恢復，重啟與舊格式相容；再次失敗清除恢復狀態", () => {
+  const failed = "model-router-catalog-refresh-failed:status=401;using-cache";
+  const recovered = 'model-router-catalog-refresh-recovered:{"source":"official","status":200,"at":"2026-11-04T02:00:00.000Z"}';
+  assert.deepEqual(installer.parseRouterLog(recovered), [], "沒有失敗時不新增錯誤列");
+  const log = [failed, "model-router-ready:restart", recovered].join("\n");
+  assert.equal(installer.parseRouterLog(log)[0].recoveredAt, "2026-11-04T02:00:00.000Z");
+  assert.equal(installer.parseRouterLog(log + "\n" + failed)[0].recoveredAt, undefined);
+  for (const invalid of ["{broken", '{"source":"cache","status":401,"at":"2026-11-04T02:00:00Z"}',
+    '{"source":"official","status":200,"at":"bad-date"}']) {
+    const entries = installer.parseRouterLog(failed + "\nmodel-router-catalog-refresh-recovered:" + invalid);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].recoveredAt, undefined);
+  }
+});
+
+test("歷史恢復事件只更新對應診斷 ID，保留原因；舊紀錄與無效事件不誤標", () => {
+  const failure = (id, code = "router_history_unavailable", reason) => "model-router-error:" + JSON.stringify({
+    at: "2026-11-04T01:00:00Z", requestId: id, code, message: "history missing", historyReason: reason,
+  });
+  const recovered = (at, ids) => "model-router-history-recovered:" + JSON.stringify({ at, requestIds: ids });
+  const log = [failure("a", undefined, "expired"), failure("b", undefined, "capacity"),
+    failure("c", "upstream_network_error"), failure("legacy"),
+    recovered("bad-date", ["b"]), recovered("2026-11-03T01:00:00Z", ["b"]),
+    "model-router-history-recovered:{broken", recovered("2026-11-04T02:00:00Z", ["a", "c", "missing"]),
+  ].join("\n");
+  const entries = installer.parseRouterLog(log);
+  assert.equal(entries.length, 4);
+  const a = entries.find(entry => entry.requestId === "a");
+  assert.equal(a.recoveredAt, "2026-11-04T02:00:00Z");
+  assert.equal(a.historyReason, "expired");
+  assert.equal(entries.find(entry => entry.requestId === "b").recoveredAt, undefined);
+  assert.equal(entries.find(entry => entry.requestId === "c").recoveredAt, undefined);
+  assert.equal(entries.find(entry => entry.requestId === "legacy").historyReason, null);
+  assert.equal(installer.parseRouterLog(log, 1)[0].requestId, "legacy");
+});
+
 test("內嵌的網頁管理介面在 .sh 與 .ps1 中一致，Claude CLI 段不會吃進後面的內容", () => {
   const page = installer.loadManagerPage(shellPath);
   assert.equal(page, managerPage);

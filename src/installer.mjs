@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.0";
+const INSTALLER_VERSION = "1.41.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -6854,17 +6854,37 @@ async function managerVersionInfo({ refresh = false } = {}) {
 
 export function parseRouterLog(text, limit = 50) {
   const entries = [];
+  let latestCatalogEntry = null;
+  const historyErrors = new Map();
   const clip = (value, max = 300) => (value == null ? null : terminalSafeText(value, max) || null);
   for (const line of String(text ?? "").split(/\r?\n/)) {
     const match = /^model-router-([a-z-]+):(.*)$/.exec(line);
-    if (!match || !MANAGER_LOG_KINDS.has(match[1])) continue;
+    if (!match || (!MANAGER_LOG_KINDS.has(match[1]) && !["catalog-refresh-recovered", "history-recovered"].includes(match[1]))) continue;
     const [, kind, rest] = match;
     let record = null;
-    if (kind === "error" && rest.trim().startsWith("{")) {
+    if ((kind === "error" || kind.startsWith("catalog-refresh-") || kind === "history-recovered") && rest.trim().startsWith("{")) {
       try { record = JSON.parse(rest); } catch {}
     }
+    if (kind === "history-recovered") {
+      if (typeof record?.at === "string" && Number.isFinite(Date.parse(record.at)) && Array.isArray(record.requestIds)) {
+        for (const id of record.requestIds) {
+          const entry = historyErrors.get(id);
+          if (entry && (!entry.at || Date.parse(record.at) >= Date.parse(entry.at))) entry.recoveredAt = clip(record.at, 40);
+        }
+      }
+      continue;
+    }
+    if (kind === "catalog-refresh-recovered") {
+      if (latestCatalogEntry && record?.source === "official" && record?.status === 200 &&
+          typeof record.at === "string" && Number.isFinite(Date.parse(record.at))) {
+        latestCatalogEntry.recoveredAt = clip(record.at, 40);
+      }
+      continue;
+    }
     if (!record || typeof record !== "object") {
-      entries.push({ kind, message: clip(rest) });
+      const entry = { kind, message: clip(rest) };
+      entries.push(entry);
+      if (kind === "catalog-refresh-failed") latestCatalogEntry = entry;
       continue;
     }
     entries.push({
@@ -6874,9 +6894,16 @@ export function parseRouterLog(text, limit = 50) {
       transport: clip(record.transport, 20), route: clip(record.route, 20), phase: clip(record.phase, 40),
       causeCode: clip(record.causeCode, 60),
       upstreamStatus: Number.isInteger(record.upstreamStatus) ? record.upstreamStatus : null,
+      ...(record.code === "router_history_unavailable" ? { historyReason: clip(record.historyReason, 40) } : {}),
     });
+    if (record.code === "router_history_unavailable" && typeof record.requestId === "string") {
+      historyErrors.set(record.requestId, entries.at(-1));
+    }
+    if (kind === "catalog-refresh-failed") latestCatalogEntry = entries.at(-1);
   }
-  return entries.slice(-limit).reverse();
+  // 先合併再截取，避免大量同步失敗把真正的對話錯誤擠出最近紀錄。
+  return entries.filter(entry => entry.kind !== "catalog-refresh-failed" || entry === latestCatalogEntry)
+    .slice(-limit).reverse();
 }
 
 function readFileTail(path, maxBytes = 256 * 1024) {

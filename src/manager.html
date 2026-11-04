@@ -464,6 +464,20 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "最近的錯誤": "Recent errors",
 "記錄檔裡沒有錯誤紀錄。": "No errors in the log.",
 "模型清單同步": "Model list sync",
+"已恢復": "Recovered",
+"恢復時間：{time}": "Recovered at: {time}",
+"遺失原因：{reason}": "History unavailable: {reason}",
+"快取已過期": "The cached history expired",
+"快取容量不足，舊歷史已淘汰": "The history was evicted to stay within the cache size limit",
+"同一連線保存的回應數已達上限": "The response limit for this connection was reached",
+"保存的工作階段數已達上限": "The cached session limit was reached",
+"完整請求已取代舊歷史": "A full request replaced the older history",
+"單次歷史過大，無法保存完整快照": "The history was too large to cache in full",
+"連線或工作階段識別改變": "The connection or session identity changed",
+"請求未提供可識別的工作階段": "The request had no usable session identity",
+"快照沒有可重建的輸入": "The snapshot had no input to reconstruct",
+"原因不明，可能服務重啟或上一輪未保存": "Unknown; the router may have restarted or the previous turn was not cached",
+"舊版紀錄未保存遺失原因": "This older log entry did not record the reason",
 "請求過大": "Request too large",
 "上游 WebSocket 冷卻": "Upstream WebSocket cooldown",
 "官方驗證寬限": "Official auth grace period",
@@ -1879,6 +1893,22 @@ function routerErrorMessage(entry) {
   return serverText(entry.message);
 }
 
+function historyReasonText(reason) {
+  switch (reason) {
+    case "expired": return t("快取已過期");
+    case "capacity": return t("快取容量不足，舊歷史已淘汰");
+    case "response_limit": return t("同一連線保存的回應數已達上限");
+    case "thread_limit": return t("保存的工作階段數已達上限");
+    case "replaced": return t("完整請求已取代舊歷史");
+    case "snapshot_too_large": return t("單次歷史過大，無法保存完整快照");
+    case "scope_changed": return t("連線或工作階段識別改變");
+    case "missing_session_key": return t("請求未提供可識別的工作階段");
+    case "empty_snapshot": return t("快照沒有可重建的輸入");
+    case null: case undefined: return t("舊版紀錄未保存遺失原因");
+    default: return t("原因不明，可能服務重啟或上一輪未保存");
+  }
+}
+
 function renderErrorsPanel() {
   const refresh = h("button", { type: "button", class: "icon-button", title: t("重新整理"), "aria-label": t("重新整理錯誤紀錄"), onclick: () => refreshErrors() }, icon("refresh"));
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("最近的錯誤") }), refresh));
@@ -1901,13 +1931,17 @@ function renderErrorsPanel() {
   };
   const rows = entries.map((entry) => {
     const what = entry.kind === "error"
-      ? [entry.code ? h("span", { class: "chip rose mono", text: entry.status ? entry.status + " " + entry.code : entry.code }) : h("span", { class: "chip rose", text: t("錯誤") })]
-      : [h("span", { class: "chip amber", text: kindLabels[entry.kind] || entry.kind })];
+      ? [entry.code ? h("span", { class: "chip mono " + (entry.recoveredAt ? "green" : "rose"), text: entry.status ? entry.status + " " + entry.code : entry.code }) : h("span", { class: "chip rose", text: t("錯誤") })]
+      : [h("span", { class: "chip " + (entry.recoveredAt ? "green" : "amber"), text: kindLabels[entry.kind] || entry.kind })];
+    if (entry.recoveredAt) what.push(h("span", { class: "chip green", text: t("已恢復") }));
     const where = [entry.model, entry.provider ? t("供應商 {name}", { name: providerLabel(entry.provider) }) : null, entry.upstreamHost].filter(Boolean).join(" · ");
     return h("tr", {},
       h("td", { class: "tight mono muted", text: formatTime(entry.at) }),
       h("td", { class: "tight" }, ...what),
-      h("td", {}, h("div", { text: routerErrorMessage(entry) || "—" }), where ? h("div", { class: "model-sub", text: where }) : null),
+      h("td", {}, h("div", { text: routerErrorMessage(entry) || "—" }),
+        entry.code === "router_history_unavailable" ? h("div", { class: "model-sub", text: t("遺失原因：{reason}", { reason: historyReasonText(entry.historyReason) }) }) : null,
+        entry.recoveredAt ? h("div", { class: "model-sub", text: t("恢復時間：{time}", { time: formatTime(entry.recoveredAt) }) }) : null,
+        where ? h("div", { class: "model-sub", text: where }) : null),
       h("td", { class: "tight mono faint", text: entry.requestId || "" }));
   });
   panel.append(h("div", { class: "table-wrap" }, h("table", {},

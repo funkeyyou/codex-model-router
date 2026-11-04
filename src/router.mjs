@@ -409,12 +409,16 @@ export async function refreshOfficialCatalog(requestHeaders, searchParams, fetch
       }
       stats.catalogRefreshes += 1;
       stats.catalogModels = merged.models.length;
+      const recovered = stats.lastCatalogSync?.source !== "official";
       stats.lastCatalogSync = { source: "official", status, at: new Date().toISOString() };
+      // 啟動後首次成功也留下標記，讓重啟前的失敗紀錄能顯示已恢復。
+      if (recovered) process.stderr.write(`model-router-catalog-refresh-recovered:${JSON.stringify(stats.lastCatalogSync)}\n`);
       return merged;
     } catch {
       stats.catalogRefreshFailures += 1;
       stats.lastCatalogSync = { source: "cache", status, at: new Date().toISOString() };
-      process.stderr.write(`model-router-catalog-refresh-failed:status=${status ?? "unavailable"};using-cache\n`);
+      process.stderr.write(`model-router-catalog-refresh-failed:${JSON.stringify({ ...stats.lastCatalogSync,
+        message: `status=${status ?? "unavailable"};using-cache` })}\n`);
       return current();
     }
   })();
@@ -560,13 +564,98 @@ const maxHistoryBytes = Number.isSafeInteger(settings.maxHistoryBytes) && settin
   ? settings.maxHistoryBytes : 128 * 1024 * 1024;
 const historyTtlMs = Number.isSafeInteger(settings.historyTtlMs) && settings.historyTtlMs > 0
   ? settings.historyTtlMs : 30 * 60 * 1000;
+// 診斷只留雜湊與原因，不保存第二份對話；服務重啟後未知原因不能冒充已確認的重啟。
+const historyRemovals = new Map();
+const pendingHistoryRecoveries = new Map();
+const historyDiagnosticTtlMs = 24 * 60 * 60 * 1000;
+const historyDigest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+function pruneHistoryDiagnostics(map, limit, now = Date.now()) {
+  for (const [key, entry] of map) if (entry.expiresAt <= now) map.delete(key);
+  while (map.size > limit) map.delete(map.keys().next().value);
+}
+
+function noteHistoryRemoval(key, id, reason, now = Date.now()) {
+  const digest = historyDigest([key, id]);
+  historyRemovals.delete(digest);
+  historyRemovals.set(digest, { reason, expiresAt: now + historyDiagnosticTtlMs });
+  pruneHistoryDiagnostics(historyRemovals, 1024, now);
+}
+
+function removeHistorySnapshot(key, responses, id, reason, now = Date.now()) {
+  noteHistoryRemoval(key, id, reason, now);
+  responses.delete(id);
+}
+
+function historyMissReason(key, previousId) {
+  if (!key) return "missing_session_key";
+  pruneHistoryDiagnostics(historyRemovals, 1024);
+  const removal = historyRemovals.get(historyDigest([key, previousId]));
+  if (removal) return removal.reason;
+  const snapshot = findHistorySnapshot(key, previousId);
+  if (snapshot) return "empty_snapshot";
+  for (const [otherKey, responses] of threadHistories) {
+    if (otherKey !== key && responses.has(previousId)) return "scope_changed";
+  }
+  return "unknown";
+}
+
+function historyRecoveryScope(body, headers) {
+  // client_metadata.session_id 可能被背景工作共用，不能單靠它宣告某個任務已恢復。
+  const task = headers?.["thread-id"] || headers?.["session-id"];
+  const account = headers?.["chatgpt-account-id"] || headers?.authorization;
+  if (typeof task !== "string" || !task || typeof account !== "string" || !account) return null;
+  return historyDigest([account, task, body?.model, body?.[BACKGROUND_KIND] ?? backgroundTaskKind(body)]);
+}
+
+function historyInputItems(input) {
+  return typeof input === "string" ? [{ role: "user", content: input }] : Array.isArray(input) ? input : [];
+}
+
+function historyUnavailableError(key, body, headers) {
+  const error = new RouterRequestError(409, "router_history_unavailable",
+    "找不到 previous_response_id 對應的完整歷史，請重連並重送完整對話。", "history");
+  error.historyReason = historyMissReason(key, body.previous_response_id);
+  error.historyDiagnosticId = randomBytes(8).toString("hex");
+  const scope = historyRecoveryScope(body, headers);
+  const tail = historyInputItems(body.input).slice(-8);
+  if (scope && tail.length && body.generate !== false) {
+    pendingHistoryRecoveries.set(error.historyDiagnosticId, {
+      scope, tailLength: tail.length, tailDigest: historyDigest(tail), expiresAt: Date.now() + historyDiagnosticTtlMs,
+    });
+    pruneHistoryDiagnostics(pendingHistoryRecoveries, 256);
+  }
+  return error;
+}
+
+function historyRecoveryCandidates(body, headers) {
+  if (!pendingHistoryRecoveries.size || body?.previous_response_id || body?.generate === false) return [];
+  pruneHistoryDiagnostics(pendingHistoryRecoveries, 256);
+  const scope = historyRecoveryScope(body, headers);
+  if (!scope) return [];
+  const items = historyInputItems(body.input);
+  if (!items.some(item => item?.role === "user")) return [];
+  const digests = new Map();
+  return [...pendingHistoryRecoveries].flatMap(([id, entry]) => {
+    if (entry.scope !== scope || items.length < entry.tailLength) return [];
+    if (!digests.has(entry.tailLength)) digests.set(entry.tailLength, historyDigest(items.slice(-entry.tailLength)));
+    return digests.get(entry.tailLength) === entry.tailDigest ? [id] : [];
+  });
+}
+
+function recordHistoryRecovery(history) {
+  const requestIds = (history.recoveryIds || []).filter(id => pendingHistoryRecoveries.has(id));
+  if (!requestIds.length) return;
+  for (const id of requestIds) pendingHistoryRecoveries.delete(id);
+  process.stderr.write(`model-router-history-recovered:${JSON.stringify({ at: new Date().toISOString(), requestIds })}\n`);
+}
 
 export function historyCacheInfo(now = Date.now()) {
   let bytes = 0;
   let count = 0;
   for (const [key, responses] of threadHistories) {
     for (const [id, history] of responses) {
-      if (history.expiresAt <= now) responses.delete(id);
+      if (history.expiresAt <= now) removeHistorySnapshot(key, responses, id, "expired", now);
       else { bytes += history.bytes; count += 1; }
     }
     if (!responses.size) threadHistories.delete(key);
@@ -674,13 +763,22 @@ function prepareHistory(key, input, previousId = null) {
 
 function rememberHistoryEvent(history, event) {
   if (history?.usage) recordUsageEvent(history.usage, event);
-  if (!history || history.completed || history.disabled) return;
+  if (!history || history.completed) return;
+  if (history.disabled) {
+    if (history.disabledReason && event?.response?.id &&
+        (event.type === "response.completed" || event.type === "response.incomplete")) {
+      noteHistoryRemoval(history.key, event.response.id, history.disabledReason);
+      history.completed = true;
+    }
+    return;
+  }
   const replayable = (item) => item && typeof item === "object" &&
     (item.type !== "reasoning" || item.encrypted_content);
   if (event?.type === "response.output_item.done" && replayable(event.item)) {
     history.outputBytes = (history.outputBytes || 0) + Buffer.byteLength(JSON.stringify(event.item));
     if (history.outputBytes > maxHistoryBytes) {
       history.disabled = true;
+      history.disabledReason = "snapshot_too_large";
       history.input = [];
       history.output = [];
       return;
@@ -700,27 +798,41 @@ function rememberHistoryEvent(history, event) {
   });
   // 用位元組計帳的不可變快照，避免共享物件被後續轉譯修改；超限不保存半份歷史。
   const bytes = Buffer.byteLength(serialized);
-  if (bytes > maxHistoryBytes) return;
+  if (bytes > maxHistoryBytes) {
+    noteHistoryRemoval(history.key, responseId, "snapshot_too_large");
+    return;
+  }
   const snapshot = { serialized, bytes, expiresAt: Date.now() + historyTtlMs };
   const responses = history.previousId
     ? threadHistories.get(history.key) || new Map()
     : new Map();
+  if (!history.previousId) {
+    for (const id of threadHistories.get(history.key)?.keys() || []) {
+      if (id !== responseId) noteHistoryRemoval(history.key, id, "replaced");
+    }
+  }
+  historyRemovals.delete(historyDigest([history.key, responseId]));
   responses.delete(responseId);
   responses.set(responseId, snapshot);
-  while (responses.size > maxResponsesPerHistory) responses.delete(responses.keys().next().value);
+  while (responses.size > maxResponsesPerHistory) removeHistorySnapshot(history.key, responses, responses.keys().next().value, "response_limit");
   threadHistories.delete(history.key);
   threadHistories.set(history.key, responses);
   while (threadHistories.size > maxRememberedHistories) {
-    threadHistories.delete(threadHistories.keys().next().value);
+    const [key, oldResponses] = threadHistories.entries().next().value;
+    for (const id of oldResponses.keys()) noteHistoryRemoval(key, id, "thread_limit");
+    threadHistories.delete(key);
   }
   let total = historyCacheInfo().bytes;
   while (total > maxHistoryBytes) {
     const [key, oldest] = threadHistories.entries().next().value;
     const [id, snapshot] = oldest.entries().next().value;
     total -= snapshot.bytes;
-    oldest.delete(id);
+    removeHistorySnapshot(key, oldest, id, "capacity");
     if (!oldest.size) threadHistories.delete(key);
   }
+  if (event.type === "response.completed" && !event.response?.error &&
+      (!event.response?.status || event.response.status === "completed") &&
+      threadHistories.get(history.key)?.has(responseId)) recordHistoryRecovery(history);
 }
 
 function rebuildStatefulInput(key, incomingInput, previousId) {
@@ -1147,7 +1259,9 @@ export function describeRouterError(error) {
   }
   if (error instanceof RouterRequestError) {
     const { status, code, message, phase, upstreamStatus } = error;
-    return { status, code, message, phase, upstreamStatus, causeCode: null };
+    return { status, code, message, phase, upstreamStatus, causeCode: null,
+      ...(code === "router_history_unavailable" ? { historyReason: error.historyReason || "unknown" } : {}),
+    };
   }
   const chain = [];
   const visit = (value, depth = 0) => {
@@ -1201,7 +1315,8 @@ function contextProvider(context) {
 
 function recordRouterError(error, context = {}, countFailure = true) {
   const details = describeRouterError(error);
-  const requestId = randomBytes(8).toString("hex");
+  const requestId = details.code === "router_history_unavailable" && /^[a-f0-9]{16}$/.test(error.historyDiagnosticId)
+    ? error.historyDiagnosticId : randomBytes(8).toString("hex");
   // API Key 模式擋下官方模型是預期中的狀態，不算錯誤；只計數，管理頁頂部的提示會顯示總數。
   if (details.code === "quota_mode_official_unavailable") {
     process.stderr.write(`model-router-quota-blocked:${typeof context.model === "string" ? context.model.slice(0, 80) : "-"}\n`);
@@ -1971,16 +2086,13 @@ export async function fetchModelUpstream(
       stats.statefulRebuilds += 1;
     } else {
       stats.statefulRebuildMisses += 1;
-      throw new RouterRequestError(
-        409, "router_history_unavailable",
-        "找不到 previous_response_id 對應的完整歷史，請重連並重送完整對話。",
-        "history",
-      );
+      throw historyUnavailableError(historyKey, body, requestHeaders);
     }
   }
   meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
   // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
   meta.history = meta.history || { disabled: true };
+  meta.history.recoveryIds = historyRecoveryCandidates(body, requestHeaders);
   meta.history.usage = usageContext({
     requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
     provider: route?.transport === "claude-cli" ? "claude-cli" : provider?.id ?? null,
@@ -3318,6 +3430,7 @@ async function tryUpstreamWebSocketTurn(
     let outgoing = { ...message };
     history = fullInput ? prepareHistory(historyKey, fullInput, previousId) : null;
     history = history || { disabled: true };
+    history.recoveryIds = historyRecoveryCandidates(probe, request.headers);
     history.usage = usageContext({
       requestHeaders: request.headers, model: message?.model, route: "official", provider: null,
       transport: "upstream-websocket", backgroundKind: null,
