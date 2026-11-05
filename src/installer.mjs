@@ -3941,8 +3941,7 @@ async function install(preset = null) {
     writeJsonAtomic(manifestPath, manifest);
     // 未登入時 model/list 不會向路由器探索；先建立本機登入與目錄再驗證。
     if (login === "none") {
-      await enableQuotaMode({ allowLoggedOut: true });
-      apiKeyMode = true;
+      apiKeyMode = (await enableQuotaMode({ allowLoggedOut: true })).changed;
     }
     await waitForPickerModels(allRoutes,
       existingRoutes.map(route => route.pickerSlug).filter(slug => !allRoutes.some(route => route.pickerSlug === slug)),
@@ -4135,7 +4134,7 @@ async function commitAddedModels(provider, newRoutes, discoveredModels) {
   const templates = await withCodexLock(() => loadCatalogTemplates());
   const { manifest, settings, catalog } = requireInstallation();
   const plan = planAddModels(manifest, settings, catalog, templates, provider, newRoutes, discoveredModels);
-  const backupDir = await commitRouterChange("add-model", plan);
+  const backupDir = await commitRouterChange("add-model", { ...plan, autoApiKeyMode: true });
   return { plan, backupDir };
 }
 
@@ -4336,7 +4335,8 @@ function requireInstallation() {
 // 寫入新的設定並原地重啟路由器；任何一步失敗都還原備份，並確認路由器回來了。
 // apply／restore 用來一併處理 config.toml 之類的附帶修改。
 async function commitRouterChange(label, { settings, manifest, catalog, absent = [], configFile = null,
-  apply = null, restore = null }) {
+  apply = null, restore = null, autoApiKeyMode = false }) {
+  const enableApiKey = autoApiKeyMode && codexIntegrationEnabled() && verifyLogin() === "none";
   const previousRoutes = readSettingsIfExists().routes || [];
   const port = Number(settings.port ?? manifest.port);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) fail("現有安裝沒有可用的連接埠設定。");
@@ -4354,6 +4354,7 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
     fail("無法備份 config.toml，已取消。");
   }
   let applied = false;
+  let apiKeyMode = false;
   try {
     writeFileSync(routerPath, extractRouterSource(), { mode: 0o600 });
     chmodSync(routerPath, 0o600);
@@ -4368,10 +4369,16 @@ async function commitRouterChange(label, { settings, manifest, catalog, absent =
       applied = true;
       await apply();
     }
+    if (enableApiKey) {
+      apiKeyMode = (await enableQuotaMode({ allowLoggedOut: true })).changed;
+    }
     await waitForPickerModels(settings.routes, absent, previousRoutes);
   } catch (error) {
     console.error("\n修改失敗，正在還原之前的配置...");
     const failures = [];
+    if (apiKeyMode) {
+      try { await disableQuotaMode({ quiet: true }); } catch (restoreError) { failures.push(restoreError.message); }
+    }
     // 先撤回依賴新目錄的 Codex 設定，再還原舊目錄。獨立模式的目錄不是 Codex schema，
     // 先換回它會讓 app-server 連 config/read 都失敗，無法還原 API Key 模式。
     if (applied && restore) {
@@ -4740,7 +4747,7 @@ async function configureClaudeCli(subcommand = null) {
   if (!passed.length) { console.log("沒找到可用模型，路由配置未修改。"); return; }
   // Re-read after login/probing; never overwrite intervening catalog refreshes.
   const plan = planClaudeCliModels(requireInstallation(), binary, passed, contextWindow, resolvedModels);
-  const backup = await commitRouterChange("claude-cli", plan);
+  const backup = await commitRouterChange("claude-cli", { ...plan, autoApiKeyMode: true });
   console.log(`已添加：${claudeCliDisplayNames(plan, passed.map((model) => resolvedModels[model])).join("、")}。請重開 Codex 後選擇模型。`);
   console.log(`可從「刪除自訂模型」移除；不會登出 Claude。備份：${backup}`);
 }
@@ -4901,7 +4908,7 @@ async function addProvider() {
       credentialPath: isWindows ? credentialFileFor(keychainService) : null,
     };
     const plan = planAddProvider(manifest, settings, catalog, loadCatalogTemplates(), provider, newRoutes, discovery.models);
-    const backupDir = await commitRouterChange("add-provider", plan);
+    const backupDir = await commitRouterChange("add-provider", { ...plan, autoApiKeyMode: true });
 
     printHeading("新增完成");
     console.log(`供應商：${id}（${discovery.apiRoot}）`);
@@ -7432,7 +7439,7 @@ async function managerAddProvider({ draftId, models, providerId, contextWindow, 
     };
     console.log("\n探測完成，正在寫入設定並重新啟動路由器…");
     const plan = planAddProvider(manifest, settings, catalog, templates, provider, newRoutes, draft.discovery.models);
-    const backupDir = await commitRouterChange("add-provider", plan);
+    const backupDir = await commitRouterChange("add-provider", { ...plan, autoApiKeyMode: true });
     managerDrafts.delete(draftKey);
     console.log(`已新增供應商「${id}」。`);
     printAddedLimits(newRoutes, defaults);
@@ -8596,7 +8603,7 @@ async function managerClaudeCliAdd({ models, contextWindow, maxOutputTokens, fir
   const plan = planClaudeCliModels(requireInstallation(), tested.binary, tested.passed, defaults.contextWindow,
     tested.resolvedModels, { maxOutputTokens: defaults.maxOutputTokens });
   console.log("\n測試完成，正在寫入設定並重新啟動路由器…");
-  const backupDir = await commitRouterChange("claude-cli", plan);
+  const backupDir = await commitRouterChange("claude-cli", { ...plan, autoApiKeyMode: true });
   const added = [...new Set(tested.passed.map((model) => tested.resolvedModels[model]))];
   console.log(`已添加：${claudeCliDisplayNames(plan, added).join("、")}`);
   console.log(`上下文 ${defaults.contextWindow.toLocaleString("en-US")}，輸出 ${defaults.maxOutputTokens.toLocaleString("en-US")}（超過模型上限時 Claude CLI 會自動壓到上限）。`);

@@ -254,9 +254,22 @@ for (const bare of [false, true]) {
         assert.equal((await codexRpc("account/read", { refreshToken: false })).account.type, "apiKey");
         if (${bare}) {
           assert.equal(readSettingsIfExists().routes.length, 0);
+          await disableQuotaMode({ quiet: true });
+          assert.equal(existsSync(codexAuthPath), false);
           const draft = await managerProviderDraft({ baseUrl: ${JSON.stringify(api.baseUrl)}, apiKey: "fixture-key" });
           await managerAddProvider({ draftId: draft.draftId, providerId: "fixture", models: ["claude-opus-fixture"] });
+          assert.equal(quotaModeEnabled(), true, "已安裝且未登入時新增供應商也會自動啟用");
           await validate(readSettingsIfExists().routes);
+          await disableQuotaMode({ quiet: true });
+          const before = readSettingsIfExists();
+          waitForPickerModels = async () => { throw new Error("fixture-add-failed"); };
+          await assert.rejects(managerAddModels({ providerId: "fixture", models: ["claude-opus-next"] }), /fixture-add-failed/);
+          assert.equal(quotaModeEnabled(), false);
+          assert.equal(existsSync(codexAuthPath), false);
+          assert.deepEqual(readSettingsIfExists(), before);
+          waitForPickerModels = validate;
+          await managerAddModels({ providerId: "fixture", models: ["claude-opus-next"] });
+          assert.equal(quotaModeEnabled(), true, "添加模型自動啟用");
         }
         await uninstallRouter(readManifest(), { deleteKeys: async () => false });
         assert.equal(existsSync(codexAuthPath), false);
