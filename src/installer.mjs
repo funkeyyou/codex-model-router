@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.3";
+const INSTALLER_VERSION = "1.41.4";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -76,6 +76,7 @@ const claudeDesktopConfigPath = join(installRoot, "claude-desktop.json");
 const claudeDesktopBackupPath = join(backupsRoot, "claude-desktop-active.json");
 const settingsPath = join(installRoot, "settings.json");
 const catalogPath = join(installRoot, "models.json");
+const apiKeyCatalogPath = join(installRoot, "models-api-key.json");
 // 備用 API Key 清單（只有鑰匙圈項目名稱與 Key 末四碼，沒有 Key 本身）。路由器依修改時間重讀。
 const keyPoolPath = join(installRoot, "key-pool.json");
 const logPath = join(installRoot, "router.err.log");
@@ -147,6 +148,12 @@ function writeJsonAtomic(path, value, mode = 0o600) {
   });
   renameSync(temporaryPath, path);
   chmodSync(path, mode);
+  if (path === catalogPath) writeJsonAtomic(apiKeyCatalogPath, apiKeyCatalog(value), mode);
+}
+
+export function apiKeyCatalog(catalog) {
+  return { ...catalog, models: catalog.models.map(model =>
+    String(model.slug).startsWith("custom/") ? model : { ...model, visibility: "hide" }) };
 }
 
 function shell(command, args, options = {}) {
@@ -3416,6 +3423,7 @@ function copyIfExists(source, destination) {
   if (!existsSync(source)) return false;
   copyFileSync(source, destination);
   chmodSync(destination, statSync(source).mode & 0o777);
+  if (destination === catalogPath) writeJsonAtomic(apiKeyCatalogPath, apiKeyCatalog(readCatalogIfExists()));
   return true;
 }
 
@@ -3904,7 +3912,7 @@ async function install(preset = null) {
       },
       // 讓 Codex 每次啟動向 /models 拉取；固定檔案會停用遠端清單刷新。
       // API Key 模式例外：API Key 登入時 Codex 不會拉 /models，要繼續讀路由器的目錄。
-      { keyPath: "model_catalog_json", value: quotaModeEnabled() ? catalogPath : null },
+      { keyPath: "model_catalog_json", value: quotaModeEnabled() ? apiKeyCatalogPath : null },
       { keyPath: `model_providers.${PROVIDER_ID}`, value: null },
     ]) : {};
     configChanged = useCodex;
@@ -5041,7 +5049,10 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
   const routes = settings.routes.map(withDefaultModelPrefix);
   const providers = installedProviders(settings, manifest);
   // 只連接 Claude 訂閱時沒有 API 供應商，路由仍完整。
-  if (providers.length === 0 && !settings.claudeCli?.binary) return { ok: false, reason: "no-providers" };
+  if (providers.length === 0 && !settings.claudeCli?.binary &&
+      !(Array.isArray(settings.providers) && Array.isArray(settings.routes) && settings.routes.length === 0)) {
+    return { ok: false, reason: "no-providers" };
+  }
   const providerIds = new Set(providers.map((provider) => provider.id));
   if (routes.some((route) => route.transport === "claude-cli"
     ? route.translate !== "anthropic" || !settings.claudeCli?.binary
@@ -5094,7 +5105,8 @@ const UPDATE_FAILURES = {
 
 export function isManagedCatalogPath(value, managedPath) {
   if (typeof value !== "string" || !value) return false;
-  return resolve(value) === resolve(managedPath);
+  return resolve(value) === resolve(managedPath) ||
+    (basename(managedPath) === "models.json" && resolve(value) === join(dirname(resolve(managedPath)), "models-api-key.json"));
 }
 
 async function update() {
@@ -5153,7 +5165,7 @@ async function update() {
   backupChatBridge(backupDir);
   copyIfExists(settingsPath, join(backupDir, "settings.json"));
   copyIfExists(manifestPath, join(backupDir, "install.json"));
-  if (migrateCatalog) copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
+  if (migrateCatalog || (useCodex && quotaModeEnabled())) copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
   if (namesChanged) copyIfExists(catalogPath, join(backupDir, "models.json"));
   for (const path of serviceArchivePaths()) {
     copyIfExists(path, join(backupDir, basename(path)));
@@ -5197,6 +5209,10 @@ async function update() {
       }
     }
     health = await waitForHealth(plan.port);
+    if (useCodex && quotaModeEnabled()) {
+      catalogConfigAttempted = true;
+      await enableQuotaMode();
+    }
     if (migrateCatalog) {
       catalogConfigAttempted = true;
       await writeConfigEdits([{ keyPath: "model_catalog_json", value: null }]);
@@ -5343,7 +5359,7 @@ async function executeHiddenModels(requested, { bundledCatalog = loadBundledCata
       effectiveCatalog,
       chosen,
       customSlugs,
-      settings.hideOfficialModels === true && !quotaModeEnabled(),
+      settings.hideOfficialModels === true || quotaModeEnabled(),
     );
     if (!validation.ok) {
       const details = [
@@ -7901,6 +7917,9 @@ export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
   const current = readQuotaMode();
   const login = codexLogin(current);
   if (current?.enabled === true && login === "quota") {
+    await assertRouterConfigured(Number(settings.port ?? manifest.port));
+    writeJsonAtomic(apiKeyCatalogPath, apiKeyCatalog(readCatalogIfExists()));
+    await writeConfigEdits([{ keyPath: "model_catalog_json", value: apiKeyCatalogPath }]);
     console.log("已經是 API Key 模式。");
     return { changed: false, enabled: true };
   }
@@ -7935,10 +7954,11 @@ export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
       enabled: true, keySha256: quotaKeyDigest(key), enabledAt: new Date().toISOString(), catalogAdded,
       previousLogin: original ? "chatgpt" : "none",
     });
-    if (catalogAdded) {
+    {
       console.log("正在讓 Codex 改讀路由器的模型目錄…");
+      writeJsonAtomic(apiKeyCatalogPath, apiKeyCatalog(readCatalogIfExists()));
       catalogWritten = true;
-      await writeConfigEdits([{ keyPath: "model_catalog_json", value: catalogPath }]);
+      await writeConfigEdits([{ keyPath: "model_catalog_json", value: apiKeyCatalogPath }]);
       const verified = (await readUserConfig()).config.model_catalog_json;
       if (!isManagedCatalogPath(verified, catalogPath)) fail("模型目錄設定驗證失敗。");
     }
@@ -7949,7 +7969,8 @@ export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
     if (account?.account?.type !== "apiKey") fail("Codex 沒有讀到新的登入方式。");
     const expected = settings.routes.map((route) => route.pickerSlug);
     const listed = await codexRpc("model/list", { includeHidden: true },
-      (result) => expected.every((slug) => result?.data?.some((model) => model.id === slug)));
+      (result) => expected.every((slug) => result?.data?.some((model) => model.id === slug && model.hidden === false)) &&
+        result?.data?.filter(model => !model.id.startsWith("custom/")).every(model => model.hidden === true));
     const missing = expected.filter((slug) => !listed.data.some((model) => model.id === slug));
     if (missing.length) fail(`模型選單缺少第三方模型：${missing.join("、")}`);
   } catch (error) {
@@ -7959,7 +7980,7 @@ export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
       else rmSync(codexAuthPath, { force: true });
     }
     if (catalogWritten) {
-      try { await writeConfigEdits([{ keyPath: "model_catalog_json", value: null }]); }
+      try { await writeConfigEdits([{ keyPath: "model_catalog_json", value: config.model_catalog_json || null }]); }
       catch { console.error(`模型目錄設定還原失敗，原配置備份：${join(backupDir, "config.toml")}`); }
     }
     rmSync(quotaModePath, { force: true });
@@ -8010,8 +8031,8 @@ export async function disableQuotaMode({ quiet = false } = {}) {
     console.log("Codex 已經重新以 ChatGPT 登入，保留目前的登入。");
     rmSync(quotaAuthBackupPath, { force: true });
   }
-  if (state?.catalogAdded !== false && user && isManagedCatalogPath(user.config.model_catalog_json, catalogPath)) {
-    await writeConfigEdits([{ keyPath: "model_catalog_json", value: null }]);
+  if (user && isManagedCatalogPath(user.config.model_catalog_json, catalogPath)) {
+    await writeConfigEdits([{ keyPath: "model_catalog_json", value: state?.catalogAdded === false ? catalogPath : null }]);
   }
   rmSync(quotaModePath, { force: true });
   if (!quiet) console.log(wasLoggedOut && login !== "chatgpt"

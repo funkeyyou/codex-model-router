@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadPayloads, loadRouterInDir } from "./helpers/payloads.mjs";
 
-const { router } = await loadPayloads();
+const { router, installer } = await loadPayloads();
 const model = (slug, visibility = "list") => ({ slug, display_name: slug, visibility,
   supported_reasoning_levels: [{ effort: "high", description: "High" }], context_window: 1000000 });
 const catalog = { schema: 1, models: [model("gpt-official"), model("gpt-hidden", "hide"), model("custom/test")] };
@@ -33,6 +33,16 @@ test("沒有可選自訂模型時保留官方選項，避免刪除最後一個�
   assert.equal(router.applyOfficialModelVisibility(hiddenCustom, true), hiddenCustom);
   const onlyOfficial = catalogWithoutCustom();
   assert.equal(router.applyOfficialModelVisibility(onlyOfficial, true), onlyOfficial);
+});
+
+test("API Key 模式即使尚無自訂模型仍隱藏官方項目，來源與帳號偏好不變", () => {
+  for (const source of [catalog, catalogWithoutCustom()]) {
+    const snapshot = structuredClone(source);
+    const hidden = installer.apiKeyCatalog(source);
+    assert.deepEqual(hidden, router.applyOfficialModelVisibility(source, false, true));
+    assert.ok(hidden.models.filter(model => !model.slug.startsWith("custom/")).every(model => model.visibility === "hide"));
+    assert.deepEqual(source, snapshot);
+  }
 });
 
 function catalogWithoutCustom() {
@@ -81,13 +91,14 @@ for (const mode of ["online", "offline", "sync-disabled"]) {
     assert.equal(readFileSync(path, "utf8"), offlineBackup);
     assert.equal(fetches, mode === "sync-disabled" ? 0 : 2);
 
-    // 切到 API Key 模式讀原目錄；本機 Key 絕不發給官方。
+    // API Key 模式強制隱藏官方項目，保留原目錄；本機 Key 絕不發給官方。
     const localKey = "fixture-local-quota-key";
     writeFileSync(join(dir, "quota-mode.json"), JSON.stringify({ enabled: true,
       keySha256: createHash("sha256").update(localKey).digest("hex") }));
     update(true);
     const response = await realFetch(origin + "/models?client_version=0.157.0", { headers: { authorization: `Bearer ${localKey}` } });
-    assert.deepEqual(await response.json(), saved);
+    assert.deepEqual(await response.json(), running.applyOfficialModelVisibility(saved, true, true));
+    assert.equal(readFileSync(path, "utf8"), offlineBackup);
     assert.equal(fetches, mode === "sync-disabled" ? 0 : 2);
   });
 }

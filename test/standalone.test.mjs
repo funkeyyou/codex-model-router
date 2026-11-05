@@ -252,7 +252,20 @@ for (const bare of [false, true]) {
         assert.equal(quotaModeEnabled(), true);
         assert.equal(readQuotaMode().previousLogin, "none");
         assert.equal((await codexRpc("account/read", { refreshToken: false })).account.type, "apiKey");
+        const assertHidden = async () => {
+          const listed = await codexRpc("model/list", { includeHidden: true });
+          assert.ok(listed.data.filter(model => !model.id.startsWith("custom/")).every(model => model.hidden));
+          assert.ok(listed.data.filter(model => model.id.startsWith("custom/")).every(model => !model.hidden));
+          assert.ok(readCatalogIfExists().models.some(model => !model.slug.startsWith("custom/") && model.visibility === "list"));
+        };
+        await assertHidden();
         if (${bare}) {
+          // 舊版 API Key 模式仍指向原始目錄：更新後遷移，不重建登入 Key。
+          await writeConfigEdits([{ keyPath: "model_catalog_json", value: catalogPath }]);
+          const authBefore = readFileSync(codexAuthPath, "utf8");
+          await update();
+          assert.equal(readFileSync(codexAuthPath, "utf8"), authBefore);
+          await assertHidden();
           assert.equal(readSettingsIfExists().routes.length, 0);
           await disableQuotaMode({ quiet: true });
           assert.equal(existsSync(codexAuthPath), false);
@@ -270,6 +283,10 @@ for (const bare of [false, true]) {
           waitForPickerModels = validate;
           await managerAddModels({ providerId: "fixture", models: ["claude-opus-next"] });
           assert.equal(quotaModeEnabled(), true, "添加模型自動啟用");
+          await assertHidden();
+          await disableQuotaMode({ quiet: true });
+          assert.equal((await readUserConfig()).config.model_catalog_json, undefined);
+          assert.ok((await codexRpc("model/list", { includeHidden: true })).data.some(model => !model.id.startsWith("custom/") && !model.hidden));
         }
         await uninstallRouter(readManifest(), { deleteKeys: async () => false });
         assert.equal(existsSync(codexAuthPath), false);

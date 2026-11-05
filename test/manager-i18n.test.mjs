@@ -177,6 +177,26 @@ test("首次使用沒有模型也能開啟 API Key 模式，既有 Key 與寫入
   }
 });
 
+test("API Key 模式強制勾選隱藏官方模型，切回帳號模式恢復偏好", () => {
+  const renderer = script.slice(script.indexOf("function renderOfficialModelVisibilityPanel("), script.indexOf("function confirmQuotaMode("));
+  const context = vm.createContext({ ...languageModule(),
+    state: { installed: true, hideOfficialModels: false, quotaMode: { enabled: true, customModelCount: 1 } },
+    paragraph: text => ({ text }), desktopName: () => "Codex",
+    h(tag, attrs, ...children) { return { tag, attrs, children, append(...items) { this.children.push(...items); } }; },
+  });
+  for (const [enabled, preference, checked] of [[true, false, true], [false, false, false], [false, true, true]]) {
+    context.state.quotaMode.enabled = enabled;
+    context.state.hideOfficialModels = preference;
+    const panel = vm.runInContext(renderer + "\nrenderOfficialModelVisibilityPanel(false)", context);
+    const inputs = [];
+    const visit = node => { if (node?.tag === "input") inputs.push(node); node?.children?.flat(Infinity).forEach(visit); };
+    visit(panel);
+    assert.equal(inputs[0].attrs.checked, checked);
+    assert.equal(inputs[0].attrs.disabled, enabled);
+    assert.equal(context.state.hideOfficialModels, preference);
+  }
+});
+
 test("同步警告的恢復標記與時間在三種語言正確顯示，未恢復時不顯示", () => {
   const renderer = script.slice(script.indexOf("function routerErrorMessage("), script.indexOf("function renderEnvironmentPanel("));
   for (const [language, label] of [["zh-TW", "已恢復"], ["zh-CN", "已恢复"], ["en-US", "Recovered"]]) {

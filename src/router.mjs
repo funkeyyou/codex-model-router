@@ -308,9 +308,9 @@ const catalogRefreshEnabled = settings.catalogRefresh !== false;
 
 // 只調整回傳給選擇器的 visibility，不把隱藏狀態寫進官方目錄備份。
 // 關閉後即使離線也能恢復原清單；沒有可選自訂模型時保留官方選項。
-export function applyOfficialModelVisibility(catalog, hidden = false) {
+export function applyOfficialModelVisibility(catalog, hidden = false, apiKeyMode = false) {
   const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
-  if (!hidden || !catalog.models.some(model => isCustom(model) && model.visibility === "list")) return catalog;
+  if (!apiKeyMode && (!hidden || !catalog.models.some(model => isCustom(model) && model.visibility === "list"))) return catalog;
   return { ...catalog, models: catalog.models.map(model =>
     isCustom(model) ? model : { ...model, visibility: "hide" }) };
 }
@@ -3903,7 +3903,7 @@ const server = http.createServer(async (request, response) => {
       const catalog = await refreshOfficialCatalog(request.headers, incomingUrl.searchParams);
       response.setHeader("cache-control", "no-store");
       writeJson(response, 200, applyOfficialModelVisibility(catalog,
-        !isQuotaModeRequest(request.headers) && officialModelsHidden()));
+        officialModelsHidden(), isQuotaModeRequest(request.headers)));
       return;
     }
     if (

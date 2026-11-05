@@ -781,7 +781,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "隱藏官方模型選項": "Hide official models in the picker",
 "只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。": "In ChatGPT account mode, hide official models from the model picker while keeping your sign-in, existing tasks, and automatic catalog updates. Turn this off to restore them.",
 "此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。": "This does not disable official models; existing tasks and background tasks still use their configured models.",
-"API Key 模式下不適用；切回 ChatGPT 帳號模式後可調整，原本的選擇會保留。": "Not applicable in API key mode. Switch back to ChatGPT account mode to change this setting; your selection is kept.",
+"API Key 模式自動隱藏無法使用的官方模型；切回 ChatGPT 帳號模式後恢復原本的選擇。": "API key mode automatically hides unavailable official models. Switching back to ChatGPT account mode restores your previous preference.",
 "設定官方模型選項": "Set official model visibility",
 "儲存後請重新啟動 {app}，讓模型選單重新載入。": "Restart {app} after saving to reload the model picker.",
 "已開啟「隱藏官方模型選項」；下列勾選會保留，關閉該開關後才會顯示。": "Hide official models in the picker is on. The selections below are saved and will appear after you turn it off.",
@@ -3227,8 +3227,8 @@ function renderQuotaModePanel(blocked) {
 
 function renderOfficialModelVisibilityPanel(blocked) {
   const quota = state && state.installed ? state.quotaMode : null;
-  const hidden = state?.hideOfficialModels === true;
   const apiKeyMode = quota?.enabled === true;
+  const hidden = apiKeyMode || state?.hideOfficialModels === true;
   const noModels = !quota?.customModelCount;
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
     h("h2", { text: t("隱藏官方模型選項") })));
@@ -3246,7 +3246,7 @@ function renderOfficialModelVisibilityPanel(blocked) {
     paragraph(t("此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。"), "note"),
     noModels ? paragraph(t("請先添加第三方模型。"), "note warn") : null,
     paragraph(apiKeyMode
-      ? t("API Key 模式下不適用；切回 ChatGPT 帳號模式後可調整，原本的選擇會保留。")
+      ? t("API Key 模式自動隱藏無法使用的官方模型；切回 ChatGPT 帳號模式後恢復原本的選擇。")
       : t("儲存後請重新啟動 {app}，讓模型選單重新載入。", { app: desktopName() }), "note")));
   return panel;
 }
