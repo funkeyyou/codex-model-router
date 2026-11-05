@@ -150,18 +150,25 @@ function languageModule({ languages = ["en-US"], language = languages[0], prefer
 test("首次使用沒有模型也能開啟 API Key 模式，既有 Key 與寫入封鎖仍停用按鈕", () => {
   const renderer = script.slice(script.indexOf("function renderQuotaModePanel("), script.indexOf("function renderOfficialModelVisibilityPanel("));
   const settings = script.slice(script.indexOf("function renderSettings("), script.indexOf("function renderCodexConnection("));
+  const setup = script.slice(script.indexOf("function renderSetupSettings("), script.indexOf("// ---- 總覽"));
+  const dispatch = script.slice(script.indexOf("function renderView("), script.indexOf("function pageHead("));
   for (const language of ["zh-TW", "zh-CN", "en-US"]) {
     const context = vm.createContext({ ...languageModule({ languages: [language] }),
       state: { installed: false, quotaMode: { enabled: false, login: "none", consistent: true, customModelCount: 0 } },
       codexAvailable: () => true, codexConnected: () => false, desktopName: () => "Codex",
+      currentView: "settings", document: { getElementById: () => ({ replaceChildren(...children) { context.rendered = children; } }) },
+      renderGlobalContextPanel: () => ({ text: "context-setting" }), renderHiddenModelsPanel: () => ({ text: "hidden-setting" }),
       pageHead: () => null, paragraph: text => ({ text }), icon: () => null,
       h(tag, attrs, ...children) { return { tag, attrs, children, append(...items) { this.children.push(...items); } }; },
     });
-    vm.runInContext(renderer + settings, context);
+    vm.runInContext(renderer + settings + setup + dispatch, context);
     for (const [login, blocked, disabled] of [["none", false, false], ["apikey", false, true], ["none", true, true]]) {
       context.state.quotaMode.login = login;
       context.state.writeBlocked = blocked;
-      const panel = vm.runInContext("renderSettings()[1]", context);
+      vm.runInContext("renderView()", context);
+      const panel = context.rendered[1];
+      assert.equal(context.rendered[2].text, "context-setting");
+      assert.equal(context.rendered[3].text, "hidden-setting");
       const buttons = [];
       const visit = node => { if (node?.tag === "button") buttons.push(node); node?.children?.flat(Infinity).forEach(visit); };
       visit(panel);

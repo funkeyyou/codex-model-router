@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.2";
+const INSTALLER_VERSION = "1.41.3";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -18587,7 +18587,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "連接供應商": "Connect a provider",
 "調整全域上下文": "Adjust global context",
 "連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。": "Connecting a provider installs the router; you can add more providers, relay image generation and backup keys afterwards. Prefer the terminal? Run the installer with menu to use the terminal menu.",
-"尚未連接供應商，這裡只能調整不需要路由器的設定。": "No provider is connected yet, so only settings that don't need the router are available here.",
+"尚未連接供應商，可先開啟 API Key 模式或調整全域上下文。": "No provider is connected yet. You can enable API key mode or adjust the global context first.",
 "首次設定": "First-time setup",
 "僅備用 Key": "Backup key only",
 "主 Key 沒有這個模型；路由器會固定用有它的備用 Key。": "The primary key doesn't have this model, so the router always uses a backup key that does.",
@@ -19317,8 +19317,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -19991,6 +19991,7 @@ function renderWelcome() {
       h("div", { class: "actions" },
         h("button", { type: "button", class: "button primary", disabled: Boolean(blocked), onclick: () => openAddProvider({ firstInstall: true }) },
           icon("plus"), t("連接供應商")),
+        codexAvailable() ? h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("key"), t("API Key 模式")) : null,
         codexAvailable() ? h("button", { type: "button", class: "button", onclick: () => switchView("settings") }, icon("settings"), t("調整全域上下文")) : null),
       paragraph(t("連接供應商時會安裝路由器；之後可以再新增其他供應商、中轉生圖與備用 Key。偏好終端操作的話，執行安裝器時加上 menu 即可使用終端選單。"), "muted"))];
 }
@@ -19998,7 +19999,8 @@ function renderWelcome() {
 function renderSetupSettings() {
   if (!codexAvailable()) return renderCodexConnection();
   return [
-    pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，這裡只能調整不需要路由器的設定。")),
+    pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，可先開啟 API Key 模式或調整全域上下文。")),
+    renderQuotaModePanel(Boolean(state.writeBlocked || state.setupBlocked)),
     renderGlobalContextPanel(!codexAvailable()),
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
     renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
@@ -21131,10 +21133,7 @@ function confirmDisableImagegen() {
 // ---- 設定：全域上下文、隱藏的官方模型 --------------------------------------------
 
 function renderSettings() {
-  if (codexAvailable() && state && !state.installed) return [
-    pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
-    renderQuotaModePanel(Boolean(state.writeBlocked)),
-  ];
+  if (state && !state.installed) return renderSetupSettings();
   if (!codexAvailable() || !codexConnected()) return renderCodexConnection();
   const blocked = writeBlocked();
   return [
