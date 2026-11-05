@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.1";
+const INSTALLER_VERSION = "1.41.2";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3538,7 +3538,7 @@ function verifyLoginForCodex() {
 
 // 安裝時沒有登入任何帳號：預設開啟 API Key 模式，第三方模型不必登入 ChatGPT 也能用。
 async function enableApiKeyModeIfLoggedOut(login) {
-  if (login !== "none" || testMode) return false;
+  if (login !== "none") return false;
   console.log("\n偵測到 Codex 尚未登入帳號，正在開啟 API Key 模式…");
   try {
     await enableQuotaMode({ allowLoggedOut: true });
@@ -4038,6 +4038,7 @@ async function install(preset = null) {
   writeServiceDefinition();
 
   let configChanged = false;
+  let apiKeyMode = false;
   try {
     startService();
     removeLegacyLauncher();
@@ -4085,11 +4086,17 @@ async function install(preset = null) {
       ...(entrySource?.managerMcpEntry ? { managerMcpEntry: entrySource.managerMcpEntry } : {}),
     }, providers);
     writeJsonAtomic(manifestPath, manifest);
+    // 未登入時 model/list 不會向路由器探索；先建立本機登入與目錄再驗證。
+    if (login === "none") {
+      await enableQuotaMode({ allowLoggedOut: true });
+      apiKeyMode = true;
+    }
     await waitForPickerModels(allRoutes,
       existingRoutes.map(route => route.pickerSlug).filter(slug => !allRoutes.some(route => route.pickerSlug === slug)),
       existingRoutes);
   } catch (error) {
     invalidatePickerCacheAfterFailure();
+    if (apiKeyMode) await disableQuotaMode({ quiet: true });
     if (configChanged && !existingManifest) {
       try {
         await writeConfigEdits(rollbackEdits(previousConfig));
@@ -4177,8 +4184,6 @@ async function install(preset = null) {
   if (existsSync(managerRecordPath)) rmSync(managerRecordPath, { force: true });
   // 網頁首次設定不能在終端提問；中轉生圖改由管理頁的「生圖」頁設定。
   if (!preset) await offerInstalledRelayImagegen();
-  // bare 安裝此時還沒有模型；由呼叫端寫入 Claude 訂閱模型後再開啟。
-  const apiKeyMode = preset?.bare ? false : await enableApiKeyModeIfLoggedOut(login);
   return { added: routes.map(summarizeRoute), backupKeys: backupResult, apiKeyMode, restartDesktop: useCodex };
 }
 
@@ -6862,6 +6867,7 @@ async function managerState() {
       versions: { manager: INSTALLER_VERSION, installed: terminalSafeText(record?.version, 32) || null },
       setupBlocked: null,
       codex: { available: Boolean(codexBin), connected: false },
+      quotaMode: codexBin ? quotaModeStatus() : null,
       providerPresets: PROVIDER_PRESETS, providers: [], models: [],
       desktop: { name: desktop?.name || desktopAppName, canRestart: codexIntegrationEnabled() && Boolean(desktop) },
     };
@@ -8045,7 +8051,6 @@ export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
     if (verifyLogin() !== "none") fail("Codex 的 ChatGPT 登入資訊存放在系統鑰匙圈，API Key 模式無法自動切換與還原。");
     if (!allowLoggedOut) fail("Codex 目前沒有登入帳號。");
   }
-  if (!settings.routes.length) fail("尚未添加任何第三方模型。請先新增供應商與模型。");
   const port = Number(settings.port ?? manifest.port);
   await waitForHealth(port);
   const config = await assertRouterConfigured(port);
@@ -8246,9 +8251,15 @@ function managerUsage({ limit = 300, sinceHours = 24 } = {}) {
 
 async function managerSetQuotaMode({ enabled } = {}) {
   requireCodexIntegration();
-  assertManagerWritable();
+  if (readManifest() || enabled !== true) assertManagerWritable();
   if (typeof enabled !== "boolean") fail("請指定要開啟或關閉 API Key 模式。");
-  if (enabled) return enableQuotaMode();
+  if (enabled) {
+    if (!readManifest()) {
+      await install({ bare: true });
+      if (quotaModeEnabled()) return { changed: true, enabled: true, restartDesktop: true };
+    }
+    return enableQuotaMode();
+  }
   // 開啟前本來就沒有登入：先帶使用者登入 ChatGPT，登入成功才關閉模式；
   // 登入失敗或取消時什麼都不改，第三方模型照常可用。
   if (readQuotaMode()?.previousLogin === "none" && !existsSync(quotaAuthBackupPath)) {
@@ -18919,6 +18930,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "全域上下文必須是 16,000～4,000,000 之間的整數。": "Global context must be an integer between 16,000 and 4,000,000.",
 "設定全域上下文": "Set global context",
 "API Key 模式": "API key mode",
+"尚未添加模型；可先開啟 API Key 模式，再到供應商頁添加模型。": "No models added yet. You can enable API key mode first, then add models on the Providers page.",
 "隱藏官方模型選項": "Hide official models in the picker",
 "只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。": "In ChatGPT account mode, hide official models from the model picker while keeping your sign-in, existing tasks, and automatic catalog updates. Turn this off to restore them.",
 "此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。": "This does not disable official models; existing tasks and background tasks still use their configured models.",
@@ -21119,6 +21131,10 @@ function confirmDisableImagegen() {
 // ---- 設定：全域上下文、隱藏的官方模型 --------------------------------------------
 
 function renderSettings() {
+  if (codexAvailable() && state && !state.installed) return [
+    pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
+    renderQuotaModePanel(Boolean(state.writeBlocked)),
+  ];
   if (!codexAvailable() || !codexConnected()) return renderCodexConnection();
   const blocked = writeBlocked();
   return [
@@ -21333,7 +21349,7 @@ function renderKeysmithPanel(blocked) {
 }
 
 function renderQuotaModePanel(blocked) {
-  const quota = state && state.installed ? state.quotaMode : null;
+  const quota = state ? state.quotaMode : null;
   const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
   if (!quota) {
     panel.append(h("div", { class: "panel-body setting-body" }, paragraph(t("請先添加第三方模型。"), "muted")));
@@ -21352,11 +21368,11 @@ function renderQuotaModePanel(blocked) {
     quota.consistent ? null : paragraph(t("Codex 目前的登入方式與這個模式不一致（可能在 Codex 裡重新登入過）。請重新開啟或關閉一次。"), "note warn"),
     !on && quota.login === "none" ? paragraph(t("Codex 目前沒有登入帳號；開啟後不必登入也能使用第三方模型，或直接登入 ChatGPT 帳號。"), "note warn") : null,
     ownKey ? paragraph(t("Codex 目前以您自己的 OpenAI API Key 登入，請先在 Codex 登出後再開啟。"), "note") : null,
-    !on && noModels ? paragraph(t("請先添加第三方模型。"), "note warn") : null,
+    noModels ? paragraph(t("尚未添加模型；可先開啟 API Key 模式，再到供應商頁添加模型。"), "note") : null,
     h("div", { class: "actions" }, on
       ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => confirmQuotaMode(false, quota.previousLogin) }, icon("power"),
         quota.previousLogin === "none" ? t("關閉並登入 ChatGPT") : t("關閉 API Key 模式"))
-      : h("button", { type: "button", class: "button primary", disabled: blocked || noModels || ownKey, onclick: () => confirmQuotaMode(true) }, icon("power"), t("開啟 API Key 模式")),
+      : h("button", { type: "button", class: "button primary", disabled: blocked || ownKey, onclick: () => confirmQuotaMode(true) }, icon("power"), t("開啟 API Key 模式")),
       !on && quota.login === "none"
         ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => runJob("chatgpt-login", {}, { title: t("登入 ChatGPT 帳號") }) }, icon("key"), t("登入 ChatGPT 帳號"))
         : null)));

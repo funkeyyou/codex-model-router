@@ -147,6 +147,29 @@ function languageModule({ languages = ["en-US"], language = languages[0], prefer
     "\n({ matchLanguage, browserLanguage, t, toSimplified, serverText, logText, joinList, sectionTitle, locale })", context);
 }
 
+test("首次使用沒有模型也能開啟 API Key 模式，既有 Key 與寫入封鎖仍停用按鈕", () => {
+  const renderer = script.slice(script.indexOf("function renderQuotaModePanel("), script.indexOf("function renderOfficialModelVisibilityPanel("));
+  const settings = script.slice(script.indexOf("function renderSettings("), script.indexOf("function renderCodexConnection("));
+  for (const language of ["zh-TW", "zh-CN", "en-US"]) {
+    const context = vm.createContext({ ...languageModule({ languages: [language] }),
+      state: { installed: false, quotaMode: { enabled: false, login: "none", consistent: true, customModelCount: 0 } },
+      codexAvailable: () => true, codexConnected: () => false, desktopName: () => "Codex",
+      pageHead: () => null, paragraph: text => ({ text }), icon: () => null,
+      h(tag, attrs, ...children) { return { tag, attrs, children, append(...items) { this.children.push(...items); } }; },
+    });
+    vm.runInContext(renderer + settings, context);
+    for (const [login, blocked, disabled] of [["none", false, false], ["apikey", false, true], ["none", true, true]]) {
+      context.state.quotaMode.login = login;
+      context.state.writeBlocked = blocked;
+      const panel = vm.runInContext("renderSettings()[1]", context);
+      const buttons = [];
+      const visit = node => { if (node?.tag === "button") buttons.push(node); node?.children?.flat(Infinity).forEach(visit); };
+      visit(panel);
+      assert.equal(buttons[0].attrs.disabled, disabled);
+    }
+  }
+});
+
 test("同步警告的恢復標記與時間在三種語言正確顯示，未恢復時不顯示", () => {
   const renderer = script.slice(script.indexOf("function routerErrorMessage("), script.indexOf("function renderEnvironmentPanel("));
   for (const [language, label] of [["zh-TW", "已恢復"], ["zh-CN", "已恢复"], ["en-US", "Recovered"]]) {

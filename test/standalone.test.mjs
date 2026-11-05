@@ -218,6 +218,55 @@ test("獨立安裝後偵測到 Codex 不自動改設定；明確連接可用真�
   `, { noCodex: false });
 });
 
+for (const bare of [false, true]) {
+  for (const failValidation of [false, true]) {
+    test(`未登入首次安裝：bare=${bare}，rollback=${failValidation}`, {
+      skip: !codexBin && "需要 Codex CLI", timeout: 90000,
+    }, async t => {
+      const api = await upstream(t);
+      await runScenario(t, `
+      await installManagerOnly();
+      verifyLoginForCodex = () => "none";
+      const original = (await readUserConfig()).config;
+      assert.equal((await managerState()).quotaMode.login, "none");
+      assert.equal((await managerState()).quotaMode.customModelCount, 0);
+      const validate = waitForPickerModels;
+      waitForPickerModels = async (...args) => {
+        assert.equal(quotaModeEnabled(), true, "驗證模型清單之前必須完成登入");
+        if (${failValidation}) throw new Error("fixture-picker-failed");
+        return validate(...args);
+      };
+      const perform = async () => {
+        if (${bare}) return managerSetQuotaMode({ enabled: true });
+        const draft = await managerProviderDraft({ baseUrl: ${JSON.stringify(api.baseUrl)}, apiKey: "fixture-key" });
+        return managerFirstInstall({ draftId: draft.draftId, models: ["claude-opus-fixture"] });
+      };
+      if (${failValidation}) {
+        await assert.rejects(perform(), /fixture-picker-failed/);
+        assert.equal(readManifest(), null);
+        assert.equal(quotaModeEnabled(), false);
+        assert.equal(existsSync(codexAuthPath), false);
+        assert.deepEqual((await readUserConfig()).config, original);
+      } else {
+        await perform();
+        assert.equal(quotaModeEnabled(), true);
+        assert.equal(readQuotaMode().previousLogin, "none");
+        assert.equal((await codexRpc("account/read", { refreshToken: false })).account.type, "apiKey");
+        if (${bare}) {
+          assert.equal(readSettingsIfExists().routes.length, 0);
+          const draft = await managerProviderDraft({ baseUrl: ${JSON.stringify(api.baseUrl)}, apiKey: "fixture-key" });
+          await managerAddProvider({ draftId: draft.draftId, providerId: "fixture", models: ["claude-opus-fixture"] });
+          await validate(readSettingsIfExists().routes);
+        }
+        await uninstallRouter(readManifest(), { deleteKeys: async () => false });
+        assert.equal(existsSync(codexAuthPath), false);
+        assert.deepEqual((await readUserConfig()).config, original);
+      }
+      `, { noCodex: false });
+    });
+  }
+}
+
 for (const failValidation of [false, true]) {
   test(`獨立安裝連接未登入的 Codex：${failValidation ? "清單驗證失敗會還原設定與登入檔" : "先啟用 API Key 模式再驗證模型清單"}`, {
     skip: !codexBin && "需要 Codex CLI", timeout: 90000,
