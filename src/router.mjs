@@ -307,10 +307,12 @@ function recordImageBudget(result) {
 const catalogRefreshEnabled = settings.catalogRefresh !== false;
 
 // 只調整回傳給選擇器的 visibility，不把隱藏狀態寫進官方目錄備份。
-// 關閉後即使離線也能恢復原清單；沒有可選自訂模型時保留官方選項。
+// 關閉後即使離線也能恢復原清單；帳號模式沒有可選自訂模型時保留官方選項。
+// API Key 模式排除官方項目，避免 includeHidden:true 的桌面版仍列出無法使用的模型。
 export function applyOfficialModelVisibility(catalog, hidden = false, apiKeyMode = false) {
   const isCustom = (model) => String(model?.slug || "").startsWith("custom/");
-  if (!apiKeyMode && (!hidden || !catalog.models.some(model => isCustom(model) && model.visibility === "list"))) return catalog;
+  if (apiKeyMode) return { ...catalog, models: catalog.models.filter(isCustom) };
+  if (!hidden || !catalog.models.some(model => isCustom(model) && model.visibility === "list")) return catalog;
   return { ...catalog, models: catalog.models.map(model =>
     isCustom(model) ? model : { ...model, visibility: "hide" }) };
 }

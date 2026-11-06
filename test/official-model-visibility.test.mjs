@@ -35,14 +35,25 @@ test("沒有可選自訂模型時保留官方選項，避免刪除最後一個�
   assert.equal(router.applyOfficialModelVisibility(onlyOfficial, true), onlyOfficial);
 });
 
-test("API Key 模式即使尚無自訂模型仍隱藏官方項目，來源與帳號偏好不變", () => {
-  for (const source of [catalog, catalogWithoutCustom()]) {
+test("API Key 模式移除官方項目而非只標成隱藏，來源與自訂能力不變", () => {
+  const hiddenCustom = { ...catalog, models: [...catalog.models, model("custom/hidden", "hide")] };
+  for (const source of [catalog, hiddenCustom]) {
     const snapshot = structuredClone(source);
     const hidden = installer.apiKeyCatalog(source);
     assert.deepEqual(hidden, router.applyOfficialModelVisibility(source, false, true));
-    assert.ok(hidden.models.filter(model => !model.slug.startsWith("custom/")).every(model => model.visibility === "hide"));
+    assert.deepEqual(hidden.models, source.models.filter(model => model.slug.startsWith("custom/")));
     assert.deepEqual(source, snapshot);
   }
+});
+
+test("尚無自訂模型時保留全隱藏的非空靜態目錄，避免 Codex 拒絕啟動", () => {
+  const source = catalogWithoutCustom();
+  const snapshot = structuredClone(source);
+  const result = installer.apiKeyCatalog(source);
+  assert.equal(result.models.length, source.models.length);
+  assert.ok(result.models.every(model => model.visibility === "hide"));
+  assert.deepEqual(router.applyOfficialModelVisibility(source, false, true).models, []);
+  assert.deepEqual(source, snapshot);
 });
 
 function catalogWithoutCustom() {
@@ -96,8 +107,12 @@ for (const mode of ["online", "offline", "sync-disabled"]) {
     writeFileSync(join(dir, "quota-mode.json"), JSON.stringify({ enabled: true,
       keySha256: createHash("sha256").update(localKey).digest("hex") }));
     update(true);
-    const response = await realFetch(origin + "/models?client_version=0.157.0", { headers: { authorization: `Bearer ${localKey}` } });
-    assert.deepEqual(await response.json(), running.applyOfficialModelVisibility(saved, true, true));
+    for (const endpoint of ["/models?client_version=0.157.0", "/v1/models?client_version=0.157.0"]) {
+      const response = await realFetch(origin + endpoint, { headers: { authorization: `Bearer ${localKey}` } });
+      const result = await response.json();
+      assert.deepEqual(result, running.applyOfficialModelVisibility(saved, true, true));
+      assert.deepEqual(result.models.map(model => model.slug), ["custom/test"]);
+    }
     assert.equal(readFileSync(path, "utf8"), offlineBackup);
     assert.equal(fetches, mode === "sync-disabled" ? 0 : 2);
   });

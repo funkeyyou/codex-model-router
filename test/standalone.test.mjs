@@ -253,12 +253,30 @@ for (const bare of [false, true]) {
         assert.equal(readQuotaMode().previousLogin, "none");
         assert.equal((await codexRpc("account/read", { refreshToken: false })).account.type, "apiKey");
         const assertHidden = async () => {
-          const listed = await codexRpc("model/list", { includeHidden: true });
-          assert.ok(listed.data.filter(model => !model.id.startsWith("custom/")).every(model => model.hidden));
-          assert.ok(listed.data.filter(model => model.id.startsWith("custom/")).every(model => !model.hidden));
+          const expected = readSettingsIfExists().routes.map(route => route.pickerSlug).sort();
+          for (const includeHidden of [false, true]) {
+            const listed = await codexRpc("model/list", { includeHidden });
+            if (!expected.length && includeHidden) {
+              assert.ok(listed.data.length > 0);
+              assert.ok(listed.data.every(model => model.hidden));
+            } else {
+              assert.deepEqual(listed.data.map(model => model.id).sort(), expected);
+              assert.ok(listed.data.every(model => !model.hidden));
+            }
+          }
           assert.ok(readCatalogIfExists().models.some(model => !model.slug.startsWith("custom/") && model.visibility === "list"));
         };
         await assertHidden();
+        if (!${bare}) {
+          // 舊版把官方模型標成 hide：includeHidden:true 仍會帶回它們。
+          writeJsonAtomic(apiKeyCatalogPath, { ...readCatalogIfExists(), models: readCatalogIfExists().models.map(model =>
+            model.slug.startsWith("custom/") ? model : { ...model, visibility: "hide" }) });
+          assert.ok((await codexRpc("model/list", { includeHidden: true })).data.some(model => !model.id.startsWith("custom/")));
+          const authBefore = readFileSync(codexAuthPath, "utf8");
+          await update();
+          assert.equal(readFileSync(codexAuthPath, "utf8"), authBefore);
+          await assertHidden();
+        }
         if (${bare}) {
           // 舊版 API Key 模式仍指向原始目錄：更新後遷移，不重建登入 Key。
           await writeConfigEdits([{ keyPath: "model_catalog_json", value: catalogPath }]);

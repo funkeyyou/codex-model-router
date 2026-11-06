@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.4";
+const INSTALLER_VERSION = "1.41.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -152,8 +152,11 @@ function writeJsonAtomic(path, value, mode = 0o600) {
 }
 
 export function apiKeyCatalog(catalog) {
-  return { ...catalog, models: catalog.models.map(model =>
-    String(model.slug).startsWith("custom/") ? model : { ...model, visibility: "hide" }) };
+  // 桌面版可用 includeHidden:true 讀取目錄；只標成 hide 仍會被列出。
+  // API Key 模式沒有官方推理權限，專用目錄只保留自訂項目，原始目錄留作帳號模式還原。
+  const custom = catalog.models.filter(model => String(model.slug).startsWith("custom/"));
+  // Codex 拒絕空的 model_catalog_json；尚未添加模型時保留隱藏目錄供初始化使用。
+  return { ...catalog, models: custom.length ? custom : catalog.models.map(model => ({ ...model, visibility: "hide" })) };
 }
 
 function shell(command, args, options = {}) {
@@ -4174,6 +4177,12 @@ export function removedDefaultModel(config, selectedSlugs) {
   return configured.present && selectedSlugs.includes(configured.value) ? configured.value : null;
 }
 
+function warnIfNoApiKeyModels(plan) {
+  if (quotaModeEnabled() && plan.settings.routes.length === 0) {
+    console.log("警告：刪除後將沒有可用模型。API Key 模式會保持開啟，官方模型仍無法使用；請重新添加第三方模型，或到 Codex 設定切回 ChatGPT 帳號模式。聊天記錄不會刪除。");
+  }
+}
+
 async function removeModels() {
   const manifest = readManifest();
   if (manifest?.version) assertInstallerNotOlder(manifest.version);
@@ -4217,7 +4226,10 @@ async function removeModels() {
   const defaultModel = removedDefaultModel(userConfig.config, selectedSlugs);
   console.log("\n即將刪除：");
   for (const route of preview.removed) console.log(`  - ${route.displayName || route.upstreamModel}`);
-  if (defaultModel) console.log("這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
+  warnIfNoApiKeyModels(preview);
+  if (defaultModel) console.log(quotaModeEnabled()
+    ? "這些模型包含全域預設模型；確認後會清除該預設，請重新選擇可用模型。"
+    : "這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
   console.log("使用上述模型的既有任務需切換到其他模型後才能繼續。");
   if (!(await confirm("確認刪除所選自訂模型？", false))) {
     console.log("未進行任何修改。");
@@ -4959,7 +4971,10 @@ async function removeProvider() {
   console.log(`\n即將移除供應商「${providerName(chosen)}」（${chosen.baseUrl}）與它的 ${preview.removedRoutes.length} 個模型：`);
   for (const route of preview.removedRoutes) console.log(`  - ${route.displayName || route.upstreamModel}`);
   if (providers[0].id === chosen.id) console.log(`移除後由「${providerName(preview.providers[0])}」擔任主要供應商。`);
-  if (defaultModel) console.log("這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
+  warnIfNoApiKeyModels(preview);
+  if (defaultModel) console.log(quotaModeEnabled()
+    ? "這些模型包含全域預設模型；確認後會清除該預設，請重新選擇可用模型。"
+    : "這些模型包含全域預設模型；確認後會清除該預設，讓 Codex 使用官方預設模型。");
   if (imagegenAffected) console.log("中轉 API 生圖使用這家供應商，會一併停用；之後可從選單重新設定。");
   console.log("使用上述模型的既有任務需切換到其他模型後才能繼續。");
   if (!(await confirm(`確認移除供應商「${providerName(chosen)}」？`, false))) {
@@ -7970,7 +7985,7 @@ export async function enableQuotaMode({ allowLoggedOut = true } = {}) {
     const expected = settings.routes.map((route) => route.pickerSlug);
     const listed = await codexRpc("model/list", { includeHidden: true },
       (result) => expected.every((slug) => result?.data?.some((model) => model.id === slug && model.hidden === false)) &&
-        result?.data?.filter(model => !model.id.startsWith("custom/")).every(model => model.hidden === true));
+        Array.isArray(result?.data) && result.data.every(model => model.id.startsWith("custom/") || (!expected.length && model.hidden === true)));
     const missing = expected.filter((slug) => !listed.data.some((model) => model.id === slug));
     if (missing.length) fail(`模型選單缺少第三方模型：${missing.join("、")}`);
   } catch (error) {

@@ -862,6 +862,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "關閉": "Close",
 "確定": "OK",
 "刪除模型": "Delete models",
+"刪除後將沒有可用模型。API Key 模式會保持開啟，官方模型仍無法使用；請重新添加第三方模型，或到 Codex 設定切回 ChatGPT 帳號模式。聊天記錄不會刪除。": "No usable models will remain. API key mode will stay on, and official models will still be unavailable. Add a third-party model again, or switch back to ChatGPT account mode in Codex settings. Your chat history will be kept.",
+"其中包含全域預設模型，刪除後會一併清除這個預設，請重新選擇可用模型。": "This includes the global default model, which will also be cleared. Select an available model afterward.",
 "調整模型順序": "Reorder models",
 "修改模型": "Edit model",
 "修改供應商": "Edit provider",
@@ -2680,7 +2682,10 @@ function confirmRemoveClaudeCli() {
     body: [
       paragraph(t("會刪除它的 {count} 個模型：", { count: models.length })),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", { text: model.displayName }))),
-      includesDefault ? banner("warn", "alert", t("其中包含全域預設模型，移除後會一併清除這個預設，改用官方預設模型。")) : null,
+      lastApiKeyModelWarning(models),
+      includesDefault ? banner("warn", "alert", state.quotaMode?.enabled
+        ? t("其中包含全域預設模型，刪除後會一併清除這個預設，請重新選擇可用模型。")
+        : t("其中包含全域預設模型，移除後會一併清除這個預設，改用官方預設模型。")) : null,
       paragraph(t("不會登出 Claude，也不會解除安裝 Claude CLI；之後可以從「新增供應商」重新連接。刪除前會自動備份，接著重新啟動路由器。"), "note"),
     ],
   }).then((ok) => {
@@ -3779,6 +3784,13 @@ function openAddModels(initialProviderId) {
   }
 }
 
+function lastApiKeyModelWarning(models) {
+  if (!state.quotaMode?.enabled || !models.length) return null;
+  const removed = new Set(models.map(model => model.slug));
+  if ((state.models || []).some(model => !removed.has(model.slug))) return null;
+  return banner("warn", "alert", t("刪除後將沒有可用模型。API Key 模式會保持開啟，官方模型仍無法使用；請重新添加第三方模型，或到 Codex 設定切回 ChatGPT 帳號模式。聊天記錄不會刪除。"));
+}
+
 function confirmRemoveModels(slugs) {
   const models = (state.models || []).filter((model) => slugs.includes(model.slug));
   if (models.length === 0) return;
@@ -3790,7 +3802,10 @@ function confirmRemoveModels(slugs) {
     body: [
       paragraph(t("以下模型會從 Codex 選擇器移除：")),
       h("ul", { class: "plain-list" }, models.map((model) => h("li", {}, model.displayName, h("span", { class: "faint mono", text: "  " + model.upstreamModel })))),
-      includesDefault ? banner("warn", "alert", t("其中包含全域預設模型，刪除後會一併清除這個預設，改用官方預設模型。")) : null,
+      lastApiKeyModelWarning(models),
+      includesDefault ? banner("warn", "alert", state.quotaMode?.enabled
+        ? t("其中包含全域預設模型，刪除後會一併清除這個預設，請重新選擇可用模型。")
+        : t("其中包含全域預設模型，刪除後會一併清除這個預設，改用官方預設模型。")) : null,
       paragraph(t("使用這些模型的既有任務需切換到其他模型才能繼續。刪除前會自動備份，接著重新啟動路由器。"), "note"),
     ],
   }).then(async (ok) => {
@@ -4133,6 +4148,7 @@ function confirmRemoveProvider(provider) {
       provider.primary && others[0] ? banner("info", "info", t("移除後由「{name}」擔任主要供應商。", { name: providerLabel(others[0].id) })) : null,
       includesDefault ? banner("warn", "alert", t("其中包含全域預設模型，移除後會一併清除這個預設。")) : null,
       imagegen ? banner("warn", "alert", t("中轉 API 生圖使用這家供應商，會一併停用；之後可在生圖頁重新設定。")) : null,
+      lastApiKeyModelWarning(models),
       h("label", { class: "check-line" }, deleteKey, h("span", { text: t("同時刪除這家的 API Key") })),
       paragraph(t("移除前會自動備份，接著重新啟動路由器。"), "note"),
     ],

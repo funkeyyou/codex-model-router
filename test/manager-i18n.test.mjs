@@ -197,6 +197,40 @@ test("API Key 模式強制勾選隱藏官方模型，切回帳號模式恢復偏
   }
 });
 
+test("API Key 模式刪光模型前提醒：模型、供應商與 Claude 訂閱皆涵蓋，取消不執行刪除", async () => {
+  const functions = [
+    ["function lastApiKeyModelWarning(", "function confirmRemoveModels("],
+    ["function confirmRemoveModels(", "// 上次 Fast"],
+    ["function confirmRemoveProvider(", "// ---- 重新啟動"],
+    ["function confirmRemoveClaudeCli(", "// 以下三個確認框"],
+  ].map(([start, end]) => script.slice(script.indexOf(start), script.indexOf(end, script.indexOf(start)))).join("\n");
+  for (const [language, warning] of [["zh-TW", "刪除後將沒有可用模型"], ["zh-CN", "删除后将没有可用模型"], ["en-US", "No usable models will remain"]]) {
+    const model = { slug: "custom/one", providerId: "one", transport: "claude-cli", displayName: "One", upstreamModel: "one" };
+    const context = vm.createContext({ ...languageModule({ languages: [language] }),
+      state: { models: [model], providers: [{ id: "one" }, { id: "empty" }], quotaMode: { enabled: true }, config: { model: model.slug } },
+      paragraph: text => ({ text }), banner: (kind, icon, text) => ({ kind, text }),
+      h: (tag, attrs, ...children) => ({ tag, attrs, children }), providerLabel: id => id,
+      confirmDialog: options => { context.dialog = options; return Promise.resolve(false); },
+      runJob: () => { assert.fail("取消後不應刪除模型"); },
+    });
+    vm.runInContext(functions, context);
+    for (const action of ["confirmRemoveModels(['custom/one'])", "confirmRemoveProvider({id:'one'})", "confirmRemoveClaudeCli()"]) {
+      for (const [enabled, extraModel, expected] of [[true, false, true], [false, false, false], [true, true, false]]) {
+        context.state.quotaMode.enabled = enabled;
+        context.state.models = extraModel ? [model, { slug: "custom/two", providerId: "two" }] : [model];
+        vm.runInContext(action, context);
+        await Promise.resolve();
+        const body = JSON.stringify(context.dialog.body);
+        assert.equal(body.includes(warning), expected, language + ": " + action);
+        if (enabled) assert.doesNotMatch(body, /改用官方預設模型|改用官方默认模型|official default model is used/);
+      }
+    }
+    context.state.models = [model];
+    vm.runInContext("confirmRemoveProvider({id:'empty'})", context);
+    assert.ok(!JSON.stringify(context.dialog.body).includes(warning), "移除沒有模型的供應商不誤報");
+  }
+});
+
 test("同步警告的恢復標記與時間在三種語言正確顯示，未恢復時不顯示", () => {
   const renderer = script.slice(script.indexOf("function routerErrorMessage("), script.indexOf("function renderEnvironmentPanel("));
   for (const [language, label] of [["zh-TW", "已恢復"], ["zh-CN", "已恢复"], ["en-US", "Recovered"]]) {
