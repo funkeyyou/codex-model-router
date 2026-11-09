@@ -765,6 +765,11 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "停用中轉 API 生圖": "Disable relay API image generation",
 "會把 $router-imagegen 技能封存到備份目錄，Codex 之後就不會再使用它；之後可以隨時重新偵測並啟用。": "The $router-imagegen skill is archived to the backup directory and Codex stops using it. You can test and enable it again at any time.",
 "停用中轉生圖": "Disable relay image generation",
+"第三方模型生圖保護": "Image generation protection for third-party models",
+"設定第三方上游生圖": "Set third-party upstream image generation",
+"部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。": "Some relays generate images on their own servers as soon as they recognize Codex, passing the reasoning effort as the image complexity. If their image model doesn't support it, the whole turn fails with “Complexity 'high' is not supported for this image model”.",
+"開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。": "When on, the router identifies itself with its own user agent for third-party GPT models, so images are made by Codex's built-in tool or $router-imagegen instead. Conversations, caching and official models are unaffected. Providers that only accept the Codex client automatically get the original identity back.",
+"立即生效，不必重新啟動。": "Takes effect immediately; no restart needed.",
 "影響所有模型的 Codex 設定。": "Codex settings that affect every model.",
 "重新整理全域上下文": "Refresh global context",
 "未設定": "Not set",
@@ -2915,6 +2920,7 @@ function renderImagegen() {
     statusPanel.append(h("div", { class: "panel-body" }, paragraph(t("尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。"), "muted")));
   }
   parts.push(statusPanel);
+  parts.push(renderUpstreamImageGuardPanel(info, blocked));
 
   const options = info.choices.map((choice) => {
     const box = h("input", { type: "checkbox", checked: imagegenDraft.models.has(choice.id), disabled: blocked });
@@ -2955,6 +2961,26 @@ function renderImagegen() {
             : h("span", { class: "result-bad" }, icon("alert"), serverText(check.error) || t("未通過"))))))))));
   }
   return parts;
+}
+
+// 部分中轉站看到 Codex 用戶端就在伺服器端代為生圖，並把思考深度當成圖片 complexity 送出，
+// 不支援的圖片模型會讓整輪失敗。開啟時路由器對第三方模型改用自己的 User-Agent。
+function renderUpstreamImageGuardPanel(info, blocked) {
+  const enabled = info.upstreamImageGuard !== false;
+  return h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("第三方模型生圖保護") })),
+    h("div", { class: "panel-body setting-body" },
+      h("label", { class: "check-line" }, h("input", {
+        type: "checkbox", checked: enabled, disabled: blocked, "aria-label": t("第三方模型生圖保護"),
+        onchange: (event) => {
+          const value = event.target.checked;
+          event.target.checked = enabled;
+          runJob("set-upstream-image-guard", { enabled: value }, { title: t("設定第三方上游生圖") });
+        },
+      }), h("span", { text: enabled ? t("已開啟") : t("未開啟") })),
+      paragraph(t("部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。"), "muted"),
+      paragraph(t("開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。"), "note"),
+      paragraph(t("立即生效，不必重新啟動。"), "note")));
 }
 
 function confirmImagegenSetup(info) {
@@ -3454,7 +3480,8 @@ function jobTitle(type, fallback) {
     "set-claude-desktop": t("設定 Claude Desktop 接入"),
     "connect-claude-desktop": t("一鍵接入 Claude Desktop"), "restore-claude-desktop": t("一鍵回退 Claude Desktop"),
     "chatgpt-login": t("登入 ChatGPT 帳號"),
-    "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
+    "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"),
+    "set-upstream-image-guard": t("設定第三方上游生圖"), "claude-cli-install": t("安裝 Claude CLI"),
     "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
     uninstall: t("解除安裝"),
   };

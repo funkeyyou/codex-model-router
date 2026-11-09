@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.5";
+const INSTALLER_VERSION = "1.41.6";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8098,6 +8098,34 @@ async function managerSetBackgroundModel({ kind, model } = {}) {
 }
 
 // --- 模型使用記錄 ----------------------------------------------------------------
+
+// --- 第三方上游代為生圖 ------------------------------------------------------------
+//
+// 部分中轉站看到 Codex 用戶端的 User-Agent 就在伺服器端替模型生圖，並把思考深度當成
+// 圖片 complexity，不支援的圖片模型會讓整輪失敗。預設開啟：路由器改用自己的
+// User-Agent，生圖交回 Codex 內建工具或 $router-imagegen。路由器依內容重讀，不必重新啟動；
+// 只有關閉時才寫檔。
+const upstreamImageGuardPath = join(installRoot, "upstream-image-guard.json");
+
+function readUpstreamImageGuard() {
+  try { return readJsonIfExists(upstreamImageGuardPath)?.enabled !== false; } catch { return true; }
+}
+
+async function managerSetUpstreamImageGuard({ enabled } = {}) {
+  assertManagerWritable();
+  requireInstallation();
+  if (typeof enabled !== "boolean") fail("請指定是否開啟。");
+  if (readUpstreamImageGuard() === enabled) {
+    console.log("設定沒有變更。");
+    return { changed: false, enabled };
+  }
+  if (enabled) rmSync(upstreamImageGuardPath, { force: true });
+  else writeJsonAtomic(upstreamImageGuardPath, { enabled: false, updatedAt: new Date().toISOString() });
+  console.log(enabled
+    ? "已開啟：第三方模型不再由上游代為生圖，不必重新啟動。"
+    : "已關閉：第三方模型的請求恢復原本的 Codex 用戶端識別，不必重新啟動。");
+  return { changed: true, enabled };
+}
 //
 // 路由器每一輪結束時把用量寫進 usage.jsonl（超過 5 MB 輪替成 usage.jsonl.1）。管理頁讀最近的
 // 記錄並彙整：各模型的請求數、token、快取命中率與耗時。只有數字與識別，沒有對話內容。
@@ -8319,6 +8347,7 @@ function relayImagegenStatus() {
   return {
     enabled: Boolean(config),
     error,
+    upstreamImageGuard: readUpstreamImageGuard(),
     models: Array.isArray(config?.models) ? config.models : [],
     upstreamModels: config?.upstreamModels || {},
     apiMode: config?.apiMode || null,
@@ -8821,6 +8850,7 @@ function managerOperations() {
       "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
       "imagegen-setup": job("偵測並啟用中轉生圖", managerImagegenSetup),
       "imagegen-disable": job("停用中轉生圖", managerImagegenDisable),
+      "set-upstream-image-guard": job("設定第三方上游生圖", managerSetUpstreamImageGuard),
       "claude-cli-install": job("安裝 Claude CLI", managerClaudeCliInstall),
       "claude-cli-update": job("更新 Claude CLI", managerClaudeCliUpdate),
       "claude-cli-login": job("登入 Claude 訂閱帳號", managerClaudeCliLogin),

@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.5";
+const INSTALLER_VERSION = "1.41.6";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8245,6 +8245,34 @@ async function managerSetBackgroundModel({ kind, model } = {}) {
 }
 
 // --- 模型使用記錄 ----------------------------------------------------------------
+
+// --- 第三方上游代為生圖 ------------------------------------------------------------
+//
+// 部分中轉站看到 Codex 用戶端的 User-Agent 就在伺服器端替模型生圖，並把思考深度當成
+// 圖片 complexity，不支援的圖片模型會讓整輪失敗。預設開啟：路由器改用自己的
+// User-Agent，生圖交回 Codex 內建工具或 $router-imagegen。路由器依內容重讀，不必重新啟動；
+// 只有關閉時才寫檔。
+const upstreamImageGuardPath = join(installRoot, "upstream-image-guard.json");
+
+function readUpstreamImageGuard() {
+  try { return readJsonIfExists(upstreamImageGuardPath)?.enabled !== false; } catch { return true; }
+}
+
+async function managerSetUpstreamImageGuard({ enabled } = {}) {
+  assertManagerWritable();
+  requireInstallation();
+  if (typeof enabled !== "boolean") fail("請指定是否開啟。");
+  if (readUpstreamImageGuard() === enabled) {
+    console.log("設定沒有變更。");
+    return { changed: false, enabled };
+  }
+  if (enabled) rmSync(upstreamImageGuardPath, { force: true });
+  else writeJsonAtomic(upstreamImageGuardPath, { enabled: false, updatedAt: new Date().toISOString() });
+  console.log(enabled
+    ? "已開啟：第三方模型不再由上游代為生圖，不必重新啟動。"
+    : "已關閉：第三方模型的請求恢復原本的 Codex 用戶端識別，不必重新啟動。");
+  return { changed: true, enabled };
+}
 //
 // 路由器每一輪結束時把用量寫進 usage.jsonl（超過 5 MB 輪替成 usage.jsonl.1）。管理頁讀最近的
 // 記錄並彙整：各模型的請求數、token、快取命中率與耗時。只有數字與識別，沒有對話內容。
@@ -8466,6 +8494,7 @@ function relayImagegenStatus() {
   return {
     enabled: Boolean(config),
     error,
+    upstreamImageGuard: readUpstreamImageGuard(),
     models: Array.isArray(config?.models) ? config.models : [],
     upstreamModels: config?.upstreamModels || {},
     apiMode: config?.apiMode || null,
@@ -8968,6 +8997,7 @@ function managerOperations() {
       "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
       "imagegen-setup": job("偵測並啟用中轉生圖", managerImagegenSetup),
       "imagegen-disable": job("停用中轉生圖", managerImagegenDisable),
+      "set-upstream-image-guard": job("設定第三方上游生圖", managerSetUpstreamImageGuard),
       "claude-cli-install": job("安裝 Claude CLI", managerClaudeCliInstall),
       "claude-cli-update": job("更新 Claude CLI", managerClaudeCliUpdate),
       "claude-cli-login": job("登入 Claude 訂閱帳號", managerClaudeCliLogin),
@@ -10540,6 +10570,9 @@ const stats = {
   lastImageProvider: null,
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
+  upstreamImageGuarded: 0,
+  codexUserAgentFallbacks: 0,
+  codexUserAgentProviders: [],
   translatedRequests: 0,
   claudeRefusals: 0,
   claudeEmptyResponses: 0,
@@ -11266,6 +11299,58 @@ export function buildCustomHeaders(requestHeaders, apiKey, target = null) {
   return headers;
 }
 
+// --- 第三方上游代為生圖 ---------------------------------------------------------
+//
+// 部分 Responses 相容中轉站一看到 Codex 用戶端的 User-Agent（Codex Desktop、codex_exec…），
+// 就在伺服器端替模型開啟生圖：請求裡沒有任何生圖工具，回應卻直接出現 image_generation_call，
+// 並把這一輪的思考深度當成圖片 complexity 送給後端圖片模型。不支援的圖片模型會拒絕，
+// 串流中途失敗成「Complexity 'high' is not supported for this image model.」，Codex 重試
+// 五次都一樣。換成路由器自己的 User-Agent 後，模型改走 Codex 內建的 image_gen 工具呼叫
+// （由 Codex 自己生圖）或 $router-imagegen，其他行為與快取命中不受影響。
+//
+// 只套用在 Responses 直通；Chat 轉譯與 /messages 沒有伺服器端生圖。只接受 Codex 用戶端
+// 的中轉站會回 401／403：同一把 Key 改用原本的 User-Agent 重送一次，成功就記住這家，
+// 之後直接沿用原本的 User-Agent。開關存在 upstream-image-guard.json，每次比對內容，不必重啟。
+const upstreamImageGuardPath = join(routerDirectory, "upstream-image-guard.json");
+let upstreamImageGuardCache = { raw: undefined, enabled: true };
+
+export function upstreamImageGuardEnabled() {
+  const raw = readSettingFile(upstreamImageGuardPath);
+  if (raw !== upstreamImageGuardCache.raw) {
+    let enabled = true;
+    if (raw !== null) {
+      try { enabled = JSON.parse(raw)?.enabled !== false; } catch { /* 損壞或寫到一半：維持預設開啟。 */ }
+    }
+    upstreamImageGuardCache = { raw, enabled };
+  }
+  return upstreamImageGuardCache.enabled;
+}
+
+export const ROUTER_USER_AGENT = `codex-model-router/${settings.version || "unknown"}`;
+const codexUserAgentProviders = new Set();
+
+export function routerUserAgentBuilder(onFallback = () => {}, base = buildCustomHeaders) {
+  const builder = (requestHeaders, apiKey, target) => {
+    const headers = base(requestHeaders, apiKey, target);
+    headers.set("user-agent", ROUTER_USER_AGENT);
+    return headers;
+  };
+  builder.fallback = base;
+  builder.onFallback = onFallback;
+  return builder;
+}
+
+function responsesHeaderBuilder(provider) {
+  if (!provider || !upstreamImageGuardEnabled() || codexUserAgentProviders.has(provider.id)) return buildCustomHeaders;
+  stats.upstreamImageGuarded += 1;
+  return routerUserAgentBuilder((accepted) => {
+    if (!accepted) return;
+    codexUserAgentProviders.add(provider.id);
+    stats.codexUserAgentFallbacks += 1;
+    stats.codexUserAgentProviders = [...codexUserAgentProviders];
+  });
+}
+
 function filteredResponseHeaders(upstreamHeaders) {
   const headers = {};
   for (const [name, value] of upstreamHeaders) {
@@ -11549,9 +11634,9 @@ export async function streamUpstream(upstream, response, history = null, respons
 // 單把 Key 的一次請求。上游回 401／403 時重讀這把 Key（可能剛在管理頁換過）；
 // 只有內容真的變了才重送，Key 本身無效時不會白白多打一次。
 async function fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder = buildCustomHeaders) {
-  const send = (apiKey) => fetch(target, {
+  const send = (apiKey, builder = headerBuilder) => fetch(target, {
     method: "POST",
-    headers: headerBuilder(headers, apiKey, target),
+    headers: builder(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
@@ -11562,7 +11647,15 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal, h
   } catch (error) {
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), { keyReadFailed: true });
   }
-  const upstream = await send(apiKey);
+  let upstream = await send(apiKey);
+  if ((upstream.status === 401 || upstream.status === 403) && headerBuilder.fallback) {
+    // 換了 User-Agent 被拒：先用原本的 User-Agent 重送，Key 本身沒問題時就不必動到 Key 輪替。
+    await upstream.arrayBuffer().catch(() => {});
+    const guarded = headerBuilder;
+    headerBuilder = guarded.fallback;
+    upstream = await send(apiKey, headerBuilder);
+    guarded.onFallback?.(upstream.status !== 401 && upstream.status !== 403);
+  }
   if (upstream.status !== 401 && upstream.status !== 403) return upstream;
   let reloaded;
   try { reloaded = await getApiKey(provider, true, slot); } catch { return upstream; }
@@ -11779,7 +11872,7 @@ export async function fetchModelUpstream(
       requestHeaders,
       outboundBody,
       signal,
-      { model: route.upstreamModel },
+      { model: route.upstreamModel, headerBuilder: responsesHeaderBuilder(provider) },
     );
     stats.lastCustomStatus = upstream.status;
     if (upstream.status === 400 || upstream.status === 422) {
@@ -13440,6 +13533,7 @@ const server = http.createServer(async (request, response) => {
         historyCache: historyCacheInfo(),
         providers: providerSummary,
         keyPools: keyPoolSummary(),
+        upstreamImageGuard: upstreamImageGuardEnabled(),
         stats,
       });
       return;
@@ -18963,6 +19057,11 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "停用中轉 API 生圖": "Disable relay API image generation",
 "會把 $router-imagegen 技能封存到備份目錄，Codex 之後就不會再使用它；之後可以隨時重新偵測並啟用。": "The $router-imagegen skill is archived to the backup directory and Codex stops using it. You can test and enable it again at any time.",
 "停用中轉生圖": "Disable relay image generation",
+"第三方模型生圖保護": "Image generation protection for third-party models",
+"設定第三方上游生圖": "Set third-party upstream image generation",
+"部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。": "Some relays generate images on their own servers as soon as they recognize Codex, passing the reasoning effort as the image complexity. If their image model doesn't support it, the whole turn fails with “Complexity 'high' is not supported for this image model”.",
+"開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。": "When on, the router identifies itself with its own user agent for third-party GPT models, so images are made by Codex's built-in tool or $router-imagegen instead. Conversations, caching and official models are unaffected. Providers that only accept the Codex client automatically get the original identity back.",
+"立即生效，不必重新啟動。": "Takes effect immediately; no restart needed.",
 "影響所有模型的 Codex 設定。": "Codex settings that affect every model.",
 "重新整理全域上下文": "Refresh global context",
 "未設定": "Not set",
@@ -21113,6 +21212,7 @@ function renderImagegen() {
     statusPanel.append(h("div", { class: "panel-body" }, paragraph(t("尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。"), "muted")));
   }
   parts.push(statusPanel);
+  parts.push(renderUpstreamImageGuardPanel(info, blocked));
 
   const options = info.choices.map((choice) => {
     const box = h("input", { type: "checkbox", checked: imagegenDraft.models.has(choice.id), disabled: blocked });
@@ -21153,6 +21253,26 @@ function renderImagegen() {
             : h("span", { class: "result-bad" }, icon("alert"), serverText(check.error) || t("未通過"))))))))));
   }
   return parts;
+}
+
+// 部分中轉站看到 Codex 用戶端就在伺服器端代為生圖，並把思考深度當成圖片 complexity 送出，
+// 不支援的圖片模型會讓整輪失敗。開啟時路由器對第三方模型改用自己的 User-Agent。
+function renderUpstreamImageGuardPanel(info, blocked) {
+  const enabled = info.upstreamImageGuard !== false;
+  return h("div", { class: "panel" },
+    h("div", { class: "panel-head" }, h("h2", { text: t("第三方模型生圖保護") })),
+    h("div", { class: "panel-body setting-body" },
+      h("label", { class: "check-line" }, h("input", {
+        type: "checkbox", checked: enabled, disabled: blocked, "aria-label": t("第三方模型生圖保護"),
+        onchange: (event) => {
+          const value = event.target.checked;
+          event.target.checked = enabled;
+          runJob("set-upstream-image-guard", { enabled: value }, { title: t("設定第三方上游生圖") });
+        },
+      }), h("span", { text: enabled ? t("已開啟") : t("未開啟") })),
+      paragraph(t("部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。"), "muted"),
+      paragraph(t("開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。"), "note"),
+      paragraph(t("立即生效，不必重新啟動。"), "note")));
 }
 
 function confirmImagegenSetup(info) {
@@ -21652,7 +21772,8 @@ function jobTitle(type, fallback) {
     "set-claude-desktop": t("設定 Claude Desktop 接入"),
     "connect-claude-desktop": t("一鍵接入 Claude Desktop"), "restore-claude-desktop": t("一鍵回退 Claude Desktop"),
     "chatgpt-login": t("登入 ChatGPT 帳號"),
-    "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"), "claude-cli-install": t("安裝 Claude CLI"),
+    "imagegen-setup": t("偵測並啟用中轉生圖"), "imagegen-disable": t("停用中轉生圖"),
+    "set-upstream-image-guard": t("設定第三方上游生圖"), "claude-cli-install": t("安裝 Claude CLI"),
     "claude-cli-update": t("更新 Claude CLI"), "claude-cli-login": t("登入 Claude 訂閱帳號"), "claude-cli-add": t("添加 Claude 訂閱模型"),
     uninstall: t("解除安裝"),
   };

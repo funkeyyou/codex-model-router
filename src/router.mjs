@@ -993,6 +993,9 @@ const stats = {
   lastImageProvider: null,
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
+  upstreamImageGuarded: 0,
+  codexUserAgentFallbacks: 0,
+  codexUserAgentProviders: [],
   translatedRequests: 0,
   claudeRefusals: 0,
   claudeEmptyResponses: 0,
@@ -1719,6 +1722,58 @@ export function buildCustomHeaders(requestHeaders, apiKey, target = null) {
   return headers;
 }
 
+// --- 第三方上游代為生圖 ---------------------------------------------------------
+//
+// 部分 Responses 相容中轉站一看到 Codex 用戶端的 User-Agent（Codex Desktop、codex_exec…），
+// 就在伺服器端替模型開啟生圖：請求裡沒有任何生圖工具，回應卻直接出現 image_generation_call，
+// 並把這一輪的思考深度當成圖片 complexity 送給後端圖片模型。不支援的圖片模型會拒絕，
+// 串流中途失敗成「Complexity 'high' is not supported for this image model.」，Codex 重試
+// 五次都一樣。換成路由器自己的 User-Agent 後，模型改走 Codex 內建的 image_gen 工具呼叫
+// （由 Codex 自己生圖）或 $router-imagegen，其他行為與快取命中不受影響。
+//
+// 只套用在 Responses 直通；Chat 轉譯與 /messages 沒有伺服器端生圖。只接受 Codex 用戶端
+// 的中轉站會回 401／403：同一把 Key 改用原本的 User-Agent 重送一次，成功就記住這家，
+// 之後直接沿用原本的 User-Agent。開關存在 upstream-image-guard.json，每次比對內容，不必重啟。
+const upstreamImageGuardPath = join(routerDirectory, "upstream-image-guard.json");
+let upstreamImageGuardCache = { raw: undefined, enabled: true };
+
+export function upstreamImageGuardEnabled() {
+  const raw = readSettingFile(upstreamImageGuardPath);
+  if (raw !== upstreamImageGuardCache.raw) {
+    let enabled = true;
+    if (raw !== null) {
+      try { enabled = JSON.parse(raw)?.enabled !== false; } catch { /* 損壞或寫到一半：維持預設開啟。 */ }
+    }
+    upstreamImageGuardCache = { raw, enabled };
+  }
+  return upstreamImageGuardCache.enabled;
+}
+
+export const ROUTER_USER_AGENT = `codex-model-router/${settings.version || "unknown"}`;
+const codexUserAgentProviders = new Set();
+
+export function routerUserAgentBuilder(onFallback = () => {}, base = buildCustomHeaders) {
+  const builder = (requestHeaders, apiKey, target) => {
+    const headers = base(requestHeaders, apiKey, target);
+    headers.set("user-agent", ROUTER_USER_AGENT);
+    return headers;
+  };
+  builder.fallback = base;
+  builder.onFallback = onFallback;
+  return builder;
+}
+
+function responsesHeaderBuilder(provider) {
+  if (!provider || !upstreamImageGuardEnabled() || codexUserAgentProviders.has(provider.id)) return buildCustomHeaders;
+  stats.upstreamImageGuarded += 1;
+  return routerUserAgentBuilder((accepted) => {
+    if (!accepted) return;
+    codexUserAgentProviders.add(provider.id);
+    stats.codexUserAgentFallbacks += 1;
+    stats.codexUserAgentProviders = [...codexUserAgentProviders];
+  });
+}
+
 function filteredResponseHeaders(upstreamHeaders) {
   const headers = {};
   for (const [name, value] of upstreamHeaders) {
@@ -2002,9 +2057,9 @@ export async function streamUpstream(upstream, response, history = null, respons
 // 單把 Key 的一次請求。上游回 401／403 時重讀這把 Key（可能剛在管理頁換過）；
 // 只有內容真的變了才重送，Key 本身無效時不會白白多打一次。
 async function fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder = buildCustomHeaders) {
-  const send = (apiKey) => fetch(target, {
+  const send = (apiKey, builder = headerBuilder) => fetch(target, {
     method: "POST",
-    headers: headerBuilder(headers, apiKey, target),
+    headers: builder(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
@@ -2015,7 +2070,15 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal, h
   } catch (error) {
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), { keyReadFailed: true });
   }
-  const upstream = await send(apiKey);
+  let upstream = await send(apiKey);
+  if ((upstream.status === 401 || upstream.status === 403) && headerBuilder.fallback) {
+    // 換了 User-Agent 被拒：先用原本的 User-Agent 重送，Key 本身沒問題時就不必動到 Key 輪替。
+    await upstream.arrayBuffer().catch(() => {});
+    const guarded = headerBuilder;
+    headerBuilder = guarded.fallback;
+    upstream = await send(apiKey, headerBuilder);
+    guarded.onFallback?.(upstream.status !== 401 && upstream.status !== 403);
+  }
   if (upstream.status !== 401 && upstream.status !== 403) return upstream;
   let reloaded;
   try { reloaded = await getApiKey(provider, true, slot); } catch { return upstream; }
@@ -2232,7 +2295,7 @@ export async function fetchModelUpstream(
       requestHeaders,
       outboundBody,
       signal,
-      { model: route.upstreamModel },
+      { model: route.upstreamModel, headerBuilder: responsesHeaderBuilder(provider) },
     );
     stats.lastCustomStatus = upstream.status;
     if (upstream.status === 400 || upstream.status === 422) {
@@ -3893,6 +3956,7 @@ const server = http.createServer(async (request, response) => {
         historyCache: historyCacheInfo(),
         providers: providerSummary,
         keyPools: keyPoolSummary(),
+        upstreamImageGuard: upstreamImageGuardEnabled(),
         stats,
       });
       return;
