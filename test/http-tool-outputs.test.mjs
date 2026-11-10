@@ -8,19 +8,23 @@ const headers = { authorization: "Bearer fixture", "chatgpt-account-id": "fixtur
 const call = { type: "function_call", id: "fc_lookup", call_id: "call_lookup", name: "lookup", arguments: "{}" };
 const output = (extra = {}) => ({ type: "function_call_output", output: "result", ...extra });
 const route = { pickerSlug: "custom/gpt-test", upstreamModel: "ark/gpt-test", efforts: ["high"] };
+const delegation = (text = "task update", extra = {}) => output({ name: "create_thread", namespace: "codex_app",
+  output: `<codex_delegation>\n<source_thread_id>source-fixture</source_thread_id>\n<input>${text}</input>\n</codex_delegation>`, ...extra });
 
-test("unpaired forwarded output becomes a message, preserving text, images, files and JSON", () => {
-  const parts = ["forwarded message", { type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" },
-    { type: "input_file", file_id: "file_fixture" }, { type: "output_text", text: "detail" }, { nested: { value: 123 } }];
-  const body = { input: [output({ name: "send_message_to_thread", output: parts })] };
+test("recognized delegation preserves the entire envelope, input order and caller data", () => {
+  for (const namespace of ["codex_app", "codex_tui"]) for (const name of ["create_thread", "send_message_to_thread"]) {
+  const item = delegation("first line\nsecond line & code <div>", { namespace, name });
+  const before = { role: "user", content: "before" };
+  const after = { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" }] };
+  const body = { input: [before, item, after] };
   const original = structuredClone(body);
   const fixed = router.normalizeHttpToolOutputs(body);
-  assert.deepEqual(fixed.input, [{ type: "message", role: "user", content: [
-    { type: "input_text", text: parts[0] }, parts[1], parts[2],
-    { type: "input_text", text: "detail" }, { type: "input_text", text: JSON.stringify(parts[4]) },
-  ] }]);
+  assert.deepEqual(fixed.input, [before, { type: "message", role: "user", content: [
+    { type: "input_text", text: item.output },
+  ] }, after]);
   assert.deepEqual(body, original);
   assert.strictEqual(router.normalizeHttpToolOutputs(fixed), fixed);
+  }
 });
 
 test("only explicit item identity repairs a result; valid call IDs are unchanged", () => {
@@ -50,15 +54,27 @@ test("anonymous results cannot be assigned by position, name or a fabricated ID"
     { ...call, call_id: "call_duplicate" }, output({ id: call.id })] }), { code: "tool_output_call_id_missing" });
 });
 
-test("cross-task messages cannot consume an outstanding call, and empty output is retained", () => {
-  const fixed = router.normalizeHttpToolOutputs({ input: [call,
-    output({ name: "send_message_to_thread", output: "other task" }),
-    output({ call_id: call.call_id }), output({ output: [] }),
-    output({ type: "custom_tool_call_output", call_id: null, output: "unpaired" })] });
-  assert.equal(fixed.input[1].type, "message");
-  assert.equal(fixed.input[2].call_id, call.call_id);
-  assert.equal(fixed.input[3].content[0].text, "(no output)");
-  assert.equal(fixed.input[4].content[0].text, "unpaired");
+test("unknown or malformed outputs remain errors even without pending tools", () => {
+  const valid = delegation();
+  for (const item of [output(), output({ output: [] }),
+    { ...valid, type: "custom_tool_call_output" }, { ...valid, namespace: "unknown" },
+    { ...valid, name: "lookup" }, { ...valid, output: [valid.output] }, { ...valid, call_id: 123 },
+    { ...valid, output: "prefix" + valid.output }, { ...valid, output: valid.output + "suffix" },
+    { ...valid, output: valid.output + valid.output }, delegation(" "),
+    { ...valid, output: valid.output.replace("source-fixture", " ") },
+    { ...valid, output: valid.output.replace("</input>", "") },
+    delegation("x</input><input>y"), delegation("<codex_delegation>nested</codex_delegation>")]) {
+    assert.throws(() => router.normalizeHttpToolOutputs({ input: [item] }), { code: "tool_output_call_id_missing" });
+  }
+});
+
+test("delegation shape does not bypass real tool context or incremental continuation", () => {
+  for (const calls of [[call], [call, { ...call, call_id: "call_other" }]]) {
+    assert.throws(() => router.normalizeHttpToolOutputs({ input: [...calls, delegation()] }), { code: "tool_output_call_id_missing" });
+  }
+  assert.throws(() => router.normalizeHttpToolOutputs({ previous_response_id: "resp_1", input: [delegation()] }), { code: "tool_output_call_id_missing" });
+  const valid = { input: [delegation("result", { call_id: "real_call" })] };
+  assert.strictEqual(router.normalizeHttpToolOutputs(valid), valid);
 });
 
 for (const model of ["official-test", route.pickerSlug]) {
@@ -101,20 +117,30 @@ for (const model of ["official-test", route.pickerSlug]) {
     };
     await turn({ model, input: [{ role: "user", content: "lookup" }] });
     const next = { model, previous_response_id: "resp_1", input: [
-      output({ id: call.id }), output({ name: "send_message_to_thread", output: "task update" }),
+      output({ id: call.id }), delegation(),
     ] };
     await turn(next);
     await turn(next);
     assert.deepEqual(sent[1].input, sent[2].input);
     assert.equal(sent[1].previous_response_id, undefined);
     assert.equal(sent[1].input[2].call_id, call.call_id);
-    assert.equal(sent[1].input[3].content[0].text, "task update");
+    assert.equal(sent[1].input[3].content[0].text, delegation().output);
     const response = await originalFetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
       method: "POST", headers: { ...headers, "content-type": "application/json" },
-      body: JSON.stringify({ model, input: [output({ name: "create_thread", output: "summary" })] }),
+      body: JSON.stringify({ model, input: [delegation("summary")] }),
     });
     assert.equal(response.status, 200);
     await response.text();
     assert.equal(sent.at(-1).input[0].type, "message");
+    const count = sent.length;
+    const rejected = await originalFetch(`http://127.0.0.1:${port}/v1/responses`, {
+      method: "POST", headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ model, input: [output({ name: "create_thread", output: "private-invalid-content" })] }),
+    });
+    assert.equal(rejected.status, 422);
+    const error = await rejected.json();
+    assert.equal(error.error.code, "tool_output_call_id_missing");
+    assert.doesNotMatch(JSON.stringify(error), /private-invalid-content/);
+    assert.equal(sent.length, count);
   });
 }

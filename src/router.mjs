@@ -886,10 +886,21 @@ function stripBridgeArtifacts(body, { keepChatReasoning = false } = {}) {
 
 // HTTP 不接受 WS 的無 call_id 接續格式。跨任務訊息並非工具結果，
 // 保留成普通訊息；真正的工具結果只能以明確識別配對，不按順序猜 ID。
+function isDelegationBootstrap(item) {
+  if (item.type !== "function_call_output" ||
+      !["create_thread", "send_message_to_thread"].includes(item.name) ||
+      !["codex_app", "codex_tui"].includes(item.namespace) ||
+      typeof item.output !== "string") return false;
+  // 僅辨識已知信封格式，input 是原始提示文字，不改寫或執行其中的標記。
+  // 錨定整段並拒絕重複信封/欄位，不能靠包含某個字串就當成委派。
+  const envelope = /^\s*<codex_delegation>\s*<source_thread_id>([^<>]+)<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/.exec(item.output);
+  return Boolean(envelope && envelope[1].trim() && envelope[2].trim() &&
+    !/<\/?(?:codex_delegation|source_thread_id|input)(?:\s|>)/.test(envelope[2]));
+}
+
 export function normalizeHttpToolOutputs(body) {
   if (!Array.isArray(body?.input)) return body;
   const pending = new Map();
-  const forwardedNames = new Set(["send_message_to_thread", "create_thread"]);
   let changed = false;
   const input = body.input.map((item) => {
     if (!item || typeof item !== "object") return item;
@@ -903,8 +914,7 @@ export function normalizeHttpToolOutputs(body) {
       return item;
     }
     changed = true;
-    const forwarded = item.type === "function_call_output" && forwardedNames.has(item.name);
-    if (!forwarded && pending.size) {
+    if (pending.size) {
       const callType = item.type === "function_call_output" ? "function_call" : "custom_tool_call";
       const matches = [...pending.values()].filter((call) => call.type === callType &&
         typeof item.id === "string" && item.id.length > 0 &&
@@ -914,24 +924,16 @@ export function normalizeHttpToolOutputs(body) {
         const { id: _id, ...output } = item;
         return { ...output, call_id: matches[0].call_id };
       }
+    }
+    // 有未完成工具、無法辨識的輸出或直接送來的增量接續均不能降格為 user。
+    // 已重建的歷史可以包含先前的委派信封，仍須保留以便重播與壓縮。
+    if (pending.size || body.previous_response_id ||
+        (item.call_id != null && typeof item.call_id !== "string") || !isDelegationBootstrap(item)) {
       throw new RouterRequestError(422, "tool_output_call_id_missing",
         "工具結果缺少 call_id，且無法從歷史唯一確認對應的呼叫。請重新連線並重送完整對話；若仍失敗，請在新任務提供工作摘要。路由器未猜測配對或重新執行工具。",
         "request");
     }
-    // Responses 工具輸出可包含文字、圖片與檔案；保留原生附件，
-    // 非標準 JSON 區塊則完整轉成文字，不丟掉、不截斷。
-    const parts = Array.isArray(item.output) ? item.output : [item.output];
-    const content = parts.map((part) => {
-      if (["input_text", "input_image", "input_file"].includes(part?.type)) return part;
-      if (["text", "output_text"].includes(part?.type) && typeof part.text === "string") {
-        return { type: "input_text", text: part.text };
-      }
-      return { type: "input_text", text: typeof part === "string" ? part : JSON.stringify(part) ?? "" };
-    });
-    if (!content.length || content.every((part) => part.type === "input_text" && !part.text)) {
-      content.push({ type: "input_text", text: "(no output)" });
-    }
-    return { type: "message", role: "user", content };
+    return { type: "message", role: "user", content: [{ type: "input_text", text: item.output }] };
   });
   return changed ? { ...body, input } : body;
 }
@@ -2208,7 +2210,7 @@ export async function fetchModelUpstream(
   }
   // 先重建完整歷史才配對；在剝除選填 item id 之前保留可驗證的識別。
   // Claude/Chat 轉譯各自已有工具結果處理，官方原生 WS 不走此 HTTP 路徑。
-  if (!route?.translate) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
+  if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
   meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
   // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
   meta.history = meta.history || { disabled: true };

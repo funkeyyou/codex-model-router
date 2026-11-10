@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.7";
+const INSTALLER_VERSION = "1.41.8";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -10394,10 +10394,21 @@ function stripBridgeArtifacts(body, { keepChatReasoning = false } = {}) {
 
 // HTTP 不接受 WS 的無 call_id 接續格式。跨任務訊息並非工具結果，
 // 保留成普通訊息；真正的工具結果只能以明確識別配對，不按順序猜 ID。
+function isDelegationBootstrap(item) {
+  if (item.type !== "function_call_output" ||
+      !["create_thread", "send_message_to_thread"].includes(item.name) ||
+      !["codex_app", "codex_tui"].includes(item.namespace) ||
+      typeof item.output !== "string") return false;
+  // 僅辨識已知信封格式，input 是原始提示文字，不改寫或執行其中的標記。
+  // 錨定整段並拒絕重複信封/欄位，不能靠包含某個字串就當成委派。
+  const envelope = /^\s*<codex_delegation>\s*<source_thread_id>([^<>]+)<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/.exec(item.output);
+  return Boolean(envelope && envelope[1].trim() && envelope[2].trim() &&
+    !/<\/?(?:codex_delegation|source_thread_id|input)(?:\s|>)/.test(envelope[2]));
+}
+
 export function normalizeHttpToolOutputs(body) {
   if (!Array.isArray(body?.input)) return body;
   const pending = new Map();
-  const forwardedNames = new Set(["send_message_to_thread", "create_thread"]);
   let changed = false;
   const input = body.input.map((item) => {
     if (!item || typeof item !== "object") return item;
@@ -10411,8 +10422,7 @@ export function normalizeHttpToolOutputs(body) {
       return item;
     }
     changed = true;
-    const forwarded = item.type === "function_call_output" && forwardedNames.has(item.name);
-    if (!forwarded && pending.size) {
+    if (pending.size) {
       const callType = item.type === "function_call_output" ? "function_call" : "custom_tool_call";
       const matches = [...pending.values()].filter((call) => call.type === callType &&
         typeof item.id === "string" && item.id.length > 0 &&
@@ -10422,24 +10432,16 @@ export function normalizeHttpToolOutputs(body) {
         const { id: _id, ...output } = item;
         return { ...output, call_id: matches[0].call_id };
       }
+    }
+    // 有未完成工具、無法辨識的輸出或直接送來的增量接續均不能降格為 user。
+    // 已重建的歷史可以包含先前的委派信封，仍須保留以便重播與壓縮。
+    if (pending.size || body.previous_response_id ||
+        (item.call_id != null && typeof item.call_id !== "string") || !isDelegationBootstrap(item)) {
       throw new RouterRequestError(422, "tool_output_call_id_missing",
         "工具結果缺少 call_id，且無法從歷史唯一確認對應的呼叫。請重新連線並重送完整對話；若仍失敗，請在新任務提供工作摘要。路由器未猜測配對或重新執行工具。",
         "request");
     }
-    // Responses 工具輸出可包含文字、圖片與檔案；保留原生附件，
-    // 非標準 JSON 區塊則完整轉成文字，不丟掉、不截斷。
-    const parts = Array.isArray(item.output) ? item.output : [item.output];
-    const content = parts.map((part) => {
-      if (["input_text", "input_image", "input_file"].includes(part?.type)) return part;
-      if (["text", "output_text"].includes(part?.type) && typeof part.text === "string") {
-        return { type: "input_text", text: part.text };
-      }
-      return { type: "input_text", text: typeof part === "string" ? part : JSON.stringify(part) ?? "" };
-    });
-    if (!content.length || content.every((part) => part.type === "input_text" && !part.text)) {
-      content.push({ type: "input_text", text: "(no output)" });
-    }
-    return { type: "message", role: "user", content };
+    return { type: "message", role: "user", content: [{ type: "input_text", text: item.output }] };
   });
   return changed ? { ...body, input } : body;
 }
@@ -11716,7 +11718,7 @@ export async function fetchModelUpstream(
   }
   // 先重建完整歷史才配對；在剝除選填 item id 之前保留可驗證的識別。
   // Claude/Chat 轉譯各自已有工具結果處理，官方原生 WS 不走此 HTTP 路徑。
-  if (!route?.translate) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
+  if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
   meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
   // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
   meta.history = meta.history || { disabled: true };
@@ -19449,8 +19451,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",

@@ -1,6 +1,15 @@
 {
-  "latest": "1.41.7",
+  "latest": "1.41.8",
   "releases": [
+    {
+      "version": "1.41.8",
+      "date": "2026-11-10",
+      "changes": [
+        "加固：Responses HTTP 的無 call_id 訊息相容處理收緊為已知跨任務委派格式，核對 create_thread／send_message_to_thread、codex_app／codex_tui 命名空間，以及完整且必要欄位非空的 codex_delegation 信封；保留原始信封與訊息順序。",
+        "修正：未知、損壞的輸出或存在未完成工具卻無法配對時，明確回報錯誤，不再一律轉為一般訊息；正常 call_id 結果保持原樣。DeepSeek 自動 Chat 路徑沿用既有轉譯，不受 Responses 檢查影響。",
+        "驗證：補上委派格式、重複信封、缺失欄位、工具混入、增量接續，以及拒絕異常請求時不轉送上游、不洩漏內容的回歸測試。"
+      ]
+    },
     {
       "version": "1.41.7",
       "date": "2026-11-10",
