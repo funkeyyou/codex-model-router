@@ -1,6 +1,14 @@
 {
-  "latest": "1.41.8",
+  "latest": "1.41.9",
   "releases": [
+    {
+      "version": "1.41.9",
+      "date": "2026-11-10",
+      "changes": [
+        "修正：Codex 新版會在送出訊息時附上目前開啟的 Page 快照（codex_apps_open_page、codex_apps_selected_page_part_N_of_M），格式像工具結果但沒有 call_id。1.41.8 會把它誤判成無法配對的工具結果，整個對話持續回報 422 tool_output_call_id_missing；現在改為轉成一般上下文訊息，接續對話與重建歷史時同樣適用。",
+        "安全：只認 agent 命名空間下這組固定名稱且內容為文字的項目；真正的工具結果仍須以 call_id 或明確識別配對，不按順序猜測。已經卡住的對話更新後重新送出即可繼續。"
+      ]
+    },
     {
       "version": "1.41.8",
       "date": "2026-11-10",

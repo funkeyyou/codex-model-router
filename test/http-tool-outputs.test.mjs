@@ -10,6 +10,41 @@ const output = (extra = {}) => ({ type: "function_call_output", output: "result"
 const route = { pickerSlug: "custom/gpt-test", upstreamModel: "ark/gpt-test", efforts: ["high"] };
 const delegation = (text = "task update", extra = {}) => output({ name: "create_thread", namespace: "codex_app",
   output: `<codex_delegation>\n<source_thread_id>source-fixture</source_thread_id>\n<input>${text}</input>\n</codex_delegation>`, ...extra });
+const openPage = (extra = {}) => output({ id: "fco_open", name: "codex_apps_open_page", namespace: "agent",
+  output: '{"page_id":null}', ...extra });
+const selectedPage = (extra = {}) => output({ id: "fco_selected", name: "codex_apps_selected_page_part_1_of_1",
+  namespace: "agent", output: 'Companion Page snapshot part 1 of 1:\n{"page_id":null,"document_view":null}', ...extra });
+
+test("Codex Page snapshots become context messages, including incremental continuation and pending tools", () => {
+  const after = { role: "user", content: "hi" };
+  for (const extra of [{}, { previous_response_id: "resp_1" }]) {
+    for (const prefix of [[], [call]]) {
+      const body = { ...extra, input: [...prefix, openPage(), selectedPage(), after] };
+      const fixed = router.normalizeHttpToolOutputs(body);
+      assert.deepEqual(fixed.input.slice(prefix.length), [
+        { type: "message", role: "user", content: [{ type: "input_text", text: `[codex_apps_open_page]\n${openPage().output}` }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: `[codex_apps_selected_page_part_1_of_1]\n${selectedPage().output}` }] },
+        after,
+      ]);
+    }
+  }
+  const multi = selectedPage({ name: "codex_apps_selected_page_part_2_of_3" });
+  assert.equal(router.normalizeHttpToolOutputs({ input: [multi] }).input[0].type, "message");
+  // 快照不會吃掉真正的工具結果配對，之後的結果仍需要正確 call_id。
+  assert.throws(() => router.normalizeHttpToolOutputs({ input: [call, openPage(), output()] }), { code: "tool_output_call_id_missing" });
+});
+
+test("look-alike Page snapshots are still rejected", () => {
+  for (const item of [openPage({ namespace: "codex_app" }), openPage({ namespace: undefined }),
+    openPage({ name: "codex_apps_open_page_extra" }), openPage({ name: "lookup" }),
+    selectedPage({ name: "codex_apps_selected_page_part_0_of_1" }), selectedPage({ name: "codex_apps_selected_page_part_x_of_1" }),
+    openPage({ type: "custom_tool_call_output" }), openPage({ output: ["x"] }), openPage({ output: " " }),
+    openPage({ call_id: 123 })]) {
+    assert.throws(() => router.normalizeHttpToolOutputs({ input: [item] }), { code: "tool_output_call_id_missing" });
+  }
+  const paired = { input: [{ ...call, call_id: "call_page" }, openPage({ call_id: "call_page" })] };
+  assert.strictEqual(router.normalizeHttpToolOutputs(paired), paired);
+});
 
 test("recognized delegation preserves the entire envelope, input order and caller data", () => {
   for (const namespace of ["codex_app", "codex_tui"]) for (const name of ["create_thread", "send_message_to_thread"]) {
@@ -117,7 +152,7 @@ for (const model of ["official-test", route.pickerSlug]) {
     };
     await turn({ model, input: [{ role: "user", content: "lookup" }] });
     const next = { model, previous_response_id: "resp_1", input: [
-      output({ id: call.id }), delegation(),
+      output({ id: call.id }), delegation(), openPage(), selectedPage(),
     ] };
     await turn(next);
     await turn(next);
@@ -125,6 +160,8 @@ for (const model of ["official-test", route.pickerSlug]) {
     assert.equal(sent[1].previous_response_id, undefined);
     assert.equal(sent[1].input[2].call_id, call.call_id);
     assert.equal(sent[1].input[3].content[0].text, delegation().output);
+    assert.match(sent[1].input[4].content[0].text, /^\[codex_apps_open_page\]\n/);
+    assert.match(sent[1].input[5].content[0].text, /^\[codex_apps_selected_page_part_1_of_1\]\n/);
     const response = await originalFetch(`http://127.0.0.1:${port}/v1/responses/compact`, {
       method: "POST", headers: { ...headers, "content-type": "application/json" },
       body: JSON.stringify({ model, input: [delegation("summary")] }),

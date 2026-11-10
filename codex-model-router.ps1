@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.8";
+const INSTALLER_VERSION = "1.41.9";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -10475,6 +10475,17 @@ function isDelegationBootstrap(item) {
     !/<\/?(?:codex_delegation|source_thread_id|input)(?:\s|>)/.test(envelope[2]));
 }
 
+// Codex 在使用者送出訊息時，會附上「旁邊開著哪個 Page」的快照，格式借用
+// function_call_output 但沒有對應的工具呼叫，也沒有 call_id。它是宿主附上的
+// 上下文，與工具配對無關；只認這組固定名稱與命名空間，轉成一般訊息。
+const HOST_CONTEXT_SNAPSHOT_NAME = /^codex_apps_(?:open_page|selected_page_part_[1-9]\d{0,3}_of_[1-9]\d{0,3})$/;
+
+function isHostContextSnapshot(item) {
+  return item.type === "function_call_output" && item.namespace === "agent" &&
+    typeof item.name === "string" && HOST_CONTEXT_SNAPSHOT_NAME.test(item.name) &&
+    item.call_id == null && typeof item.output === "string" && item.output.trim().length > 0;
+}
+
 export function normalizeHttpToolOutputs(body) {
   if (!Array.isArray(body?.input)) return body;
   const pending = new Map();
@@ -10491,6 +10502,10 @@ export function normalizeHttpToolOutputs(body) {
       return item;
     }
     changed = true;
+    // 宿主快照不是工具結果，不參與配對；增量接續與重建的歷史都會帶到它。
+    if (isHostContextSnapshot(item)) {
+      return { type: "message", role: "user", content: [{ type: "input_text", text: `[${item.name}]\n${item.output}` }] };
+    }
     if (pending.size) {
       const callType = item.type === "function_call_output" ? "function_call" : "custom_tool_call";
       const matches = [...pending.values()].filter((call) => call.type === callType &&
