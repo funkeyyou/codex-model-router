@@ -462,6 +462,10 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.equal(state.json.installed, true);
   assert.equal(state.json.writeBlocked, null);
   assert.equal(state.json.router.ok, true);
+  assert.deepEqual([state.json.account.plan, state.json.account.free, state.json.account.source], ["plus", false, "codex-login"]);
+  const diagnostics = (await ui.call("/api/query", { method: "POST", body: { type: "diagnostics" } })).json;
+  assert.deepEqual([diagnostics.report.account.plan, diagnostics.report.account.free], ["plus", false]);
+  assert.doesNotMatch(JSON.stringify(diagnostics.report.account), /fake|fixture@example/);
   assert.equal(state.json.versions.installed, releases.latest);
   assert.deepEqual(state.json.models.map((model) => model.slug), ["custom/e2e-a", "custom/e2e-b"]);
   assert.deepEqual(state.json.providers.map((item) => [item.id, item.primary, item.keyStored, item.modelCount]), [["default", true, true, 2]]);

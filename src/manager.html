@@ -754,6 +754,12 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "正在讀取供應商模型清單（不生圖、不計費）…": "Reading the provider's model list (no images generated, no charge)…",
 "無法讀取供應商模型清單，可從下方已知清單勾選測試。": "Couldn't read the provider's model list. You can pick from the known list below to test.",
 "供應商模型清單沒有列出生圖模型；部分中轉不公開圖片模型，可從下方已知清單勾選測試。": "The provider's model list shows no image models. Some relays don't list them, so you can still pick from the known list below to test.",
+"目前是免費方案（free）：內建 image_gen 不可用，建議啟用中轉生圖。": "You're on the Free plan: the built-in image_gen isn't available. We recommend enabling relay image generation.",
+"前往生圖設定": "Open image settings",
+"API Key 模式（沒有帳號方案資料）": "API key mode (no plan information)",
+"未登入 ChatGPT 帳號": "Not signed in to ChatGPT",
+"{plan}（訂閱到 {date}）": "{plan} (subscribed until {date})",
+"帳號方案": "Plan",
 "自動偵測": "Detected",
 "供應商模型清單中的生圖模型": "Image models in the provider's model list",
 "重新讀取": "Reload",
@@ -1905,7 +1911,26 @@ function renderOverview() {
 
   const invalidDefault = state.config && state.config.model && state.config.model.startsWith("custom/") &&
     !(state.models || []).some(model => model.slug === state.config.model);
-  return [head, ...(invalidDefault ? [banner("warn", "alert", t("全域預設模型已失效，請點擊「同步與修復模型清單」。"))] : []), cards, renderErrorsPanel(), renderEnvironmentPanel()];
+  return [head, ...(invalidDefault ? [banner("warn", "alert", t("全域預設模型已失效，請點擊「同步與修復模型清單」。"))] : []),
+    ...(freePlanImagegenHint() ? [freePlanImagegenBanner()] : []), cards, renderErrorsPanel(), renderEnvironmentPanel()];
+}
+
+// 免費方案沒有內建 image_gen：中轉生圖還沒啟用時提示。
+function freePlanImagegenHint() {
+  return Boolean(state.account && state.account.free && !state.imagegen);
+}
+
+function freePlanImagegenBanner() {
+  return banner("warn", "image", t("目前是免費方案（free）：內建 image_gen 不可用，建議啟用中轉生圖。"),
+    currentView === "imagegen" ? null : h("button", { type: "button", class: "button small", onclick: () => switchView("imagegen") }, t("前往生圖設定")));
+}
+
+function accountPlanText(account) {
+  if (!account) return "—";
+  if (!account.plan) return account.source === "api-key-mode" ? t("API Key 模式（沒有帳號方案資料）") : t("未登入 ChatGPT 帳號");
+  const names = { free: "Free", plus: "Plus", pro: "Pro", prolite: "Pro Lite", team: "Team", business: "Business", enterprise: "Enterprise", edu: "Edu", go: "Go" };
+  const name = names[account.plan] || account.plan;
+  return account.activeUntil ? t("{plan}（訂閱到 {date}）", { plan: name, date: formatTime(account.activeUntil) }) : name;
 }
 
 // 路由器錯誤記錄的英文說明：記錄檔裡的訊息是中文，英文介面依錯誤代碼改用這裡的說明。
@@ -1990,6 +2015,7 @@ function renderEnvironmentPanel() {
     [t("全域預設模型"), config ? (config.model || t("未設定（使用官方預設）")) : loading, Boolean(config && config.model)],
     [t("全域上下文"), config ? (config.modelContextWindow ? t("{value} tokens（覆蓋各模型的設定）", { value: formatNumber(config.modelContextWindow) }) : t("未設定（各模型自行決定）")) : loading, false],
     [t("中轉 API 生圖"), imagegen, false],
+    [t("帳號方案"), accountPlanText(state.account), false],
     [t("管理頁捷徑"), state.paths.shortcut || t("尚未建立（執行一次 update 會建立）"), Boolean(state.paths.shortcut)],
   ];
   return h("div", { class: "panel" },
@@ -2933,6 +2959,7 @@ function renderImagegen() {
   const labels = new Map(info.choices.map((choice) => [choice.id, choice.label]));
   const parts = [head];
   if (info.error) parts.push(banner("error", "alert", serverText(info.error)));
+  if (freePlanImagegenHint()) parts.push(freePlanImagegenBanner());
 
   const statusPanel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("目前狀態") }),
     info.enabled ? h("button", { type: "button", class: "button small danger", disabled: blocked, onclick: confirmDisableImagegen }, t("停用")) : null));

@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.42.0";
+const INSTALLER_VERSION = "1.43.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -6912,6 +6912,7 @@ async function managerState() {
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     quotaMode: codexIntegrationEnabled() ? quotaModeStatus() : null,
     hideOfficialModels: settings.hideOfficialModels === true,
+    account: codexIntegrationEnabled() ? safeAccountPlan() : null,
     keysmith: codexIntegrationEnabled() && codexBin ? await keysmithStatus() : null,
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
@@ -7205,6 +7206,7 @@ export async function collectDiagnostics() {
       custom: catalogModels.filter((model) => String(model.slug).startsWith("custom/")).length,
     },
     imagegen,
+    account: codexIntegrationEnabled() ? safeAccountPlan() : null,
     files: {
       "router.mjs": diagnosticFile(routerPath), "claude-bridge.mjs": diagnosticFile(bridgePath),
       "chat-bridge.mjs": diagnosticFile(chatBridgePath), "claude-cli.mjs": diagnosticFile(claudeCliPath),
@@ -7962,6 +7964,59 @@ function writeFileAtomicRaw(path, content, mode = 0o600) {
   writeFileSync(temporaryPath, content, { mode });
   renameSync(temporaryPath, path);
   chmodSync(path, mode);
+}
+
+// ChatGPT 帳號的訂閱方案：讀 Codex 登入檔裡 id_token 的 chatgpt_plan_type（上次刷新登入時的快照）。
+// API Key 模式下 auth.json 是 API Key，改讀模式開啟前保存的帳號登入備份。不回傳任何 token。
+export function codexPlanFromAuth(auth) {
+  const token = auth?.tokens?.id_token;
+  if (typeof token !== "string" || token.split(".").length < 2) return null;
+  let claims;
+  try { claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"))?.["https://api.openai.com/auth"]; }
+  catch { return null; }
+  const plan = typeof claims?.chatgpt_plan_type === "string" ? claims.chatgpt_plan_type.trim().toLowerCase() : "";
+  if (!/^[a-z0-9_-]{1,32}$/.test(plan)) return null;
+  const time = (value) => typeof value === "string" && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : null;
+  return { plan, free: plan === "free", activeUntil: time(claims.chatgpt_subscription_active_until),
+    lastChecked: time(claims.chatgpt_subscription_last_checked) };
+}
+
+export function codexAccountPlan() {
+  const quota = quotaModeEnabled();
+  let auth = null;
+  try { auth = readJsonIfExists(quota ? quotaAuthBackupPath : codexAuthPath); } catch {}
+  const info = codexPlanFromAuth(auth);
+  if (info) return { ...info, source: quota ? "quota-backup" : "codex-login" };
+  return { plan: null, free: false, source: quota ? "api-key-mode" : "not-logged-in" };
+}
+
+function safeAccountPlan() {
+  try { return codexAccountPlan(); } catch { return { plan: null, free: false, source: "unreadable" }; }
+}
+
+// 免費方案沒有內建 image_gen、也用不到官方模型：添加第三方模型後自動隱藏官方模型，並提示中轉生圖。
+// 只在從未設定過時套用；使用者之後手動改回就尊重他的選擇。
+export async function applyFreePlanDefaults() {
+  const account = safeAccountPlan();
+  if (!account.free) return null;
+  const result = { plan: account.plan, hiddenOfficial: false, imagegenHint: false };
+  const settings = readSettingsIfExists();
+  if (codexIntegrationEnabled() && !quotaModeEnabled() && settings.hideOfficialModels === undefined) {
+    try {
+      const changed = await managerSetOfficialModelsVisibility({ hidden: true });
+      result.hiddenOfficial = changed.changed === true;
+      if (result.hiddenOfficial) console.log("偵測到免費方案（free）：官方模型無法使用，已自動隱藏官方模型選項，可在「Codex設定」改回。");
+    } catch (error) {
+      console.error(`免費方案：自動隱藏官方模型未完成（${error.message}），可稍後在「Codex設定」手動開啟。`);
+    }
+  }
+  let imagegenEnabled = false;
+  try { imagegenEnabled = Boolean(relayConfig()); } catch {}
+  if (!imagegenEnabled) {
+    result.imagegenHint = true;
+    console.log("提示：免費方案的內建 image_gen 不可用，建議到「生圖」頁啟用中轉生圖。");
+  }
+  return result;
 }
 
 function quotaModeStatus() {
@@ -8865,6 +8920,13 @@ export async function managerRestoreClaudeDesktop() {
 
 function managerOperations() {
   const job = (title, run) => ({ title, run });
+  // 添加第三方模型成功後，免費方案自動隱藏官方模型並提示中轉生圖。
+  const addJob = (title, run) => job(title, async (params) => {
+    const result = await run(params);
+    const freePlan = await applyFreePlanDefaults();
+    if (!freePlan) return result;
+    return { ...(result || {}), freePlan, ...(freePlan.hiddenOfficial ? { restartDesktop: true } : {}) };
+  });
   return {
     state: () => managerState(),
     version: (options) => managerVersionInfo(options),
@@ -8890,14 +8952,14 @@ function managerOperations() {
       "connect-claude-desktop": job("一鍵接入 Claude Desktop", managerConnectClaudeDesktop),
       "restore-claude-desktop": job("一鍵回退 Claude Desktop", managerRestoreClaudeDesktop),
       "repair-models": job("同步與修復模型清單", repairModels),
-      "add-models": job("添加模型", managerAddModels),
+      "add-models": addJob("添加模型", managerAddModels),
       "remove-models": job("刪除模型", managerRemoveModels),
       "reorder-models": job("調整模型順序", managerReorderModels),
       "edit-model": job("修改模型", managerEditModel),
       "detect-fast": job("偵測 Fast", managerDetectFast),
-      "add-provider": job("新增供應商", managerAddProvider),
-      install: job("首次設定", managerFirstInstall),
-      "install-claude": job("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
+      "add-provider": addJob("新增供應商", managerAddProvider),
+      install: addJob("首次設定", managerFirstInstall),
+      "install-claude": addJob("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
       "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
       "replace-key": job("更換 API Key", managerReplaceKey),
@@ -8924,7 +8986,7 @@ function managerOperations() {
       "claude-cli-install": job("安裝 Claude CLI", managerClaudeCliInstall),
       "claude-cli-update": job("更新 Claude CLI", managerClaudeCliUpdate),
       "claude-cli-login": job("登入 Claude 訂閱帳號", managerClaudeCliLogin),
-      "claude-cli-add": job("添加 Claude 訂閱模型", managerClaudeCliAdd),
+      "claude-cli-add": addJob("添加 Claude 訂閱模型", managerClaudeCliAdd),
       uninstall: job("解除安裝", managerUninstall),
     },
   };
@@ -9475,7 +9537,10 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     }
     else if (action === "install" || action === "setup") await install();
     else if (action === "update" || action === "upgrade") await update();
-    else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
+    else if (action === "add" || action === "add-model" || action === "addmodel") {
+      await addModels();
+      await applyFreePlanDefaults();
+    }
     else if (["remove", "remove-model", "remove-models", "delete-model", "delete-models"].includes(action)) await removeModels();
     else if (action === "providers" || action === "provider") await manageProviders(requestedAction ? process.argv[3] : null);
     else if (action === "hidden-models" || action === "hidden" || action === "unhide-models") {
