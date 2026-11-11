@@ -750,7 +750,15 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "偵測結果：上次沒有問到結果，可以重新偵測。": "Test result: the last test got no answer. You can test again.",
 "尚未偵測（新增這個模型時還沒有這項偵測），可以按「重新偵測」。": "Not tested yet (this model was added before this test existed). Click “Test again”.",
 "偵測並啟用": "Test and enable",
-"多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。": "With several models selected, the AI chooses as needed: among GPT Image, Flare for general generation and Sunburst for precise edits; among Nano Banana, 2.1 for general use, Pro for complex compositions and in-image text, and 2 Lite for fast bulk output. Image 2, Nano Banana 2 and the original Nano Banana are for explicit requests or compatibility.",
+"多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst，2.6 優先於 2.5；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。": "With several models selected, the AI chooses as needed: among GPT Image, Flare for general generation and Sunburst for precise edits, with 2.6 ahead of 2.5; among Nano Banana, 2.1 for general use, Pro for complex compositions and in-image text, and 2 Lite for fast bulk output. Image 2, Nano Banana 2 and the original Nano Banana are for explicit requests or compatibility.",
+"正在讀取供應商模型清單（不生圖、不計費）…": "Reading the provider's model list (no images generated, no charge)…",
+"無法讀取供應商模型清單，可從下方已知清單勾選測試。": "Couldn't read the provider's model list. You can pick from the known list below to test.",
+"供應商模型清單沒有列出生圖模型；部分中轉不公開圖片模型，可從下方已知清單勾選測試。": "The provider's model list shows no image models. Some relays don't list them, so you can still pick from the known list below to test.",
+"自動偵測": "Detected",
+"供應商模型清單中的生圖模型": "Image models in the provider's model list",
+"重新讀取": "Reload",
+"已知清單": "Known models",
+"供應商沒有列出也可以勾選，以實際生圖測試為準": "Pick these even if the provider doesn't list them; the test image decides",
 "偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。": "Testing really generates images and is billed by the provider: GPT Image models first try the standard interface with one low-quality image each, then the Ark task API if all fail; Nano Banana models try Chat, native Gemini and the standard interface in turn, stopping at the first success. Only passing models are enabled; if none pass, the current setup is unchanged.",
 "重新偵測並套用": "Test again and apply",
 "最近一次偵測": "Last test",
@@ -1109,6 +1117,9 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 ["^上一代圖片模型，適合既有流程與相容需求。$", "Previous-generation image model, for existing workflows and compatibility."],
 ["^偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。$", "Focused on editing precision, for detailed edits that keep the original's details."],
 ["^偏重速度，適合一般生圖與快速迭代。$", "Focused on speed, for general generation and fast iteration."],
+["^Sunburst 新一代：偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。$", "Newer Sunburst: focused on editing precision, for detailed edits that keep the original's details."],
+["^Flare 新一代：偏重速度，適合一般生圖與快速迭代。$", "Newer Flare: focused on speed, for general generation and fast iteration."],
+["^由供應商模型清單偵測到；特性未知，尺寸與品質交給上游決定。$", "Found in the provider's model list. Capabilities unknown; size and quality are left to the provider."],
 ["^Google 目前的主力生圖模型：速度快、成本低，畫質、文字渲染與多輪改圖一致性都比 Nano Banana 2 好。$", "Google's current workhorse: fast and low-cost, with better quality, text rendering and multi-turn editing consistency than Nano Banana 2."],
 ["^Google 品質最高的生圖模型：適合複雜構圖、精準文字、品牌一致性與精細控制，較慢也較貴。$", "Google's highest-quality image model: for complex compositions, accurate text, brand consistency and fine control; slower and pricier."],
 ["^上一代主力：兼顧速度、4K 輸出與多張參考圖的一致性。$", "Previous workhorse: balances speed, 4K output and consistency across multiple reference images."],
@@ -2567,6 +2578,8 @@ function openEditProvider(providerId) {
 const queries = {};
 let hiddenDraft = null;
 let imagegenDraft = null;
+// 生圖頁的供應商模型清單偵測（只讀清單、不生圖），依供應商快取。
+const imagegenDetect = {};
 
 function ensureQuery(type) {
   const entry = queries[type] || (queries[type] = { loading: false, data: null, error: null });
@@ -2589,6 +2602,25 @@ async function loadQuery(type) {
   if (type === "hidden-models") hiddenDraft = null;
   if (type === "imagegen") imagegenDraft = null;
   renderView();
+}
+
+function loadImagegenDetect(providerId) {
+  const existing = imagegenDetect[providerId];
+  if (existing) return existing;
+  const entry = imagegenDetect[providerId] = { loading: true, data: null, error: null };
+  api("/api/query", { method: "POST", body: { type: "imagegen-detect", params: { providerId } } })
+    .then((data) => { entry.data = data; }, (error) => { entry.error = error.message; })
+    .finally(() => {
+      entry.loading = false;
+      // 尚未啟用、也還沒手動改過勾選時，預設勾選偵測到的第一個模型。
+      const first = entry.data && entry.data.detected[0];
+      const info = queries.imagegen && queries.imagegen.data;
+      if (first && imagegenDraft && !imagegenDraft.touched && info && !info.enabled && imagegenDraft.providerId === providerId) {
+        imagegenDraft.models = new Set([entry.data.detected.some((item) => item.id === "gpt-image-2.6-flare") ? "gpt-image-2.6-flare" : first.id]);
+      }
+      renderView();
+    });
+  return entry;
 }
 
 function reloadQuery(type) {
@@ -2894,7 +2926,7 @@ function renderImagegen() {
   if (!imagegenDraft) {
     const fallbackProvider = providers.find((provider) => provider.id === info.providerId) || providers[0];
     imagegenDraft = {
-      models: new Set(info.enabled ? info.models : ["gpt-image-2.5-flare"]),
+      models: new Set(info.enabled ? info.models : ["gpt-image-2.6-flare"]),
       providerId: fallbackProvider ? fallbackProvider.id : null,
     };
   }
@@ -2922,27 +2954,47 @@ function renderImagegen() {
   parts.push(statusPanel);
   parts.push(renderUpstreamImageGuardPanel(info, blocked));
 
-  const options = info.choices.map((choice) => {
+  const detection = imagegenDraft.providerId ? loadImagegenDetect(imagegenDraft.providerId) : null;
+  const detected = detection && detection.data ? detection.data.detected : [];
+  const option = (choice, upstream) => {
     const box = h("input", { type: "checkbox", checked: imagegenDraft.models.has(choice.id), disabled: blocked });
     box.addEventListener("change", () => {
+      imagegenDraft.touched = true;
       if (box.checked) imagegenDraft.models.add(choice.id);
       else imagegenDraft.models.delete(choice.id);
       renderView();
     });
     return h("label", { class: "check-row option-row" }, box, h("div", { class: "pick-text" },
-      h("div", { class: "model-name" }, h("span", { text: choice.label }), h("span", { class: "faint mono", text: choice.id }),
+      h("div", { class: "model-name" }, h("span", { text: choice.label }), h("span", { class: "faint mono", text: upstream || choice.id }),
         info.enabled && info.models.includes(choice.id) ? h("span", { class: "chip green", text: t("已啟用") }) : null),
       h("div", { class: "note", text: serverText(choice.description) })));
-  });
+  };
+  const known = info.choices.filter((choice) => !detected.some((item) => item.id === choice.id));
+  let detectNote;
+  if (!detection) detectNote = null;
+  else if (detection.loading || (!detection.data && !detection.error)) detectNote = paragraph(t("正在讀取供應商模型清單（不生圖、不計費）…"), "muted");
+  else if (detection.error) detectNote = paragraph(t("無法讀取供應商模型清單，可從下方已知清單勾選測試。"), "muted");
+  else if (!detection.data.listed) detectNote = paragraph(t("無法讀取供應商模型清單，可從下方已知清單勾選測試。"), "muted");
+  else if (!detected.length) detectNote = paragraph(t("供應商模型清單沒有列出生圖模型；部分中轉不公開圖片模型，可從下方已知清單勾選測試。"), "muted");
+  const detectedSection = h("div", { class: "stack" },
+    h("div", { class: "panel-head" }, h("h3", { text: t("自動偵測") }), h("span", { class: "note", text: t("供應商模型清單中的生圖模型") }),
+      imagegenDraft.providerId ? h("button", { type: "button", class: "button small", disabled: Boolean(detection && detection.loading),
+        onclick: () => { delete imagegenDetect[imagegenDraft.providerId]; renderView(); } }, icon("refresh"), t("重新讀取")) : null),
+    detectNote,
+    detected.length ? h("div", { class: "check-list" }, detected.map((choice) => option(choice, choice.upstreamModel))) : null);
+  const knownSection = h("div", { class: "stack" },
+    h("div", { class: "panel-head" }, h("h3", { text: t("已知清單") }), h("span", { class: "note", text: t("供應商沒有列出也可以勾選，以實際生圖測試為準") })),
+    h("div", { class: "check-list" }, known.map((choice) => option(choice))));
   const providerField = providers.length > 1 ? h("label", { class: "field" }, h("span", { text: t("用哪一家供應商生圖") }),
-    h("select", { disabled: blocked, onchange: (event) => { imagegenDraft.providerId = event.target.value; } },
+    h("select", { disabled: blocked, onchange: (event) => { imagegenDraft.providerId = event.target.value; renderView(); } },
       providers.map((provider) => h("option", { value: provider.id, selected: provider.id === imagegenDraft.providerId, text: providerOption(provider) })))) : null;
   parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: info.enabled ? t("重新偵測") : t("偵測並啟用") })),
     h("div", { class: "panel-body stack" },
-      paragraph(t("多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。"), "muted"),
-      h("div", { class: "check-list" }, options),
       providerField,
+      paragraph(t("多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst，2.6 優先於 2.5；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。"), "muted"),
+      detectedSection,
+      knownSection,
       banner("warn", "alert", t("偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。")),
       h("div", { class: "actions end" },
         h("button", { type: "button", class: "button primary", disabled: blocked || imagegenDraft.models.size === 0, onclick: () => confirmImagegenSetup(info) },
@@ -2984,7 +3036,10 @@ function renderUpstreamImageGuardPanel(info, blocked) {
 }
 
 function confirmImagegenSetup(info) {
-  const chosen = info.choices.filter((choice) => imagegenDraft.models.has(choice.id));
+  const detection = imagegenDraft.providerId ? imagegenDetect[imagegenDraft.providerId] : null;
+  const detected = detection && detection.data ? detection.data.detected : [];
+  const all = [...detected, ...info.choices.filter((choice) => !detected.some((item) => item.id === choice.id))];
+  const chosen = all.filter((choice) => imagegenDraft.models.has(choice.id));
   const providerId = imagegenDraft.providerId;
   confirmDialog({
     title: t("偵測並啟用中轉生圖"),

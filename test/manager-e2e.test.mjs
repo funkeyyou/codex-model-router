@@ -634,12 +634,17 @@ test("網頁管理介面：偵測並啟用中轉生圖，再停用封存", { tim
   const query = async (type) => (await ui.call("/api/query", { method: "POST", body: { type } })).json;
   const before = await query("imagegen");
   assert.deepEqual([before.enabled, before.models, before.lastCheck], [false, [], null]);
-  assert.deepEqual(before.choices.map((choice) => choice.id), ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare",
+  assert.deepEqual(before.choices.map((choice) => choice.id), ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2",
     "gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"]);
 
-  const invalid = await ui.runJob("imagegen-setup", { models: ["gpt-image-1"] });
+  const invalid = await ui.runJob("imagegen-setup", { models: ["gpt-6-sol"] });
   assert.equal(invalid.status, "failed");
   assert.equal(requests.length, 0, "選擇無效時不能查上游或生圖");
+
+  const detect = (await ui.call("/api/query", { method: "POST", body: { type: "imagegen-detect", params: {} } })).json;
+  assert.deepEqual([detect.providerId, detect.listed, detect.detected.map((model) => [model.id, model.upstreamModel])],
+    ["default", true, [["gpt-image-2.5-flare", "ark/gpt-image-2.5-flare"]]]);
+  assert.deepEqual(requests.map((request) => request.path), ["/v1/models"], "偵測清單只讀模型清單、不生圖");
 
   const setup = await ui.runJob("imagegen-setup", { models: ["gpt-image-2.5-flare", "gpt-image-2"] });
   assert.equal(setup.status, "succeeded", setup.output);

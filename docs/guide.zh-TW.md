@@ -320,14 +320,17 @@ API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案�
 設定了多家供應商時會先問要用哪一家；技能會記住這個選擇，之後的生圖都送到那一家，
 那一家被移除時技能會一併停用，不會改用別家的帳號計費。
 
-設定時先選擇要偵測的模型（可複選），工具會自動測試並添加成功的項目。
+設定時先選供應商，工具會讀取它的模型清單（不生圖、不計費），把清單裡的生圖模型放在最上方「自動偵測」；
+清單中不在內建清單的生圖模型（例如之後才推出的新模型）也會列出，特性未知時只用 `auto` 尺寸與品質。
+下方「已知清單」是內建的模型，供應商沒有列出也可以勾選，部分中轉本來就不公開圖片模型。
+再選擇要偵測的模型（可複選），工具會自動測試並添加成功的項目。
 先使用目前 API Key 呼叫通用 `/v1/images/generations`；已選模型全部未通過時，才自動改測 Ark 任務介面。
 只測試勾選的模型，只有成功取得 PNG 圖片的模型才會添加；未選模型不會測試，也不會作為失敗後的替代。
 通用介面只要有一個成功，就保留這次成功的模型，不再額外呼叫 Ark。
-新設定預選 Flare，已有技能則預選目前啟用的模型；也可輸入 `all` 選擇全部三個。
+新設定預選 2.6 Flare（或清單偵測到的第一個模型），已有技能則預選目前啟用的模型；也可輸入 `all` 選擇全部。
 `/models` 只協助判斷名稱與前綴；即使清單沒有圖片模型或查詢失敗，也能進行實測。
 清單未列出的模型自動沿用既有設定中的共同前綴；無法推斷時使用原始模型名稱。
-清單已列出的模型保留原始名稱。Ark 任務介面使用這三個模型的原始 ID。
+清單已列出的模型保留原始名稱。Ark 任務介面使用模型的原始 ID。
 
 **偵測會真的生圖，可能產生費用。** 選完模型後自動執行，不再詢問介面類型、前綴或測試確認。
 每個已選模型每種介面最多提交一次；選一個最多兩次、選兩個最多四次，通用成功時不會執行第二輪。
@@ -342,6 +345,8 @@ API Key；圖片費用由你的中轉供應商計算，不使用 ChatGPT 方案�
 | Image 2 | `gpt-image-2` | 上一代模型，保留給既有流程或相容需求 |
 | Image 2.5 Sunburst | `gpt-image-2.5-sunburst` | 偏重編輯精準度，適合精細改圖與保留原圖細節 |
 | Image 2.5 Flare | `gpt-image-2.5-flare` | 偏重速度，適合一般生圖與快速迭代 |
+| Image 2.6 Sunburst | `gpt-image-2.6-sunburst` | Sunburst 新一代：偏重編輯精準度，適合精細改圖 |
+| Image 2.6 Flare | `gpt-image-2.6-flare` | Flare 新一代：偏重速度，適合一般生圖與快速迭代 |
 | Nano Banana 2.1 | `gemini-nano-banana-2.1` | Google 目前主力：快、便宜，畫質、文字與多輪改圖一致性比 Nano Banana 2 好 |
 | Nano Banana Pro | `gemini-3-pro-image` | Google 品質最高：複雜構圖、精準文字、品牌一致性，較慢較貴 |
 | Nano Banana 2 | `gemini-3.1-flash-image` | 上一代主力：兼顧速度、4K 與多張參考圖一致性 |
@@ -388,7 +393,8 @@ node "$env:USERPROFILE\.codex\skills\router-imagegen\scripts\imagegen.mjs" gener
 
 每次生成一張圖，預設 `size=auto`、`quality=auto`、輸出 PNG，保留已存在的輸出檔。
 `--image` 可重複提供參考圖，`--dry-run` 不送出生成請求。`--model` 省略時，生圖依
-Flare → Sunburst → Image 2、改圖依 Sunburst → Flare → Image 2，使用第一個已啟用模型。
+Flare 2.6 → 2.5 → Sunburst 2.6 → 2.5 → Image 2、改圖依 Sunburst 2.6 → 2.5 → Flare 2.6 → 2.5 → Image 2，使用第一個已啟用模型。
+`--model sunburst`／`flare` 會選已啟用的最新版；要指定版本用 `sunburst2.5`、`flare2.6` 這類寫法。
 Nano Banana 排在 GPT Image 之後：生圖依 2.1 → Pro → 2 → 2 Lite → 初代，改圖優先 Pro。
 通用模式需支援 Images API 的 JSON／multipart 請求與 `b64_json` 圖片回應。
 Ark 模式使用同一供應商 origin 下的 `/v2/extend/image/ark_gpt_image/generations`、`edits` 及 `tasks/{task_id}`：

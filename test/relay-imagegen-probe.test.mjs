@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer, imagegen } = await loadPayloads();
-const all = imagegen.GPT_IMAGE_MODELS;
+const all = imagegen.GPT_IMAGE_MODELS.slice(0, 3); // 2.5 世代的三個模型；2.6 另有測試
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
 const base = { model: all[2], apiRoot: "https://gateway.example/v1", apiKey: "probe-fixture-secret" };
 
@@ -95,9 +95,9 @@ test("網路失敗只回報連線問題，不洩漏 fetch 例外中的憑證，�
   assert.equal(calls, 1);
 });
 
-test("三種以外的模型或錯誤前綴在發請求前拒絕", async () => {
+test("非生圖模型或錯誤前綴在發請求前拒絕", async () => {
   const fetchImpl = () => assert.fail("不能發送請求");
-  await assert.rejects(imagegen.probeRelayImageModel({ ...base, model: "gpt-image-1.5", fetchImpl }));
+  await assert.rejects(imagegen.probeRelayImageModel({ ...base, model: "gpt-6-astra", fetchImpl }));
   await assert.rejects(imagegen.probeRelayImageModel({ ...base, upstreamModel: all[0], fetchImpl }));
   await assert.rejects(imagegen.probeRelayImageModel({ ...base, upstreamModel: "ark/\n" + all[2], fetchImpl }));
 });
