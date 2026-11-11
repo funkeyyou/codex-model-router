@@ -26,7 +26,7 @@ receive an explanation for the maintainer and auto_fix=false.
 
 Return JSON matching the supplied schema. Include the relevant file references
 in evidence. The reply should explain findings and, where appropriate, ask for
-the exact missing information. Use the issue's language; use Traditional Chinese
+the exact missing information. Use the issue's language; use Simplified Chinese
 for Chinese replies. Do not claim to have fixed or tested anything in this phase.
 
 Repository-specific guidance for codex-model-router:
