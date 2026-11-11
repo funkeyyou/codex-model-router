@@ -1,6 +1,14 @@
 {
-  "latest": "1.43.0",
+  "latest": "1.44.0",
   "releases": [
+    {
+      "version": "1.44.0",
+      "date": "2026-11-11",
+      "changes": [
+        "調整：生圖頁的「第三方模型生圖保護」勾選時會關閉 Codex 內建 Image Gen（config.toml 的 features.image_generation = false，官方模型也一併停用），生圖只走 $router-imagegen；取消勾選會移除這個設定、恢復內建 Image Gen。修改前自動備份 config.toml，需重新啟動 ChatGPT 才套用到新任務。尚未啟用中轉生圖就勾選時會先提醒。",
+        "調整：$router-imagegen 技能改為英文，並在說明與開頭明確寫成這台 Codex 的預設生圖方式：生圖或改圖一律用它、不呼叫內建 image_gen，只有使用者點名內建工具時才例外；失敗時回報原因，不會自行改用內建工具。已安裝的技能在更新後自動改寫（手動改過的檔案照常保留）。"
+      ]
+    },
     {
       "version": "1.43.0",
       "date": "2026-11-11",

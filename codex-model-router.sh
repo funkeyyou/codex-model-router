@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.43.0";
+const INSTALLER_VERSION = "1.44.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -195,6 +195,23 @@ function isGeminiImageId(id) {
 export function relayImageModelInfo(id) {
   return RELAY_IMAGE_MODELS.find((model) => model.id === id) ||
     { id, label: id, description: "由供應商模型清單偵測到；特性未知，尺寸與品質交給上游決定。", detected: true };
+}
+// 技能內容用英文：Codex 的系統提示與內建 imagegen 技能都是英文，英文指示對模型最明確。
+const RELAY_IMAGE_SKILL_NOTES = {
+  "gpt-image-2": "Previous-generation model for existing workflows and compatibility.",
+  "gpt-image-2.5-sunburst": "Optimized for editing precision; best for detailed edits that must keep source details.",
+  "gpt-image-2.5-flare": "Optimized for speed; best for general generation and fast iteration.",
+  "gpt-image-2.6-sunburst": "Newer Sunburst: optimized for editing precision; best for detailed edits that must keep source details.",
+  "gpt-image-2.6-flare": "Newer Flare: optimized for speed; best for general generation and fast iteration.",
+  "gemini-nano-banana-2.1": "Google's current main image model: fast and low-cost, with better quality, text rendering and multi-turn edit consistency than Nano Banana 2.",
+  "gemini-3-pro-image": "Google's highest-quality image model: complex compositions, accurate in-image text, brand consistency and fine control; slower and more expensive.",
+  "gemini-3.1-flash-image": "Previous main model: balances speed, 4K output and consistency across several reference images.",
+  "gemini-3.1-flash-lite-image": "Fastest and cheapest, for high volume; weak with several references or repeated edits.",
+  "gemini-2.5-flash-image": "Original legacy model for existing workflows; Google recommends Nano Banana 2 Lite instead.",
+};
+function relayImageSkillNote(model) {
+  return RELAY_IMAGE_SKILL_NOTES[model.id] ||
+    "Detected from the provider's model list; capabilities unknown, size and quality are left to the provider.";
 }
 const installHash = createHash("sha256")
   .update(codexHome)
@@ -5569,46 +5586,54 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
   return [
     "---",
     "name: router-imagegen",
-    "description: 透過使用者已啟用的中轉 API 生成或編輯圖片，適用於免費帳號或內建 image_gen 不可用的生圖需求，以及明確指定中轉生圖或 router-imagegen 的任務。",
-    "---", "", "# 中轉 API 生圖", "",
-    "此技能由使用者在路由器安裝器中選擇啟用，使用中轉供應商的圖片 API 並依其規則計費。",
-    "API 請求連到本機路由器，由路由器讀取已保存的憑證；不需要 OPENAI_API_KEY，也不要讀出或複製金鑰。Ark 結果圖片由命令下載，下載不附帶中轉憑證。",
-    "若使用者指定官方內建工具或其他供應商，遵從其選擇。本技能不修改官方 imagegen。", "",
-    "## 模型選擇", "",
-    ...selected.map((model) => `- ${model.label}（${model.id}）：${model.description}`), "",
-    "只使用 config.json 中已勾選的模型。每次先執行下面的 list 命令確認最新清單。",
-    "若只有一個模型就固定使用；有多個時由 AI 按需求選擇，並以 --model 明確指定。",
-    "使用者明確指定的模型優先；若未啟用，說明並請使用者從安裝器設定，不擅自啟用。",
-    "一般生圖／快速迭代優先 Flare；需要精確修改或保留原圖細節時優先 Sunburst。同時啟用 2.6 與 2.5 時優先 2.6，2.5 用於使用者指定或既有流程。",
-    "標示「由供應商模型清單偵測到」的模型特性未知：只在使用者指定或其他模型不適用時使用，size 與 quality 必須用 auto。",
-    "Image 2 用於使用者指定、既有流程或相容需求。只從已啟用模型中選擇，速度與費用以中轉商實際回應為準。", "",
-    "Nano Banana（Google Gemini 圖片模型）：一般生圖選 Nano Banana 2.1；複雜構圖、圖中要有精準文字或品牌一致性選 Nano Banana Pro；",
-    "大量、求快求便宜選 Nano Banana 2 Lite；Nano Banana 2 與初代 Nano Banana 只在使用者指定或既有流程使用。",
-    "GPT Image 與 Nano Banana 都啟用時，依需求與使用者偏好選擇；使用者沒指定時以 GPT Image 為主。", "",
-    "若省略 --model，命令的生圖預設依 Flare 2.6 → 2.5 → Sunburst 2.6 → 2.5 → Image 2 → Nano Banana 2.1 → Pro → 2 → 2 Lite → Nano Banana，改圖則先 Sunburst 2.6 → 2.5 → Flare 2.6 → 2.5 → Image 2 → Nano Banana Pro，選第一個已啟用模型。AI 應明確指定，不以這個順序代替需求判斷。", "",
-    "## 執行", "",
-    "把提示詞寫進 UTF-8 檔案，避免 shell 引號與特殊字元影響內容。使用絕對路徑。",
-    "新圖片用 generate；改圖或帶參考圖用 edit，先查看本機參考圖，並寫清楚要保留及修改的部分。",
-    "以下路徑與 MODEL 請換成實際值；只需 Node.js，不需要 Python 或額外套件。", "",
+    "description: Default image generation and editing for this Codex install. Use this skill INSTEAD of the built-in image_gen tool and the system imagegen skill for every request to create, generate, draw or edit a raster image (photos, illustrations, icons, mockups, sprites, edits of existing images). Use the built-in tool only when the user explicitly asks for it by name.",
+    "---", "", "# Image generation", "",
+    "## Precedence (read first)", "",
+    "- The user enabled this skill in the model router as the default way to generate and edit images in this Codex install.",
+    "- For any request to generate or edit an image, use this skill and the command below. Do not call the built-in `image_gen` tool and do not follow the built-in-tool workflow of the system `imagegen` skill, even when that tool is listed.",
+    "- The built-in tool can be missing (for example on free ChatGPT plans) or fail when a third-party model is selected; this skill does not depend on either.",
+    "- Exception: when the user explicitly asks for the built-in Image Gen / image_gen tool or for another provider, follow that choice.",
+    "- If this command fails, report the error. Do not silently switch to the built-in tool; ask the user first.", "",
+    "## Credentials and billing", "",
+    "- Requests go to the local model router, which reads the saved credentials. No OPENAI_API_KEY is needed. Never read, print or copy API keys.",
+    "- Images are billed by the user's image provider. Ark result images are downloaded by the command without provider credentials.",
+    "- This skill does not modify the built-in imagegen skill.", "",
+    "## Models", "",
+    ...selected.map((model) => `- ${model.label} (${model.id}): ${relayImageSkillNote(model)}`), "",
+    "- Use only the models enabled in config.json. Run the list command below first to confirm the current list.",
+    "- With one enabled model, always use it. With several, choose by the request and pass it explicitly with --model.",
+    "- A model named by the user wins. If it is not enabled, say so and ask the user to enable it in the router manager; do not enable it yourself.",
+    "- GPT Image: prefer Flare for general generation and fast iteration, Sunburst for precise edits that must keep source details. Prefer 2.6 over 2.5 when both are enabled; use 2.5 only when the user asks or an existing workflow needs it.",
+    "- Models detected from the provider's model list have unknown capabilities: use them only when the user asks or no other enabled model fits, and keep size and quality at auto.",
+    "- Image 2 is for user requests, existing workflows or compatibility.",
+    "- Nano Banana (Google Gemini image models): Nano Banana 2.1 for general generation; Nano Banana Pro for complex compositions, accurate in-image text or brand consistency; Nano Banana 2 Lite for high volume, speed and low cost. Use Nano Banana 2 and the original Nano Banana only when the user asks or an existing workflow needs them.",
+    "- When both GPT Image and Nano Banana are enabled, follow the request and the user's preference; default to GPT Image.",
+    "- Without --model the command picks the first enabled model in this order. Generate: Flare 2.6, Flare 2.5, Sunburst 2.6, Sunburst 2.5, Image 2, Nano Banana 2.1, Pro, 2, 2 Lite, Nano Banana. Edit: Sunburst 2.6, Sunburst 2.5, Flare 2.6, Flare 2.5, Image 2, Nano Banana Pro. Always choose explicitly instead of relying on this order.", "",
+    "## Run", "",
+    "- Write the prompt to a UTF-8 file so shell quoting and special characters cannot change it. Use absolute paths.",
+    "- Use generate for new images. Use edit for changes or reference images: look at the local reference first and state clearly what to keep and what to change.",
+    "- Replace the paths and MODEL with real values. Only Node.js is needed; no Python or extra packages.", "",
     "```" + (platform === "win32" ? "powershell" : "bash"),
     `${command} list`,
     `${command} generate --model MODEL --prompt-file 'prompt.txt' --out 'output.png'`,
     `${command} edit --model MODEL --prompt-file 'prompt.txt' --image 'reference.png' --out 'output-v2.png'`,
     "```", "",
-    "## 權限", "",
-    "generate 與 edit 會連到 127.0.0.1 的本機路由器。Codex 沙盒在非「完整存取權」時會封鎖網路，連本機也擋；list 與 --dry-run 不連網，不受影響。",
-    "目前若在沙盒中且網路受限，直接以提升權限執行 generate／edit（申請核准，理由寫「連本機路由器生圖」），不要先在沙盒裡試一次。",
-    "命令回報「連不上本機路由器」時，先以提升權限重跑同一個命令；無法申請提升權限時，告訴使用者：把 Codex 權限切到「完整存取權」，或改用「代我核准」讓提升權限的請求自動審核，然後重試。",
-    "這類失敗發生在送出生圖請求之前，重跑不會重複計費。", "",
-    "--image 可重複提供；--quality 支援 auto、low、medium、high，兩個 2.5 模型另支援 xhigh、max。",
-    "--size 可用 auto 或 WIDTHxHEIGHT；--background 可用 auto、opaque、transparent；--output-format 可用 png、jpeg、webp。",
-    "list 回傳 apiMode=ark-task 時，使用已偵測到的 Ark 任務介面：size、quality 保持 auto，background 只能 auto 或 opaque。命令會省略不支援的欄位、以 JSON 傳送參考圖、查詢任務並下載結果；不要自行取得 API Key。",
-    "list 的 apiModes 列出每個模型的介面。Nano Banana（chat 或 gemini 介面）的 size、quality 只能 auto，background 不支援 transparent；比例、尺寸與構圖寫進提示詞。",
-    "Nano Banana 的輸出格式由上游決定，與 --out 副檔名不同時命令會改用實際格式的副檔名儲存，以回傳的 path 為準。",
-    "--dry-run 只檢查參數，不送出圖片 API 請求。命令每次只生成一張圖，預設逾時 300 秒。",
-    "已存在的輸出檔會被拒絕；換新檔名保留原圖。生成失敗或逾時時回報原因，不自動換模型重送，以免重複計費。",
-    "成功後查看輸出圖片，確認符合需求，再以絕對路徑顯示圖片，並告知使用的模型及檔案位置。",
-    "如果 Node 路徑已因桌面版更新失效，重新執行路由器 update 會刷新此技能。", "",
+    "## Permissions", "",
+    "- generate and edit connect to the local router on 127.0.0.1. Unless Codex has full access, its sandbox blocks network access, including localhost. list and --dry-run do not use the network.",
+    "- When running in a network-restricted sandbox, run generate/edit with escalated permissions right away (request approval with the justification \"connect to the local model router to generate an image\"). Do not try inside the sandbox first.",
+    "- If the command reports that it cannot reach the local router, rerun the same command with escalated permissions. If escalation is not possible, tell the user to switch Codex permissions to Full access (完整存取權) or use Approve for me (代我核准) so escalation requests are reviewed automatically, then retry.",
+    "- These failures happen before any image request is sent, so retrying is not billed twice.", "",
+    "## Options", "",
+    "- --image can be repeated. --quality accepts auto, low, medium, high; the two 2.5 models also accept xhigh and max.",
+    "- --size accepts auto or WIDTHxHEIGHT. --background accepts auto, opaque, transparent. --output-format accepts png, jpeg, webp.",
+    "- When list reports apiMode=ark-task, the detected Ark task API is used: keep size and quality at auto, and background only auto or opaque. The command drops unsupported fields, sends references as JSON, polls the task and downloads the result. Never fetch an API key yourself.",
+    "- list shows each model's interface in apiModes. For Nano Banana (chat or gemini interface), size and quality must be auto and background cannot be transparent; put aspect ratio, size and composition in the prompt.",
+    "- Nano Banana's output format is chosen by the provider. If it differs from the --out extension, the command saves with the actual extension; use the returned path.",
+    "- --dry-run only validates arguments and sends no image request. Each run makes one image; the default timeout is 300 seconds.",
+    "- Existing output files are refused; use a new file name to keep earlier images. On failure or timeout, report the reason and do not retry with another model, to avoid double billing.",
+    "- After success, look at the image to confirm it matches the request, then show it with its absolute path and tell the user which model was used and where the file is.",
+    "- If the Node path stopped working after a desktop app update, running the router update refreshes this skill.",
+    "- Reply to the user in their language.", "",
   ].join("\n");
 }
 
@@ -5641,9 +5666,9 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, apiModes
     "SKILL.md": renderRelayImageSkill({ root, nodePath, models, platform }),
     "scripts/imagegen.mjs": loadImagegenSource(sourcePath),
     "agents/openai.yaml": [
-      "interface:", '  display_name: "中轉 API 生圖"',
-      '  short_description: "沿用路由器憑證生成或編輯圖片，從已啟用模型中依需求選擇"',
-      '  default_prompt: "使用 $router-imagegen 依照我的需求生成圖片。"', "",
+      "interface:", '  display_name: "Image Gen"',
+      '  short_description: "Default image generation and editing for this Codex install"',
+      '  default_prompt: "Use $router-imagegen to generate an image for my request."', "",
     ].join("\n"),
   };
   const sha = (value) => createHash("sha256").update(value).digest("hex");
@@ -8301,32 +8326,88 @@ async function managerSetBackgroundModel({ kind, model } = {}) {
 
 // --- 模型使用記錄 ----------------------------------------------------------------
 
-// --- 第三方上游代為生圖 ------------------------------------------------------------
+// --- 第三方模型生圖保護 ------------------------------------------------------------
 //
 // 部分中轉站看到 Codex 用戶端的 User-Agent 就在伺服器端替模型生圖，並把思考深度當成
-// 圖片 complexity，不支援的圖片模型會讓整輪失敗。預設開啟：路由器改用自己的
-// User-Agent，生圖交回 Codex 內建工具或 $router-imagegen。路由器依內容重讀，不必重新啟動；
-// 只有關閉時才寫檔。
+// 圖片 complexity，不支援的圖片模型會讓整輪失敗。這部分預設開啟：路由器改用自己的
+// User-Agent；路由器依內容重讀，不必重新啟動；只有關閉時才寫檔。
+// 管理頁的開關另外控制 Codex 內建的 Image Gen（config.toml 的 features.image_generation）：
+// 勾選時關閉內建工具，生圖只走 $router-imagegen；取消時移除這個設定，回到 Codex 預設。
 const upstreamImageGuardPath = join(installRoot, "upstream-image-guard.json");
 
 function readUpstreamImageGuard() {
   try { return readJsonIfExists(upstreamImageGuardPath)?.enabled !== false; } catch { return true; }
 }
 
+// available：有 Codex 且已接入，能讀寫 features.image_generation；disabled：使用者設定檔明確關閉。
+async function builtinImagegenStatus() {
+  if (!codexBin || !codexIntegrationEnabled()) return { available: false, disabled: false };
+  try {
+    const { config } = await readUserConfig();
+    return { available: true, disabled: deepGet(config, "features.image_generation").value === false };
+  } catch (error) {
+    return { available: false, disabled: false, error: error.message };
+  }
+}
+
+async function managerImagegenStatus() {
+  return { ...relayImagegenStatus(), builtinImagegen: await builtinImagegenStatus() };
+}
+
+async function setBuiltinImagegenDisabled(disabled) {
+  const userConfig = await readUserConfig();
+  const previous = deepGet(userConfig.config, "features.image_generation");
+  if (disabled ? previous.value === false : !previous.present) return { changed: false };
+  const backupDir = join(backupsRoot, `builtin-imagegen-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
+  const target = disabled ? false : null;
+  try {
+    await writeConfigEdits([{ keyPath: "features.image_generation", value: target }]);
+    const verified = deepGet((await readUserConfig()).config, "features.image_generation");
+    if (disabled ? verified.value !== false : verified.present) fail("內建 Image Gen 設定驗證失敗。");
+  } catch (error) {
+    try {
+      await writeConfigEdits([{ keyPath: "features.image_generation", value: previous.present ? previous.value : null }]);
+    } catch (restoreError) {
+      console.error(`配置還原失敗：${restoreError.message}；備份：${backupDir}`);
+    }
+    throw error;
+  }
+  return { changed: true, backupDir, filePath: userConfig.filePath };
+}
+
 async function managerSetUpstreamImageGuard({ enabled } = {}) {
   assertManagerWritable();
   requireInstallation();
   if (typeof enabled !== "boolean") fail("請指定是否開啟。");
-  if (readUpstreamImageGuard() === enabled) {
+  const builtin = await builtinImagegenStatus();
+  const guardChanged = readUpstreamImageGuard() !== enabled;
+  if (!guardChanged && (!builtin.available || builtin.disabled === enabled)) {
     console.log("設定沒有變更。");
     return { changed: false, enabled };
   }
-  if (enabled) rmSync(upstreamImageGuardPath, { force: true });
-  else writeJsonAtomic(upstreamImageGuardPath, { enabled: false, updatedAt: new Date().toISOString() });
-  console.log(enabled
-    ? "已開啟：第三方模型不再由上游代為生圖，不必重新啟動。"
-    : "已關閉：第三方模型的請求恢復原本的 Codex 用戶端識別，不必重新啟動。");
-  return { changed: true, enabled };
+  let builtinResult = { changed: false };
+  if (builtin.available) {
+    console.log(enabled ? "正在關閉 Codex 內建 Image Gen…" : "正在恢復 Codex 內建 Image Gen…");
+    builtinResult = await setBuiltinImagegenDisabled(enabled);
+    if (builtinResult.changed) {
+      console.log(enabled
+        ? "已關閉 Codex 內建 Image Gen（features.image_generation = false），官方與第三方模型都不再使用它。"
+        : "已恢復 Codex 內建 Image Gen（移除 features.image_generation）。");
+      console.log(`備份：${builtinResult.backupDir}`);
+    }
+  }
+  if (guardChanged) {
+    if (enabled) rmSync(upstreamImageGuardPath, { force: true });
+    else writeJsonAtomic(upstreamImageGuardPath, { enabled: false, updatedAt: new Date().toISOString() });
+    console.log(enabled
+      ? "已開啟：第三方模型不再由上游代為生圖。"
+      : "已關閉：第三方模型的請求恢復原本的 Codex 用戶端識別。");
+  }
+  if (builtinResult.changed) console.log(`請重新啟動 ${desktopAppName}，新任務才會套用。`);
+  return { changed: true, enabled, builtinImagegenDisabled: builtin.available ? enabled : null,
+    restartDesktop: builtinResult.changed };
 }
 //
 // 路由器每一輪結束時把用量寫進 usage.jsonl（超過 5 MB 輪替成 usage.jsonl.1）。管理頁讀最近的
@@ -9017,7 +9098,7 @@ function managerOperations() {
       "claude-desktop-connection": () => managerClaudeDesktop({ connection: true }),
       "global-context": () => managerGlobalContext(),
       "hidden-models": () => managerHiddenModels(),
-      imagegen: () => relayImagegenStatus(),
+      imagegen: () => managerImagegenStatus(),
       "imagegen-detect": (params) => managerImagegenDetect(params || {}),
       "claude-cli": () => managerClaudeCliStatus(),
       "claude-cli-models": () => managerClaudeCliModels(),
@@ -19243,6 +19324,13 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。": "Some relays generate images on their own servers as soon as they recognize Codex, passing the reasoning effort as the image complexity. If their image model doesn't support it, the whole turn fails with “Complexity 'high' is not supported for this image model”.",
 "開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。": "When on, the router identifies itself with its own user agent for third-party GPT models, so images are made by Codex's built-in tool or $router-imagegen instead. Conversations, caching and official models are unaffected. Providers that only accept the Codex client automatically get the original identity back.",
 "立即生效，不必重新啟動。": "Takes effect immediately; no restart needed.",
+"關閉內建 Image Gen": "Turn off built-in Image Gen",
+"仍要關閉": "Turn off anyway",
+"尚未啟用中轉 API 生圖。關閉內建 Image Gen 後，Codex 暫時無法生圖，直到你在本頁偵測並啟用中轉生圖。": "Relay API image generation isn't enabled yet. With built-in Image Gen off, Codex can't generate images until you test and enable relay image generation on this page.",
+"內建 Image Gen：已關閉": "Built-in Image Gen: off",
+"內建 Image Gen：使用中": "Built-in Image Gen: on",
+"勾選後會關閉 Codex 內建的 Image Gen（官方模型也一併停用），生圖只走 $router-imagegen；路由器也對第三方 GPT 模型改用自己的用戶端識別，避免上游代為生圖。取消勾選會恢復內建 Image Gen。對話內容與快取不受影響。": "When checked, Codex's built-in Image Gen is turned off (for official models too) and images go only through $router-imagegen. The router also uses its own user agent for third-party GPT models so relays don't generate images on their own. Unchecking restores built-in Image Gen. Conversations and caching are unaffected.",
+"內建 Image Gen 的變更需要重新啟動 ChatGPT 才會套用到新任務。": "Changes to built-in Image Gen apply to new tasks after restarting ChatGPT.",
 "影響所有模型的 Codex 設定。": "Codex settings that affect every model.",
 "重新整理全域上下文": "Refresh global context",
 "未設定": "Not set",
@@ -19647,8 +19735,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許訴診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诉诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -21502,9 +21590,11 @@ function renderImagegen() {
 }
 
 // 部分中轉站看到 Codex 用戶端就在伺服器端代為生圖，並把思考深度當成圖片 complexity 送出，
-// 不支援的圖片模型會讓整輪失敗。開啟時路由器對第三方模型改用自己的 User-Agent。
+// 不支援的圖片模型會讓整輪失敗。勾選時關閉 Codex 內建 Image Gen，路由器也對第三方模型改用自己的 User-Agent。
 function renderUpstreamImageGuardPanel(info, blocked) {
-  const enabled = info.upstreamImageGuard !== false;
+  const builtin = info.builtinImagegen || { available: false, disabled: false };
+  const enabled = info.upstreamImageGuard !== false && (!builtin.available || builtin.disabled);
+  const apply = (value) => runJob("set-upstream-image-guard", { enabled: value }, { title: t("設定第三方上游生圖") });
   return h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: t("第三方模型生圖保護") })),
     h("div", { class: "panel-body setting-body" },
@@ -21513,12 +21603,24 @@ function renderUpstreamImageGuardPanel(info, blocked) {
         onchange: (event) => {
           const value = event.target.checked;
           event.target.checked = enabled;
-          runJob("set-upstream-image-guard", { enabled: value }, { title: t("設定第三方上游生圖") });
+          if (value && builtin.available && !info.enabled) {
+            confirmDialog({
+              title: t("關閉內建 Image Gen"),
+              confirmLabel: t("仍要關閉"),
+              body: paragraph(t("尚未啟用中轉 API 生圖。關閉內建 Image Gen 後，Codex 暫時無法生圖，直到你在本頁偵測並啟用中轉生圖。")),
+            }).then((ok) => { if (ok) apply(true); });
+            return;
+          }
+          apply(value);
         },
-      }), h("span", { text: enabled ? t("已開啟") : t("未開啟") })),
+      }), h("span", { text: enabled ? t("已開啟") : t("未開啟") }),
+        builtin.available ? h("span", { class: builtin.disabled ? "chip" : "chip green",
+          text: builtin.disabled ? t("內建 Image Gen：已關閉") : t("內建 Image Gen：使用中") }) : null),
       paragraph(t("部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。"), "muted"),
-      paragraph(t("開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。"), "note"),
-      paragraph(t("立即生效，不必重新啟動。"), "note")));
+      builtin.available
+        ? paragraph(t("勾選後會關閉 Codex 內建的 Image Gen（官方模型也一併停用），生圖只走 $router-imagegen；路由器也對第三方 GPT 模型改用自己的用戶端識別，避免上游代為生圖。取消勾選會恢復內建 Image Gen。對話內容與快取不受影響。"), "note")
+        : paragraph(t("開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。"), "note"),
+      paragraph(builtin.available ? t("內建 Image Gen 的變更需要重新啟動 ChatGPT 才會套用到新任務。") : t("立即生效，不必重新啟動。"), "note")));
 }
 
 function confirmImagegenSetup(info) {

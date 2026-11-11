@@ -565,6 +565,27 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.equal(contextCleared.value, null, JSON.stringify(contextCleared));
   assert.ok(readdirSync(join(root, "backups", "model-router")).filter((name) => name.startsWith("global-context-")).length >= 2);
 
+  // 第三方模型生圖保護：勾選時關閉 Codex 內建 Image Gen，取消時移除設定回到預設。
+  const imagegenBefore = await query("imagegen");
+  assert.deepEqual(imagegenBefore.builtinImagegen, { available: true, disabled: false }, JSON.stringify(imagegenBefore));
+  const guardOn = await ui.runJob("set-upstream-image-guard", { enabled: true });
+  assert.equal(guardOn.status, "succeeded", guardOn.output + windowsProcesses());
+  assert.deepEqual([guardOn.result.changed, guardOn.result.restartDesktop, guardOn.result.builtinImagegenDisabled], [true, true, true]);
+  assert.match(readFileSync(join(root, "config.toml"), "utf8"), /image_generation = false/);
+  assert.equal((await query("imagegen")).builtinImagegen.disabled, true);
+  const guardSame = await ui.runJob("set-upstream-image-guard", { enabled: true });
+  assert.deepEqual([guardSame.status, guardSame.result.changed], ["succeeded", false]);
+  const guardOff = await ui.runJob("set-upstream-image-guard", { enabled: false });
+  assert.equal(guardOff.status, "succeeded", guardOff.output + windowsProcesses());
+  assert.doesNotMatch(readFileSync(join(root, "config.toml"), "utf8"), /image_generation/);
+  assert.equal((await query("imagegen")).upstreamImageGuard, false);
+  const guardRestore = await ui.runJob("set-upstream-image-guard", { enabled: true });
+  assert.equal(guardRestore.status, "succeeded", guardRestore.output);
+  const guardReset = await ui.runJob("set-upstream-image-guard", { enabled: false });
+  assert.equal(guardReset.status, "succeeded", guardReset.output);
+  rmSync(join(root, "model-router", "upstream-image-guard.json"), { force: true });
+  assert.ok(readFileSync(join(root, "config.toml"), "utf8").includes("http://127.0.0.1:" + port + "/v1"), "其他設定保留");
+
   // 帳號模式的官方選項：熱更新並用真實 Codex model/list 驗證，保留登入與原始目錄。
   const originalAuth = readFileSync(join(root, "auth.json"), "utf8");
   const originalConfig = readFileSync(join(root, "config.toml"), "utf8");

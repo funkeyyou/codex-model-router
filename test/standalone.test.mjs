@@ -166,9 +166,10 @@ test("沒有 Codex：首次安裝、Claude Gateway 對話、模型管理、更�
   for (const type of ["set-global-context", "set-hidden-models", "set-quota-mode", "set-background-model", "connect-codex"]) {
     await assert.rejects(ops.jobs[type].run({ value: 1000000, slugs: [], enabled: true, kind: "light", model: null }), /Codex CLI/);
   }
-  assert.equal(ops.queries.imagegen().upstreamImageGuard, true);
+  assert.equal((await ops.queries.imagegen()).upstreamImageGuard, true);
+  assert.deepEqual((await ops.queries.imagegen()).builtinImagegen, { available: false, disabled: false });
   await ops.jobs["set-upstream-image-guard"].run({ enabled: false });
-  assert.equal(ops.queries.imagegen().upstreamImageGuard, false);
+  assert.equal((await ops.queries.imagegen()).upstreamImageGuard, false);
   assert.equal(JSON.parse(readFileSync(join(installRoot, "upstream-image-guard.json"), "utf8")).enabled, false);
   await ops.jobs["set-upstream-image-guard"].run({ enabled: true });
   assert.equal(existsSync(join(installRoot, "upstream-image-guard.json")), false);

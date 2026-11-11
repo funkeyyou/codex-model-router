@@ -48,7 +48,7 @@ test("偵測到的未知生圖模型可安裝，技能標示特性未知；勾�
   const result = installer.installRelayImageSkill({ ...options, models: ["gpt-image-3-preview"], aliases: { "gpt-image-3-preview": "ark/gpt-image-3-preview" } });
   assert.equal(result.config.upstreamModels["gpt-image-3-preview"], "ark/gpt-image-3-preview");
   assert.equal(result.config.apiModes["gpt-image-3-preview"], "images");
-  assert.match(readFileSync(join(options.root, "SKILL.md"), "utf8"), /gpt-image-3-preview（gpt-image-3-preview）：由供應商模型清單偵測到/);
+  assert.match(readFileSync(join(options.root, "SKILL.md"), "utf8"), /gpt-image-3-preview \(gpt-image-3-preview\): Detected from the provider's model list/);
   const plan = installer.planRelayImageProbes([], "ark/", ["gpt-image-3-preview"]);
   assert.equal(plan.find((model) => model.id === "gpt-image-3-preview").upstreamModel, "ark/gpt-image-3-preview");
   assert.throws(() => installer.installRelayImageSkill({ ...options, models: ["gpt-6-astra"] }));
