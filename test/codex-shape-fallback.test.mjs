@@ -112,6 +112,8 @@ test("安裝器探測 Codex 工具格式：通過、被拒、問不到分開判�
   assert.equal(seen.input[0].type, "additional_tools");
   assert.equal(seen.input[0].tools[0].type, "namespace");
   assert.equal(seen.input[0].tools[0].tools[0].type, "custom");
+  assert.equal(await installer.probeCodexToolShapes(async () => ({ ok: true, status: 200, toolCalled: true }), silent), "supported");
+  assert.equal(await installer.probeCodexToolShapes(async () => ({ ok: true, status: 200, toolCalled: false }), silent), "ignored");
   assert.equal(await installer.probeCodexToolShapes(async () => ({ ok: false, status: 422 }), silent), "unsupported");
   assert.equal(await installer.probeCodexToolShapes(async () => ({ ok: false, status: 400 }), silent), "unsupported");
   assert.equal(await installer.probeCodexToolShapes(async () => ({ ok: false, status: 429 }), silent), "unknown");

@@ -72,6 +72,15 @@ test("DeepSeek 自動轉譯僅適用 Codex 工具、壓縮與 chat 推理接續"
   }
 });
 
+test("Gemini 帶 Codex 工具格式時自動改走 chat，避免閘道悄悄丟掉工具", () => {
+  const gemini = { upstreamModel: "gemini-4-hydrogen-xhigh" };
+  assert.equal(router.needsDeepseekChat({ input: [{ type: "additional_tools", tools }] }, gemini), true);
+  assert.equal(router.needsDeepseekChat({ tools: [{ type: "custom", name: "exec" }] }, gemini), true);
+  assert.equal(router.needsDeepseekChat({ tools }, gemini), false);
+  assert.equal(router.needsDeepseekChat({ input: "hello" }, gemini), false);
+  assert.equal(router.needsDeepseekChat({ input: [{ type: "additional_tools", tools }] }, { ...gemini, translate: "chat" }), false);
+});
+
 for (const transport of ["HTTP", "WebSocket"]) {
   test(`${transport}: DeepSeek Code Mode 工具走 chat 並保留命名空間、進度與下一輪推理`, async (t) => {
     useTestKey(t);

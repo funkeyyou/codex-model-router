@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.3";
+const INSTALLER_VERSION = "1.44.4";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1455,6 +1455,7 @@ async function testResponse(apiRoot, apiKey, model, effort, extra = {}) {
     ok: response.ok,
     status: response.status,
     detail: response.ok ? "" : responseText.slice(0, 240),
+    toolCalled: response.ok ? /"type"\s*:\s*"(?:custom_tool_call|function_call)"/.test(responseText) : undefined,
   };
 }
 
@@ -1665,15 +1666,20 @@ export const CODEX_TOOL_SHAPE_INPUT = [
   { type: "additional_tools", role: "developer", tools: [{ type: "namespace", name: "functions", description: "Tools.", tools: [
     { type: "custom", name: "exec", description: "Run code.", format: { type: "grammar", syntax: "lark", definition: "start: /[\\s\\S]+/" } },
   ] }] },
-  { type: "message", role: "user", content: [{ type: "input_text", text: "Reply with exactly OK." }] },
+  { type: "message", role: "user", content: [{ type: "input_text", text: "Call the exec tool once with the input 1+1. Do not answer in text." }] },
 ];
 
-// 回傳 "supported"、"unsupported"（上游拒收這些格式）或 "unknown"（這次問不到）。
+// 回傳 "supported"、"unsupported"（上游拒收這些格式）、"ignored"（回 200 卻沒有呼叫工具，
+// 多半是閘道悄悄丟掉了工具定義，例如 sharkora 的 Gemini）或 "unknown"（這次問不到）。
 export async function probeCodexToolShapes(send, log = consoleProbeLog) {
   log.write("  Codex 工具格式  ");
   try {
-    const result = await send({ input: CODEX_TOOL_SHAPE_INPUT });
+    const result = await send({ input: CODEX_TOOL_SHAPE_INPUT, max_output_tokens: 1024 });
     if (result.ok) {
+      if (result.toolCalled === false) {
+        log.line("上游接受請求但沒有呼叫工具（可能丟掉了 Codex 工具格式）");
+        return "ignored";
+      }
       log.line("支持");
       return "supported";
     }
@@ -3839,8 +3845,10 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
   const probeEffort = probe.stripReasoning ? null : (probe.efforts.includes("low") ? "low" : probe.efforts[0] ?? null);
   const shapes = await probeCodexToolShapes(
     (extra) => testResponse(discovery.apiRoot, apiKey, model, probeEffort, extra), log);
-  if (shapes === "unsupported") {
-    log.line("  Responses 端點不接受 Codex 的工具格式，改探 Chat Completions（本機轉譯）");
+  if (shapes === "unsupported" || shapes === "ignored") {
+    log.line(shapes === "ignored"
+      ? "  Responses 端點沒有讓模型看到 Codex 的工具，改探 Chat Completions（本機轉譯）"
+      : "  Responses 端點不接受 Codex 的工具格式，改探 Chat Completions（本機轉譯）");
     const chat = await probeChatModel(discovery.apiRoot, apiKey, model, log);
     if (chat.supported) return { route: chatRouteFor(chat), transient: false, transientEfforts: [] };
     log.line("  Chat Completions 也不可用，沿用 Responses；帶工具的對話可能會被上游拒絕。");
@@ -11214,7 +11222,11 @@ export function usesCodexToolShapes(body) {
 }
 
 export function needsDeepseekChat(body, route) {
-  if (route?.translate || !/(?:^|\/)deepseek(?:[-/]|$)/i.test(route?.upstreamModel || "")) return false;
+  if (route?.translate) return false;
+  // Gemini 的 Responses 相容閘道（例如 sharkora）不拒絕 additional_tools／namespace／custom，
+  // 卻直接丟掉，模型只看到空的工具清單。帶 Codex 工具格式時一律改走 Chat 轉譯。
+  if (/(?:^|\/)gemini(?:[-/]|$)/i.test(route?.upstreamModel || "")) return usesCodexToolShapes(body);
+  if (!/(?:^|\/)deepseek(?:[-/]|$)/i.test(route?.upstreamModel || "")) return false;
   const input = Array.isArray(body?.input) ? body.input : [];
   // 有些 Responses 相容閘道不拒絕 custom/namespace，卻將 DSML 當成一般文字
   // 回傳。事先轉成標準 function 工具，不能等 400/422 才回退。

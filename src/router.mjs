@@ -1442,7 +1442,11 @@ export function usesCodexToolShapes(body) {
 }
 
 export function needsDeepseekChat(body, route) {
-  if (route?.translate || !/(?:^|\/)deepseek(?:[-/]|$)/i.test(route?.upstreamModel || "")) return false;
+  if (route?.translate) return false;
+  // Gemini 的 Responses 相容閘道（例如 sharkora）不拒絕 additional_tools／namespace／custom，
+  // 卻直接丟掉，模型只看到空的工具清單。帶 Codex 工具格式時一律改走 Chat 轉譯。
+  if (/(?:^|\/)gemini(?:[-/]|$)/i.test(route?.upstreamModel || "")) return usesCodexToolShapes(body);
+  if (!/(?:^|\/)deepseek(?:[-/]|$)/i.test(route?.upstreamModel || "")) return false;
   const input = Array.isArray(body?.input) ? body.input : [];
   // 有些 Responses 相容閘道不拒絕 custom/namespace，卻將 DSML 當成一般文字
   // 回傳。事先轉成標準 function 工具，不能等 400/422 才回退。
