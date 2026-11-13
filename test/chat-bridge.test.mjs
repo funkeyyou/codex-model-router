@@ -25,6 +25,36 @@ const translate = (body, options) => toChatRequest(body, route(options)).request
 
 // --- 請求方向 ---------------------------------------------------------------
 
+test("工具 schema 移除 Codex 自有標註（encrypted），但保留同名的真實參數", () => {
+  const request = translate({
+    input: [user("hi")],
+    tools: [{
+      type: "function",
+      name: "send_message",
+      description: "send",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          message: { type: "string", description: "text", encrypted: true },
+          encrypted: { type: "boolean", description: "a real parameter named encrypted" },
+          items: { type: "array", items: { type: "object", properties: { x: { type: "string", encrypted: true } } } },
+          mode: { anyOf: [{ type: "string", enum: ["a"], encrypted: true }, { type: "null" }] },
+        },
+        required: ["message"],
+      },
+    }],
+  });
+  const params = request.tools[0].function.parameters;
+  assert.ok(!JSON.stringify(params).includes('"encrypted":true'));
+  assert.deepEqual(params.properties.message, { type: "string", description: "text" });
+  assert.deepEqual(params.properties.encrypted, { type: "boolean", description: "a real parameter named encrypted" });
+  assert.deepEqual(params.properties.items.items.properties.x, { type: "string" });
+  assert.deepEqual(params.properties.mode.anyOf[0], { type: "string", enum: ["a"] });
+  assert.equal(params.additionalProperties, false);
+  assert.deepEqual(params.required, ["message"]);
+});
+
 test("instructions 與 developer 訊息合成一則最前面的 system；純文字的 user 訊息送字串", () => {
   const request = translate({
     instructions: "base rules",

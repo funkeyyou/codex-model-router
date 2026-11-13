@@ -1,6 +1,13 @@
 {
-  "latest": "1.44.1",
+  "latest": "1.44.2",
   "releases": [
+    {
+      "version": "1.44.2",
+      "date": "2026-11-13",
+      "changes": [
+        "修正：用 gemini-4-hydrogen 等走 Chat Completions 的 Gemini 模型時，出現 Invalid JSON payload received. Unknown name \"encrypted\" 錯誤。Codex 會在部分工具參數格式裡加自有標記，Gemini 會因此拒收整個請求；路由器現在轉送前只保留標準 JSON Schema 欄位，參數名稱不受影響。"
+      ]
+    },
     {
       "version": "1.44.1",
       "date": "2026-11-13",

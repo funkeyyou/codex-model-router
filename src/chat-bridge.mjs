@@ -118,6 +118,36 @@ function toChatContent(parts) {
   return parts;
 }
 
+// Codex 會在工具參數 schema 裡加自有標註（例如多代理工具的 "encrypted": true）。
+// OpenAI 會忽略未知關鍵字，但 Gemini 等嚴格驗證 schema 的上游會整個請求拒收
+// （Unknown name "encrypted" ... Cannot find field）。只保留標準 JSON Schema 關鍵字；
+// properties／$defs 底下的 key 是屬性名稱，不能被當成關鍵字過濾。
+const SCHEMA_KEYWORDS = new Set([
+  "type", "description", "title", "default", "enum", "const", "format", "nullable", "examples",
+  "properties", "required", "additionalProperties", "patternProperties", "propertyNames",
+  "minProperties", "maxProperties", "items", "prefixItems", "minItems", "maxItems", "uniqueItems",
+  "contains", "minLength", "maxLength", "pattern", "minimum", "maximum", "exclusiveMinimum",
+  "exclusiveMaximum", "multipleOf", "anyOf", "oneOf", "allOf", "not", "$ref", "$defs", "definitions",
+]);
+const SCHEMA_MAPS = new Set(["properties", "patternProperties", "$defs", "definitions"]);
+
+export function sanitizeToolSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(sanitizeToolSchema);
+  if (!schema || typeof schema !== "object") return schema;
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (!SCHEMA_KEYWORDS.has(key)) continue;
+    if (SCHEMA_MAPS.has(key) && value && typeof value === "object" && !Array.isArray(value)) {
+      out[key] = Object.fromEntries(Object.entries(value).map(([name, sub]) => [name, sanitizeToolSchema(sub)]));
+    } else if (["enum", "const", "default", "examples", "required"].includes(key)) {
+      out[key] = value;
+    } else {
+      out[key] = sanitizeToolSchema(value);
+    }
+  }
+  return out;
+}
+
 function toChatTools(codexTools) {
   const tools = [];
   const freeform = new Set();
@@ -161,7 +191,7 @@ function toChatTools(codexTools) {
         function: {
           name: tool.name,
           description: tool.description || "",
-          parameters: flattenTopLevelSchema(tool.parameters),
+          parameters: sanitizeToolSchema(flattenTopLevelSchema(tool.parameters)),
         },
       });
     }
