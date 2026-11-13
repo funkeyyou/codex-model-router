@@ -905,7 +905,9 @@ const HOST_CONTEXT_SNAPSHOT_NAME = /^codex_apps_(?:open_page|selected_page_part_
 
 function isHostContextSnapshot(item) {
   return item.type === "function_call_output" && item.namespace === "agent" &&
-    typeof item.name === "string" && HOST_CONTEXT_SNAPSHOT_NAME.test(item.name) &&
+    typeof item.name === "string" && (HOST_CONTEXT_SNAPSHOT_NAME.test(item.name) ||
+      (item.name === "browser_tabs" && typeof item.output === "string" &&
+        /^\s*<in-app-browser-context source="ambient-ui-state">[\s\S]*<\/in-app-browser-context>\s*$/.test(item.output))) &&
     item.call_id == null && typeof item.output === "string" && item.output.trim().length > 0;
 }
 

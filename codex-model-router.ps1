@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.4";
+const INSTALLER_VERSION = "1.44.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -10754,7 +10754,9 @@ const HOST_CONTEXT_SNAPSHOT_NAME = /^codex_apps_(?:open_page|selected_page_part_
 
 function isHostContextSnapshot(item) {
   return item.type === "function_call_output" && item.namespace === "agent" &&
-    typeof item.name === "string" && HOST_CONTEXT_SNAPSHOT_NAME.test(item.name) &&
+    typeof item.name === "string" && (HOST_CONTEXT_SNAPSHOT_NAME.test(item.name) ||
+      (item.name === "browser_tabs" && typeof item.output === "string" &&
+        /^\s*<in-app-browser-context source="ambient-ui-state">[\s\S]*<\/in-app-browser-context>\s*$/.test(item.output))) &&
     item.call_id == null && typeof item.output === "string" && item.output.trim().length > 0;
 }
 

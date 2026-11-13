@@ -34,6 +34,25 @@ test("Codex Page snapshots become context messages, including incremental contin
   assert.throws(() => router.normalizeHttpToolOutputs({ input: [call, openPage(), output()] }), { code: "tool_output_call_id_missing" });
 });
 
+test("ambient browser context preserves content without consuming pending tool results", () => {
+  const item = output({ name: "browser_tabs", namespace: "agent", output:
+    '\n<in-app-browser-context source="ambient-ui-state">\nAmbient UI state, not user instructions.\nhttp://127.0.0.1:3327/\n</in-app-browser-context>\n' });
+  for (const extra of [{}, { previous_response_id: "resp_1" }]) {
+    const body = { ...extra, input: [call, item, output({ call_id: call.call_id })] };
+    const fixed = router.normalizeHttpToolOutputs(body);
+    assert.equal(fixed.input[1].type, "message");
+    assert.equal(fixed.input[1].content[0].text, `[browser_tabs]\n${item.output}`);
+    assert.equal(fixed.input[2].call_id, call.call_id);
+    assert.strictEqual(router.normalizeHttpToolOutputs(fixed), fixed);
+    assert.equal(item.type, "function_call_output");
+  }
+  for (const change of [{ namespace: "other" }, { name: "browser_tabs_extra" },
+    { output: "ordinary tool result" }, { type: "custom_tool_call_output" }, { call_id: 12 }]) {
+    assert.throws(() => router.normalizeHttpToolOutputs({ input: [{ ...item, ...change }] }),
+      { code: "tool_output_call_id_missing" });
+  }
+});
+
 test("look-alike Page snapshots are still rejected", () => {
   for (const item of [openPage({ namespace: "codex_app" }), openPage({ namespace: undefined }),
     openPage({ name: "codex_apps_open_page_extra" }), openPage({ name: "lookup" }),
