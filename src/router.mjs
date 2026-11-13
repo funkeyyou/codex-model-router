@@ -884,6 +884,75 @@ function stripBridgeArtifacts(body, { keepChatReasoning = false } = {}) {
   return result;
 }
 
+// HTTP 不接受 WS 的無 call_id 接續格式。跨任務訊息並非工具結果，
+// 保留成普通訊息；真正的工具結果只能以明確識別配對，不按順序猜 ID。
+function isDelegationBootstrap(item) {
+  if (item.type !== "function_call_output" ||
+      !["create_thread", "send_message_to_thread"].includes(item.name) ||
+      !["codex_app", "codex_tui"].includes(item.namespace) ||
+      typeof item.output !== "string") return false;
+  // 僅辨識已知信封格式，input 是原始提示文字，不改寫或執行其中的標記。
+  // 錨定整段並拒絕重複信封/欄位，不能靠包含某個字串就當成委派。
+  const envelope = /^\s*<codex_delegation>\s*<source_thread_id>([^<>]+)<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/.exec(item.output);
+  return Boolean(envelope && envelope[1].trim() && envelope[2].trim() &&
+    !/<\/?(?:codex_delegation|source_thread_id|input)(?:\s|>)/.test(envelope[2]));
+}
+
+// Codex 在使用者送出訊息時，會附上「旁邊開著哪個 Page」的快照，格式借用
+// function_call_output 但沒有對應的工具呼叫，也沒有 call_id。它是宿主附上的
+// 上下文，與工具配對無關；只認這組固定名稱與命名空間，轉成一般訊息。
+const HOST_CONTEXT_SNAPSHOT_NAME = /^codex_apps_(?:open_page|selected_page_part_[1-9]\d{0,3}_of_[1-9]\d{0,3})$/;
+
+function isHostContextSnapshot(item) {
+  return item.type === "function_call_output" && item.namespace === "agent" &&
+    typeof item.name === "string" && HOST_CONTEXT_SNAPSHOT_NAME.test(item.name) &&
+    item.call_id == null && typeof item.output === "string" && item.output.trim().length > 0;
+}
+
+export function normalizeHttpToolOutputs(body) {
+  if (!Array.isArray(body?.input)) return body;
+  const pending = new Map();
+  let changed = false;
+  const input = body.input.map((item) => {
+    if (!item || typeof item !== "object") return item;
+    if (["function_call", "custom_tool_call"].includes(item.type) && item.call_id) {
+      pending.set(item.call_id, item);
+      return item;
+    }
+    if (!["function_call_output", "custom_tool_call_output"].includes(item.type)) return item;
+    if (typeof item.call_id === "string" && item.call_id.trim()) {
+      pending.delete(item.call_id);
+      return item;
+    }
+    changed = true;
+    // 宿主快照不是工具結果，不參與配對；增量接續與重建的歷史都會帶到它。
+    if (isHostContextSnapshot(item)) {
+      return { type: "message", role: "user", content: [{ type: "input_text", text: `[${item.name}]\n${item.output}` }] };
+    }
+    if (pending.size) {
+      const callType = item.type === "function_call_output" ? "function_call" : "custom_tool_call";
+      const matches = [...pending.values()].filter((call) => call.type === callType &&
+        typeof item.id === "string" && item.id.length > 0 &&
+        (call.id === item.id || call.call_id === item.id));
+      if (matches.length === 1) {
+        pending.delete(matches[0].call_id);
+        const { id: _id, ...output } = item;
+        return { ...output, call_id: matches[0].call_id };
+      }
+    }
+    // 有未完成工具、無法辨識的輸出或直接送來的增量接續均不能降格為 user。
+    // 已重建的歷史可以包含先前的委派信封，仍須保留以便重播與壓縮。
+    if (pending.size || body.previous_response_id ||
+        (item.call_id != null && typeof item.call_id !== "string") || !isDelegationBootstrap(item)) {
+      throw new RouterRequestError(422, "tool_output_call_id_missing",
+        "工具結果缺少 call_id，且無法從歷史唯一確認對應的呼叫。請重新連線並重送完整對話；若仍失敗，請在新任務提供工作摘要。路由器未猜測配對或重新執行工具。",
+        "request");
+    }
+    return { type: "message", role: "user", content: [{ type: "input_text", text: item.output }] };
+  });
+  return changed ? { ...body, input } : body;
+}
+
 // 舊轉譯層與部分相容供應商會替 custom_tool_call 填 fc_ id。壓縮會嚴格
 // 驗證項目類型；移除不相符的選填 id，保留 call_id 與工具結果的配對。
 export function normalizeToolCallIds(body) {
@@ -993,6 +1062,9 @@ const stats = {
   lastImageProvider: null,
   viewImageCallsInjected: 0,
   viewImageCallsStripped: 0,
+  upstreamImageGuarded: 0,
+  codexUserAgentFallbacks: 0,
+  codexUserAgentProviders: [],
   translatedRequests: 0,
   claudeRefusals: 0,
   claudeEmptyResponses: 0,
@@ -1719,6 +1791,58 @@ export function buildCustomHeaders(requestHeaders, apiKey, target = null) {
   return headers;
 }
 
+// --- 第三方上游代為生圖 ---------------------------------------------------------
+//
+// 部分 Responses 相容中轉站一看到 Codex 用戶端的 User-Agent（Codex Desktop、codex_exec…），
+// 就在伺服器端替模型開啟生圖：請求裡沒有任何生圖工具，回應卻直接出現 image_generation_call，
+// 並把這一輪的思考深度當成圖片 complexity 送給後端圖片模型。不支援的圖片模型會拒絕，
+// 串流中途失敗成「Complexity 'high' is not supported for this image model.」，Codex 重試
+// 五次都一樣。換成路由器自己的 User-Agent 後，模型改走 Codex 內建的 image_gen 工具呼叫
+// （由 Codex 自己生圖）或 $router-imagegen，其他行為與快取命中不受影響。
+//
+// 只套用在 Responses 直通；Chat 轉譯與 /messages 沒有伺服器端生圖。只接受 Codex 用戶端
+// 的中轉站會回 401／403：同一把 Key 改用原本的 User-Agent 重送一次，成功就記住這家，
+// 之後直接沿用原本的 User-Agent。開關存在 upstream-image-guard.json，每次比對內容，不必重啟。
+const upstreamImageGuardPath = join(routerDirectory, "upstream-image-guard.json");
+let upstreamImageGuardCache = { raw: undefined, enabled: true };
+
+export function upstreamImageGuardEnabled() {
+  const raw = readSettingFile(upstreamImageGuardPath);
+  if (raw !== upstreamImageGuardCache.raw) {
+    let enabled = true;
+    if (raw !== null) {
+      try { enabled = JSON.parse(raw)?.enabled !== false; } catch { /* 損壞或寫到一半：維持預設開啟。 */ }
+    }
+    upstreamImageGuardCache = { raw, enabled };
+  }
+  return upstreamImageGuardCache.enabled;
+}
+
+export const ROUTER_USER_AGENT = `codex-model-router/${settings.version || "unknown"}`;
+const codexUserAgentProviders = new Set();
+
+export function routerUserAgentBuilder(onFallback = () => {}, base = buildCustomHeaders) {
+  const builder = (requestHeaders, apiKey, target) => {
+    const headers = base(requestHeaders, apiKey, target);
+    headers.set("user-agent", ROUTER_USER_AGENT);
+    return headers;
+  };
+  builder.fallback = base;
+  builder.onFallback = onFallback;
+  return builder;
+}
+
+function responsesHeaderBuilder(provider) {
+  if (!provider || !upstreamImageGuardEnabled() || codexUserAgentProviders.has(provider.id)) return buildCustomHeaders;
+  stats.upstreamImageGuarded += 1;
+  return routerUserAgentBuilder((accepted) => {
+    if (!accepted) return;
+    codexUserAgentProviders.add(provider.id);
+    stats.codexUserAgentFallbacks += 1;
+    stats.codexUserAgentProviders = [...codexUserAgentProviders];
+  });
+}
+
 function filteredResponseHeaders(upstreamHeaders) {
   const headers = {};
   for (const [name, value] of upstreamHeaders) {
@@ -2002,9 +2126,9 @@ export async function streamUpstream(upstream, response, history = null, respons
 // 單把 Key 的一次請求。上游回 401／403 時重讀這把 Key（可能剛在管理頁換過）；
 // 只有內容真的變了才重送，Key 本身無效時不會白白多打一次。
 async function fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder = buildCustomHeaders) {
-  const send = (apiKey) => fetch(target, {
+  const send = (apiKey, builder = headerBuilder) => fetch(target, {
     method: "POST",
-    headers: headerBuilder(headers, apiKey, target),
+    headers: builder(headers, apiKey, target),
     body,
     redirect: "manual",
     signal,
@@ -2015,7 +2139,15 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal, h
   } catch (error) {
     throw Object.assign(error instanceof Error ? error : new Error(String(error)), { keyReadFailed: true });
   }
-  const upstream = await send(apiKey);
+  let upstream = await send(apiKey);
+  if ((upstream.status === 401 || upstream.status === 403) && headerBuilder.fallback) {
+    // 換了 User-Agent 被拒：先用原本的 User-Agent 重送，Key 本身沒問題時就不必動到 Key 輪替。
+    await upstream.arrayBuffer().catch(() => {});
+    const guarded = headerBuilder;
+    headerBuilder = guarded.fallback;
+    upstream = await send(apiKey, headerBuilder);
+    guarded.onFallback?.(upstream.status !== 401 && upstream.status !== 403);
+  }
   if (upstream.status !== 401 && upstream.status !== 403) return upstream;
   let reloaded;
   try { reloaded = await getApiKey(provider, true, slot); } catch { return upstream; }
@@ -2091,6 +2223,9 @@ export async function fetchModelUpstream(
       throw historyUnavailableError(historyKey, body, requestHeaders);
     }
   }
+  // 先重建完整歷史才配對；在剝除選填 item id 之前保留可驗證的識別。
+  // Claude/Chat 轉譯各自已有工具結果處理，官方原生 WS 不走此 HTTP 路徑。
+  if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
   meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
   // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
   meta.history = meta.history || { disabled: true };
@@ -2232,7 +2367,7 @@ export async function fetchModelUpstream(
       requestHeaders,
       outboundBody,
       signal,
-      { model: route.upstreamModel },
+      { model: route.upstreamModel, headerBuilder: responsesHeaderBuilder(provider) },
     );
     stats.lastCustomStatus = upstream.status;
     if (upstream.status === 400 || upstream.status === 422) {
@@ -3893,6 +4028,7 @@ const server = http.createServer(async (request, response) => {
         historyCache: historyCacheInfo(),
         providers: providerSummary,
         keyPools: keyPoolSummary(),
+        upstreamImageGuard: upstreamImageGuardEnabled(),
         stats,
       });
       return;

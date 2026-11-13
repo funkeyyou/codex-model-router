@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
 const { installer, dir: payloadDir } = await loadPayloads();
-const all = installer.RELAY_IMAGE_MODELS.map((model) => model.id).filter((id) => id.startsWith("gpt-"));
+const all = installer.RELAY_IMAGE_MODELS.map((model) => model.id).filter((id) => id.startsWith("gpt-")).slice(0, 3); // 2.5 世代；2.6 另有測試
 const sourcePath = fileURLToPath(new URL("../codex-model-router.sh", import.meta.url));
 
 function fixture(t) {
@@ -24,15 +24,34 @@ function fixture(t) {
   return { home, options };
 }
 
-test("只偵測三種圖片模型，支援供應商前綴，完全不展示其他模型", () => {
+test("偵測已知圖片模型與清單中其他生圖模型，支援供應商前綴，不展示非生圖模型", () => {
   const found = installer.detectRelayImageModels(["ark/gpt-image-2.5-flare", "gpt-image-2", "gpt-image-1.5", "gpt-image-2.5-sunburst-preview", "gpt-6-astra"]);
-  assert.deepEqual(found.map((model) => [model.id, model.upstreamModel]), [
-    [all[0], all[0]], [all[2], "ark/gpt-image-2.5-flare"],
+  assert.deepEqual(found.map((model) => [model.id, model.upstreamModel, Boolean(model.detected)]), [
+    [all[2], "ark/gpt-image-2.5-flare", false], [all[0], all[0], false], ["gpt-image-1.5", "gpt-image-1.5", true],
   ]);
-  assert.deepEqual(installer.selectRelayImageModels("2", found), [all[2]]);
-  assert.deepEqual(installer.selectRelayImageModels("all", found), [all[0], all[2]]);
-  assert.throws(() => installer.selectRelayImageModels("3", found));
-  assert.deepEqual(installer.detectRelayImageModels(["gpt-image-1", "image-other"]), []);
+  assert.deepEqual(installer.selectRelayImageModels("2", found), [all[0]]);
+  assert.deepEqual(installer.selectRelayImageModels("all", found), [all[2], all[0], "gpt-image-1.5"]);
+  assert.throws(() => installer.selectRelayImageModels("4", found));
+  assert.deepEqual(installer.detectRelayImageModels(["gpt-6-astra", "text-embedding-3", "ark/GPT-Image-X", "bad name image"]), []);
+});
+
+test("2.6 Flare／Sunburst 在已知清單，顯示順序新版在前；清單列出時一併偵測", () => {
+  assert.deepEqual(installer.relayImageKnownChoices().slice(0, 5).map((model) => model.id),
+    ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"]);
+  const found = installer.detectRelayImageModels(["gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2", "gpt-image-2.6-flare", "gpt-image-2.6-sunburst"]);
+  assert.deepEqual(found.map((model) => model.id), installer.relayImageKnownChoices().slice(0, 5).map((model) => model.id));
+  assert.ok(found.every((model) => !model.detected && model.description));
+});
+
+test("偵測到的未知生圖模型可安裝，技能標示特性未知；勾選但清單讀不到時用推斷前綴測試", (t) => {
+  const { options } = fixture(t);
+  const result = installer.installRelayImageSkill({ ...options, models: ["gpt-image-3-preview"], aliases: { "gpt-image-3-preview": "ark/gpt-image-3-preview" } });
+  assert.equal(result.config.upstreamModels["gpt-image-3-preview"], "ark/gpt-image-3-preview");
+  assert.equal(result.config.apiModes["gpt-image-3-preview"], "images");
+  assert.match(readFileSync(join(options.root, "SKILL.md"), "utf8"), /gpt-image-3-preview \(gpt-image-3-preview\): Detected from the provider's model list/);
+  const plan = installer.planRelayImageProbes([], "ark/", ["gpt-image-3-preview"]);
+  assert.equal(plan.find((model) => model.id === "gpt-image-3-preview").upstreamModel, "ark/gpt-image-3-preview");
+  assert.throws(() => installer.installRelayImageSkill({ ...options, models: ["gpt-6-astra"] }));
 });
 
 test("同名模型同時有原名與供應商前綴時，優先使用原名", () => {
@@ -134,9 +153,10 @@ test("更新在搬移新技能時失敗，會把完整舊技能還原", (t) => {
   }
 });
 
-test("拒絕三種以外的模型以及替換成其他模型的別名", (t) => {
+test("拒絕非生圖模型以及替換成其他模型的別名", (t) => {
   const { options } = fixture(t);
-  assert.throws(() => installer.installRelayImageSkill({ ...options, models: ["gpt-image-1.5"] }));
+  assert.throws(() => installer.installRelayImageSkill({ ...options, models: ["gpt-6-astra"] }));
+  assert.throws(() => installer.installRelayImageSkill({ ...options, models: ["Bad Image"] }));
   assert.throws(() => installer.installRelayImageSkill({ ...options, aliases: { [all[2]]: "gpt-image-other" } }));
   assert.equal(existsSync(options.root), false);
 });
@@ -151,7 +171,17 @@ test("已同意的安裝會沿用授權刷新，不再重問同意", async () =>
 
 const probePng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
 
-async function setupThroughCommand(t, { ids = [], status = 200, testModels = "1,2,3",
+// 終端選單先讀清單再編號：偵測到的模型排前面，所以依顯示名稱找編號。
+const LABELS = { [all[0]]: "Image 2", [all[1]]: "Image 2.5 Sunburst", [all[2]]: "Image 2.5 Flare" };
+function pick(...ids) {
+  return (output) => ids.map((id) => {
+    const match = new RegExp(`^\\s+(\\d+)\\. ${LABELS[id].replaceAll(".", "\\.")} — `, "m").exec(output);
+    assert.ok(match, `找不到 ${id} 的編號`);
+    return match[1];
+  }).join(",");
+}
+
+async function setupThroughCommand(t, { ids = [], status = 200, testModels = pick(...all),
   imageResponses = {}, arkModels = [], routes = [], existingModels = null, extraEnv = {} } = {}) {
   const { home, options } = fixture(t);
   const requests = [];
@@ -219,7 +249,7 @@ async function setupThroughCommand(t, { ids = [], status = 200, testModels = "1,
     for (const reply of replies) {
       if (reply.sent || !output.includes(reply.marker)) continue;
       reply.sent = true;
-      child.stdin.write(reply.answer + "\n");
+      child.stdin.write((typeof reply.answer === "function" ? reply.answer(output) : reply.answer) + "\n");
     }
   });
   child.stderr.on("data", (chunk) => { output += chunk; });
@@ -257,7 +287,7 @@ test("選 all 時測三個模型，只讓成功回圖的模型可選，正確映
 
 test("清單沒有圖片模型時，依既有路由前綴實測成功後仍可添加，保留測試圖片", async (t) => {
   const result = await setupThroughCommand(t, { ids: ["ark/gpt-6-astra"], routes: [{ upstreamModel: "ark/gpt-6-astra" }],
-    testModels: "2,3", imageResponses: Object.fromEntries(all.map((id) => ["ark/" + id, {}])) });
+    testModels: pick(all[1], all[2]), imageResponses: Object.fromEntries(all.map((id) => ["ark/" + id, {}])) });
   assert.equal(result.code, 0, result.output);
   const config = JSON.parse(readFileSync(join(result.root, "config.json"), "utf8"));
   assert.deepEqual(config.models, all.slice(1));
@@ -270,7 +300,7 @@ test("清單沒有圖片模型時，依既有路由前綴實測成功後仍可�
 });
 
 test("只選 Flare 就只測一次，即使重複填編號也不重送；未選模型不觸發前綴問題", async (t) => {
-  const result = await setupThroughCommand(t, { ids: ["ark/" + all[2]], testModels: "3,3",
+  const result = await setupThroughCommand(t, { ids: ["ark/" + all[2]], testModels: (output) => `${pick(all[2])(output)},${pick(all[2])(output)}`,
     imageResponses: Object.fromEntries(all.map((id) => ["ark/" + id, {}])) });
   assert.equal(result.code, 0, result.output);
   assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), ["ark/" + all[2]]);
@@ -289,17 +319,17 @@ test("測試選擇留空時，新設定預選 Flare，既有設定只預選已�
   }
 });
 
-test("選測模型時取消或輸入無效編號，不查上游模型、不生圖、不更動技能", async (t) => {
-  for (const testModels of ["cancel", "9"]) {
+test("選測模型時取消或輸入無效編號，只讀過模型清單、不生圖、不更動技能", async (t) => {
+  for (const testModels of ["cancel", "99"]) {
     const result = await setupThroughCommand(t, { testModels, existingModels: [all[2]] });
     assert.equal(result.code, testModels === "cancel" ? 0 : 1, result.output);
-    assert.equal(result.requests.some((r) => r.path.startsWith("/v1/")), false);
+    assert.deepEqual(result.requests.filter((r) => r.path.startsWith("/v1/")).map((r) => `${r.method} ${r.path}`), ["GET /v1/models"]);
     assert.deepEqual(readFileSync(join(result.root, "config.json")), result.configBefore);
   }
 });
 
 test("已選模型通用失敗時只回退同一模型，未選模型不測不添加", async (t) => {
-  const result = await setupThroughCommand(t, { ids: all, testModels: "2",
+  const result = await setupThroughCommand(t, { ids: all, testModels: pick(all[1]),
     imageResponses: { [all[0]]: {}, [all[2]]: {} } });
   assert.equal(result.code, 0, result.output);
   assert.deepEqual(result.requests.filter((r) => /images/.test(r.path)).map((r) => r.body.model), [all[1]]);
@@ -331,7 +361,7 @@ test("模型清單不可用時仍自動推斷前綴，不詢問額外問題", as
 });
 
 test("通用全部失敗後自動用 Ark 查任務並下載，記住模式與成功模型", async (t) => {
-  const result = await setupThroughCommand(t, { ids: ["ark/gpt-6-astra"], testModels: "2,3", arkModels: [all[2]] });
+  const result = await setupThroughCommand(t, { ids: ["ark/gpt-6-astra"], testModels: pick(all[1], all[2]), arkModels: [all[2]] });
   assert.equal(result.code, 0, result.output);
   const posts = result.requests.filter((r) => r.method === "POST");
   assert.deepEqual(posts.map((r) => r.body.model), ["ark/" + all[1], "ark/" + all[2], all[1], all[2]]);
@@ -345,10 +375,10 @@ test("通用全部失敗後自動用 Ark 查任務並下載，記住模式與成
   assert.deepEqual(config.upstreamModels, { [all[2]]: all[2] });
 });
 
-test("none 直接停用，不查模型也不生圖", async (t) => {
+test("none 直接停用，只讀過模型清單、不生圖", async (t) => {
   const result = await setupThroughCommand(t, { testModels: "none", existingModels: [all[2]] });
   assert.equal(result.code, 0, result.output);
-  assert.equal(result.requests.some((request) => request.path !== "/releases"), false);
+  assert.equal(result.requests.some((request) => request.path !== "/releases" && request.path !== "/v1/models"), false);
   assert.equal(existsSync(result.root), false);
 });
 

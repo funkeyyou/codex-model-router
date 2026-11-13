@@ -187,13 +187,18 @@ test("沒有備用 Key 時與以前相同：只送一次，Key 沒變不重送",
   const { instance, origin } = await startRouter(t, null);
   const originalFetch = globalThis.fetch;
   let calls = 0;
-  t.mock.method(globalThis, "fetch", async (url) => {
+  const agents = [];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
     if (!String(url).startsWith("https://relay.example/")) return Response.json({ models: [] });
     calls += 1;
+    agents.push(new Headers(options.headers).get("user-agent"));
     return new Response('{"error":{"message":"invalid key"}}', { status: 401 });
   });
   assert.equal(await send(instance), 401);
-  assert.equal(calls, 1);
+  // 第二次是第三方生圖保護退回原 User-Agent 的確認（只接受 Codex 用戶端的中轉站），同一把 Key、不是重讀 Key。
+  assert.equal(calls, 2);
+  assert.equal(agents[0], instance.ROUTER_USER_AGENT);
+  assert.notEqual(agents[1], instance.ROUTER_USER_AGENT);
   t.mock.restoreAll();
   const health = await originalFetch(`${origin}/healthz`).then((response) => response.json());
   assert.deepEqual(health.keyPools, {});
