@@ -32,8 +32,9 @@ import {
 // 比照 Claude 轉譯用單一字串參數模擬。
 const FREEFORM_KEY = "input";
 
-// Codex 的推理強度對到 Chat Completions 的 reasoning_effort。OpenAI 定義的檔位只到
-// high，更高的一律對到 high。
+// Codex 的推理強度對到 Chat Completions 的 reasoning_effort。在 Chat Completions 上探測到
+// 上游收 xhigh／max 的路由（translate:"chat"）原樣轉送，例如 Gemini 的 Extra High；
+// 其餘更高檔位一律對到 high（Responses 路由退回 Chat 時，檔位是在 Responses 測的）。
 const CHAT_EFFORTS = {
   minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "high", max: "high", ultra: "high",
 };
@@ -469,7 +470,10 @@ export function toChatRequest(body, route) {
 
   const effort = body?.reasoning?.effort;
   if (effort && Array.isArray(route?.efforts) && route.efforts.length && CHAT_EFFORTS[effort]) {
-    request.reasoning_effort = CHAT_EFFORTS[effort];
+    request.reasoning_effort = route.translate === "chat" && !route.chatFallback
+      && ["xhigh", "max"].includes(effort) && route.efforts.includes(effort)
+      ? effort
+      : CHAT_EFFORTS[effort];
   }
   if (Number.isSafeInteger(body.max_output_tokens) && body.max_output_tokens > 0) {
     request.max_tokens = body.max_output_tokens;

@@ -2356,7 +2356,7 @@ export async function fetchModelUpstream(
       return translated;
     };
     if (route.translate === "chat" || deepseekChat) return sendChat(route);
-    if (chatFallbackRoutes.has(route.pickerSlug)) return sendChat({ ...route, translate: "chat" });
+    if (chatFallbackRoutes.has(route.pickerSlug)) return sendChat({ ...route, translate: "chat", chatFallback: true });
     const outboundBody = budget.buffer;
     if (upstreamRequestTooLarge(outboundBody.length)) {
       return oversizeResponse(outboundBody.length);
@@ -2377,7 +2377,7 @@ export async function fetchModelUpstream(
         chatFallbackRoutes.add(route.pickerSlug);
         stats.codexShapeChatFallbacks += 1;
         stats.lastCodexShapeChatFallback = { model: body?.model ?? null, provider: provider?.id ?? null, at: new Date().toISOString() };
-        return sendChat({ ...route, translate: "chat" });
+        return sendChat({ ...route, translate: "chat", chatFallback: true });
       }
       const headers = new Headers(upstream.headers);
       headers.delete("content-encoding");

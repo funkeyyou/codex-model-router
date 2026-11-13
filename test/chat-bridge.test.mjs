@@ -163,6 +163,11 @@ test("tool_choice、推理強度、輸出上限與 JSON schema 都對到 Chat Co
     { type: "function", function: { name: "lookup" } });
   assert.throws(() => translate({ ...base, tool_choice: { type: "function", name: "missing" } }), /不在這次可用工具清單內/);
   assert.equal(translate({ ...base, reasoning: { effort: "xhigh" } }).reasoning_effort, "high");
+  const geminiRoute = { translate: "chat", efforts: ["low", "medium", "high", "xhigh"] };
+  assert.equal(translate({ ...base, reasoning: { effort: "xhigh" } }, geminiRoute).reasoning_effort, "xhigh");
+  assert.equal(translate({ ...base, reasoning: { effort: "max" } }, geminiRoute).reasoning_effort, "high");
+  assert.equal(translate({ ...base, reasoning: { effort: "xhigh" } }, { efforts: ["low", "medium", "high", "xhigh"] }).reasoning_effort, "high",
+    "Responses 路由退回 Chat 時不沿用 Responses 測出的 xhigh");
   assert.equal(translate({ ...base, reasoning: { effort: "low" } }, { efforts: [] }).reasoning_effort, undefined);
   assert.equal(translate({ ...base, max_output_tokens: 777 }).max_tokens, 777);
   assert.deepEqual(translate({ ...base, text: { format: { type: "json_schema", name: "out", schema: { type: "object" }, strict: true } } }).response_format,

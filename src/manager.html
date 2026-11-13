@@ -740,6 +740,11 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "偵測 Fast": "Test Fast",
 "偵測 Fast：{name}": "Test Fast: {name}",
 "在選擇器顯示 Fast": "Show Fast in the picker",
+"推理強度": "Reasoning effort",
+"勾選要在選擇器顯示的推理強度。上游不支援某個檔位時，可能被拒或落回模型預設。": "Select the reasoning efforts to show in the picker. If the provider doesn't support an effort, it may reject it or fall back to the model default.",
+"目前：手動設定，更新或重新探測時不會被覆蓋。": "Currently: set manually; updates and re-tests won't overwrite it.",
+"目前：探測結果。": "Currently: from testing.",
+"至少要保留一個推理強度。": "Keep at least one reasoning effort.",
 "選擇器會顯示 Fast（service_tier=priority）": "The picker shows Fast (service_tier=priority)",
 "開啟後，選擇 Fast 會送出 service_tier=priority：通常更快，費用依供應商計算（多半較貴）。上游不支援時可能被拒或沒有效果。": "When on, choosing Fast sends service_tier=priority: usually faster, billed by the provider (often at a higher rate). Providers that don't support it may reject it or ignore it.",
 "目前：手動開啟。": "Currently: turned on manually.",
@@ -3992,9 +3997,20 @@ function openEditModel(model) {
       modal.close();
       runJob("detect-fast", { slug: model.slug }, { title: t("偵測 Fast：{name}", { name: model.displayName }) });
     } }, icon("refresh"), t("重新偵測")))) : null;
+  // 推理強度：探測只認得標準檔位，其他檔位（例如 Gemini 的 Extra High）讓使用者自行勾選。
+  const effortBoxes = model.effortsConfigurable
+    ? EFFORTS.map((effort) => ({ effort, box: h("input", { type: "checkbox", checked: (model.efforts || []).includes(effort) }) }))
+    : null;
+  const effortField = effortBoxes ? h("div", { class: "field" },
+    h("span", { text: t("推理強度") }),
+    h("div", { style: "display:flex;flex-wrap:wrap;gap:6px 16px" },
+      ...effortBoxes.map(({ effort, box }) => h("label", { class: "check-line" }, box, h("span", { class: "mono", text: effort })))),
+    h("span", { class: "hint", text: model.effortsManual ? t("目前：手動設定，更新或重新探測時不會被覆蓋。") : t("目前：探測結果。") }),
+    h("span", { class: "hint", text: t("勾選要在選擇器顯示的推理強度。上游不支援某個檔位時，可能被拒或落回模型預設。") })) : null;
   const body = [
     h("label", { class: "field" }, h("span", { text: t("顯示名稱") }), name, h("span", { class: "hint", text: t("只影響選擇器裡顯示的名稱；上游模型 ID 與選擇器 ID 不變。") })),
     limits.nodes,
+    effortField,
     fastField,
     globalContextBanner(),
     info,
@@ -4015,7 +4031,12 @@ function openEditModel(model) {
       if (result.contextWindow != null && result.contextWindow !== model.contextWindow) params.contextWindow = result.contextWindow;
       if (result.maxOutputTokens != null && result.maxOutputTokens !== model.outputTokens) params.maxOutputTokens = result.maxOutputTokens;
       if (fastBox && fastBox.checked !== Boolean(model.fast)) params.fast = fastBox.checked;
-      if (displayName === model.displayName && !("contextWindow" in params) && !("maxOutputTokens" in params) && !("fast" in params)) {
+      if (effortBoxes) {
+        const efforts = effortBoxes.filter(({ box }) => box.checked).map(({ effort }) => effort);
+        if (efforts.length === 0) { toast(t("至少要保留一個推理強度。"), "error"); return; }
+        if (efforts.join(",") !== (model.efforts || []).join(",")) params.efforts = efforts;
+      }
+      if (displayName === model.displayName && !("contextWindow" in params) && !("maxOutputTokens" in params) && !("fast" in params) && !("efforts" in params)) {
         modal.close();
         toast(t("沒有任何變更。"));
         return;

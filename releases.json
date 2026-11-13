@@ -1,6 +1,14 @@
 {
-  "latest": "1.44.0",
+  "latest": "1.44.1",
   "releases": [
+    {
+      "version": "1.44.1",
+      "date": "2026-11-13",
+      "changes": [
+        "修正：gemini-4-hydrogen 走 Chat Completions 添加時只會偵測到 low／medium／high，現在會額外加入 xhigh（Gemini 的 Extra High），選 xhigh 時也會原樣轉送，不再降成 high。其他模型照舊維持 low／medium／high（很多閘道對不存在的檔位也回成功，無法靠探測判斷）。已添加的 gemini-4-hydrogen 需移除後重新添加，或用下面的手動設定。",
+        "新增：管理頁「修改模型」可以手動勾選要在選擇器顯示的推理強度（low／medium／high／xhigh／max），手動設定在更新或重新探測時不會被覆蓋。Claude 訂閱的模型由 Claude CLI 決定，不提供這個設定。"
+      ]
+    },
     {
       "version": "1.44.0",
       "date": "2026-11-11",

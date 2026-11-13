@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.0";
+const INSTALLER_VERSION = "1.44.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1695,7 +1695,8 @@ export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeL
     const probe = await testChatCompletion(apiRoot, apiKey, model, { ...base, reasoning_effort: "low" });
     if (probe.ok) {
       efforts = ["low", "medium", "high"];
-      log.line("reasoning_effort（low／medium／high）");
+      efforts.push(...knownChatExtraEfforts(model));
+      log.line(`reasoning_effort（${efforts.join("／")}）`);
     } else {
       log.line(isTransientProbeStatus(probe.status)
         ? `暫時無法確認（HTTP ${probe.status}），使用模型預設`
@@ -1707,6 +1708,19 @@ export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeL
   const fastProbe = await probeServiceTier(
     (tier) => testChatCompletion(apiRoot, apiKey, model, { ...base, service_tier: tier }), log);
   return { supported: true, transient: false, tools, streamOptions, efforts, fastProbe };
+}
+
+// Chat Completions 的 low／medium／high 以外的檔位。很多閘道照收不存在的 reasoning_effort
+// （回 200、落回預設），狀態碼分不出真假，所以只對已知支援的模型加入；其他模型在管理頁
+// 「修改模型」手動調整。比對上游 ID 的最後一段，不分大小寫。
+const KNOWN_CHAT_EXTRA_EFFORTS = Object.freeze({
+  // Gemini 4 家族目前只有 Hydrogen 有 Extra High。
+  "gemini-4-hydrogen": ["xhigh"],
+});
+
+export function knownChatExtraEfforts(model) {
+  const key = String(model || "").split("/").at(-1).toLowerCase();
+  return [...(KNOWN_CHAT_EXTRA_EFFORTS[key] || [])];
 }
 
 // --- 中轉供應商 ---------------------------------------------------------------
@@ -2628,7 +2642,7 @@ export function describeRouteLimits(route) {
 // 修改選擇器顯示名稱、上下文上限與輸出上限。名稱與上下文只影響模型目錄，路由器轉發時
 // 用不到，不必重啟；輸出上限由路由器在轉送 Claude 請求時套用，改了要重啟路由器才會生效
 // （restartRouter）。上游 ID、選擇器 ID、推理強度與憑證一律不變。
-export function planEditModel(manifest, settings, catalog, slug, { displayName, contextWindow, maxOutputTokens, fast } = {}) {
+export function planEditModel(manifest, settings, catalog, slug, { displayName, contextWindow, maxOutputTokens, fast, efforts } = {}) {
   if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
     fail("安裝設定或模型目錄不完整，無法修改模型。");
   }
@@ -2639,6 +2653,22 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
   if (fast !== undefined && fast !== null) {
     if (typeof fast !== "boolean") fail("Fast 設定必須是開或關。");
     if (!fastConfigurable(route)) fail("這個模型的介面不支援在這裡切換 Fast。");
+  }
+
+  // 推理強度：手動指定的檔位記成 effortsManual，之後更新或重新探測都不覆蓋。
+  // Claude 訂閱（CLI）固定支援全部檔位，不在這裡改。
+  let effortsPatch = null;
+  if (efforts !== undefined && efforts !== null) {
+    if (!effortsConfigurable(route)) fail("這個模型的推理強度由 Claude CLI 決定，無法在這裡修改。");
+    if (!Array.isArray(efforts) || efforts.some((effort) => !EFFORTS.includes(effort))) {
+      fail(`推理強度只能是 ${EFFORTS.join("、")}。`);
+    }
+    if (efforts.length === 0) fail("至少要保留一個推理強度。");
+    const ordered = EFFORTS.filter((effort) => efforts.includes(effort));
+    const current = Array.isArray(route.efforts) ? route.efforts : [];
+    if (JSON.stringify(ordered) !== JSON.stringify(current) || route.stripReasoning) {
+      effortsPatch = { efforts: ordered, stripReasoning: false, effortsManual: true };
+    }
   }
 
   let name = entry.display_name || route.displayName || route.upstreamModel;
@@ -2689,14 +2719,16 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
   const fastChanged = Boolean(fastPatch) && (route.fast !== fast || route.fastManual !== true);
   const editRoute = (item) => item.pickerSlug !== slug ? item : {
     ...item, displayName: name, ...(context != null ? { contextWindow: context } : {}), ...(outputChanged ? outputPatch : {}),
-    ...(fastChanged ? fastPatch : {}),
+    ...(fastChanged ? fastPatch : {}), ...(effortsPatch || {}),
   };
   const routes = settings.routes.map(editRoute);
   const tiers = fastChanged ? customSpeedTiers({ ...route, ...fastPatch }) : {};
+  const effortsChanged = Boolean(effortsPatch);
   return {
-    changed: nameChanged || contextChanged || routeContextChanged || outputChanged || fastChanged,
-    restartRouter: outputChanged || fastChanged,
-    restartDesktop: nameChanged || contextChanged || routeContextChanged || fastChanged,
+    changed: nameChanged || contextChanged || routeContextChanged || outputChanged || fastChanged || effortsChanged,
+    // 路由器依 route.efforts 夾住請求的檔位，改了要重啟才會套用。
+    restartRouter: outputChanged || fastChanged || effortsChanged,
+    restartDesktop: nameChanged || contextChanged || routeContextChanged || fastChanged || effortsChanged,
     settings: { ...settings, routes },
     manifest: { ...manifest, routes: Array.isArray(manifest.routes) ? manifest.routes.map(editRoute) : routes },
     catalog: {
@@ -2711,8 +2743,20 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
         } : {}),
         ...(outputChanged && outputPatch.maxOutputTokens ? { max_output_tokens: outputPatch.maxOutputTokens } : {}),
         ...tiers,
+        ...(effortsChanged ? catalogEffortFields(effortsPatch.efforts) : {}),
       }),
     },
+  };
+}
+
+export function effortsConfigurable(route) {
+  return route?.transport !== "claude-cli";
+}
+
+function catalogEffortFields(efforts) {
+  return {
+    default_reasoning_level: defaultEffort(efforts),
+    supported_reasoning_levels: efforts.map((effort) => ({ effort, description: EFFORT_DESCRIPTIONS[effort] })),
   };
 }
 
@@ -2764,11 +2808,7 @@ export function customCatalogEntry(officialModels, route, index) {
   entry.slug = route.pickerSlug;
   entry.display_name = withDefaultModelPrefix(route).displayName;
   entry.description = `${route.upstreamModel}，由 ${route.providerHost} 提供`;
-  entry.default_reasoning_level = defaultEffort(route.efforts);
-  entry.supported_reasoning_levels = route.efforts.map((effort) => ({
-    effort,
-    description: EFFORT_DESCRIPTIONS[effort],
-  }));
+  Object.assign(entry, catalogEffortFields(route.efforts));
   entry.priority =
     Math.max(0, ...officialModels.map((model) => Number(model.priority || 0))) +
     index +
@@ -3516,7 +3556,13 @@ function rollbackEdits(previousConfig) {
 //   restored  被補回來的推理強度
 export function resolveRouteWithPrevious(outcome, previous) {
   const result = resolveRouteWithPreviousEfforts(outcome, previous);
-  return result.route ? { ...result, route: keepPreviousFast(result.route, previous) } : result;
+  return result.route ? { ...result, route: keepManualEfforts(keepPreviousFast(result.route, previous), previous) } : result;
+}
+
+// 使用者在管理頁手動改過推理強度的，重新探測時沿用手動設定。
+export function keepManualEfforts(route, previous) {
+  if (!previous?.effortsManual || route === previous || !Array.isArray(previous.efforts)) return route;
+  return { ...route, efforts: [...previous.efforts], stripReasoning: false, effortsManual: true };
 }
 
 // 重新探測時保留 Fast 設定：使用者手動切過的一律沿用；這次問不到（unknown）時沿用上次結果。
@@ -6898,6 +6944,8 @@ async function managerState() {
       fastConfigurable: fastConfigurable(route),
       fastProbe: typeof route.fastProbe === "string" ? route.fastProbe : null,
       fastManual: route.fastManual === true,
+      effortsConfigurable: effortsConfigurable(route),
+      effortsManual: route.effortsManual === true,
       inCatalog: Boolean(entry),
     };
   }).sort((left, right) => (position.get(left.slug) ?? Number.MAX_SAFE_INTEGER) -
@@ -7432,17 +7480,17 @@ async function managerReorderModels({ slugs } = {}) {
   return { changed: true, backupDir, restartDesktop: codexIntegrationEnabled() };
 }
 
-async function managerEditModel({ slug, displayName, contextWindow, maxOutputTokens, fast } = {}) {
+async function managerEditModel({ slug, displayName, contextWindow, maxOutputTokens, fast, efforts } = {}) {
   assertManagerWritable();
   const { manifest, settings, catalog } = requireInstallation();
-  const plan = planEditModel(manifest, settings, catalog, String(slug || ""), { displayName, contextWindow, maxOutputTokens, fast });
+  const plan = planEditModel(manifest, settings, catalog, String(slug || ""), { displayName, contextWindow, maxOutputTokens, fast, efforts });
   if (!plan.changed) {
     console.log("沒有任何變更。");
     return { changed: false };
   }
   if (plan.restartRouter) {
     // 輸出上限與 Fast 由路由器在轉送時套用，路由器沒有熱重載，必須重啟才會生效。
-    console.log("正在寫入模型設定並重新啟動路由器（輸出上限與 Fast 要重啟後才會套用）…");
+    console.log("正在寫入模型設定並重新啟動路由器（輸出上限、Fast 與推理強度要重啟後才會套用）…");
     const backupDir = await commitRouterChange("edit-model", plan);
     console.log(`已儲存。備份：${backupDir}`);
     return { changed: true, backupDir, restartDesktop: plan.restartDesktop };

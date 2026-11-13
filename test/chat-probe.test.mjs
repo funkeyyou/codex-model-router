@@ -58,6 +58,45 @@ test("探測：支援工具與推理強度時全部記下；不收 stream_option
     .every((request) => !request.body.stream_options), "Fast 探測沿用不帶 stream_options 的設定");
 });
 
+test("探測：已知支援 xhigh 的模型（gemini-4-hydrogen）額外加入，其他模型維持 low／medium／high", async (t) => {
+  const gateway = await fakeGateway(t);
+  assert.deepEqual((await installer.probeChatModel(gateway.apiRoot, "key", "gemini-4-hydrogen", silent)).efforts,
+    ["low", "medium", "high", "xhigh"]);
+  assert.deepEqual((await installer.probeChatModel(gateway.apiRoot, "key", "gemini-4-helium", silent)).efforts,
+    ["low", "medium", "high"]);
+  assert.deepEqual(installer.knownChatExtraEfforts("google/Gemini-4-Hydrogen"), ["xhigh"]);
+  assert.ok(!gateway.requests.some((request) => ["xhigh", "max"].includes(request.body?.reasoning_effort)),
+    "閘道多半照收不存在的檔位，不靠探測判斷 xhigh／max");
+});
+
+test("修改模型：手動調整推理強度會寫進路由與目錄，重新探測時沿用", () => {
+  const route = { ...chatRoute, pickerSlug: "custom/m" };
+  const settings = { routes: [route] };
+  const catalog = { models: [{ slug: "custom/m", display_name: route.displayName, default_reasoning_level: "medium",
+    supported_reasoning_levels: ["low", "medium", "high"].map((effort) => ({ effort })) }] };
+  const plan = installer.planEditModel({ routes: [route] }, settings, catalog, "custom/m", { efforts: ["max", "low", "xhigh"] });
+  assert.equal(plan.changed, true);
+  assert.equal(plan.restartRouter, true);
+  assert.equal(plan.restartDesktop, true);
+  const edited = plan.settings.routes[0];
+  assert.deepEqual(edited.efforts, ["low", "xhigh", "max"], "依標準順序排列");
+  assert.equal(edited.effortsManual, true);
+  assert.deepEqual(plan.catalog.models[0].supported_reasoning_levels.map((level) => level.effort), ["low", "xhigh", "max"]);
+  assert.equal(plan.catalog.models[0].default_reasoning_level, "low");
+
+  assert.equal(installer.planEditModel({ routes: [route] }, settings, catalog, "custom/m", { efforts: ["low", "medium", "high"] }).changed, false);
+  assert.throws(() => installer.planEditModel({ routes: [route] }, settings, catalog, "custom/m", { efforts: [] }), /至少要保留/);
+  assert.throws(() => installer.planEditModel({ routes: [route] }, settings, catalog, "custom/m", { efforts: ["ultra"] }), /推理強度只能是/);
+  const cli = { ...route, transport: "claude-cli" };
+  assert.throws(() => installer.planEditModel({ routes: [cli] }, { routes: [cli] }, catalog, "custom/m", { efforts: ["low"] }), /Claude CLI/);
+
+  const reprobed = installer.resolveRouteWithPrevious({ route: { ...route }, transient: false }, edited).route;
+  assert.deepEqual(reprobed.efforts, ["low", "xhigh", "max"]);
+  assert.equal(reprobed.effortsManual, true);
+  assert.deepEqual(installer.resolveRouteWithPrevious({ route: { ...route }, transient: false }, route).route.efforts,
+    ["low", "medium", "high"], "沒有手動設定的照新探測結果");
+});
+
 test("探測：404 代表不支援，5xx 代表暫時問不到", async (t) => {
   const missing = await fakeGateway(t, { status: 404 });
   assert.deepEqual(await installer.probeChatModel(missing.apiRoot, "key", "m", silent), { supported: false, transient: false });
