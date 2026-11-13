@@ -322,6 +322,42 @@ test("工具呼叫的片段依 index 拼回；namespace 與自由格式工具還
   }
 });
 
+test("同一工具的平行呼叫被中轉擠在同一個 index 時拆回多個呼叫（Gemini 閘道實測形狀）", async () => {
+  const events = await run(sse([
+    delta({ tool_calls: [{ index: 0, id: "toolu_a", type: "function", function: { name: "shell_command", arguments: "" } }] }),
+    delta({ tool_calls: [{ index: 0, function: { arguments: "{\"command\":\"Get-ChildItem\"}" } }] }),
+    delta({ tool_calls: [{ index: 0, function: { arguments: "{\"command\":\"[System.Environment]::OSVersion\"}" } }] }),
+    delta({ tool_calls: [{ index: 0, function: { arguments: "{\"command\":" } }] }),
+    delta({ tool_calls: [{ index: 0, function: { arguments: "\"[math]::Pow(2,40)\"}" } }] }, "tool_calls"),
+  ]));
+  const [done] = terminal(events);
+  assert.equal(done.type, "response.completed");
+  const calls = done.response.output.filter((item) => item.type === "function_call");
+  assert.deepEqual(calls.map((item) => [item.name, JSON.parse(item.arguments).command]), [
+    ["shell_command", "Get-ChildItem"],
+    ["shell_command", "[System.Environment]::OSVersion"],
+    ["shell_command", "[math]::Pow(2,40)"],
+  ]);
+  assert.equal(calls[0].call_id, "toolu_a");
+  assert.equal(new Set(calls.map((item) => item.call_id)).size, 3);
+  assert.equal(new Set(calls.map((item) => item.id)).size, 3);
+  assert.equal(events.filter((event) => event.type === "response.output_item.added").length, 3);
+});
+
+test("同一個 index 換了新的 id 視為新呼叫；先送 {} 佔位再送參數的仍是同一個呼叫", async () => {
+  const split = terminal(await run(sse([
+    delta({ tool_calls: [{ index: 0, id: "c1", function: { name: "lookup", arguments: "{\"q\":\"a\"}" } }] }),
+    delta({ tool_calls: [{ index: 0, id: "c2", function: { name: "lookup", arguments: "{\"q\":\"b\"}" } }] }, "tool_calls"),
+  ])))[0];
+  assert.deepEqual(split.response.output.map((item) => [item.call_id, item.arguments]), [["c1", "{\"q\":\"a\"}"], ["c2", "{\"q\":\"b\"}"]]);
+  const placeholder = terminal(await run(sse([
+    delta({ tool_calls: [{ index: 0, id: "c1", function: { name: "lookup", arguments: "{}" } }] }),
+    delta({ tool_calls: [{ index: 0, function: { arguments: "{\"q\":\"a\"}" } }] }, "tool_calls"),
+  ])))[0];
+  assert.deepEqual(placeholder.response.output.map((item) => [item.call_id, item.arguments]), [["c1", "{\"q\":\"a\"}"]]);
+});
+
+
 test("自由格式工具直接給原始內容也接受；以 { 開頭卻不完整的參數則讓這一輪失敗", async () => {
   const context = ctx({ freeform: new Set(["apply_patch"]) });
   const raw = terminal(await run(sse([delta({ tool_calls: [{ index: 0, id: "c", function: { name: "apply_patch", arguments: "*** Begin Patch" } }] }, "tool_calls")]), context))[0];

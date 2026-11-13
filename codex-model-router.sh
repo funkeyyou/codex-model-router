@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.2";
+const INSTALLER_VERSION = "1.44.3";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -13192,6 +13192,19 @@ function streamBridgeFor(meta) {
 }
 
 function recordClaudeBridgeFailure(event, meta) {
+  // Chat 轉譯在串流中產生的失敗（例如工具參數無法解析）只會回給 Codex，
+  // 不會經過 HTTP 錯誤路徑；這裡補記一筆，管理頁「最近的錯誤」與診斷包才看得到。
+  // 只記錯誤碼與說明，不記工具參數或對話內容。
+  if (event.type === "response.failed" && (meta.translate === "chat"
+    || (meta.translate === "anthropic" && event.response?.error?.code === "invalid_tool_arguments"))) {
+    const error = event.response?.error || {};
+    recordRouterError(new RouterRequestError(
+      502,
+      typeof error.code === "string" && error.code ? error.code.slice(0, 80) : "translation_failed",
+      typeof error.message === "string" && error.message ? error.message.slice(0, 300) : "轉譯回應失敗。",
+      "translation",
+    ), { transport: meta.transport || null, route: "custom", model: meta.model });
+  }
   if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
   if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
   if (["empty_response", "output_limit"].includes(meta.claudeFailureKind)) stats.claudeEmptyResponses += 1;
@@ -15778,6 +15791,18 @@ function clip(text, max = 2000) {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+// 已累積的工具參數是否已經是一個完整的 JSON 物件。
+function completeJsonObject(text) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+  try {
+    const value = JSON.parse(trimmed);
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
 function isUserMessage(item) {
   return (item?.type === "message" || (!item?.type && item?.role)) && item.role === "user";
 }
@@ -16235,6 +16260,8 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
   let reasoning = null;
   let message = null;
   const calls = new Map();
+  // 同一個 index 被拆出來的平行呼叫（見 addToolCallFragment）。
+  const splitCalls = [];
   let finishReason = null;
   let usage = null;
   let failed = false;
@@ -16360,12 +16387,31 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
       entry = { itemId: randomId("fc_", 54), callId: null, alias: "", args: "", announced: false, index: null };
       calls.set(key, entry);
     }
-    if (typeof fragment?.id === "string" && fragment.id && !entry.callId) entry.callId = fragment.id;
     const name = fragment?.function?.name;
+    const rawArgs = fragment?.function?.arguments;
+    const argsText = typeof rawArgs === "string" ? rawArgs
+      : (rawArgs && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
+    // 部分中轉（例如某些 Gemini 閘道）把同一個工具的多個平行呼叫全標成同一個 index，
+    // 而且只有第一段帶 id 與名稱，參數就變成 {...}{...} 黏在一起。已經是完整 JSON 物件
+    // 之後又以 { 開頭，或換了一個不同的 id，都不可能是同一份參數的延續，拆成新的呼叫。
+    const newId = typeof fragment?.id === "string" && fragment.id && entry.callId && fragment.id !== entry.callId;
+    const continuesAfterObject = argsText.trimStart().startsWith("{") && !(typeof name === "string" && name)
+      && completeJsonObject(entry.args);
+    if (newId || continuesAfterObject) {
+      if (!newId && entry.args.trim() === "{}") {
+        // 先送 "{}" 佔位、再送真正參數的上游：前面的空物件不是另一個呼叫。
+        entry.args = "";
+      } else {
+        splitCalls.push(entry);
+        const alias = entry.alias;
+        entry = { itemId: randomId("fc_", 54), callId: null, alias: "", args: "", announced: false, index: null };
+        if (!(typeof name === "string" && name)) entry.alias = alias;
+        calls.set(key, entry);
+      }
+    }
+    if (typeof fragment?.id === "string" && fragment.id && !entry.callId) entry.callId = fragment.id;
     if (typeof name === "string" && name && !entry.alias) entry.alias = name;
-    const args = fragment?.function?.arguments;
-    if (typeof args === "string") entry.args += args;
-    else if (args && typeof args === "object") entry.args += JSON.stringify(args);
+    entry.args += argsText;
     if (!entry.announced && entry.alias) announce(entry);
   };
 
@@ -16414,7 +16460,7 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     closeReasoning();
     closeMessage();
     flushMessage(calls.size === 0 && (!finishReason || finishReason === "stop") ? "final_answer" : "commentary");
-    const pending = [...calls.values()];
+    const pending = [...splitCalls, ...calls.values()];
     if (pending.some((entry) => !entry.announced)) {
       fail({ code: "invalid_tool_arguments", message: "上游工具呼叫缺少名稱；未執行，請重新產生該工具呼叫。" });
       return;

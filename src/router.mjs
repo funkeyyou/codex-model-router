@@ -3420,6 +3420,19 @@ function streamBridgeFor(meta) {
 }
 
 function recordClaudeBridgeFailure(event, meta) {
+  // Chat 轉譯在串流中產生的失敗（例如工具參數無法解析）只會回給 Codex，
+  // 不會經過 HTTP 錯誤路徑；這裡補記一筆，管理頁「最近的錯誤」與診斷包才看得到。
+  // 只記錯誤碼與說明，不記工具參數或對話內容。
+  if (event.type === "response.failed" && (meta.translate === "chat"
+    || (meta.translate === "anthropic" && event.response?.error?.code === "invalid_tool_arguments"))) {
+    const error = event.response?.error || {};
+    recordRouterError(new RouterRequestError(
+      502,
+      typeof error.code === "string" && error.code ? error.code.slice(0, 80) : "translation_failed",
+      typeof error.message === "string" && error.message ? error.message.slice(0, 300) : "轉譯回應失敗。",
+      "translation",
+    ), { transport: meta.transport || null, route: "custom", model: meta.model });
+  }
   if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
   if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
   if (["empty_response", "output_limit"].includes(meta.claudeFailureKind)) stats.claudeEmptyResponses += 1;
