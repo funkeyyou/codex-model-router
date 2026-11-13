@@ -158,6 +158,7 @@ test("首次使用沒有模型也能開啟 API Key 模式，既有 Key 與寫入
       codexAvailable: () => true, codexConnected: () => false, desktopName: () => "Codex",
       currentView: "settings", document: { getElementById: () => ({ replaceChildren(...children) { context.rendered = children; } }) },
       renderGlobalContextPanel: () => ({ text: "context-setting" }), renderHiddenModelsPanel: () => ({ text: "hidden-setting" }),
+      renderToolOutputBudgetPanel: () => ({ text: "tool-budget-setting" }),
       pageHead: () => null, paragraph: text => ({ text }), icon: () => null,
       h(tag, attrs, ...children) { return { tag, attrs, children, append(...items) { this.children.push(...items); } }; },
     });
@@ -168,7 +169,8 @@ test("首次使用沒有模型也能開啟 API Key 模式，既有 Key 與寫入
       vm.runInContext("renderView()", context);
       const panel = context.rendered[1];
       assert.equal(context.rendered[2].text, "context-setting");
-      assert.equal(context.rendered[3].text, "hidden-setting");
+      assert.equal(context.rendered[3].text, "tool-budget-setting");
+      assert.equal(context.rendered[4].text, "hidden-setting");
       const buttons = [];
       const visit = node => { if (node?.tag === "button") buttons.push(node); node?.children?.flat(Infinity).forEach(visit); };
       visit(panel);

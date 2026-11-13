@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.5";
+const INSTALLER_VERSION = "1.44.6";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -7958,6 +7958,47 @@ async function managerConnectCodex() {
   return { changed: true, backupDir, apiKeyMode, restartDesktop: true };
 }
 
+export function normalizeToolOutputBudget(value = 10000) {
+  if (value === null || value === "" || typeof value === "boolean") fail("工具輸出預算必須是 1～1,000,000 之間的整數。");
+  return parseTokenSetting(value, { label: "工具輸出預算", min: 1, max: 1000000 });
+}
+
+export async function setToolOutputBudget(value, { readConfig = readUserConfig, writeConfig = writeConfigEdits } = {}) {
+  const target = normalizeToolOutputBudget(value);
+  const user = await readConfig();
+  const previous = deepGet(user.config, "tool_output_token_limit");
+  if (previous.present && previous.value === target) return { changed: false, value: target };
+  const backupDir = join(backupsRoot, `tool-output-budget-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(user.filePath, join(backupDir, "config.toml"));
+  try {
+    await writeConfig([{ keyPath: "tool_output_token_limit", value: target }]);
+    const verified = await readConfig();
+    if (verified.config.tool_output_token_limit !== target) fail("工具輸出預算驗證失敗。");
+  } catch (error) {
+    try { await writeConfig([{ keyPath: "tool_output_token_limit", value: previous.present ? previous.value : null }]); }
+    catch (restoreError) { console.error(`配置還原失敗：${restoreError.message}；備份：${backupDir}`); }
+    throw error;
+  }
+  return { changed: true, value: target, backupDir };
+}
+
+async function managerToolOutputBudget() {
+  requireCodexIntegration();
+  const user = await readUserConfig();
+  return { value: user.config.tool_output_token_limit ?? null, defaultValue: 10000, filePath: user.filePath };
+}
+
+async function managerSetToolOutputBudget({ value } = {}) {
+  requireCodexIntegration();
+  if (readManifest()) assertManagerWritable();
+  const result = await setToolOutputBudget(value);
+  console.log(result.changed ? "已更新工具輸出預算；請重新啟動 Codex 後測試。" : "設定沒有變更。");
+  if (result.backupDir) console.log(`備份：${result.backupDir}`);
+  // Do not interrupt active chats automatically for this preference.
+  return result;
+}
+
 async function managerGlobalContext() {
   requireCodexIntegration();
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -9075,6 +9116,7 @@ function managerOperations() {
       "claude-desktop": () => managerClaudeDesktop(),
       "claude-desktop-connection": () => managerClaudeDesktop({ connection: true }),
       "global-context": () => managerGlobalContext(),
+      "tool-output-budget": () => managerToolOutputBudget(),
       "hidden-models": () => managerHiddenModels(),
       imagegen: () => managerImagegenStatus(),
       "imagegen-detect": (params) => managerImagegenDetect(params || {}),
@@ -9111,6 +9153,7 @@ function managerOperations() {
       "apply-update": job("套用新版本", managerApplyLocalUpdate),
       "connect-codex": job("連接 Codex", managerConnectCodex),
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
+      "set-tool-output-budget": job("設定工具輸出預算", managerSetToolOutputBudget),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
       "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
       "set-official-model-visibility": job("設定官方模型選項", managerSetOfficialModelsVisibility),

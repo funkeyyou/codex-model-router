@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.5";
+const INSTALLER_VERSION = "1.44.6";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8105,6 +8105,47 @@ async function managerConnectCodex() {
   return { changed: true, backupDir, apiKeyMode, restartDesktop: true };
 }
 
+export function normalizeToolOutputBudget(value = 10000) {
+  if (value === null || value === "" || typeof value === "boolean") fail("工具輸出預算必須是 1～1,000,000 之間的整數。");
+  return parseTokenSetting(value, { label: "工具輸出預算", min: 1, max: 1000000 });
+}
+
+export async function setToolOutputBudget(value, { readConfig = readUserConfig, writeConfig = writeConfigEdits } = {}) {
+  const target = normalizeToolOutputBudget(value);
+  const user = await readConfig();
+  const previous = deepGet(user.config, "tool_output_token_limit");
+  if (previous.present && previous.value === target) return { changed: false, value: target };
+  const backupDir = join(backupsRoot, `tool-output-budget-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(user.filePath, join(backupDir, "config.toml"));
+  try {
+    await writeConfig([{ keyPath: "tool_output_token_limit", value: target }]);
+    const verified = await readConfig();
+    if (verified.config.tool_output_token_limit !== target) fail("工具輸出預算驗證失敗。");
+  } catch (error) {
+    try { await writeConfig([{ keyPath: "tool_output_token_limit", value: previous.present ? previous.value : null }]); }
+    catch (restoreError) { console.error(`配置還原失敗：${restoreError.message}；備份：${backupDir}`); }
+    throw error;
+  }
+  return { changed: true, value: target, backupDir };
+}
+
+async function managerToolOutputBudget() {
+  requireCodexIntegration();
+  const user = await readUserConfig();
+  return { value: user.config.tool_output_token_limit ?? null, defaultValue: 10000, filePath: user.filePath };
+}
+
+async function managerSetToolOutputBudget({ value } = {}) {
+  requireCodexIntegration();
+  if (readManifest()) assertManagerWritable();
+  const result = await setToolOutputBudget(value);
+  console.log(result.changed ? "已更新工具輸出預算；請重新啟動 Codex 後測試。" : "設定沒有變更。");
+  if (result.backupDir) console.log(`備份：${result.backupDir}`);
+  // Do not interrupt active chats automatically for this preference.
+  return result;
+}
+
 async function managerGlobalContext() {
   requireCodexIntegration();
   if (!codexBin) fail(`未找到 Codex CLI，請先安裝 ${desktopAppName} 或 Codex CLI。`);
@@ -9222,6 +9263,7 @@ function managerOperations() {
       "claude-desktop": () => managerClaudeDesktop(),
       "claude-desktop-connection": () => managerClaudeDesktop({ connection: true }),
       "global-context": () => managerGlobalContext(),
+      "tool-output-budget": () => managerToolOutputBudget(),
       "hidden-models": () => managerHiddenModels(),
       imagegen: () => managerImagegenStatus(),
       "imagegen-detect": (params) => managerImagegenDetect(params || {}),
@@ -9258,6 +9300,7 @@ function managerOperations() {
       "apply-update": job("套用新版本", managerApplyLocalUpdate),
       "connect-codex": job("連接 Codex", managerConnectCodex),
       "set-global-context": job("設定全域上下文", managerSetGlobalContext),
+      "set-tool-output-budget": job("設定工具輸出預算", managerSetToolOutputBudget),
       "set-hidden-models": job("設定隱藏的官方模型", managerSetHiddenModels),
       "set-quota-mode": job("切換 API Key 模式", managerSetQuotaMode),
       "set-official-model-visibility": job("設定官方模型選項", managerSetOfficialModelsVisibility),
@@ -19250,6 +19293,12 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "全域預設模型": "Global default model",
 "未設定（使用官方預設）": "Not set (official default)",
 "全域上下文": "Global context",
+"工具輸出預算": "Tool output budget",
+"設定工具輸出預算": "Set tool output budget",
+"未設定（Codex 預設）": "Not set (Codex default)",
+"每筆工具結果存入歷史的原生 token 預算，適用官方與自訂模型。建議起始值 10,000；不會清理既有歷史。": "Native token budget for each tool result stored in history, for official and custom models. Suggested starting value: 10,000. Existing history is not cleaned up.",
+"工具輸出預算必須是 1～1,000,000 之間的整數。": "Tool output budget must be an integer between 1 and 1,000,000.",
+"儲存後請自行重新啟動 Codex；不會自動中斷任務。": "Restart Codex manually after saving; running tasks will not be interrupted automatically.",
 "通用": "General",
 "管理頁與路由器的通用功能。": "General manager and router options.",
 "Claude 桌面客戶端的接入與回退設定。": "Connect Claude Desktop or restore its previous settings.",
@@ -20636,6 +20685,7 @@ function renderSetupSettings() {
     pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，可先開啟 API Key 模式或調整全域上下文。")),
     renderQuotaModePanel(Boolean(state.writeBlocked || state.setupBlocked)),
     renderGlobalContextPanel(!codexAvailable()),
+    renderToolOutputBudgetPanel(Boolean(state.writeBlocked || state.setupBlocked)),
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
     renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
   ];
@@ -21879,6 +21929,7 @@ function renderSettings() {
     renderOfficialModelVisibilityPanel(blocked),
     renderKeysmithPanel(blocked),
     renderGlobalContextPanel(blocked),
+    renderToolOutputBudgetPanel(blocked),
     renderHiddenModelsPanel(blocked),
   ];
 }
@@ -22155,6 +22206,30 @@ function confirmQuotaMode(enabled, previousLogin = null) {
   }).then((ok) => {
     if (ok) runJob("set-quota-mode", { enabled }, { title: enabled ? t("開啟 API Key 模式") : t("關閉 API Key 模式") });
   });
+}
+
+function renderToolOutputBudgetPanel(blocked) {
+  const entry = ensureQuery("tool-output-budget");
+  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
+    h("h2", { text: t("工具輸出預算") }), refreshButton("tool-output-budget", t("工具輸出預算"))));
+  if (!entry.data) { panel.append(queryPlaceholder(entry, "tool-output-budget")); return panel; }
+  const current = entry.data.value;
+  const input = h("input", { type: "number", min: "1", max: "1000000", step: "1",
+    value: String(current ?? entry.data.defaultValue ?? 10000), disabled: blocked });
+  panel.append(h("div", { class: "panel-body setting-body" },
+    h("div", { class: "setting-value", text: current == null ? t("未設定（Codex 預設）") : t("{value} tokens", { value: formatNumber(current) }) }),
+    paragraph(t("每筆工具結果存入歷史的原生 token 預算，適用官方與自訂模型。建議起始值 10,000；不會清理既有歷史。"), "muted"),
+    h("label", { class: "field" }, h("span", { text: "tool_output_token_limit (tokens)" }), input),
+    paragraph(t("儲存後請自行重新啟動 Codex；不會自動中斷任務。"), "note"),
+    h("div", { class: "actions" }, h("button", { type: "button", class: "button primary", disabled: blocked, text: t("儲存"), onclick: () => {
+      const value = Number(input.value.trim());
+      if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) {
+        toast(t("工具輸出預算必須是 1～1,000,000 之間的整數。"), "error"); return;
+      }
+      if (value === current) { toast(t("沒有任何變更。")); return; }
+      runJob("set-tool-output-budget", { value }, { title: t("設定工具輸出預算") });
+    } }))));
+  return panel;
 }
 
 function renderGlobalContextPanel(blocked) {
