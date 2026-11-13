@@ -20,7 +20,7 @@ Return JSON matching the supplied schema. Set resolved=true only if reproduction
 the scoped fix, and the configured verification all succeeded. Describe actual
 before/after observations and executed checks in validation. If checks fail,
 set resolved=false and explain what remains uncertain. Use the issue's language;
-use Traditional Chinese for Chinese replies. The workflow will add the PR link.
+use Simplified Chinese for Chinese replies. The workflow will add the PR link.
 
 Repository-specific guidance for codex-model-router:
 - Read README.zh-TW.md for the overview, then the detailed docs it links to:

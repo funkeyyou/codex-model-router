@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { loadPayloads, loadRouterWith } from "./helpers/payloads.mjs";
 
 const { imagegen } = await loadPayloads();
-const all = imagegen.GPT_IMAGE_MODELS;
+const all = imagegen.GPT_IMAGE_MODELS.slice(0, 3); // 2.5 世代的三個模型；2.6 另有測試
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZB9sAAAAASUVORK5CYII=", "base64");
 
 function fixture(t, models = all) {
@@ -35,6 +35,38 @@ test("多模型有確定預設，使用者明確指定優先，單一模型固�
   assert.equal(imagegen.chooseImageModel({ models: [all[0]] }, null, "edit"), all[0]);
   assert.throws(() => imagegen.chooseImageModel({ models: [all[2]] }, "sunburst", "edit"), /未啟用/);
   assert.throws(() => imagegen.chooseImageModel(config, "gpt-image-1.5", "generate"), /未啟用/);
+});
+
+test("2.6 與 2.5 同時啟用時預設用 2.6；不帶版本的別名選已啟用的最新版，帶版本可指定", () => {
+  const [image2, sunburst25, flare25, sunburst26, flare26] = imagegen.GPT_IMAGE_MODELS;
+  const config = { models: [image2, sunburst25, flare25, sunburst26, flare26] };
+  assert.equal(imagegen.chooseImageModel(config, null, "generate"), flare26);
+  assert.equal(imagegen.chooseImageModel(config, null, "edit"), sunburst26);
+  assert.equal(imagegen.chooseImageModel(config, "flare", "generate"), flare26);
+  assert.equal(imagegen.chooseImageModel(config, "flare2.5", "generate"), flare25);
+  assert.equal(imagegen.chooseImageModel(config, "image2.6-sunburst", "edit"), sunburst26);
+  assert.equal(imagegen.chooseImageModel({ models: [flare25] }, "flare", "generate"), flare25);
+  assert.throws(() => imagegen.chooseImageModel({ models: [flare25] }, "flare2.6", "generate"), /未啟用/);
+});
+
+test("供應商清單偵測到的未知模型：可用完整 ID，只接受 auto 尺寸與品質，排在已知模型之後", async (t) => {
+  const f = fixture(t, ["gpt-image-3-preview"]);
+  assert.equal(imagegen.chooseImageModel({ models: ["gpt-image-3-preview", all[2]] }, null, "generate"), all[2]);
+  assert.equal(imagegen.chooseImageModel({ models: ["gpt-image-3-preview"] }, null, "generate"), "gpt-image-3-preview");
+  const dry = await imagegen.runRelayImagegen([...f.generate, "--dry-run"], { configPath: f.configPath, fetchImpl: () => assert.fail("不能連網") });
+  assert.equal(dry.model, "gpt-image-3-preview");
+  await assert.rejects(imagegen.runRelayImagegen([...f.generate, "--quality", "high", "--dry-run"], { configPath: f.configPath }), /quality=high/);
+  await assert.rejects(imagegen.runRelayImagegen([...f.generate, "--size", "1024x1024", "--dry-run"], { configPath: f.configPath }), /特性未知/);
+  assert.throws(() => imagegen.chooseImageModel({ models: ["gpt-6-astra"] }, null, "generate"), /設定無效/);
+});
+
+test("未知模型的偵測請求不送尺寸與品質", async () => {
+  let body;
+  const result = await imagegen.probeRelayImageModel({ model: "gpt-image-3-preview", apiRoot: "https://relay.example/v1", apiKey: "k",
+    fetchImpl: async (url, options) => { body = JSON.parse(options.body); return Response.json({ data: [{ b64_json: png.toString("base64") }] }); } });
+  assert.equal(result.ok, true);
+  assert.equal("size" in body, false);
+  assert.equal("quality" in body, false);
 });
 
 test("dry-run 不連網、不產生檔案，也不需要 API Key", async (t) => {

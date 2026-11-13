@@ -54,8 +54,8 @@ test("拒絕連線：先提示路由器沒在執行，再提沙盒；回應格�
 test("技能說明：generate／edit 在沙盒中直接申請提升權限，並告訴使用者可改完整存取權或代我核准", () => {
   for (const platform of ["win32", "darwin"]) {
     const text = installer.renderRelayImageSkill({ root: "/skills/router-imagegen", nodePath: "/node", models: [model], platform });
-    assert.match(text, /## 權限/);
-    assert.match(text, /以提升權限執行 generate／edit/);
+    assert.match(text, /## Permissions/);
+    assert.match(text, /run generate\/edit with escalated permissions right away/);
     assert.match(text, /完整存取權/);
     assert.match(text, /代我核准/);
   }

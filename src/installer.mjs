@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.41.5";
+const INSTALLER_VERSION = "1.44.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -86,6 +86,8 @@ export const RELAY_IMAGE_MODELS = [
   { id: "gpt-image-2", label: "Image 2", description: "上一代圖片模型，適合既有流程與相容需求。" },
   { id: "gpt-image-2.5-sunburst", label: "Image 2.5 Sunburst", description: "偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。" },
   { id: "gpt-image-2.5-flare", label: "Image 2.5 Flare", description: "偏重速度，適合一般生圖與快速迭代。" },
+  { id: "gpt-image-2.6-sunburst", label: "Image 2.6 Sunburst", description: "Sunburst 新一代：偏重編輯精準度，適合精細改圖與需保留原圖細節的工作。" },
+  { id: "gpt-image-2.6-flare", label: "Image 2.6 Flare", description: "Flare 新一代：偏重速度，適合一般生圖與快速迭代。" },
   { id: "gemini-nano-banana-2.1", label: "Nano Banana 2.1", description: "Google 目前的主力生圖模型：速度快、成本低，畫質、文字渲染與多輪改圖一致性都比 Nano Banana 2 好。" },
   { id: "gemini-3-pro-image", label: "Nano Banana Pro", description: "Google 品質最高的生圖模型：適合複雜構圖、精準文字、品牌一致性與精細控制，較慢也較貴。" },
   { id: "gemini-3.1-flash-image", label: "Nano Banana 2", description: "上一代主力：兼顧速度、4K 輸出與多張參考圖的一致性。" },
@@ -93,6 +95,46 @@ export const RELAY_IMAGE_MODELS = [
   { id: "gemini-2.5-flash-image", label: "Nano Banana", description: "初代舊型號，適合既有流程；Google 建議改用 Nano Banana 2 Lite。" },
 ];
 const RELAY_IMAGE_MODE_LABELS = { images: "通用", "ark-task": "Ark", chat: "Chat", gemini: "Gemini 原生" };
+// 管理頁與終端選單的顯示順序：新版在前。
+const RELAY_IMAGE_DISPLAY_ORDER = ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"];
+export function relayImageKnownChoices() {
+  const rank = (id) => { const index = RELAY_IMAGE_DISPLAY_ORDER.indexOf(id); return index < 0 ? RELAY_IMAGE_DISPLAY_ORDER.length : index; };
+  return RELAY_IMAGE_MODELS.map((model, index) => ({ model, index }))
+    .sort((a, b) => rank(a.model.id) - rank(b.model.id) || a.index - b.index).map(({ model }) => model);
+}
+// 供應商清單偵測到、不在已知清單的生圖模型（與 imagegen.mjs 的規則相同）。
+const DETECTED_IMAGE_ID = /^[a-z0-9][a-z0-9._-]{0,79}$/;
+export function looksLikeImageModel(name) {
+  return typeof name === "string" && /(?:^|[-_.])image(?:[-_.]|$)|banana|imagen|dall-e/i.test(name);
+}
+export function isRelayImageModelId(id) {
+  return RELAY_IMAGE_MODELS.some((model) => model.id === id) ||
+    (typeof id === "string" && DETECTED_IMAGE_ID.test(id) && looksLikeImageModel(id));
+}
+function isGeminiImageId(id) {
+  return String(id).startsWith("gemini-") || (!RELAY_IMAGE_MODELS.some((model) => model.id === id) && /gemini|banana|imagen/i.test(String(id)));
+}
+export function relayImageModelInfo(id) {
+  return RELAY_IMAGE_MODELS.find((model) => model.id === id) ||
+    { id, label: id, description: "由供應商模型清單偵測到；特性未知，尺寸與品質交給上游決定。", detected: true };
+}
+// 技能內容用英文：Codex 的系統提示與內建 imagegen 技能都是英文，英文指示對模型最明確。
+const RELAY_IMAGE_SKILL_NOTES = {
+  "gpt-image-2": "Previous-generation model for existing workflows and compatibility.",
+  "gpt-image-2.5-sunburst": "Optimized for editing precision; best for detailed edits that must keep source details.",
+  "gpt-image-2.5-flare": "Optimized for speed; best for general generation and fast iteration.",
+  "gpt-image-2.6-sunburst": "Newer Sunburst: optimized for editing precision; best for detailed edits that must keep source details.",
+  "gpt-image-2.6-flare": "Newer Flare: optimized for speed; best for general generation and fast iteration.",
+  "gemini-nano-banana-2.1": "Google's current main image model: fast and low-cost, with better quality, text rendering and multi-turn edit consistency than Nano Banana 2.",
+  "gemini-3-pro-image": "Google's highest-quality image model: complex compositions, accurate in-image text, brand consistency and fine control; slower and more expensive.",
+  "gemini-3.1-flash-image": "Previous main model: balances speed, 4K output and consistency across several reference images.",
+  "gemini-3.1-flash-lite-image": "Fastest and cheapest, for high volume; weak with several references or repeated edits.",
+  "gemini-2.5-flash-image": "Original legacy model for existing workflows; Google recommends Nano Banana 2 Lite instead.",
+};
+function relayImageSkillNote(model) {
+  return RELAY_IMAGE_SKILL_NOTES[model.id] ||
+    "Detected from the provider's model list; capabilities unknown, size and quality are left to the provider.";
+}
 const installHash = createHash("sha256")
   .update(codexHome)
   .digest("hex")
@@ -5461,49 +5503,59 @@ function imagegenShellCommand(nodePath, program, platform = process.platform) {
 
 export function renderRelayImageSkill({ root, nodePath, models, platform = process.platform }) {
   const command = imagegenShellCommand(nodePath, join(root, "scripts", "imagegen.mjs"), platform);
-  const selected = RELAY_IMAGE_MODELS.filter((model) => models.includes(model.id));
+  const selected = [...RELAY_IMAGE_MODELS.filter((model) => models.includes(model.id)),
+    ...models.filter((id) => !RELAY_IMAGE_MODELS.some((model) => model.id === id)).map(relayImageModelInfo)];
   return [
     "---",
     "name: router-imagegen",
-    "description: 透過使用者已啟用的中轉 API 生成或編輯圖片，適用於免費帳號或內建 image_gen 不可用的生圖需求，以及明確指定中轉生圖或 router-imagegen 的任務。",
-    "---", "", "# 中轉 API 生圖", "",
-    "此技能由使用者在路由器安裝器中選擇啟用，使用中轉供應商的圖片 API 並依其規則計費。",
-    "API 請求連到本機路由器，由路由器讀取已保存的憑證；不需要 OPENAI_API_KEY，也不要讀出或複製金鑰。Ark 結果圖片由命令下載，下載不附帶中轉憑證。",
-    "若使用者指定官方內建工具或其他供應商，遵從其選擇。本技能不修改官方 imagegen。", "",
-    "## 模型選擇", "",
-    ...selected.map((model) => `- ${model.label}（${model.id}）：${model.description}`), "",
-    "只使用 config.json 中已勾選的模型。每次先執行下面的 list 命令確認最新清單。",
-    "若只有一個模型就固定使用；有多個時由 AI 按需求選擇，並以 --model 明確指定。",
-    "使用者明確指定的模型優先；若未啟用，說明並請使用者從安裝器設定，不擅自啟用。",
-    "一般生圖／快速迭代優先 Flare；需要精確修改或保留原圖細節時優先 Sunburst。",
-    "Image 2 用於使用者指定、既有流程或相容需求。只從已啟用模型中選擇，速度與費用以中轉商實際回應為準。", "",
-    "Nano Banana（Google Gemini 圖片模型）：一般生圖選 Nano Banana 2.1；複雜構圖、圖中要有精準文字或品牌一致性選 Nano Banana Pro；",
-    "大量、求快求便宜選 Nano Banana 2 Lite；Nano Banana 2 與初代 Nano Banana 只在使用者指定或既有流程使用。",
-    "GPT Image 與 Nano Banana 都啟用時，依需求與使用者偏好選擇；使用者沒指定時以 GPT Image 為主。", "",
-    "若省略 --model，命令的生圖預設依 Flare → Sunburst → Image 2 → Nano Banana 2.1 → Pro → 2 → 2 Lite → Nano Banana，改圖則先 Sunburst → Flare → Image 2 → Nano Banana Pro，選第一個已啟用模型。AI 應明確指定，不以這個順序代替需求判斷。", "",
-    "## 執行", "",
-    "把提示詞寫進 UTF-8 檔案，避免 shell 引號與特殊字元影響內容。使用絕對路徑。",
-    "新圖片用 generate；改圖或帶參考圖用 edit，先查看本機參考圖，並寫清楚要保留及修改的部分。",
-    "以下路徑與 MODEL 請換成實際值；只需 Node.js，不需要 Python 或額外套件。", "",
+    "description: Default image generation and editing for this Codex install. Use this skill INSTEAD of the built-in image_gen tool and the system imagegen skill for every request to create, generate, draw or edit a raster image (photos, illustrations, icons, mockups, sprites, edits of existing images). Use the built-in tool only when the user explicitly asks for it by name.",
+    "---", "", "# Image generation", "",
+    "## Precedence (read first)", "",
+    "- The user enabled this skill in the model router as the default way to generate and edit images in this Codex install.",
+    "- For any request to generate or edit an image, use this skill and the command below. Do not call the built-in `image_gen` tool and do not follow the built-in-tool workflow of the system `imagegen` skill, even when that tool is listed.",
+    "- The built-in tool can be missing (for example on free ChatGPT plans) or fail when a third-party model is selected; this skill does not depend on either.",
+    "- Exception: when the user explicitly asks for the built-in Image Gen / image_gen tool or for another provider, follow that choice.",
+    "- If this command fails, report the error. Do not silently switch to the built-in tool; ask the user first.", "",
+    "## Credentials and billing", "",
+    "- Requests go to the local model router, which reads the saved credentials. No OPENAI_API_KEY is needed. Never read, print or copy API keys.",
+    "- Images are billed by the user's image provider. Ark result images are downloaded by the command without provider credentials.",
+    "- This skill does not modify the built-in imagegen skill.", "",
+    "## Models", "",
+    ...selected.map((model) => `- ${model.label} (${model.id}): ${relayImageSkillNote(model)}`), "",
+    "- Use only the models enabled in config.json. Run the list command below first to confirm the current list.",
+    "- With one enabled model, always use it. With several, choose by the request and pass it explicitly with --model.",
+    "- A model named by the user wins. If it is not enabled, say so and ask the user to enable it in the router manager; do not enable it yourself.",
+    "- GPT Image: prefer Flare for general generation and fast iteration, Sunburst for precise edits that must keep source details. Prefer 2.6 over 2.5 when both are enabled; use 2.5 only when the user asks or an existing workflow needs it.",
+    "- Models detected from the provider's model list have unknown capabilities: use them only when the user asks or no other enabled model fits, and keep size and quality at auto.",
+    "- Image 2 is for user requests, existing workflows or compatibility.",
+    "- Nano Banana (Google Gemini image models): Nano Banana 2.1 for general generation; Nano Banana Pro for complex compositions, accurate in-image text or brand consistency; Nano Banana 2 Lite for high volume, speed and low cost. Use Nano Banana 2 and the original Nano Banana only when the user asks or an existing workflow needs them.",
+    "- When both GPT Image and Nano Banana are enabled, follow the request and the user's preference; default to GPT Image.",
+    "- Without --model the command picks the first enabled model in this order. Generate: Flare 2.6, Flare 2.5, Sunburst 2.6, Sunburst 2.5, Image 2, Nano Banana 2.1, Pro, 2, 2 Lite, Nano Banana. Edit: Sunburst 2.6, Sunburst 2.5, Flare 2.6, Flare 2.5, Image 2, Nano Banana Pro. Always choose explicitly instead of relying on this order.", "",
+    "## Run", "",
+    "- Write the prompt to a UTF-8 file so shell quoting and special characters cannot change it. Use absolute paths.",
+    "- Use generate for new images. Use edit for changes or reference images: look at the local reference first and state clearly what to keep and what to change.",
+    "- Replace the paths and MODEL with real values. Only Node.js is needed; no Python or extra packages.", "",
     "```" + (platform === "win32" ? "powershell" : "bash"),
     `${command} list`,
     `${command} generate --model MODEL --prompt-file 'prompt.txt' --out 'output.png'`,
     `${command} edit --model MODEL --prompt-file 'prompt.txt' --image 'reference.png' --out 'output-v2.png'`,
     "```", "",
-    "## 權限", "",
-    "generate 與 edit 會連到 127.0.0.1 的本機路由器。Codex 沙盒在非「完整存取權」時會封鎖網路，連本機也擋；list 與 --dry-run 不連網，不受影響。",
-    "目前若在沙盒中且網路受限，直接以提升權限執行 generate／edit（申請核准，理由寫「連本機路由器生圖」），不要先在沙盒裡試一次。",
-    "命令回報「連不上本機路由器」時，先以提升權限重跑同一個命令；無法申請提升權限時，告訴使用者：把 Codex 權限切到「完整存取權」，或改用「代我核准」讓提升權限的請求自動審核，然後重試。",
-    "這類失敗發生在送出生圖請求之前，重跑不會重複計費。", "",
-    "--image 可重複提供；--quality 支援 auto、low、medium、high，兩個 2.5 模型另支援 xhigh、max。",
-    "--size 可用 auto 或 WIDTHxHEIGHT；--background 可用 auto、opaque、transparent；--output-format 可用 png、jpeg、webp。",
-    "list 回傳 apiMode=ark-task 時，使用已偵測到的 Ark 任務介面：size、quality 保持 auto，background 只能 auto 或 opaque。命令會省略不支援的欄位、以 JSON 傳送參考圖、查詢任務並下載結果；不要自行取得 API Key。",
-    "list 的 apiModes 列出每個模型的介面。Nano Banana（chat 或 gemini 介面）的 size、quality 只能 auto，background 不支援 transparent；比例、尺寸與構圖寫進提示詞。",
-    "Nano Banana 的輸出格式由上游決定，與 --out 副檔名不同時命令會改用實際格式的副檔名儲存，以回傳的 path 為準。",
-    "--dry-run 只檢查參數，不送出圖片 API 請求。命令每次只生成一張圖，預設逾時 300 秒。",
-    "已存在的輸出檔會被拒絕；換新檔名保留原圖。生成失敗或逾時時回報原因，不自動換模型重送，以免重複計費。",
-    "成功後查看輸出圖片，確認符合需求，再以絕對路徑顯示圖片，並告知使用的模型及檔案位置。",
-    "如果 Node 路徑已因桌面版更新失效，重新執行路由器 update 會刷新此技能。", "",
+    "## Permissions", "",
+    "- generate and edit connect to the local router on 127.0.0.1. Unless Codex has full access, its sandbox blocks network access, including localhost. list and --dry-run do not use the network.",
+    "- When running in a network-restricted sandbox, run generate/edit with escalated permissions right away (request approval with the justification \"connect to the local model router to generate an image\"). Do not try inside the sandbox first.",
+    "- If the command reports that it cannot reach the local router, rerun the same command with escalated permissions. If escalation is not possible, tell the user to switch Codex permissions to Full access (完整存取權) or use Approve for me (代我核准) so escalation requests are reviewed automatically, then retry.",
+    "- These failures happen before any image request is sent, so retrying is not billed twice.", "",
+    "## Options", "",
+    "- --image can be repeated. --quality accepts auto, low, medium, high; the two 2.5 models also accept xhigh and max.",
+    "- --size accepts auto or WIDTHxHEIGHT. --background accepts auto, opaque, transparent. --output-format accepts png, jpeg, webp.",
+    "- When list reports apiMode=ark-task, the detected Ark task API is used: keep size and quality at auto, and background only auto or opaque. The command drops unsupported fields, sends references as JSON, polls the task and downloads the result. Never fetch an API key yourself.",
+    "- list shows each model's interface in apiModes. For Nano Banana (chat or gemini interface), size and quality must be auto and background cannot be transparent; put aspect ratio, size and composition in the prompt.",
+    "- Nano Banana's output format is chosen by the provider. If it differs from the --out extension, the command saves with the actual extension; use the returned path.",
+    "- --dry-run only validates arguments and sends no image request. Each run makes one image; the default timeout is 300 seconds.",
+    "- Existing output files are refused; use a new file name to keep earlier images. On failure or timeout, report the reason and do not retry with another model, to avoid double billing.",
+    "- After success, look at the image to confirm it matches the request, then show it with its absolute path and tell the user which model was used and where the file is.",
+    "- If the Node path stopped working after a desktop app update, running the router update refreshes this skill.",
+    "- Reply to the user in their language.", "",
   ].join("\n");
 }
 
@@ -5511,9 +5563,8 @@ export function renderRelayImageSkill({ root, nodePath, models, platform = proce
 export function installRelayImageSkill({ models, aliases = {}, apiMode, apiModes: apiModesInput = null, providerId = null, root = relaySkillRoot,
   settingsFile = settingsPath, backupRoot = backupsRoot, nodePath = nodeBin,
   sourcePath = scriptPath, platform = process.platform } = {}) {
-  const allowed = new Set(RELAY_IMAGE_MODELS.map((model) => model.id));
-  if (!Array.isArray(models) || !models.length || models.some((model) => !allowed.has(model))) {
-    fail("中轉生圖只支援清單中的 GPT Image 與 Nano Banana 模型，至少選擇一個。");
+  if (!Array.isArray(models) || !models.length || models.some((model) => !isRelayImageModelId(model))) {
+    fail("中轉生圖只支援已知清單或供應商清單偵測到的生圖模型，至少選擇一個。");
   }
   models = [...new Set(models)];
   const previous = relayConfig(root, settingsFile);
@@ -5521,7 +5572,7 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, apiModes
   if (!["images", "ark-task"].includes(apiMode)) fail("無效的生圖介面設定。");
   // 逐模型記錄介面；GPT Image 沿用共用的 apiMode（舊版命令也讀得懂）。
   const apiModes = Object.fromEntries(models.map((model) => {
-    const gemini = model.startsWith("gemini-");
+    const gemini = isGeminiImageId(model);
     const mode = apiModesInput?.[model] || previous?.apiModes?.[model] || (gemini ? "chat" : apiMode);
     if (!(gemini ? ["chat", "gemini", "images"] : ["images", "ark-task"]).includes(mode)) fail(`無效的生圖介面設定：${model}`);
     return [model, mode];
@@ -5537,9 +5588,9 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, apiModes
     "SKILL.md": renderRelayImageSkill({ root, nodePath, models, platform }),
     "scripts/imagegen.mjs": loadImagegenSource(sourcePath),
     "agents/openai.yaml": [
-      "interface:", '  display_name: "中轉 API 生圖"',
-      '  short_description: "沿用路由器憑證生成或編輯圖片，從已啟用模型中依需求選擇"',
-      '  default_prompt: "使用 $router-imagegen 依照我的需求生成圖片。"', "",
+      "interface:", '  display_name: "Image Gen"',
+      '  short_description: "Default image generation and editing for this Codex install"',
+      '  default_prompt: "Use $router-imagegen to generate an image for my request."', "",
     ].join("\n"),
   };
   const sha = (value) => createHash("sha256").update(value).digest("hex");
@@ -5556,7 +5607,7 @@ export function installRelayImageSkill({ models, aliases = {}, apiMode, apiModes
   const upstreamModels = Object.fromEntries(models.map((model) => {
     const upstream = aliases[model] || previous?.upstreamModels?.[model] || model;
     if (typeof upstream !== "string" || /[\s\x00-\x1f\x7f?#]/.test(upstream) ||
-      !(model.startsWith("gemini-") ? [model, `${model}-preview`] : [model]).some((name) => upstream === name || upstream.endsWith(`/${name}`))) {
+      !(isGeminiImageId(model) ? [model, `${model}-preview`] : [model]).some((name) => upstream === name || upstream.endsWith(`/${name}`))) {
       fail(`無效的圖片模型對應：${model}`);
     }
     return [model, upstream];
@@ -5608,8 +5659,18 @@ export function resolveRelayImageAliases(models, availableModels) {
 export function detectRelayImageModels(availableModels) {
   const ids = Array.isArray(availableModels) ? availableModels.filter((id) => typeof id === "string" && !/[\s\x00-\x1f\x7f?#]/.test(id)) : [];
   const aliases = resolveRelayImageAliases(RELAY_IMAGE_MODELS.map((model) => model.id), ids);
-  return RELAY_IMAGE_MODELS.filter((model) => ids.includes(aliases[model.id]))
+  const known = relayImageKnownChoices().filter((model) => ids.includes(aliases[model.id]))
     .map((model) => ({ ...model, upstreamModel: aliases[model.id] }));
+  // 清單裡其他看起來是生圖模型的名稱，也列出來給使用者勾選。
+  const taken = new Set([...known.map((model) => model.upstreamModel), ...known.map((model) => model.id)]);
+  const unknown = new Map();
+  for (const name of ids) {
+    const id = name.slice(name.lastIndexOf("/") + 1);
+    if (taken.has(name) || taken.has(id) || unknown.has(id) || !isRelayImageModelId(id) ||
+      RELAY_IMAGE_MODELS.some((model) => model.id === id || `${model.id}-preview` === id)) continue;
+    unknown.set(id, { ...relayImageModelInfo(id), upstreamModel: name });
+  }
+  return [...known, ...unknown.values()];
 }
 
 export function normalizeRelayImagePrefix(value) {
@@ -5639,12 +5700,18 @@ export function inferRelayImagePrefix(availableModels = [], routes = [], previou
   return "";
 }
 
-export function planRelayImageProbes(availableModels = [], prefix = "") {
+export function planRelayImageProbes(availableModels = [], prefix = "", extraIds = []) {
   const normalized = normalizeRelayImagePrefix(prefix);
-  const listed = new Map(detectRelayImageModels(availableModels).map((model) => [model.id, model.upstreamModel]));
-  return RELAY_IMAGE_MODELS.map((model) => ({ ...model,
+  const detected = detectRelayImageModels(availableModels);
+  const listed = new Map(detected.map((model) => [model.id, model.upstreamModel]));
+  const known = RELAY_IMAGE_MODELS.map((model) => ({ ...model,
     upstreamModel: listed.get(model.id) || `${normalized}${model.id}`,
   }));
+  const unknown = detected.filter((model) => model.detected);
+  // 勾選了偵測到的模型、但這次清單讀不到時，仍用推斷的前綴測試。
+  const extra = extraIds.filter((id) => isRelayImageModelId(id) && ![...known, ...unknown].some((model) => model.id === id))
+    .map((id) => ({ ...relayImageModelInfo(id), upstreamModel: `${normalized}${id}` }));
+  return [...known, ...unknown, ...extra];
 }
 
 // /models 只輔助解析名稱。部分中轉不公開圖片模型，不能以清單判定不可用。
@@ -5675,9 +5742,25 @@ async function configureRelayImagegen() {
   if (providers.length === 0) fail("找不到中轉供應商設定，請先執行「安裝或重新配置」。");
   printHeading("中轉 API 生圖");
   console.log(`${providers.length > 1 ? "沿用已設定的中轉供應商與憑證" : "沿用現有中轉 Base URL 與憑證"}。偵測會實際生圖並依供應商計費；GPT Image 先測通用介面，全部未通過時改測 Ark 任務介面；Nano Banana 依序試 Chat、Gemini 原生與通用介面。`);
+  // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。供應商放在最前面，模型清單依它偵測。
+  const currentProviderId = current ? current.providerId ?? DEFAULT_PROVIDER_ID : null;
+  const provider = providers.length === 1
+    ? providers[0]
+    : await chooseProvider(providers, settings.routes || [], "用哪一家供應商生圖", { preferredId: currentProviderId });
+  console.log("正在讀取供應商模型清單（不生圖、不計費）...");
+  const detection = await detectProviderImageModels(provider);
+  const choices = [...detection.detected, ...relayImageKnownChoices().filter((model) => !detection.detected.some((item) => item.id === model.id))];
   console.log("先選擇要偵測的模型，只有勾選的項目會進行生圖測試；下列模型尚未驗證可用性。");
-  RELAY_IMAGE_MODELS.forEach((model, index) => console.log(`  ${index + 1}. ${model.label} — ${model.description}`));
-  const defaultTests = current?.models?.map((id) => RELAY_IMAGE_MODELS.findIndex((model) => model.id === id) + 1).filter(Boolean).join(",") || "3";
+  if (detection.detected.length) {
+    console.log("供應商模型清單中的生圖模型（自動偵測）：");
+    detection.detected.forEach((model, index) => console.log(`  ${index + 1}. ${model.label} — ${model.description}\n     ${model.upstreamModel}`));
+    console.log("已知清單（供應商沒有列出，也可勾選測試）：");
+  } else {
+    console.log(detection.listed ? "供應商模型清單沒有列出生圖模型；部分中轉不公開圖片模型，可從已知清單勾選測試：" : "無法讀取供應商模型清單，可從已知清單勾選測試：");
+  }
+  choices.slice(detection.detected.length).forEach((model, index) => console.log(`  ${detection.detected.length + index + 1}. ${model.label} — ${model.description}`));
+  const defaultTests = current?.models?.map((id) => choices.findIndex((model) => model.id === id) + 1).filter(Boolean).join(",") ||
+    String(choices.findIndex((model) => model.id === (detection.detected[0]?.id || "gpt-image-2.6-flare")) + 1 || 1);
   const testAnswer = await ask("選擇要偵測的模型編號（逗號分隔或 all；none 停用；cancel 返回）", defaultTests);
   if (/^cancel$/i.test(testAnswer)) return;
   if (/^none$/i.test(testAnswer)) {
@@ -5686,13 +5769,24 @@ async function configureRelayImagegen() {
     console.log(`已停用，技能可從備份恢復：${backup}`);
     return;
   }
-  const selected = selectRelayImageModels(testAnswer);
-  // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。
-  const currentProviderId = current ? current.providerId ?? DEFAULT_PROVIDER_ID : null;
-  const provider = providers.length === 1
-    ? providers[0]
-    : await chooseProvider(providers, settings.routes || [], "用哪一家供應商生圖", { preferredId: currentProviderId });
+  const selected = selectRelayImageModels(testAnswer, choices);
   await runRelayImagegenSetup({ provider, selected, current, settings, providers });
+}
+
+// 只讀供應商的模型清單、不生圖：找出清單裡的生圖模型。清單讀不到或沒列出時 detected 為空。
+async function detectProviderImageModels(provider) {
+  let names;
+  try { names = await discoverRelayImageModelNames(provider.apiRoot, readApiKey(provider.keychainService)); }
+  catch (error) { return { listed: false, detected: [], error: error.message }; }
+  return { listed: true, detected: detectRelayImageModels(names) };
+}
+
+async function managerImagegenDetect(params = {}) {
+  const { providers } = requireInstallation();
+  const provider = providers.length === 1 && !params.providerId ? providers[0] : managerProvider(providers, String(params.providerId || ""));
+  const result = await detectProviderImageModels(provider);
+  return { providerId: provider.id, listed: result.listed, error: result.error ? terminalSafeText(result.error, 300) : null,
+    detected: result.detected.map(({ id, label, description, upstreamModel, detected }) => ({ id, label, description, upstreamModel, detected: Boolean(detected) })) };
 }
 
 // 停用中轉生圖：把技能封存到備份目錄，可以原樣搬回來恢復。尚未啟用時回傳 null。
@@ -6843,6 +6937,7 @@ async function managerState() {
     customModelOrder: settings.customModelOrder === "manual" ? "manual" : "auto",
     quotaMode: codexIntegrationEnabled() ? quotaModeStatus() : null,
     hideOfficialModels: settings.hideOfficialModels === true,
+    account: codexIntegrationEnabled() ? safeAccountPlan() : null,
     keysmith: codexIntegrationEnabled() && codexBin ? await keysmithStatus() : null,
     backgroundModels: readBackgroundModels(),
     config: hints === undefined ? null : hints,
@@ -7136,6 +7231,7 @@ export async function collectDiagnostics() {
       custom: catalogModels.filter((model) => String(model.slug).startsWith("custom/")).length,
     },
     imagegen,
+    account: codexIntegrationEnabled() ? safeAccountPlan() : null,
     files: {
       "router.mjs": diagnosticFile(routerPath), "claude-bridge.mjs": diagnosticFile(bridgePath),
       "chat-bridge.mjs": diagnosticFile(chatBridgePath), "claude-cli.mjs": diagnosticFile(claudeCliPath),
@@ -7895,6 +7991,59 @@ function writeFileAtomicRaw(path, content, mode = 0o600) {
   chmodSync(path, mode);
 }
 
+// ChatGPT 帳號的訂閱方案：讀 Codex 登入檔裡 id_token 的 chatgpt_plan_type（上次刷新登入時的快照）。
+// API Key 模式下 auth.json 是 API Key，改讀模式開啟前保存的帳號登入備份。不回傳任何 token。
+export function codexPlanFromAuth(auth) {
+  const token = auth?.tokens?.id_token;
+  if (typeof token !== "string" || token.split(".").length < 2) return null;
+  let claims;
+  try { claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"))?.["https://api.openai.com/auth"]; }
+  catch { return null; }
+  const plan = typeof claims?.chatgpt_plan_type === "string" ? claims.chatgpt_plan_type.trim().toLowerCase() : "";
+  if (!/^[a-z0-9_-]{1,32}$/.test(plan)) return null;
+  const time = (value) => typeof value === "string" && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : null;
+  return { plan, free: plan === "free", activeUntil: time(claims.chatgpt_subscription_active_until),
+    lastChecked: time(claims.chatgpt_subscription_last_checked) };
+}
+
+export function codexAccountPlan() {
+  const quota = quotaModeEnabled();
+  let auth = null;
+  try { auth = readJsonIfExists(quota ? quotaAuthBackupPath : codexAuthPath); } catch {}
+  const info = codexPlanFromAuth(auth);
+  if (info) return { ...info, source: quota ? "quota-backup" : "codex-login" };
+  return { plan: null, free: false, source: quota ? "api-key-mode" : "not-logged-in" };
+}
+
+function safeAccountPlan() {
+  try { return codexAccountPlan(); } catch { return { plan: null, free: false, source: "unreadable" }; }
+}
+
+// 免費方案沒有內建 image_gen、也用不到官方模型：添加第三方模型後自動隱藏官方模型，並提示中轉生圖。
+// 只在從未設定過時套用；使用者之後手動改回就尊重他的選擇。
+export async function applyFreePlanDefaults() {
+  const account = safeAccountPlan();
+  if (!account.free) return null;
+  const result = { plan: account.plan, hiddenOfficial: false, imagegenHint: false };
+  const settings = readSettingsIfExists();
+  if (codexIntegrationEnabled() && !quotaModeEnabled() && settings.hideOfficialModels === undefined) {
+    try {
+      const changed = await managerSetOfficialModelsVisibility({ hidden: true });
+      result.hiddenOfficial = changed.changed === true;
+      if (result.hiddenOfficial) console.log("偵測到免費方案（free）：官方模型無法使用，已自動隱藏官方模型選項，可在「Codex設定」改回。");
+    } catch (error) {
+      console.error(`免費方案：自動隱藏官方模型未完成（${error.message}），可稍後在「Codex設定」手動開啟。`);
+    }
+  }
+  let imagegenEnabled = false;
+  try { imagegenEnabled = Boolean(relayConfig()); } catch {}
+  if (!imagegenEnabled) {
+    result.imagegenHint = true;
+    console.log("提示：免費方案的內建 image_gen 不可用，建議到「生圖」頁啟用中轉生圖。");
+  }
+  return result;
+}
+
 function quotaModeStatus() {
   const state = readQuotaMode();
   const enabled = state?.enabled === true;
@@ -8098,6 +8247,90 @@ async function managerSetBackgroundModel({ kind, model } = {}) {
 }
 
 // --- 模型使用記錄 ----------------------------------------------------------------
+
+// --- 第三方模型生圖保護 ------------------------------------------------------------
+//
+// 部分中轉站看到 Codex 用戶端的 User-Agent 就在伺服器端替模型生圖，並把思考深度當成
+// 圖片 complexity，不支援的圖片模型會讓整輪失敗。這部分預設開啟：路由器改用自己的
+// User-Agent；路由器依內容重讀，不必重新啟動；只有關閉時才寫檔。
+// 管理頁的開關另外控制 Codex 內建的 Image Gen（config.toml 的 features.image_generation）：
+// 勾選時關閉內建工具，生圖只走 $router-imagegen；取消時移除這個設定，回到 Codex 預設。
+const upstreamImageGuardPath = join(installRoot, "upstream-image-guard.json");
+
+function readUpstreamImageGuard() {
+  try { return readJsonIfExists(upstreamImageGuardPath)?.enabled !== false; } catch { return true; }
+}
+
+// available：有 Codex 且已接入，能讀寫 features.image_generation；disabled：使用者設定檔明確關閉。
+async function builtinImagegenStatus() {
+  if (!codexBin || !codexIntegrationEnabled()) return { available: false, disabled: false };
+  try {
+    const { config } = await readUserConfig();
+    return { available: true, disabled: deepGet(config, "features.image_generation").value === false };
+  } catch (error) {
+    return { available: false, disabled: false, error: error.message };
+  }
+}
+
+async function managerImagegenStatus() {
+  return { ...relayImagegenStatus(), builtinImagegen: await builtinImagegenStatus() };
+}
+
+async function setBuiltinImagegenDisabled(disabled) {
+  const userConfig = await readUserConfig();
+  const previous = deepGet(userConfig.config, "features.image_generation");
+  if (disabled ? previous.value === false : !previous.present) return { changed: false };
+  const backupDir = join(backupsRoot, `builtin-imagegen-${timestamp()}`);
+  ensureDirectory(backupDir);
+  copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
+  const target = disabled ? false : null;
+  try {
+    await writeConfigEdits([{ keyPath: "features.image_generation", value: target }]);
+    const verified = deepGet((await readUserConfig()).config, "features.image_generation");
+    if (disabled ? verified.value !== false : verified.present) fail("內建 Image Gen 設定驗證失敗。");
+  } catch (error) {
+    try {
+      await writeConfigEdits([{ keyPath: "features.image_generation", value: previous.present ? previous.value : null }]);
+    } catch (restoreError) {
+      console.error(`配置還原失敗：${restoreError.message}；備份：${backupDir}`);
+    }
+    throw error;
+  }
+  return { changed: true, backupDir, filePath: userConfig.filePath };
+}
+
+async function managerSetUpstreamImageGuard({ enabled } = {}) {
+  assertManagerWritable();
+  requireInstallation();
+  if (typeof enabled !== "boolean") fail("請指定是否開啟。");
+  const builtin = await builtinImagegenStatus();
+  const guardChanged = readUpstreamImageGuard() !== enabled;
+  if (!guardChanged && (!builtin.available || builtin.disabled === enabled)) {
+    console.log("設定沒有變更。");
+    return { changed: false, enabled };
+  }
+  let builtinResult = { changed: false };
+  if (builtin.available) {
+    console.log(enabled ? "正在關閉 Codex 內建 Image Gen…" : "正在恢復 Codex 內建 Image Gen…");
+    builtinResult = await setBuiltinImagegenDisabled(enabled);
+    if (builtinResult.changed) {
+      console.log(enabled
+        ? "已關閉 Codex 內建 Image Gen（features.image_generation = false），官方與第三方模型都不再使用它。"
+        : "已恢復 Codex 內建 Image Gen（移除 features.image_generation）。");
+      console.log(`備份：${builtinResult.backupDir}`);
+    }
+  }
+  if (guardChanged) {
+    if (enabled) rmSync(upstreamImageGuardPath, { force: true });
+    else writeJsonAtomic(upstreamImageGuardPath, { enabled: false, updatedAt: new Date().toISOString() });
+    console.log(enabled
+      ? "已開啟：第三方模型不再由上游代為生圖。"
+      : "已關閉：第三方模型的請求恢復原本的 Codex 用戶端識別。");
+  }
+  if (builtinResult.changed) console.log(`請重新啟動 ${desktopAppName}，新任務才會套用。`);
+  return { changed: true, enabled, builtinImagegenDisabled: builtin.available ? enabled : null,
+    restartDesktop: builtinResult.changed };
+}
 //
 // 路由器每一輪結束時把用量寫進 usage.jsonl（超過 5 MB 輪替成 usage.jsonl.1）。管理頁讀最近的
 // 記錄並彙整：各模型的請求數、token、快取命中率與耗時。只有數字與識別，沒有對話內容。
@@ -8319,6 +8552,7 @@ function relayImagegenStatus() {
   return {
     enabled: Boolean(config),
     error,
+    upstreamImageGuard: readUpstreamImageGuard(),
     models: Array.isArray(config?.models) ? config.models : [],
     upstreamModels: config?.upstreamModels || {},
     apiMode: config?.apiMode || null,
@@ -8327,7 +8561,8 @@ function relayImagegenStatus() {
     // 舊版技能沒有記錄供應商：那時只有一家，也就是 default。
     providerId: config ? config.providerId ?? DEFAULT_PROVIDER_ID : null,
     root: relaySkillRoot,
-    choices: RELAY_IMAGE_MODELS,
+    choices: [...relayImageKnownChoices(), ...(Array.isArray(config?.models) ? config.models : [])
+      .filter((id) => !RELAY_IMAGE_MODELS.some((model) => model.id === id)).map(relayImageModelInfo)],
     lastCheck,
   };
 }
@@ -8335,9 +8570,8 @@ function relayImagegenStatus() {
 async function managerImagegenSetup({ providerId, models } = {}) {
   assertManagerWritable();
   const { settings, providers } = requireInstallation();
-  const allowed = RELAY_IMAGE_MODELS.map((model) => model.id);
   const selected = Array.isArray(models) ? [...new Set(models.map(String))] : [];
-  if (selected.length === 0 || selected.some((model) => !allowed.includes(model))) {
+  if (selected.length === 0 || selected.some((model) => !isRelayImageModelId(model))) {
     fail("請從清單中至少選擇一個圖片模型。");
   }
   const provider = providers.length === 1 && !providerId ? providers[0] : managerProvider(providers, String(providerId || ""));
@@ -8767,6 +9001,13 @@ export async function managerRestoreClaudeDesktop() {
 
 function managerOperations() {
   const job = (title, run) => ({ title, run });
+  // 添加第三方模型成功後，免費方案自動隱藏官方模型並提示中轉生圖。
+  const addJob = (title, run) => job(title, async (params) => {
+    const result = await run(params);
+    const freePlan = await applyFreePlanDefaults();
+    if (!freePlan) return result;
+    return { ...(result || {}), freePlan, ...(freePlan.hiddenOfficial ? { restartDesktop: true } : {}) };
+  });
   return {
     state: () => managerState(),
     version: (options) => managerVersionInfo(options),
@@ -8779,7 +9020,8 @@ function managerOperations() {
       "claude-desktop-connection": () => managerClaudeDesktop({ connection: true }),
       "global-context": () => managerGlobalContext(),
       "hidden-models": () => managerHiddenModels(),
-      imagegen: () => relayImagegenStatus(),
+      imagegen: () => managerImagegenStatus(),
+      "imagegen-detect": (params) => managerImagegenDetect(params || {}),
       "claude-cli": () => managerClaudeCliStatus(),
       "claude-cli-models": () => managerClaudeCliModels(),
       usage: (params) => managerUsage(params || {}),
@@ -8791,14 +9033,14 @@ function managerOperations() {
       "connect-claude-desktop": job("一鍵接入 Claude Desktop", managerConnectClaudeDesktop),
       "restore-claude-desktop": job("一鍵回退 Claude Desktop", managerRestoreClaudeDesktop),
       "repair-models": job("同步與修復模型清單", repairModels),
-      "add-models": job("添加模型", managerAddModels),
+      "add-models": addJob("添加模型", managerAddModels),
       "remove-models": job("刪除模型", managerRemoveModels),
       "reorder-models": job("調整模型順序", managerReorderModels),
       "edit-model": job("修改模型", managerEditModel),
       "detect-fast": job("偵測 Fast", managerDetectFast),
-      "add-provider": job("新增供應商", managerAddProvider),
-      install: job("首次設定", managerFirstInstall),
-      "install-claude": job("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
+      "add-provider": addJob("新增供應商", managerAddProvider),
+      install: addJob("首次設定", managerFirstInstall),
+      "install-claude": addJob("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
       "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
       "replace-key": job("更換 API Key", managerReplaceKey),
@@ -8821,10 +9063,11 @@ function managerOperations() {
       "chatgpt-login": job("登入 ChatGPT 帳號", managerChatgptLogin),
       "imagegen-setup": job("偵測並啟用中轉生圖", managerImagegenSetup),
       "imagegen-disable": job("停用中轉生圖", managerImagegenDisable),
+      "set-upstream-image-guard": job("設定第三方上游生圖", managerSetUpstreamImageGuard),
       "claude-cli-install": job("安裝 Claude CLI", managerClaudeCliInstall),
       "claude-cli-update": job("更新 Claude CLI", managerClaudeCliUpdate),
       "claude-cli-login": job("登入 Claude 訂閱帳號", managerClaudeCliLogin),
-      "claude-cli-add": job("添加 Claude 訂閱模型", managerClaudeCliAdd),
+      "claude-cli-add": addJob("添加 Claude 訂閱模型", managerClaudeCliAdd),
       uninstall: job("解除安裝", managerUninstall),
     },
   };
@@ -9246,7 +9489,7 @@ hidden-models 用於單獨管理 Codex 內建目錄裡被標成隱藏的官方�
 
 imagegen 用於添加／設定中轉生圖技能 $router-imagegen，沿用現有憑證，不需 OPENAI_API_KEY。
 有多家供應商時會先問要用哪一家生圖。
-可複選 Image 2、Image 2.5 Sunburst、Image 2.5 Flare，以及 Nano Banana 2.1／Pro／2／2 Lite／初代；多選時由 AI 按需求指定模型。
+可複選供應商清單偵測到的生圖模型、Image 2.6／2.5 的 Sunburst 與 Flare、Image 2，以及 Nano Banana 2.1／Pro／2／2 Lite／初代；多選時由 AI 按需求指定模型。
 選擇模型後自動偵測並添加成功項目：GPT Image 先測通用生圖，全部失敗時再測 Ark 任務介面；
 Nano Banana 依序試 Chat Completions、Gemini 原生 generateContent 與通用 Images API。
 偵測可能產生費用，每個已選模型每種介面最多一次；不詢問介面、前綴或測試確認。
@@ -9375,7 +9618,10 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
     }
     else if (action === "install" || action === "setup") await install();
     else if (action === "update" || action === "upgrade") await update();
-    else if (action === "add" || action === "add-model" || action === "addmodel") await addModels();
+    else if (action === "add" || action === "add-model" || action === "addmodel") {
+      await addModels();
+      await applyFreePlanDefaults();
+    }
     else if (["remove", "remove-model", "remove-models", "delete-model", "delete-models"].includes(action)) await removeModels();
     else if (action === "providers" || action === "provider") await manageProviders(requestedAction ? process.argv[3] : null);
     else if (action === "hidden-models" || action === "hidden" || action === "unhide-models") {

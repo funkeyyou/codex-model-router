@@ -284,7 +284,7 @@ def package_fix(root):
             (target / "candidate.patch").write_bytes(patch)
         except ValueError as error:
             result["resolved"] = False
-            result["reply"] = "自動修復結果需要維護者檢查：" + str(error)
+            result["reply"] = "自动修复结果需要维护者检查：" + str(error)
             write_json(target / "report.json", result)
     set_output("resolved", result["resolved"])
 
@@ -344,7 +344,7 @@ def upsert_comment(number, body):
         comment_id = issue_number(event["comment"]["id"])
         comment_url = (os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"]
                        + "/issues/" + str(number) + "#issuecomment-" + str(comment_id))
-        body = "回應[這則留言](" + comment_url + ")：\n\n" + body
+        body = "回应[这条留言](" + comment_url + ")：\n\n" + body
     body = MARKER + "\n" + run_marker + "\n" + body
     login = os.environ.get("CODEX_BOT_LOGIN", "github-actions[bot]")
     page = 1
@@ -369,30 +369,30 @@ def publish(root):
         return
     run_url = os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"]
     if os.environ["TRIAGE_STATUS"] != "success":
-        body = "自動分析未完成，請維護者檢查執行紀錄與 API key 設定。"
+        body = "自动分析未完成，请维护者检查执行记录与 API key 设置。"
     else:
         check_meta(read_json(root / "triage" / "meta.json"))
         triage = triage_result(root / "triage" / "report.json")
         body = triage["reply"]
         if triage["auto_fix"]:
             if os.environ["FIX_STATUS"] != "success":
-                body += "\n\n修復工作未完成，詳見執行紀錄。"
+                body += "\n\n修复工作未完成，详见执行记录。"
             else:
                 result = fix_result(root / "fix" / "report.json")
                 if not result["resolved"]:
                     body = result["reply"]
                 elif os.environ["VERIFY_STATUS"] != "success":
-                    body = result["summary"] + "\n\n獨立測試未通過，尚未建立修復 PR；請維護者檢查執行紀錄。"
+                    body = result["summary"] + "\n\n独立测试未通过，尚未创建修复 PR；请维护者检查执行记录。"
                 else:
                     try:
                         url = open_pr(root / "fix", meta, run_url)
-                        body = result["reply"] + "\n\n已通過獨立測試並建立草稿 PR：" + url
+                        body = result["reply"] + "\n\n已通过独立测试并创建草稿 PR：" + url
                     except (ValueError, subprocess.CalledProcessError, urllib.error.HTTPError) as error:
                         # Do not expose request headers, credentials, or arbitrary command output.
-                        body = result["summary"] + "\n\n測試已通過，但 PR 發布未完成。請維護者檢查 GitHub Actions 的 PR 權限與執行紀錄。"
-                        upsert_comment(number, body + "\n\n執行紀錄：" + run_url)
+                        body = result["summary"] + "\n\n测试已通过，但 PR 发布未完成。请维护者检查 GitHub Actions 的 PR 权限与执行记录。"
+                        upsert_comment(number, body + "\n\n执行记录：" + run_url)
                         raise RuntimeError("PR publication failed: " + type(error).__name__) from None
-    upsert_comment(number, body + "\n\n執行紀錄：" + run_url)
+    upsert_comment(number, body + "\n\n执行记录：" + run_url)
     print("Issue reply published.")
 
 

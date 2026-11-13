@@ -403,6 +403,7 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
     "claude-cli-login", "claude-cli-update", "connect-claude-desktop", "connect-codex", "detect-fast", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-claude", "remove-backup-key", "remove-models",
     "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "restore-claude-desktop",
     "set-background-model", "set-claude-desktop", "set-global-context", "set-hidden-models", "set-keysmith", "set-official-model-visibility", "set-quota-mode",
+    "set-upstream-image-guard",
     "uninstall", "update"]);
   // 頁面用到的查詢都要是安裝器提供的。
   const queryTypes = new Set([...managerPage.matchAll(/(?:ensureQuery|refreshButton|reloadQuery)\("([a-z-]+)"/g)].map((match) => match[1]));

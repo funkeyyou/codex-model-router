@@ -138,6 +138,8 @@ Git 项目也可选用仓库提供的 [Actions 配置](../.codex/environments/en
 - **供应商**：新增「API Key 连接」（中转站、OpenAI 兼容服务或官方 Anthropic API）或「Claude 订阅账号（Claude CLI）」，更换 API Key、移除供应商。选 Claude 订阅时会依序检查 CLI 是否安装、版本与订阅登录，缺少的步骤可直接处理。1.28.0 起可修改供应商的显示名称与模型前缀：名称只影响显示，内部 ID、已有对话与 API Key 不变；前缀决定选择器里的「前缀/模型名」，会替换上游自带的前缀（如 `ark/`），只改自动生成的名称，手动改过的名称保留，之后新增的模型也会套用。修改前可预览，不重启路由器。Claude 订阅目前只能改前缀。
   - **常用供应商**：新增「API Key 连接」时可直接点选 DeepSeek、Kimi、通义千问、智谱 GLM／Z.ai、MiniMax、OpenRouter、xAI 等预设（分国际与中国大陆端点），自动带入 Base URL 并附上获取 API Key 的官方页面；终端的 `providers add` 也可以输入编号。端点整理自 [CC Switch](https://github.com/farion1231/cc-switch) 的公开预设，实际可用的模型以你的 Key 查询结果为准。
   - **备用 Key**：每家供应商可再加最多 5 把备用 Key，可一次填齐；新增供应商、安装或重新配置时会顺便询问，之后也可在供应商页或终端 `providers backup` 添加。路由器一直用「使用中」的那把，遇到 401／403（被拒）、402（额度用完）或 429（限流）才自动换下一把并重送请求，失败的那把冷却一段时间（429 依上游的 Retry-After）；供应商卡片会显示每把 Key 的末四码与状态。增减备用 Key 不重启路由器。从 1.31.0 起会记住每把 Key 的模型列表：添加模型时列出所有 Key 的模型（只有备用 Key 有的标成「仅备用 Key」，并用那把 Key 测试），路由器也只在有该模型的 Key 之间切换，不会换到没有这个模型的 Key。
+- **免费方案（free）**：账号模式下会读 Codex 登录资料里的方案（总览「环境」可看到，诊断包也会附上）。免费方案添加第三方模型后，
+  若从未设置过，会自动勾选「隐藏官方模型选项」（之后可在「Codex设置」改回），并提示内置 image_gen 不可用、建议启用中转生图。
 - **生图**：检测、启用或停用中转 API 生图。
 - **设置**：设置或移除全局上下文，勾选强制显示被隐藏的官方模型；「诊断包」可下载或复制一份诊断资料，反馈问题时附上（见[疑难排解](troubleshooting.md)）。
 - **版本**：左上角显示当前版本，有新版时列出更新内容，可一键更新。
@@ -322,14 +324,17 @@ API Key；图片费用由你的中转供应商计算，不使用 ChatGPT 方案�
 设置了多家供应商时会先问要用哪一家；技能会记住这个选择，之后的生图都送到那一家，
 那一家被移除时技能会一并停用，不会改用别家的账号计费。
 
-设置时先选择要检测的模型（可复选），工具会自动测试并添加成功的项目。
+设置时先选供应商，工具会读取它的模型列表（不生图、不计费），把列表里的生图模型放在最上方「自动检测」；
+列表中不在内置清单的生图模型（例如之后才推出的新模型）也会列出，特性未知时只用 `auto` 尺寸与质量。
+下方「已知清单」是内置的模型，供应商没有列出也可以勾选，部分中转本来就不公开图片模型。
+再选择要检测的模型（可复选），工具会自动测试并添加成功的项目。
 先使用目前 API Key 呼叫通用 `/v1/images/generations`；已选模型全部未通过时，才自动改测 Ark 任务接口。
 只测试勾选的模型，只有成功取得 PNG 图片的模型才会添加；未选模型不会测试，也不会作为失败后的替代。
 通用接口只要有一个成功，就保留这次成功的模型，不再额外呼叫 Ark。
-新设置预选 Flare，已有技能则预选目前启用的模型；也可输入 `all` 选择全部三个。
+新设置预选 2.6 Flare（或列表检测到的第一个模型），已有技能则预选目前启用的模型；也可输入 `all` 选择全部。
 `/models` 只协助判断名称与前缀；即使清单没有图片模型或查询失败，也能进行实测。
 清单未列出的模型自动沿用既有设置中的共同前缀；无法推断时使用原始模型名称。
-清单已列出的模型保留原始名称。Ark 任务接口使用这三个模型的原始 ID。
+清单已列出的模型保留原始名称。Ark 任务接口使用模型的原始 ID。
 
 **检测会真的生图，可能产生费用。** 选完模型后自动执行，不再询问接口类型、前缀或测试确认。
 每个已选模型每种接口最多提交一次；选一个最多两次、选两个最多四次，通用成功时不会执行第二轮。
@@ -344,6 +349,8 @@ API Key；图片费用由你的中转供应商计算，不使用 ChatGPT 方案�
 | Image 2 | `gpt-image-2` | 上一代模型，保留给既有流程或兼容需求 |
 | Image 2.5 Sunburst | `gpt-image-2.5-sunburst` | 偏重编辑精准度，适合精细改图与保留原图细节 |
 | Image 2.5 Flare | `gpt-image-2.5-flare` | 偏重速度，适合一般生图与快速迭代 |
+| Image 2.6 Sunburst | `gpt-image-2.6-sunburst` | Sunburst 新一代：偏重编辑精准度，适合精细改图 |
+| Image 2.6 Flare | `gpt-image-2.6-flare` | Flare 新一代：偏重速度，适合一般生图与快速迭代 |
 | Nano Banana 2.1 | `gemini-nano-banana-2.1` | Google 目前主力：快、便宜，画质、文字与多轮改图一致性比 Nano Banana 2 好 |
 | Nano Banana Pro | `gemini-3-pro-image` | Google 质量最高：复杂构图、精准文字、品牌一致性，较慢较贵 |
 | Nano Banana 2 | `gemini-3.1-flash-image` | 上一代主力：兼顾速度、4K 与多张参考图一致性 |
@@ -390,7 +397,8 @@ node "$env:USERPROFILE\.codex\skills\router-imagegen\scripts\imagegen.mjs" gener
 
 每次生成一张图，默认 `size=auto`、`quality=auto`、输出 PNG，保留已存在的输出档。
 `--image` 可重复提供参考图，`--dry-run` 不送出生成请求。`--model` 省略时，生图依
-Flare → Sunburst → Image 2、改图依 Sunburst → Flare → Image 2，使用第一个已启用模型。
+Flare 2.6 → 2.5 → Sunburst 2.6 → 2.5 → Image 2、改图依 Sunburst 2.6 → 2.5 → Flare 2.6 → 2.5 → Image 2，使用第一个已启用模型。
+`--model sunburst`／`flare` 会选已启用的最新版；要指定版本用 `sunburst2.5`、`flare2.6` 这类写法。
 Nano Banana 排在 GPT Image 之后：生图依 2.1 → Pro → 2 → 2 Lite → 初代，改图优先 Pro。
 通用模式需支持 Images API 的 JSON／multipart 请求与 `b64_json` 图片回应。
 Ark 模式使用同一供应商 origin 下的 `/v2/extend/image/ark_gpt_image/generations`、`edits` 及 `tasks/{task_id}`：

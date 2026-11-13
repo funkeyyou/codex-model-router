@@ -8,11 +8,24 @@ import { get as httpsGet } from "node:https";
 import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 
-export const GPT_IMAGE_MODELS = ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare"];
+export const GPT_IMAGE_MODELS = ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare",
+  "gpt-image-2.6-sunburst", "gpt-image-2.6-flare"];
 // Google 的 Nano Banana 系列（Gemini 圖片模型），ID 依 Google 官方模型清單。
 export const GEMINI_IMAGE_MODELS = ["gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image",
   "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"];
 export const IMAGE_MODELS = [...GPT_IMAGE_MODELS, ...GEMINI_IMAGE_MODELS];
+// 供應商模型清單裡偵測到、但不在已知清單的生圖模型：名稱要像生圖模型，且只用安全字元。
+// 這類模型特性未知，命令只用保守參數（尺寸、品質交給上游）。
+const DETECTED_IMAGE_ID = /^[a-z0-9][a-z0-9._-]{0,79}$/;
+export function looksLikeImageModel(name) {
+  return typeof name === "string" && /(?:^|[-_.])image(?:[-_.]|$)|banana|imagen|dall-e/i.test(name);
+}
+export function isImageModelId(id) {
+  return IMAGE_MODELS.includes(id) || (typeof id === "string" && DETECTED_IMAGE_ID.test(id) && looksLikeImageModel(id));
+}
+export function isGeminiImageModel(id) {
+  return GEMINI_IMAGE_MODELS.includes(id) || (!IMAGE_MODELS.includes(id) && /gemini|banana|imagen/i.test(String(id)));
+}
 export const ARK_IMAGE_PATH = "/v2/extend/image/ark_gpt_image";
 // Gemini 圖片模型經路由器轉送的兩條路徑：OpenAI 相容的 chat/completions，與 Gemini 原生 generateContent。
 export const CHAT_IMAGE_PATH = "/v1/router-images/chat";
@@ -20,26 +33,33 @@ export const GEMINI_IMAGE_PATH = "/v1/router-images/gemini";
 export const IMAGE_API_MODES = ["images", "ark-task", "chat", "gemini"];
 // 每個模型依序嘗試的介面：GPT Image 先通用 Images API 再 Ark；Gemini 先 chat，再原生，最後 Images API。
 export function imageApiModesFor(model) {
-  return GEMINI_IMAGE_MODELS.includes(model) ? ["chat", "gemini", "images"] : ["images", "ark-task"];
+  return isGeminiImageModel(model) ? ["chat", "gemini", "images"] : ["images", "ark-task"];
 }
 // 上游名稱可以帶供應商前綴（ark/…）或 -preview 後綴（部分中轉與 Google 的預覽版名稱）。
 export function validImageUpstream(model, upstream) {
   if (typeof upstream !== "string" || /[\s\x00-\x1f\x7f?#]/.test(upstream)) return false;
-  const names = GEMINI_IMAGE_MODELS.includes(model) ? [model, `${model}-preview`] : [model];
+  const names = isGeminiImageModel(model) ? [model, `${model}-preview`] : [model];
   return names.some((name) => upstream === name || upstream.endsWith(`/${name}`));
 }
 // 路由器依這個標頭決定用哪一家供應商生圖；與 router.mjs 的 PROVIDER_HEADER 相同。
 export const PROVIDER_HEADER = "x-codex-router-provider";
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
 const MODEL_ALIASES = {
-  image2: IMAGE_MODELS[0], "image-2": IMAGE_MODELS[0],
-  sunburst: IMAGE_MODELS[1], "image2.5-sunburst": IMAGE_MODELS[1],
-  flare: IMAGE_MODELS[2], "image2.5-flare": IMAGE_MODELS[2],
+  image2: "gpt-image-2", "image-2": "gpt-image-2",
+  "sunburst2.5": "gpt-image-2.5-sunburst", "image2.5-sunburst": "gpt-image-2.5-sunburst",
+  "flare2.5": "gpt-image-2.5-flare", "image2.5-flare": "gpt-image-2.5-flare",
+  "sunburst2.6": "gpt-image-2.6-sunburst", "image2.6-sunburst": "gpt-image-2.6-sunburst",
+  "flare2.6": "gpt-image-2.6-flare", "image2.6-flare": "gpt-image-2.6-flare",
   "banana2.1": "gemini-nano-banana-2.1", "nano-banana-2.1": "gemini-nano-banana-2.1",
   "banana-pro": "gemini-3-pro-image", "nano-banana-pro": "gemini-3-pro-image",
   banana2: "gemini-3.1-flash-image", "nano-banana-2": "gemini-3.1-flash-image",
   "banana2-lite": "gemini-3.1-flash-lite-image", "nano-banana-2-lite": "gemini-3.1-flash-lite-image",
   banana: "gemini-2.5-flash-image", "nano-banana": "gemini-2.5-flash-image",
+};
+// sunburst / flare 不帶版本時，指向已啟用的最新版。
+const VERSIONLESS_ALIASES = {
+  sunburst: ["gpt-image-2.6-sunburst", "gpt-image-2.5-sunburst"],
+  flare: ["gpt-image-2.6-flare", "gpt-image-2.5-flare"],
 };
 const HELP = `中轉 API 生圖（不需要 OPENAI_API_KEY）
   imagegen.mjs list
@@ -47,6 +67,8 @@ const HELP = `中轉 API 生圖（不需要 OPENAI_API_KEY）
   imagegen.mjs edit --model sunburst --prompt-file prompt.txt --image input.png --out output-v2.png
 
 模型只可從設定時勾選並通過測試的模型選擇。
+sunburst、flare 會選已啟用的最新版（2.6 優先）；要指定版本用 sunburst2.5、flare2.6 等。
+由供應商清單偵測到的其他模型用完整 ID，只支援 size／quality=auto。
 --model 可用完整模型 ID 或 image2 / sunburst / flare / banana2.1 / banana-pro / banana2 / banana2-lite / banana。
 --image 可重複提供（最多 16 張 PNG、JPEG 或 WebP），edit 必須提供至少一張。
 --prompt 與 --prompt-file 二擇一；提示詞上限 32000 字元。
@@ -80,20 +102,22 @@ export function parseImagegenArgs(args) {
 
 export function chooseImageModel(config, requested, action) {
   const enabled = config?.models;
-  if (!Array.isArray(enabled) || !enabled.length || enabled.some((id) => !IMAGE_MODELS.includes(id))) {
+  if (!Array.isArray(enabled) || !enabled.length || enabled.some((id) => !isImageModelId(id))) {
     throw new Error("圖片模型設定無效，請從路由器選單重新設定中轉 API 生圖。");
   }
   if (requested) {
     const name = requested.toLowerCase();
-    const id = MODEL_ALIASES[name] || name;
+    const id = VERSIONLESS_ALIASES[name]?.find((candidate) => enabled.includes(candidate)) || MODEL_ALIASES[name] || name;
     if (!enabled.includes(id)) throw new Error("此圖片模型未啟用；請從已勾選的模型中選擇，或在路由器選單重新設定。");
     return id;
   }
   const gemini = ["gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"];
+  const [image2, sunburst25, flare25, sunburst26, flare26] = GPT_IMAGE_MODELS;
   const priority = action === "edit"
-    ? [IMAGE_MODELS[1], IMAGE_MODELS[2], IMAGE_MODELS[0], "gemini-3-pro-image", ...gemini]
-    : [IMAGE_MODELS[2], IMAGE_MODELS[1], IMAGE_MODELS[0], ...gemini];
-  return priority.find((id) => enabled.includes(id));
+    ? [sunburst26, sunburst25, flare26, flare25, image2, "gemini-3-pro-image", ...gemini]
+    : [flare26, flare25, sunburst26, sunburst25, image2, ...gemini];
+  // 偵測到的未知模型排在已知模型之後，依啟用順序。
+  return priority.find((id) => enabled.includes(id)) || enabled[0];
 }
 
 function fileImageFormat(bytes) {
@@ -352,7 +376,7 @@ export async function runArkImageTask({ origin, payload, action = "generate", ap
 // 安裝器只測已選模型；每種介面每個模型最多提交一次。
 export async function probeRelayImageModel({ model, upstreamModel = model, apiRoot, apiKey,
   fetchImpl = globalThis.fetch, timeoutMs = 300000, apiMode = "images", downloadImpl, pollIntervalMs } = {}) {
-  if (!IMAGE_MODELS.includes(model) || !validImageUpstream(model, upstreamModel)) {
+  if (!isImageModelId(model) || !validImageUpstream(model, upstreamModel)) {
     throw new Error("無效的圖片測試模型。");
   }
   if (!imageApiModesFor(model).includes(apiMode)) throw new Error("此模型不支援這種生圖介面。");
@@ -392,7 +416,9 @@ export async function probeRelayImageModel({ model, upstreamModel = model, apiRo
       method: "POST", redirect: "error", signal: AbortSignal.timeout(timeoutMs),
       headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({ model: upstreamModel, prompt: "A small black circle centered on a plain white background.",
-        n: 1, size: "1024x1024", quality: "low", output_format: "png" }),
+        n: 1, output_format: "png",
+        // 偵測到的未知模型特性不明：尺寸與品質交給上游決定。
+        ...(IMAGE_MODELS.includes(model) ? { size: "1024x1024", quality: "low" } : {}) }),
     });
   } catch (error) {
     return { ok: false, error: error.name === "TimeoutError" || error.name === "AbortError"
@@ -413,12 +439,12 @@ export async function probeRelayImageModel({ model, upstreamModel = model, apiRo
 
 export async function discoverUsableRelayImages({ candidates, onProbe = () => {}, ...options } = {}) {
   const unique = [...new Map(candidates.map((model) => [model.id, model])).values()];
-  const gpt = await discoverGptImages({ candidates: unique.filter((model) => GPT_IMAGE_MODELS.includes(model.id)), onProbe, ...options });
+  const gpt = await discoverGptImages({ candidates: unique.filter((model) => !isGeminiImageModel(model.id)), onProbe, ...options });
   const checks = [...gpt.checks];
   const models = [...gpt.models];
   const apiModes = Object.fromEntries(gpt.models.map((model) => [model.id, gpt.apiMode]));
   // Gemini 每個模型各自依序試介面，通過就停；同一模型每種介面最多一次。
-  const gemini = unique.filter((model) => GEMINI_IMAGE_MODELS.includes(model.id));
+  const gemini = unique.filter((model) => isGeminiImageModel(model.id));
   for (const [index, candidate] of gemini.entries()) {
     for (const apiMode of imageApiModesFor(candidate.id)) {
       onProbe(apiMode, candidate, index);
@@ -514,9 +540,12 @@ export async function runRelayImagegen(args, {
   if (nativeGemini && (options.size !== "auto" || options.quality !== "auto" || options.background === "transparent")) {
     throw new Error("Nano Banana 由上游決定尺寸與品質：size、quality 請使用 auto，background 只可用 auto 或 opaque；比例與構圖請寫在提示詞裡。");
   }
-  const qualities = model === IMAGE_MODELS[0] ? ["auto", "low", "medium", "high"]
-    : GEMINI_IMAGE_MODELS.includes(model) ? ["auto"] : ["auto", "low", "medium", "high", "xhigh", "max"];
+  const qualities = model === GPT_IMAGE_MODELS[0] ? ["auto", "low", "medium", "high"]
+    : GPT_IMAGE_MODELS.includes(model) ? ["auto", "low", "medium", "high", "xhigh", "max"] : ["auto"];
   if (!qualities.includes(options.quality)) throw new Error(`此模型不支援 quality=${options.quality}。`);
+  if (!IMAGE_MODELS.includes(model) && options.size !== "auto") {
+    throw new Error("此模型由供應商清單偵測、特性未知：size 與 quality 請使用 auto，比例與構圖請寫在提示詞裡。");
+  }
   if (!["auto", "opaque", "transparent"].includes(options.background)) throw new Error("background 只支援 auto、opaque、transparent。");
   if (options.background === "transparent" && format === "jpeg") throw new Error("透明背景需使用 PNG 或 WebP。");
   if (options.size !== "auto") {

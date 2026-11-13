@@ -462,6 +462,10 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.equal(state.json.installed, true);
   assert.equal(state.json.writeBlocked, null);
   assert.equal(state.json.router.ok, true);
+  assert.deepEqual([state.json.account.plan, state.json.account.free, state.json.account.source], ["plus", false, "codex-login"]);
+  const diagnostics = (await ui.call("/api/query", { method: "POST", body: { type: "diagnostics" } })).json;
+  assert.deepEqual([diagnostics.report.account.plan, diagnostics.report.account.free], ["plus", false]);
+  assert.doesNotMatch(JSON.stringify(diagnostics.report.account), /fake|fixture@example/);
   assert.equal(state.json.versions.installed, releases.latest);
   assert.deepEqual(state.json.models.map((model) => model.slug), ["custom/e2e-a", "custom/e2e-b"]);
   assert.deepEqual(state.json.providers.map((item) => [item.id, item.primary, item.keyStored, item.modelCount]), [["default", true, true, 2]]);
@@ -561,6 +565,27 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.equal(contextCleared.value, null, JSON.stringify(contextCleared));
   assert.ok(readdirSync(join(root, "backups", "model-router")).filter((name) => name.startsWith("global-context-")).length >= 2);
 
+  // 第三方模型生圖保護：勾選時關閉 Codex 內建 Image Gen，取消時移除設定回到預設。
+  const imagegenBefore = await query("imagegen");
+  assert.deepEqual(imagegenBefore.builtinImagegen, { available: true, disabled: false }, JSON.stringify(imagegenBefore));
+  const guardOn = await ui.runJob("set-upstream-image-guard", { enabled: true });
+  assert.equal(guardOn.status, "succeeded", guardOn.output + windowsProcesses());
+  assert.deepEqual([guardOn.result.changed, guardOn.result.restartDesktop, guardOn.result.builtinImagegenDisabled], [true, true, true]);
+  assert.match(readFileSync(join(root, "config.toml"), "utf8"), /image_generation = false/);
+  assert.equal((await query("imagegen")).builtinImagegen.disabled, true);
+  const guardSame = await ui.runJob("set-upstream-image-guard", { enabled: true });
+  assert.deepEqual([guardSame.status, guardSame.result.changed], ["succeeded", false]);
+  const guardOff = await ui.runJob("set-upstream-image-guard", { enabled: false });
+  assert.equal(guardOff.status, "succeeded", guardOff.output + windowsProcesses());
+  assert.doesNotMatch(readFileSync(join(root, "config.toml"), "utf8"), /image_generation/);
+  assert.equal((await query("imagegen")).upstreamImageGuard, false);
+  const guardRestore = await ui.runJob("set-upstream-image-guard", { enabled: true });
+  assert.equal(guardRestore.status, "succeeded", guardRestore.output);
+  const guardReset = await ui.runJob("set-upstream-image-guard", { enabled: false });
+  assert.equal(guardReset.status, "succeeded", guardReset.output);
+  rmSync(join(root, "model-router", "upstream-image-guard.json"), { force: true });
+  assert.ok(readFileSync(join(root, "config.toml"), "utf8").includes("http://127.0.0.1:" + port + "/v1"), "其他設定保留");
+
   // 帳號模式的官方選項：熱更新並用真實 Codex model/list 驗證，保留登入與原始目錄。
   const originalAuth = readFileSync(join(root, "auth.json"), "utf8");
   const originalConfig = readFileSync(join(root, "config.toml"), "utf8");
@@ -634,12 +659,17 @@ test("網頁管理介面：偵測並啟用中轉生圖，再停用封存", { tim
   const query = async (type) => (await ui.call("/api/query", { method: "POST", body: { type } })).json;
   const before = await query("imagegen");
   assert.deepEqual([before.enabled, before.models, before.lastCheck], [false, [], null]);
-  assert.deepEqual(before.choices.map((choice) => choice.id), ["gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare",
+  assert.deepEqual(before.choices.map((choice) => choice.id), ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2",
     "gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"]);
 
-  const invalid = await ui.runJob("imagegen-setup", { models: ["gpt-image-1"] });
+  const invalid = await ui.runJob("imagegen-setup", { models: ["gpt-6-sol"] });
   assert.equal(invalid.status, "failed");
   assert.equal(requests.length, 0, "選擇無效時不能查上游或生圖");
+
+  const detect = (await ui.call("/api/query", { method: "POST", body: { type: "imagegen-detect", params: {} } })).json;
+  assert.deepEqual([detect.providerId, detect.listed, detect.detected.map((model) => [model.id, model.upstreamModel])],
+    ["default", true, [["gpt-image-2.5-flare", "ark/gpt-image-2.5-flare"]]]);
+  assert.deepEqual(requests.map((request) => request.path), ["/v1/models"], "偵測清單只讀模型清單、不生圖");
 
   const setup = await ui.runJob("imagegen-setup", { models: ["gpt-image-2.5-flare", "gpt-image-2"] });
   assert.equal(setup.status, "succeeded", setup.output);

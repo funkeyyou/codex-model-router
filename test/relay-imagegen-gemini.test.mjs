@@ -156,3 +156,14 @@ test("技能設定：逐模型保存介面，GPT Image 沿用共用 apiMode；�
   assert.match(text, /Nano Banana Pro/);
   assert.match(text, /apiModes/);
 });
+
+test("技能說明為英文，並明確要求優先於內建 image_gen", () => {
+  const text = installer.renderRelayImageSkill({ root: "/skills/router-imagegen", nodePath: "/node", models: ["gpt-image-2.6-flare"], platform: "darwin" });
+  const description = text.split("\n").find((line) => line.startsWith("description:"));
+  assert.match(description, /INSTEAD of the built-in image_gen tool/);
+  assert.match(text, /## Precedence \(read first\)/);
+  assert.match(text, /Do not call the built-in `image_gen` tool/);
+  assert.match(text, /Image 2\.6 Flare \(gpt-image-2\.6-flare\): Newer Flare/);
+  assert.doesNotMatch(text.replace("完整存取權", "").replace("代我核准", ""), /[\u4e00-\u9fff]/, "除了權限設定的介面名稱，技能內文不含中文");
+  assert.doesNotMatch(text, /relay/i, "技能內文不提中轉");
+});
