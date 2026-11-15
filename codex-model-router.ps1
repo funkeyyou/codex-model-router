@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.8";
+const INSTALLER_VERSION = "1.44.9";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -362,8 +362,10 @@ function shell(command, args, options = {}) {
     stdio: options.stdio ?? defaultStdio,
     env: options.env ?? env,
     cwd: options.cwd,
-    // 有 input 時 spawnSync 會自動把 stdio[0] 換成管線。
-    input: options.input,
+    // 有 input 時 spawnSync 會自動把 stdio[0] 換成管線。字串一律先轉成 UTF-8 位元組：
+    // spawnSync 會拿 encoding 轉換字串 input，而 Windows 這裡的 encoding 是 "buffer"，
+    // 直接傳字串會丟出 Unknown encoding: buffer（1.44.7 的 API Key 保存就是這樣壞掉的）。
+    input: typeof options.input === "string" ? Buffer.from(options.input, "utf8") : options.input,
     windowsHide: options.windowsHide ?? true,
   });
   if (isWindows) {
@@ -376,6 +378,9 @@ function shell(command, args, options = {}) {
   }
   return result;
 }
+
+// 測試用：直接驗證 shell() 的 input 與輸出解碼。
+export { shell as runShellForTest };
 
 // Windows 代碼頁 → TextDecoder 標籤。Node 內建完整 ICU，這些都能解。
 const WINDOWS_CODEPAGE_LABELS = new Map([
@@ -3590,6 +3595,63 @@ function killRouterProcesses() {
   );
 }
 
+// 解除安裝搬移安裝目錄前用：結束仍在目錄內執行的本工具程式（管理頁、Codex 啟動的管理入口、
+// 路由器殘留）。Windows 上只要有行程以該目錄內的檔案或工作目錄執行，整個目錄就 rename 不動。
+// 只比對 node／wscript／cmd 且命令列含安裝目錄者，並排除本行程與父行程。
+function installRootProcesses({ stop = false } = {}) {
+  if (!isWindows) return [];
+  const result = powershell(
+    [
+      "$ErrorActionPreference = 'SilentlyContinue'",
+      `$root = ${psQuote(installRoot)}`,
+      `$skip = @(${process.pid}, ${process.ppid})`,
+      "Get-CimInstance Win32_Process |",
+      "  Where-Object { $skip -notcontains $_.ProcessId -and $_.CommandLine -and",
+      "    @('node.exe','wscript.exe','cmd.exe') -contains $_.Name.ToLowerInvariant() -and",
+      "    $_.CommandLine.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |",
+      `  ForEach-Object { ${stop ? "Stop-Process -Id $_.ProcessId -Force; " : ""}'{0} {1}' -f $_.ProcessId, $_.Name }`,
+    ].join("\n"),
+    { allowFailure: true },
+  );
+  return String(result.stdout || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+export function isBusyRenameError(error) {
+  return ["EPERM", "EBUSY", "EACCES", "ENOTEMPTY"].includes(error?.code);
+}
+
+// 把安裝目錄搬進封存；被佔用時先收掉本工具自己的行程再重試，仍不行就說清楚是誰佔著。
+function archiveInstallRoot(archiveDir) {
+  if (!existsSync(installRoot)) return;
+  const target = join(archiveDir, "model-router");
+  let lastError = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      renameSync(installRoot, target);
+      return;
+    } catch (error) {
+      if (!isWindows || !isBusyRenameError(error)) throw error;
+      lastError = error;
+      if (attempt === 0) installRootProcesses({ stop: true });
+      sleepSync(500 * (attempt + 1));
+    }
+  }
+  const holders = installRootProcesses();
+  fail(installRootBusyMessage({ installRoot, holders, detail: lastError?.message }));
+}
+
+export function installRootBusyMessage({ installRoot: root, holders = [], detail = "" }) {
+  return [
+    `安裝目錄仍被佔用，無法封存：${root}`,
+    detail ? `（${detail}）` : null,
+    "Codex 設定已經還原；剩下的只是搬移這個資料夾。",
+    holders.length
+      ? `仍在使用它的程式：${holders.join("、")}`
+      : "多半是 Codex 桌面版、網頁管理頁，或開在這個資料夾的檔案總管／終端機。",
+    `請完全退出 ${desktopAppName}（含系統匣圖示）、關閉管理頁與位於該資料夾的視窗後，再執行一次 rollback。`,
+  ].filter(Boolean).join("\n");
+}
+
 function stopScheduledTask() {
   shell("schtasks.exe", ["/End", "/TN", taskName], {
     allowFailure: true,
@@ -6503,13 +6565,13 @@ async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
     const user = await readUserConfig();
     const entryEdit = managerHandlerRollbackEdit(user.config, manifest.managerFileHandler);
     if (entryEdit) edits.push(entryEdit);
-    else console.log("自訂模型管理的開啟方式已被修改，保留目前的設定。");
+    else if (managerEntryPresent(user.config, MANAGER_HANDLER_KEY)) console.log("自訂模型管理的開啟方式已被修改，保留目前的設定。");
   }
   if (manifest.managerMcpEntry) {
     const user = await readUserConfig();
     const entryEdit = managerMcpRollbackEdit(user.config, manifest.managerMcpEntry);
     if (entryEdit) edits.push(entryEdit);
-    else console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
+    else if (managerEntryPresent(user.config, MANAGER_MCP_KEY)) console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
   }
   if (useCodex) {
     await writeConfigEdits(edits);
@@ -6527,7 +6589,7 @@ async function uninstallRouter(manifest, { deleteKeys, deferArchive = false }) {
     if (path.startsWith(installRoot)) continue;
     if (existsSync(path)) renameSync(path, join(archiveDir, basename(path)));
   }
-  if (!deferArchive && existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
+  if (!deferArchive) archiveInstallRoot(archiveDir);
 
   const removeKey = await deleteKeys(providers.length);
   if (removeKey) {
@@ -6568,11 +6630,12 @@ async function uninstallManagerOnly({ deferArchive = false } = {}) {
     const user = await readUserConfig();
     const entryEdit = managerMcpRollbackEdit(user.config, record.managerMcpEntry);
     if (entryEdit) await writeConfigEdits([entryEdit]);
-    else console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
+    // 前一次回退已移除入口、只是搬目錄失敗時，再跑一次不該誤報「已被修改」。
+    else if (managerEntryPresent(user.config, MANAGER_MCP_KEY)) console.log("自訂模型管理的 MCP 入口已被修改，保留目前的設定。");
   }
   ensureDirectory(archiveDir);
   archiveManagerShortcut(archiveDir);
-  if (!deferArchive && existsSync(installRoot)) renameSync(installRoot, join(archiveDir, "model-router"));
+  if (!deferArchive) archiveInstallRoot(archiveDir);
   return { archiveDir };
 }
 
@@ -6798,6 +6861,10 @@ export function managerHandlerRollbackEdit(config, record) {
 export function managerMcpRollbackEdit(config, record) {
   if (!record?.installed || !sameHandler(deepGet(config, MANAGER_MCP_KEY).value, record.installed)) return null;
   return { keyPath: MANAGER_MCP_KEY, value: record.previous ?? null };
+}
+
+export function managerEntryPresent(config, keyPath) {
+  return deepGet(config, keyPath).value != null;
 }
 
 async function installManagerMcpEntry() {
@@ -20196,8 +20263,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說誰調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说谁调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",

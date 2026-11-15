@@ -276,4 +276,30 @@ test("模型清單不符時逐項說明差異", () => {
   assert.match(describePickerMismatch(null, expected).join(""), /沒有回傳/);
 });
 
+test("Windows：shell() 傳入字串 input 不會丟 Unknown encoding，中文可正確往返", { skip: process.platform !== "win32" }, () => {
+  const { runShellForTest } = installer;
+  const script = "$in=[Console]::OpenStandardInput(); $ms=New-Object IO.MemoryStream; $in.CopyTo($ms); $t=[Text.Encoding]::UTF8.GetString($ms.ToArray()); [Console]::OpenStandardOutput().Write([Text.Encoding]::UTF8.GetBytes($t.ToUpper()), 0, [Text.Encoding]::UTF8.GetByteCount($t.ToUpper()))";
+  const result = runShellForTest("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { input: "sk-測試key" });
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, "SK-測試KEY");
+});
+
+test("解除安裝：目錄被佔用時的說明，以及入口已移除時不誤報", () => {
+  const { isBusyRenameError, installRootBusyMessage, managerEntryPresent } = installer;
+  assert.ok(isBusyRenameError({ code: "EPERM" }));
+  assert.ok(isBusyRenameError({ code: "EBUSY" }));
+  assert.ok(!isBusyRenameError({ code: "ENOENT" }));
+  const withHolders = installRootBusyMessage({ installRoot: "C:\\x\\.codex\\model-router", holders: ["123 node.exe"], detail: "EPERM: operation not permitted" });
+  assert.match(withHolders, /安裝目錄仍被佔用/);
+  assert.match(withHolders, /123 node\.exe/);
+  assert.match(withHolders, /Codex 設定已經還原/);
+  assert.match(withHolders, /再執行一次 rollback/);
+  assert.match(installRootBusyMessage({ installRoot: "C:\\x" }), /Codex 桌面版、網頁管理頁/);
+  const key = "mcp_servers.model_router_manager";
+  assert.equal(managerEntryPresent({}, key), false);
+  assert.equal(managerEntryPresent({ mcp_servers: {} }, key), false);
+  assert.equal(managerEntryPresent({ mcp_servers: { model_router_manager: { command: "node" } } }, key), true);
+});
+
+
 
