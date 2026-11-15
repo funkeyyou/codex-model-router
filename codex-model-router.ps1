@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.6";
+const INSTALLER_VERSION = "1.44.7";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -355,7 +355,10 @@ function shell(command, args, options = {}) {
     ? ["pipe", "pipe", "pipe"]
     : ["ignore", "pipe", "pipe"];
   const result = spawnSync(command, args, {
-    encoding: "utf8",
+    // Windows 的 schtasks、reg、where 等原生工具輸出到管線時用的是系統代碼頁
+    // （簡中 GBK、繁中 Big5…），不是 UTF-8；直接當 UTF-8 讀，錯誤訊息就成了亂碼。
+    // 先取原始位元組，再由 decodeWindowsOutput 判斷。
+    encoding: isWindows ? "buffer" : "utf8",
     stdio: options.stdio ?? defaultStdio,
     env: options.env ?? env,
     cwd: options.cwd,
@@ -363,11 +366,77 @@ function shell(command, args, options = {}) {
     input: options.input,
     windowsHide: options.windowsHide ?? true,
   });
+  if (isWindows) {
+    if (Buffer.isBuffer(result.stdout)) result.stdout = decodeWindowsOutput(result.stdout);
+    if (Buffer.isBuffer(result.stderr)) result.stderr = decodeWindowsOutput(result.stderr);
+  }
   if (options.allowFailure !== true && result.status !== 0) {
     const detail = (result.stderr || result.stdout || "").trim();
     fail(`${command} 執行失敗${detail ? `：${detail}` : ""}`);
   }
   return result;
+}
+
+// Windows 代碼頁 → TextDecoder 標籤。Node 內建完整 ICU，這些都能解。
+const WINDOWS_CODEPAGE_LABELS = new Map([
+  [65001, "utf-8"],
+  [936, "gbk"],
+  [54936, "gb18030"],
+  [950, "big5"],
+  [932, "shift_jis"],
+  [949, "euc-kr"],
+  [866, "ibm866"],
+  [874, "windows-874"],
+  [1250, "windows-1250"],
+  [1251, "windows-1251"],
+  [1252, "windows-1252"],
+  [1253, "windows-1253"],
+  [1254, "windows-1254"],
+  [1255, "windows-1255"],
+  [1256, "windows-1256"],
+  [1257, "windows-1257"],
+  [1258, "windows-1258"],
+]);
+
+let cachedWindowsCodepages = null;
+
+// 主控台程式導向管線時多半用 OEM 代碼頁，少數用 ANSI；中日韓系統兩者相同。
+// 從登錄檔讀，不靠 chcp：chcp 反映的是目前主控台，GUI 啟動的安裝器未必有主控台。
+function windowsCodepages() {
+  if (cachedWindowsCodepages) return cachedWindowsCodepages;
+  const codepages = [];
+  for (const name of ["OEMCP", "ACP"]) {
+    const result = spawnSync(
+      "reg.exe",
+      ["query", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage", "/v", name],
+      { encoding: "latin1", stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
+    );
+    const match = String(result.stdout || "").match(new RegExp(`${name}\\s+REG_SZ\\s+(\\d+)`));
+    if (match) codepages.push(Number(match[1]));
+  }
+  cachedWindowsCodepages = codepages;
+  return codepages;
+}
+
+// 合法的 UTF-8（含純 ASCII）原樣採用：PowerShell 子行程與已 chcp 65001 的主控台都輸出 UTF-8。
+// 不合法才改用系統代碼頁；GBK、Big5 的中文位元組幾乎不可能恰好是合法 UTF-8。
+export function decodeWindowsOutput(buffer, codepages = null) {
+  if (!buffer || buffer.length === 0) return "";
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch {
+    // 落到系統代碼頁。
+  }
+  for (const codepage of codepages ?? windowsCodepages()) {
+    const label = WINDOWS_CODEPAGE_LABELS.get(codepage);
+    if (!label || label === "utf-8") continue;
+    try {
+      return new TextDecoder(label, { fatal: true }).decode(buffer);
+    } catch {
+      // 試下一個代碼頁。
+    }
+  }
+  return buffer.toString("utf8");
 }
 
 function findExecutable(candidates) {
@@ -3468,7 +3537,20 @@ function stopScheduledTask() {
 function startScheduledTask() {
   stopScheduledTask();
   sleepSync(300);
-  shell("schtasks.exe", ["/Create", "/TN", taskName, "/XML", taskXmlPath, "/F"]);
+  const created = shell("schtasks.exe", ["/Create", "/TN", taskName, "/XML", taskXmlPath, "/F"], {
+    allowFailure: true,
+  });
+  if (created.status !== 0) {
+    const detail = (created.stderr || created.stdout || "").trim();
+    const denied = isAccessDeniedText(detail);
+    // 訊息沒認出來時（例如其他語系），再用「工作已存在且目前未提權」來推斷。
+    const taskExists = shell("schtasks.exe", ["/Query", "/TN", taskName], {
+      allowFailure: true,
+      stdio: ["ignore", "ignore", "ignore"],
+    }).status === 0;
+    const elevated = denied || taskExists ? isProcessElevated() : true;
+    fail(scheduledTaskCreateFailure({ detail, denied, taskExists, elevated, taskName }));
+  }
   let lastResult = null;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     lastResult = shell("schtasks.exe", ["/Run", "/TN", taskName], {
@@ -3479,6 +3561,54 @@ function startScheduledTask() {
   }
   const detail = (lastResult?.stderr || lastResult?.stdout || "").trim();
   fail(`無法啟動排程工作${detail ? `：${detail}` : ""}`);
+}
+
+// schtasks 的「拒絕存取」在各語系的寫法。解碼正確後才比對得到，所以依賴 decodeWindowsOutput。
+const ACCESS_DENIED_PATTERNS = [
+  /access is denied/i,
+  /拒绝访问/,
+  /存取被拒/,
+  /拒絕存取/,
+  /アクセスが拒否されました/,
+  /액세스가 거부되었습니다/,
+  /zugriff verweigert/i,
+  /acc[eè]s refus[eé]/i,
+  /acceso denegado/i,
+  /отказано в доступе/i,
+];
+
+export function isAccessDeniedText(text) {
+  const value = String(text || "");
+  return ACCESS_DENIED_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+// fltmc 只有系統管理員能執行，未提權時以非零結束；不依賴語系或 PowerShell。
+function isProcessElevated() {
+  const result = spawnSync("fltmc.exe", [], { stdio: "ignore", windowsHide: true });
+  return result.status === 0;
+}
+
+// 首次設定註冊排程工作失敗時的說明。最常見的是同名工作先前以系統管理員身分建立，
+// 一般使用者對它只有讀取權，/Create /F 無法覆蓋。
+export function scheduledTaskCreateFailure({ detail = "", denied = false, taskExists = false, elevated = true, taskName: name }) {
+  const reason = detail ? `（${detail}）` : "";
+  if (!denied && !(taskExists && !elevated)) {
+    return `無法註冊背景服務：schtasks.exe 執行失敗${reason}`;
+  }
+  const lines = [`無法註冊背景服務：權限不足${reason}。`];
+  if (taskExists) {
+    lines.push(
+      `這台電腦上已有同名的排程工作 ${name}，多半是之前以系統管理員身分安裝時建立的，目前的一般權限無法覆蓋它。`,
+    );
+  }
+  lines.push("請擇一處理後再重試：");
+  lines.push("1. 關閉本視窗，以「以系統管理員身分執行」重新開啟安裝程式。");
+  if (taskExists) {
+    lines.push(`2. 或在系統管理員 PowerShell 執行 schtasks /Delete /TN ${name} /F 刪除舊工作，再以一般權限重新設定。`);
+  } else if (elevated) {
+    lines.push("2. 若已是系統管理員仍失敗，請確認防毒或群組原則未封鎖工作排程器。");
+  }
+  return lines.join("\n");
 }
 
 // --- 平台分派 --------------------------------------------------------------
@@ -20000,8 +20130,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",

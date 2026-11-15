@@ -191,3 +191,49 @@ test("已帶 /v1 就不再疊一層，否則兩種都試", () => {
   assert.deepEqual(candidateApiRoots("https://h.example"), ["https://h.example/v1", "https://h.example"]);
   assert.deepEqual(candidateApiRoots("https://h.example/"), ["https://h.example/v1", "https://h.example"]);
 });
+
+test("Windows 原生工具輸出：合法 UTF-8 原樣採用，否則依系統代碼頁解碼", () => {
+  const { decodeWindowsOutput } = installer;
+  // 簡中系統 schtasks 的「错误: 拒绝访问。」（GBK）
+  const gbk = Buffer.from("b4edcef33a20bedcbef8b7c3cecaa1a3", "hex");
+  assert.equal(decodeWindowsOutput(gbk, [936, 936]), "错误: 拒绝访问。");
+  // 繁中系統的「錯誤: 存取被拒。」（Big5）
+  const big5 = Buffer.from("bff9bb7e3a20a673a8fab351a9daa143", "hex");
+  assert.equal(decodeWindowsOutput(big5, [950, 950]), "錯誤: 存取被拒。");
+  // 已是 UTF-8（PowerShell 子行程、chcp 65001）不得被改寫。
+  assert.equal(decodeWindowsOutput(Buffer.from("錯誤：拒絕存取", "utf8"), [936]), "錯誤：拒絕存取");
+  assert.equal(decodeWindowsOutput(Buffer.from("ERROR: Access is denied.\r\n"), [437]), "ERROR: Access is denied.\r\n");
+  assert.equal(decodeWindowsOutput(Buffer.alloc(0), [936]), "");
+  // 不認得的代碼頁退回 UTF-8 寬鬆解碼，不丟例外。
+  assert.equal(typeof decodeWindowsOutput(gbk, [437]), "string");
+});
+
+test("註冊排程工作遇到權限不足時給出可操作的提示", () => {
+  const { isAccessDeniedText, scheduledTaskCreateFailure } = installer;
+  assert.ok(isAccessDeniedText("错误: 拒绝访问。"));
+  assert.ok(isAccessDeniedText("錯誤: 存取被拒。"));
+  assert.ok(isAccessDeniedText("ERROR: Access is denied."));
+  assert.ok(!isAccessDeniedText("ERROR: The system cannot find the file specified."));
+
+  const name = "CodexModelRouter-abc1234567";
+  const existing = scheduledTaskCreateFailure({
+    detail: "错误: 拒绝访问。", denied: true, taskExists: true, elevated: false, taskName: name,
+  });
+  assert.match(existing, /權限不足/);
+  assert.match(existing, /以系統管理員身分執行/);
+  assert.ok(existing.includes(`schtasks /Delete /TN ${name} /F`));
+
+  // 訊息認不出來（其他語系），但工作已存在且未提權，仍判定為權限問題。
+  const inferred = scheduledTaskCreateFailure({
+    detail: "??", denied: false, taskExists: true, elevated: false, taskName: name,
+  });
+  assert.match(inferred, /權限不足/);
+
+  // 與權限無關的失敗維持一般訊息，不誤導使用者去提權。
+  const other = scheduledTaskCreateFailure({
+    detail: "ERROR: The task XML is malformed.", denied: false, taskExists: false, elevated: false, taskName: name,
+  });
+  assert.doesNotMatch(other, /權限不足/);
+  assert.match(other, /schtasks\.exe 執行失敗/);
+});
+
