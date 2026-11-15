@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.7";
+const INSTALLER_VERSION = "1.44.8";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3108,14 +3108,22 @@ async function codexRpcOnce(method, params, acceptResult, binary, home) {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...env, CODEX_HOME: home },
   });
-  child.stderr.on("data", () => {});
+  // 保留 stderr 尾端：逾時時要能分辨「Codex 沒回應」與「回了但清單不符」，並附上 Codex 自己的說法。
+  let stderrTail = "";
+  child.stderr.on("data", (chunk) => {
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
+  });
   let buffer = "";
   let settled = false;
   let retryTimer;
   let timeout;
+  let initialized = false;
+  let replies = 0;
   const responsePromise = new Promise((resolvePromise, rejectPromise) => {
     timeout = setTimeout(() => {
-      if (!settled) rejectPromise(new Error(`Timed out waiting for ${method}`));
+      if (!settled) {
+        rejectPromise(new Error(codexRpcTimeoutMessage({ method, initialized, replies, stderr: stderrTail })));
+      }
     }, 30000);
     child.stdout.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
@@ -3131,7 +3139,9 @@ async function codexRpcOnce(method, params, acceptResult, binary, home) {
         } catch {
           continue;
         }
+        if (message.id === 0) initialized = true;
         if (message.id === 1) {
+          replies += 1;
           if (!message.error && !acceptResult(message.result)) {
             retryTimer = setTimeout(() => {
               if (!settled) child.stdin.write(`${JSON.stringify({ method, id: 1, params })}\n`);
@@ -3173,6 +3183,51 @@ async function codexRpcOnce(method, params, acceptResult, binary, home) {
     clearTimeout(retryTimer);
     await stopChildProcess(child);
   }
+}
+
+// 逾時訊息要說清楚卡在哪一段：app-server 沒起來、初始化後不回應，還是回了但結果一直不被接受。
+export function codexRpcTimeoutMessage({ method, initialized = false, replies = 0, stderr = "" }) {
+  let stage;
+  if (replies > 0) stage = `Codex 回覆了 ${replies} 次，但 30 秒內結果始終不符合預期`;
+  else if (initialized) stage = `Codex 已啟動，但 30 秒內沒有回覆 ${method}`;
+  else stage = "Codex app-server 30 秒內完全沒有回應（可能啟動卡住，或被防毒、其他 Codex 行程阻擋）";
+  // 有回覆時差異由呼叫端逐項說明；stderr 多是無關警告，只在 Codex 沒回覆時才附上。
+  const tail = replies > 0 ? "" : terminalSafeText(String(stderr || "").split(/\r?\n/).filter(Boolean).slice(-3).join(" | "), 600);
+  return `Timed out waiting for ${method}：${stage}${tail ? `。Codex 輸出：${tail}` : ""}`;
+}
+
+// model/list 不符合預期時，逐項列出差在哪裡，供逾時訊息使用。
+export function describePickerMismatch(result, expected, absent = [], allowed = null) {
+  if (!result || !Array.isArray(result.data)) return ["Codex 沒有回傳可用的模型清單"];
+  const models = new Map(result.data.map((model) => [model.id, model]));
+  const missing = [];
+  const hidden = [];
+  const renamed = [];
+  for (const item of expected) {
+    const slug = typeof item === "string" ? item : item.pickerSlug;
+    const model = models.get(slug);
+    if (!model) { missing.push(slug); continue; }
+    if (typeof item === "string") continue;
+    if (model.hidden !== false) hidden.push(slug);
+    else if (model.displayName !== item.displayName) renamed.push(`${slug}（Codex 顯示「${model.displayName}」，預期「${item.displayName}」）`);
+  }
+  const lingering = absent.filter((slug) => models.has(slug));
+  const extra = allowed
+    ? result.data.map((model) => model.id).filter((id) => id.startsWith("custom/") && !allowed.has(id) && !lingering.includes(id))
+    : [];
+  const customCount = result.data.filter((model) => String(model.id).startsWith("custom/")).length;
+  const lines = [];
+  if (missing.length) {
+    lines.push(`Codex 清單缺少 ${missing.length} 個模型：${missing.slice(0, 5).join("、")}${missing.length > 5 ? " 等" : ""}`);
+    if (customCount === 0) {
+      lines.push("Codex 清單裡完全沒有自訂模型：多半是 Codex 沒有讀到路由器的 model_catalog_json（Codex 版本過舊，或設定被設定檔 profile、專案層 .codex/config.toml 覆蓋）");
+    }
+  }
+  if (hidden.length) lines.push(`Codex 把 ${hidden.length} 個模型標為隱藏：${hidden.slice(0, 5).join("、")}`);
+  if (renamed.length) lines.push(`顯示名稱不符：${renamed.slice(0, 3).join("；")}`);
+  if (lingering.length) lines.push(`應移除的模型仍在清單中：${lingering.slice(0, 5).join("、")}`);
+  if (extra.length) lines.push(`清單多出設定以外的自訂模型：${extra.slice(0, 5).join("、")}`);
+  return lines.length ? lines : [`Codex 回傳 ${result.data.length} 個模型，但比對沒有通過（原因不明）`];
 }
 
 export function hasExpectedModels(result, expected, absent = []) {
@@ -3233,6 +3288,8 @@ async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
   ensureDirectory(backupDir);
   if (repair) configBackup(user.filePath);
   let attempted = false;
+  let lastListed = null;
+  const allowed = new Set(routes.map(route => route.pickerSlug));
   try {
     if (repair) {
       attempted = true;
@@ -3241,10 +3298,12 @@ async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
       if ((verified.config.model ?? null) !== repair.value) fail("全域預設模型修復驗證失敗。");
     }
     invalidatePickerCache(codexHome, backupDir);
-    const allowed = new Set(routes.map(route => route.pickerSlug));
     const result = await codexRpc("model/list", { includeHidden: true },
-      result => hasExpectedModels(result, expected, absent) &&
-        !result.data.some(model => model.id.startsWith("custom/") && !allowed.has(model.id)));
+      result => {
+        lastListed = result;
+        return hasExpectedModels(result, expected, absent) &&
+          !result.data.some(model => model.id.startsWith("custom/") && !allowed.has(model.id));
+      });
     const verifiedDefault = (await readUserConfig()).config.model;
     if (typeof verifiedDefault === "string" && verifiedDefault.startsWith("custom/") && !allowed.has(verifiedDefault)) {
       fail("全域預設模型在同步期間已變更為無效的模型，請重試。");
@@ -3261,7 +3320,14 @@ async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
     }
     // 外層會還原路由設定；不讓此次清單留在 Codex 快取中。
     invalidatePickerCacheAfterFailure();
-    throw new Error(`等待 Codex 模型清單同步失敗：${error.message}`);
+    const details = [];
+    if (lastListed) {
+      details.push(...describePickerMismatch(lastListed, expected, absent, allowed).map(line => `  - ${line}`));
+    }
+    const version = await diagnosticCommandVersion(codexBin);
+    details.push(`  - 使用的 Codex：${codexBin}${version ? `（${version}）` : "（無法取得版本）"}`);
+    details.push(`  - Codex 設定目錄：${codexHome}`);
+    throw new Error(`等待 Codex 模型清單同步失敗：${error.message}\n${details.join("\n")}`);
   }
 }
 

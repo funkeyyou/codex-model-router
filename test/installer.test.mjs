@@ -237,3 +237,43 @@ test("註冊排程工作遇到權限不足時給出可操作的提示", () => {
   assert.match(other, /schtasks\.exe 執行失敗/);
 });
 
+test("Codex RPC 逾時訊息分辨沒回應、未回覆與結果不符", () => {
+  const { codexRpcTimeoutMessage } = installer;
+  assert.match(codexRpcTimeoutMessage({ method: "model/list" }), /完全沒有回應/);
+  const silent = codexRpcTimeoutMessage({ method: "model/list", initialized: true, stderr: "line1\nERROR config failed\n" });
+  assert.match(silent, /已啟動，但 30 秒內沒有回覆 model\/list/);
+  assert.match(silent, /ERROR config failed/);
+  const mismatch = codexRpcTimeoutMessage({ method: "model/list", initialized: true, replies: 12, stderr: "WARN noise\n" });
+  assert.match(mismatch, /回覆了 12 次/);
+  assert.doesNotMatch(mismatch, /WARN noise/);
+});
+
+test("模型清單不符時逐項說明差異", () => {
+  const { describePickerMismatch } = installer;
+  const expected = [
+    { pickerSlug: "custom/a-1", displayName: "api/a" },
+    { pickerSlug: "custom/b-2", displayName: "api/b" },
+    { pickerSlug: "custom/c-3", displayName: "api/c" },
+  ];
+  const allowed = new Set(expected.map((item) => item.pickerSlug));
+  const result = { data: [
+    { id: "gpt-6-sol", hidden: false, displayName: "GPT" },
+    { id: "custom/b-2", hidden: true, displayName: "api/b" },
+    { id: "custom/c-3", hidden: false, displayName: "c" },
+    { id: "custom/old-9", hidden: false, displayName: "old" },
+    { id: "custom/stray-8", hidden: false, displayName: "stray" },
+  ] };
+  const lines = describePickerMismatch(result, expected, ["custom/old-9"], allowed).join("\n");
+  assert.match(lines, /缺少 1 個模型：custom\/a-1/);
+  assert.match(lines, /標為隱藏：custom\/b-2/);
+  assert.match(lines, /custom\/c-3（Codex 顯示「c」，預期「api\/c」）/);
+  assert.match(lines, /應移除的模型仍在清單中：custom\/old-9/);
+  assert.match(lines, /多出設定以外的自訂模型：custom\/stray-8/);
+
+  // 完全沒有自訂模型：指向 model_catalog_json 沒被讀到。
+  const none = describePickerMismatch({ data: [{ id: "gpt-6-sol", hidden: false }] }, expected, [], allowed).join("\n");
+  assert.match(none, /完全沒有自訂模型/);
+  assert.match(describePickerMismatch(null, expected).join(""), /沒有回傳/);
+});
+
+
