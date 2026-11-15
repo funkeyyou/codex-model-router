@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { loadRouterInDir, loadPayloads } from "./helpers/payloads.mjs";
 import { desktopRoutes, desktopModels, desktopRoute, desktopHeaders, newDesktopConfig,
   desktopUsageObserver, desktopUsageEvent, connectDesktop, restoreDesktop, integrationStatus,
-  desktopDirectories, desktopLifecycle } from "../src/claude-desktop.mjs";
+  desktopDirectories, desktopLifecycle, detectDesktop } from "../src/claude-desktop.mjs";
 
 const a = { pickerSlug: "custom/relay-claude-opus", upstreamModel: "ark/claude-opus-5-5", translate: "anthropic",
   providerId: "a", displayName: "Relay Opus", contextWindow: 1000000 };
@@ -373,4 +373,35 @@ test("Windows/macOS configuration paths and graceful lifecycle commands remain p
     assert.ok(!JSON.stringify(commands).includes("taskkill"));
     assert.ok(!JSON.stringify(commands).includes("Stop-Process"));
   }
+});
+
+test("Windows detection casts Claude paths to strings and rejects PowerShell-wrapped objects", async () => {
+  const scripts = [];
+  const detect = (payload) => detectDesktop({ platform: "win32", home: "C:\\Users\\Example", run: async (command, args) => {
+    scripts.push(args.at(-1));
+    return { stdout: JSON.stringify(payload) };
+  } });
+  const plain = await detect({ app: " C:\\Claude\\Claude.exe ", appId: "" });
+  assert.equal(plain.app, "C:\\Claude\\Claude.exe");
+  assert.equal(plain.appId, null);
+  assert.equal(plain.available, true);
+  assert.match(scripts[0], /app=\[string\]\$exe; appId=\[string\]\$id/);
+
+  const wrapped = await detect({ app: { value: "C:\\Claude\\Claude.exe", PSPath: "x" }, appId: ["Claude_1"] });
+  assert.equal(wrapped.app, null);
+  assert.equal(wrapped.appId, null);
+  assert.equal(wrapped.available, false);
+
+  const commands = [];
+  let running = false;
+  const lifecycle = desktopLifecycle({ platform: "win32", app: { value: "C:\\Claude\\Claude.exe" }, appId: "Claude_abc123!Claude" }, {
+    run: async (command, args) => {
+      commands.push([command, args]);
+      if (args.join(" ").includes("Get-Process -Name Claude -ErrorAction SilentlyContinue){")) return { stdout: String(running) };
+      if (command === "explorer.exe") running = true;
+      return { stdout: "" };
+    }, wait: async () => {},
+  });
+  await lifecycle.start();
+  assert.deepEqual(commands.find(([command]) => command === "explorer.exe")[1], ["shell:AppsFolder\\Claude_abc123!Claude"]);
 });

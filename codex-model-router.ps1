@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.10";
+const INSTALLER_VERSION = "1.44.11";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -18118,6 +18118,8 @@ import { promisify, isDeepStrictEqual } from "node:util";
 
 const execute = promisify(execFile);
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Windows PowerShell 有時會把帶額外屬性的路徑序列化成 {"value":...}；只接受非空字串。
+const pathText = (value) => typeof value === "string" && value.trim() ? value.trim() : null;
 
 export function desktopDirectories({ platform = process.platform, home = homedir(), localAppData = process.env.LOCALAPPDATA } = {}) {
   if (platform === "darwin") return posix.join(home, "Library", "Application Support", "Claude-3p");
@@ -18142,15 +18144,17 @@ export async function detectDesktop({ platform = process.platform, home = homedi
     "$paths=@((Join-Path $env:LOCALAPPDATA 'AnthropicClaude\\Claude.exe'),(Join-Path $env:LOCALAPPDATA 'Programs\\Claude\\Claude.exe'))",
     "$exe=$paths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1",
     "$id=Get-StartApps | Where-Object { $_.Name -eq 'Claude' -and $_.AppID -match '^(Claude_|AnthropicPBC.Claude_)' } | Select-Object -First 1 -ExpandProperty AppID",
-    "@{app=$exe; appId=$id} | ConvertTo-Json -Compress",
+    "@{app=[string]$exe; appId=[string]$id} | ConvertTo-Json -Compress",
   ].join("\n");
   const { stdout } = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 10000 });
-  const info = JSON.parse(stdout.trim());
+  const parsed = JSON.parse(stdout.trim());
+  const info = { managed: parsed?.managed === true, app: pathText(parsed?.app), appId: pathText(parsed?.appId) };
   return { directory, ...info, platform, available: !info.managed && Boolean(info.app || info.appId),
     reason: info.managed ? "Claude 由組織政策管理，不能自動覆寫。" : !info.app && !info.appId ? "未找到 Claude 桌面客戶端。" : null };
 }
 
 export function desktopLifecycle(info, { run = execute, wait = pause, timeoutMs = 30000 } = {}) {
+  info = { ...info, app: pathText(info?.app), appId: pathText(info?.appId) };
   const ps = (text) => run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", text], { windowsHide: true, timeout: timeoutMs + 5000 });
   const osa = (text) => run("/usr/bin/osascript", ["-e", text], { timeout: timeoutMs + 5000 });
   const application = `application ${JSON.stringify(info.app || "")}`;

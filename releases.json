@@ -1,6 +1,13 @@
 {
-  "latest": "1.44.10",
+  "latest": "1.44.11",
   "releases": [
+    {
+      "version": "1.44.11",
+      "date": "2026-11-16",
+      "changes": [
+        "修正：Windows 一鍵接入 Claude Desktop 時，部分電腦會在重新打開 Claude 的步驟出現「info.app.replaceAll is not a function」。原因是 Windows PowerShell 偵測 Claude 路徑時，把附帶額外屬性的路徑輸出成物件而非文字；現在偵測時強制轉成文字，程式也只接受文字路徑，其他格式一律視為未找到並改用開始功能表的應用程式識別碼啟動。"
+      ]
+    },
     {
       "version": "1.44.10",
       "date": "2026-11-15",
