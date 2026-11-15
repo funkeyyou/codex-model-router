@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.9";
+const INSTALLER_VERSION = "1.44.10";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3035,11 +3035,11 @@ function stopChildProcess(child, timeoutMs = 5000) {
   });
 }
 
-export function codexRpc(method, params, acceptResult = () => true, binary = codexBin, home = codexHome) {
-  return withCodexLock(() => codexRpcOnce(method, params, acceptResult, binary, home));
+export function codexRpc(method, params, acceptResult = () => true, binary = codexBin, home = codexHome, { timeoutMs = 30000 } = {}) {
+  return withCodexLock(() => codexRpcOnce(method, params, acceptResult, binary, home, timeoutMs));
 }
 
-async function codexRpcOnce(method, params, acceptResult, binary, home) {
+async function codexRpcOnce(method, params, acceptResult, binary, home, timeoutMs = 30000) {
   const child = spawn(binary, ["app-server"], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...env, CODEX_HOME: home },
@@ -3058,9 +3058,12 @@ async function codexRpcOnce(method, params, acceptResult, binary, home) {
   const responsePromise = new Promise((resolvePromise, rejectPromise) => {
     timeout = setTimeout(() => {
       if (!settled) {
-        rejectPromise(new Error(codexRpcTimeoutMessage({ method, initialized, replies, stderr: stderrTail })));
+        const error = new Error(codexRpcTimeoutMessage({ method, initialized, replies, stderr: stderrTail, timeoutMs }));
+        // 呼叫端據此判斷要不要重試：完全沒回覆多半是網路慢或啟動卡住，回了但不符則是設定問題。
+        error.codexNoReply = replies === 0;
+        rejectPromise(error);
       }
-    }, 30000);
+    }, timeoutMs);
     child.stdout.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       for (;;) {
@@ -3122,11 +3125,12 @@ async function codexRpcOnce(method, params, acceptResult, binary, home) {
 }
 
 // 逾時訊息要說清楚卡在哪一段：app-server 沒起來、初始化後不回應，還是回了但結果一直不被接受。
-export function codexRpcTimeoutMessage({ method, initialized = false, replies = 0, stderr = "" }) {
+export function codexRpcTimeoutMessage({ method, initialized = false, replies = 0, stderr = "", timeoutMs = 30000 }) {
+  const seconds = Math.round(timeoutMs / 1000);
   let stage;
-  if (replies > 0) stage = `Codex 回覆了 ${replies} 次，但 30 秒內結果始終不符合預期`;
-  else if (initialized) stage = `Codex 已啟動，但 30 秒內沒有回覆 ${method}`;
-  else stage = "Codex app-server 30 秒內完全沒有回應（可能啟動卡住，或被防毒、其他 Codex 行程阻擋）";
+  if (replies > 0) stage = `Codex 回覆了 ${replies} 次，但 ${seconds} 秒內結果始終不符合預期`;
+  else if (initialized) stage = `Codex 已啟動，但 ${seconds} 秒內沒有回覆 ${method}（網路較慢或連不上 chatgpt.com 時常見）`;
+  else stage = `Codex app-server ${seconds} 秒內完全沒有回應（可能啟動卡住、網路較慢，或被防毒、其他 Codex 行程阻擋）`;
   // 有回覆時差異由呼叫端逐項說明；stderr 多是無關警告，只在 Codex 沒回覆時才附上。
   const tail = replies > 0 ? "" : terminalSafeText(String(stderr || "").split(/\r?\n/).filter(Boolean).slice(-3).join(" | "), 600);
   return `Timed out waiting for ${method}：${stage}${tail ? `。Codex 輸出：${tail}` : ""}`;
@@ -3204,6 +3208,23 @@ function invalidatePickerCacheAfterFailure() {
   catch (error) { console.error(`清單快取清理失敗，還原後請重開桌面版：${error.message}`); }
 }
 
+// 模型清單同步：網路慢時 Codex 啟動與首次查詢可能超過半分鐘（啟動時會連 chatgpt.com），
+// 每次等 60 秒；完全沒回覆才換一個新的 app-server 重試，最多 3 次。有回覆但清單不符是設定問題，
+// 重試也不會好，直接報錯。
+export const PICKER_SYNC_TIMEOUT_MS = 60000;
+export const PICKER_SYNC_ATTEMPTS = 3;
+
+export async function retryWhenCodexNoReply(run, { attempts = PICKER_SYNC_ATTEMPTS, onRetry = () => {} } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run(attempt);
+    } catch (error) {
+      if (!error?.codexNoReply || attempt >= attempts) throw error;
+      onRetry(attempt, error);
+    }
+  }
+}
+
 async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
   if (!codexIntegrationEnabled()) {
     // 仍驗證已提交的目錄與路由一致；無需借助 Codex 程序或修改其快取。
@@ -3234,12 +3255,15 @@ async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
       if ((verified.config.model ?? null) !== repair.value) fail("全域預設模型修復驗證失敗。");
     }
     invalidatePickerCache(codexHome, backupDir);
-    const result = await codexRpc("model/list", { includeHidden: true },
+    const result = await retryWhenCodexNoReply(() => codexRpc("model/list", { includeHidden: true },
       result => {
         lastListed = result;
         return hasExpectedModels(result, expected, absent) &&
           !result.data.some(model => model.id.startsWith("custom/") && !allowed.has(model.id));
-      });
+      }, codexBin, codexHome, { timeoutMs: PICKER_SYNC_TIMEOUT_MS }), {
+      onRetry: (attempt) => console.log(
+        `Codex 模型清單 ${PICKER_SYNC_TIMEOUT_MS / 1000} 秒內沒有回應，可能是網路較慢，正在重試（第 ${attempt + 1}/${PICKER_SYNC_ATTEMPTS} 次）…`),
+    });
     const verifiedDefault = (await readUserConfig()).config.model;
     if (typeof verifiedDefault === "string" && verifiedDefault.startsWith("custom/") && !allowed.has(verifiedDefault)) {
       fail("全域預設模型在同步期間已變更為無效的模型，請重試。");

@@ -301,5 +301,34 @@ test("解除安裝：目錄被佔用時的說明，以及入口已移除時不�
   assert.equal(managerEntryPresent({ mcp_servers: { model_router_manager: { command: "node" } } }, key), true);
 });
 
+test("模型清單同步：Codex 沒回覆才重試，回了但不符或其他錯誤立即報錯", async () => {
+  const { retryWhenCodexNoReply, PICKER_SYNC_TIMEOUT_MS, PICKER_SYNC_ATTEMPTS, codexRpcTimeoutMessage } = installer;
+  assert.ok(PICKER_SYNC_TIMEOUT_MS >= 60000);
+  assert.ok(PICKER_SYNC_ATTEMPTS >= 3);
+  const noReply = () => Object.assign(new Error("Timed out"), { codexNoReply: true });
+
+  let calls = 0;
+  const retries = [];
+  const value = await retryWhenCodexNoReply(async () => {
+    calls += 1;
+    if (calls < 3) throw noReply();
+    return "ok";
+  }, { attempts: 3, onRetry: (attempt) => retries.push(attempt) });
+  assert.equal(value, "ok");
+  assert.deepEqual(retries, [1, 2]);
+
+  calls = 0;
+  await assert.rejects(retryWhenCodexNoReply(async () => { calls += 1; throw noReply(); }, { attempts: 3 }), /Timed out/);
+  assert.equal(calls, 3);
+
+  calls = 0;
+  const mismatch = Object.assign(new Error("mismatch"), { codexNoReply: false });
+  await assert.rejects(retryWhenCodexNoReply(async () => { calls += 1; throw mismatch; }, { attempts: 3 }), /mismatch/);
+  assert.equal(calls, 1);
+
+  assert.match(codexRpcTimeoutMessage({ method: "model/list", initialized: true, timeoutMs: 60000 }), /60 秒內沒有回覆/);
+});
+
+
 
 
