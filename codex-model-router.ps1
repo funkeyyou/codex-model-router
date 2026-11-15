@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.11";
+const INSTALLER_VERSION = "1.44.12";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -487,6 +487,102 @@ function powershell(script, options = {}) {
 
 function psQuote(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+// --- 代理環境變數與本機路由器 ----------------------------------------------------
+// Codex 會遵守 ALL_PROXY / HTTPS_PROXY / HTTP_PROXY；NO_PROXY 沒排除本機時，連 127.0.0.1 的路由器
+// 也會先送去代理。代理沒開就是 os error 10061，模型清單也拿不到而退回官方清單。
+const PROXY_ENV_NAMES = ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"];
+const LOCAL_BYPASS_HOSTS = ["localhost", "127.0.0.1", "::1"];
+
+function envValue(vars, name) {
+  const value = vars?.[name] ?? vars?.[name.toLowerCase()];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function redactProxyUrl(value) {
+  return String(value).replace(/\/\/[^/@\s]*@/, "//***@");
+}
+
+function bypassCovers(entries, host) {
+  return entries.some((entry) => entry === "*" || entry === host ||
+    (host === "::1" && entry === "[::1]") ||
+    (host === "127.0.0.1" && (entry === "127.0.0.0/8" || entry === "127.0.0.1/32")));
+}
+
+// 純函式：傳入環境變數（名稱大小寫皆可），回傳需要補上的 NO_PROXY；不需要時回傳 null。
+export function localProxyBypassPlan(vars) {
+  const proxies = PROXY_ENV_NAMES.map((name) => [name, envValue(vars, name)]).filter(([, value]) => value);
+  if (proxies.length === 0) return null;
+  const current = envValue(vars, "NO_PROXY") || "";
+  const entries = current.split(/[,;\s]+/).map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+  const missing = LOCAL_BYPASS_HOSTS.filter((host) => !bypassCovers(entries, host));
+  if (missing.length === 0) return null;
+  const kept = current.split(/[,;\s]+/).map((entry) => entry.trim()).filter(Boolean);
+  return {
+    proxies: proxies.map(([name, value]) => `${name}=${redactProxyUrl(value)}`),
+    previous: current || null,
+    missing,
+    noProxy: [...kept, ...missing].join(","),
+  };
+}
+
+function readWindowsUserProxyEnv() {
+  const names = [...PROXY_ENV_NAMES, "NO_PROXY"];
+  const script = `$r=@{}; foreach($n in @(${names.map(psQuote).join(",")})){ $v=[Environment]::GetEnvironmentVariable($n,'User'); if(-not $v){ $v=[Environment]::GetEnvironmentVariable($n,'Machine') }; if($v){ $r[$n]=[string]$v } }; $r | ConvertTo-Json -Compress`;
+  const result = powershell(script, { allowFailure: true });
+  if (result.status !== 0) return null;
+  try { return JSON.parse(String(result.stdout || "").trim() || "{}"); } catch { return null; }
+}
+
+function writeWindowsUserNoProxy(value) {
+  const result = powershell(`[Environment]::SetEnvironmentVariable('NO_PROXY', ${psQuote(value)}, 'User')`, { allowFailure: true });
+  return result.status === 0;
+}
+
+let localProxyBypassChecked = false;
+// 偵測到代理但沒排除本機時：Windows 自動在使用者環境變數補上 NO_PROXY；其他平台只提醒。
+// 本行程也一併補上，讓安裝器接著啟動的 Codex 能直接連到路由器。
+export function ensureLocalProxyBypass({
+  platform = process.platform,
+  processEnv = env,
+  readPersistent = platform === "win32" ? readWindowsUserProxyEnv : null,
+  writePersistent = platform === "win32" ? writeWindowsUserNoProxy : null,
+  log = (line) => console.log(line),
+} = {}) {
+  const results = { persisted: null, process: null };
+  const processPlan = localProxyBypassPlan(processEnv);
+  if (processPlan) {
+    delete processEnv.no_proxy;
+    processEnv.NO_PROXY = processPlan.noProxy;
+    results.process = processPlan;
+  }
+  const persistentPlan = readPersistent ? localProxyBypassPlan(readPersistent() || {}) : null;
+  if (persistentPlan && writePersistent) {
+    const ok = writePersistent(persistentPlan.noProxy);
+    results.persisted = { ...persistentPlan, ok };
+    log("");
+    log(`偵測到代理環境變數 ${persistentPlan.proxies.join("、")}，但 NO_PROXY 沒有排除本機。`);
+    log("Codex 連本機路由器時也會先走代理；代理沒開時會出現 os error 10061，模型選單也會退回官方模型。");
+    if (ok) {
+      log(`已在使用者環境變數設定 NO_PROXY=${persistentPlan.noProxy}${persistentPlan.previous ? `（原本為 ${persistentPlan.previous}）` : ""}；對外連線仍照常走代理。`);
+      log("請完全退出並重新打開 Codex 桌面版，新的環境變數才會生效。");
+    } else {
+      log(`自動設定失敗，請在 PowerShell 執行：[Environment]::SetEnvironmentVariable('NO_PROXY','${persistentPlan.noProxy}','User')，再完全退出並重新打開 Codex 桌面版。`);
+    }
+  } else if (processPlan && platform !== "win32") {
+    log("");
+    log(`偵測到代理環境變數 ${processPlan.proxies.join("、")}，但 NO_PROXY 沒有排除本機；本次安裝已暫時補上。`);
+    log(`請在 shell 設定檔（例如 ~/.zshrc）加上 export NO_PROXY="${processPlan.noProxy}"，否則 Codex 連本機路由器時會走代理而失敗。`);
+  }
+  return results;
+}
+
+function checkLocalProxyBypass() {
+  if (localProxyBypassChecked || testMode) return;
+  localProxyBypassChecked = true;
+  try { ensureLocalProxyBypass(); }
+  catch (error) { console.error(`檢查代理設定時發生錯誤：${error.message}`); }
 }
 
 // Windows 沒有 POSIX 權限位元；把檔案 ACL 收成只有本人可存取。
@@ -3307,6 +3403,7 @@ async function waitForPickerModels(routes, absent = [], previousRoutes = []) {
     return { data: models.map(model => ({ id: model.slug })) };
   }
   requireCodex();
+  checkLocalProxyBypass();
   const expected = routes.map(withDefaultModelPrefix);
   const user = await readUserConfig();
   const repair = planDefaultModelRepair(user.config, routes, previousRoutes);
@@ -4231,6 +4328,7 @@ async function install(preset = null) {
   if (isWindows && !testMode) assertScriptHostAvailable();
 
   printHeading(existingManifest ? "重新配置 模型路由器" : "安裝 模型路由器");
+  checkLocalProxyBypass();
   // 重新配置只改主要供應商（第一家）；其他供應商與它們的模型原樣保留。
   const existingSettings = existingManifest ? readSettingsIfExists() : {};
   const existingProviders = installedProviders(existingSettings, existingManifest);

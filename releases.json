@@ -1,6 +1,13 @@
 {
-  "latest": "1.44.11",
+  "latest": "1.44.12",
   "releases": [
+    {
+      "version": "1.44.12",
+      "date": "2026-11-16",
+      "changes": [
+        "改進：安裝、添加或移除模型時，若偵測到 ALL_PROXY、HTTPS_PROXY 或 HTTP_PROXY 代理環境變數，但 NO_PROXY 沒有排除本機，Windows 會自動在使用者環境變數補上 localhost、127.0.0.1、::1（保留原有項目），並提醒完全退出後重新打開 Codex 桌面版；macOS 則提示在 shell 設定檔加上 NO_PROXY。先前這種情況下 Codex 連本機路由器也會走代理，代理沒開時出現 os error 10061，模型選單也會退回官方模型。對外連線仍照常走代理，提示中的代理帳密會遮蔽。"
+      ]
+    },
     {
       "version": "1.44.11",
       "date": "2026-11-16",

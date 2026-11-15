@@ -329,6 +329,52 @@ test("模型清單同步：Codex 沒回覆才重試，回了但不符或其他�
   assert.match(codexRpcTimeoutMessage({ method: "model/list", initialized: true, timeoutMs: 60000 }), /60 秒內沒有回覆/);
 });
 
+test("代理環境變數沒排除本機時補上 NO_PROXY，已排除或沒有代理時不動", () => {
+  const { localProxyBypassPlan, ensureLocalProxyBypass } = installer;
+  assert.equal(localProxyBypassPlan({}), null);
+  assert.equal(localProxyBypassPlan({ ALL_PROXY: "http://127.0.0.1:10808", NO_PROXY: "localhost,127.0.0.1,::1" }), null);
+  assert.equal(localProxyBypassPlan({ https_proxy: "http://p:1", no_proxy: "*" }), null);
+  assert.equal(localProxyBypassPlan({ HTTP_PROXY: "http://p:1", NO_PROXY: "[::1];LOCALHOST 127.0.0.0/8" }), null);
+
+  const plan = localProxyBypassPlan({ ALL_PROXY: "http://user:secret@127.0.0.1:10808" });
+  assert.deepEqual(plan.missing, ["localhost", "127.0.0.1", "::1"]);
+  assert.equal(plan.noProxy, "localhost,127.0.0.1,::1");
+  assert.deepEqual(plan.proxies, ["ALL_PROXY=http://***@127.0.0.1:10808"]);
+  const merged = localProxyBypassPlan({ http_proxy: "http://p:1", no_proxy: "corp.local, localhost" });
+  assert.equal(merged.noProxy, "corp.local,localhost,127.0.0.1,::1");
+  assert.equal(merged.previous, "corp.local, localhost");
+
+  const processEnv = { ALL_PROXY: "http://127.0.0.1:10808" };
+  const writes = [];
+  const lines = [];
+  const result = ensureLocalProxyBypass({ platform: "win32", processEnv,
+    readPersistent: () => ({ ALL_PROXY: "http://127.0.0.1:10808", NO_PROXY: "corp.local" }),
+    writePersistent: (value) => { writes.push(value); return true; }, log: (line) => lines.push(line) });
+  assert.equal(processEnv.NO_PROXY, "localhost,127.0.0.1,::1");
+  assert.deepEqual(writes, ["corp.local,localhost,127.0.0.1,::1"]);
+  assert.equal(result.persisted.ok, true);
+  assert.match(lines.join("\n"), /已在使用者環境變數設定 NO_PROXY=corp\.local,localhost,127\.0\.0\.1,::1（原本為 corp\.local）/);
+  assert.match(lines.join("\n"), /重新打開 Codex 桌面版/);
+
+  const failedLines = [];
+  ensureLocalProxyBypass({ platform: "win32", processEnv: {}, readPersistent: () => ({ HTTPS_PROXY: "http://p:1" }),
+    writePersistent: () => false, log: (line) => failedLines.push(line) });
+  assert.match(failedLines.join("\n"), /SetEnvironmentVariable\('NO_PROXY','localhost,127\.0\.0\.1,::1','User'\)/);
+
+  const untouched = [];
+  const none = ensureLocalProxyBypass({ platform: "win32", processEnv: {}, readPersistent: () => ({ NO_PROXY: "x" }),
+    writePersistent: () => { untouched.push("write"); return true; }, log: (line) => untouched.push(line) });
+  assert.deepEqual(untouched, []);
+  assert.equal(none.persisted, null);
+
+  const macLines = [];
+  const macEnv = { https_proxy: "http://127.0.0.1:7890" };
+  ensureLocalProxyBypass({ platform: "darwin", processEnv: macEnv, log: (line) => macLines.push(line) });
+  assert.equal(macEnv.NO_PROXY, "localhost,127.0.0.1,::1");
+  assert.match(macLines.join("\n"), /export NO_PROXY="localhost,127\.0\.0\.1,::1"/);
+});
+
+
 
 
 
