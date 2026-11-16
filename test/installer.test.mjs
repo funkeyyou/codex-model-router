@@ -373,8 +373,3 @@ test("代理環境變數沒排除本機時補上 NO_PROXY，已排除或沒有�
   assert.equal(macEnv.NO_PROXY, "localhost,127.0.0.1,::1");
   assert.match(macLines.join("\n"), /export NO_PROXY="localhost,127\.0\.0\.1,::1"/);
 });
-
-
-
-
-
