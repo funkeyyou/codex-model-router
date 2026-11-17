@@ -1,6 +1,14 @@
 {
-  "latest": "1.44.12",
+  "latest": "1.44.13",
   "releases": [
+    {
+      "version": "1.44.13",
+      "date": "2026-11-18",
+      "changes": [
+        "修正：Gemini 中轉的上下文壓縮即使沒有附帶 Codex 工具，也會改走 Chat 轉譯，由本機封裝 Codex 要求的壓縮項目。部分上游 Responses 相容層會忽略 compaction_trigger、只回普通訊息，先前從長對話切換模型或觸發壓縮時可能因此失敗。Chat 推理接續也會維持轉譯，單純文字請求仍可使用原生 Responses。",
+        "驗證：新增 HTTP 與 WebSocket 的 Gemini 壓縮及摘要接續回歸測試。真實上游已通過 800K 合成內容回覆與 Chat 壓縮測試；修正後完整 GPT 長對話切換的真實驗證仍受供應商額度限制，尚未確認通過。"
+      ]
+    },
     {
       "version": "1.44.12",
       "date": "2026-11-16",

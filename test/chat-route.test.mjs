@@ -78,6 +78,7 @@ test("Gemini 帶 Codex 工具格式時自動改走 chat，避免閘道悄悄丟�
   assert.equal(router.needsDeepseekChat({ tools: [{ type: "custom", name: "exec" }] }, gemini), true);
   assert.equal(router.needsDeepseekChat({ tools }, gemini), false);
   assert.equal(router.needsDeepseekChat({ input: "hello" }, gemini), false);
+  assert.equal(router.needsDeepseekChat({ input: [user("600K history"), { type: "compaction_trigger" }] }, gemini), true);
   assert.equal(router.needsDeepseekChat({ input: [{ type: "additional_tools", tools }] }, { ...gemini, translate: "chat" }), false);
 });
 
@@ -136,49 +137,53 @@ for (const transport of ["HTTP", "WebSocket"]) {
 }
 
 for (const transport of ["HTTP", "WebSocket"]) {
-  test(`${transport}: DeepSeek Responses 相容路由的壓縮由 chat bridge 封裝為唯一 compaction`, async (t) => {
-    useTestKey(t);
-    const originalFetch = globalThis.fetch;
-    const native = { ...chatRoute, translate: undefined, upstreamModel: "deepseek-v4.1-flash-1017" };
-    const { instance, origin } = await startRouter(t, { routes: [native] });
-    const sent = mockUpstream(t, () => chatStream([delta({ content: "保留的工作摘要" }, "stop")]));
-    const body = { model: native.pickerSlug, stream: true, tools, input: [
-      user("原工作"),
-      { type: "custom_tool_call", id: "fc_a8acf1e3cf564fb8be20", call_id: "call_p", name: "patch", input: "text" },
-      { type: "custom_tool_call_output", call_id: "call_p", output: "done" },
-      { type: "compaction_trigger" },
-    ] };
-    let events;
-    if (transport === "HTTP") {
-      const response = await originalFetch(`${origin}/v1/responses`, {
-        method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body),
-      });
-      assert.equal(response.status, 200);
-      events = parseSse(await response.text());
-    } else {
-      const socket = socketFor(instance);
-      await instance.handleWebSocketResponseInner({ headers }, socket, new URL("http://localhost/v1/responses"),
-        { ...body, type: "response.create" }, new AbortController(),
-        { session: null, connectionNamespace: "compact", upstreamDisabled: true });
-      events = socket.events;
-    }
-    assert.equal(sent.length, 1);
-    assert.equal(sent[0].href, "https://gateway.example/v1/chat/completions");
-    assert.equal(sent[0].body.tools, undefined);
-    const done = events.at(-1);
-    assert.equal(done.type, "response.completed");
-    assert.equal(done.response.output.length, 1);
-    assert.equal(done.response.output[0].type, "compaction");
-    assert.equal(bridge.decodeCompaction(done.response.output[0].encrypted_content), "保留的工作摘要");
-    assert.equal(events.some((event) => event.type === "response.output_text.delta"), false);
-    // 壓縮後的下一輪仍能重播摘要；非壓縮回合不改走 Chat Completions。
-    const meta = {};
-    const next = { model: native.pickerSlug, input: [done.response.output[0], user("繼續")] };
-    await instance.fetchModelUpstream(headers, new URL("http://localhost/v1/responses"), next,
-      Buffer.from(JSON.stringify(next)), undefined, meta);
-    assert.equal(sent[1].href, "https://gateway.example/v1/responses");
-    assert.ok(JSON.stringify(sent[1].body.input).includes("保留的工作摘要"));
-  });
+  for (const upstreamModel of ["deepseek-v4.1-flash-1017", "gemini-4-hydrogen-high"]) {
+    test(`${transport}: ${upstreamModel} Responses 相容路由的壓縮由 chat bridge 封裝為唯一 compaction`, async (t) => {
+      useTestKey(t);
+      const originalFetch = globalThis.fetch;
+      const native = { ...chatRoute, translate: undefined, upstreamModel };
+      const { instance, origin } = await startRouter(t, { routes: [native] });
+      const sent = mockUpstream(t, () => chatStream([delta({ content: "保留的工作摘要" }, "stop")]));
+      const body = { model: native.pickerSlug, stream: true, tools, input: upstreamModel.startsWith("gemini") ? [
+        user("從 GPT 切換過來的歷史"), { type: "compaction_trigger" },
+      ] : [
+        user("原工作"),
+        { type: "custom_tool_call", id: "fc_a8acf1e3cf564fb8be20", call_id: "call_p", name: "patch", input: "text" },
+        { type: "custom_tool_call_output", call_id: "call_p", output: "done" },
+        { type: "compaction_trigger" },
+      ] };
+      let events;
+      if (transport === "HTTP") {
+        const response = await originalFetch(`${origin}/v1/responses`, {
+          method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 200);
+        events = parseSse(await response.text());
+      } else {
+        const socket = socketFor(instance);
+        await instance.handleWebSocketResponseInner({ headers }, socket, new URL("http://localhost/v1/responses"),
+          { ...body, type: "response.create" }, new AbortController(),
+          { session: null, connectionNamespace: "compact", upstreamDisabled: true });
+        events = socket.events;
+      }
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].href, "https://gateway.example/v1/chat/completions");
+      assert.equal(sent[0].body.tools, undefined);
+      const done = events.at(-1);
+      assert.equal(done.type, "response.completed");
+      assert.equal(done.response.output.length, 1);
+      assert.equal(done.response.output[0].type, "compaction");
+      assert.equal(bridge.decodeCompaction(done.response.output[0].encrypted_content), "保留的工作摘要");
+      assert.equal(events.some((event) => event.type === "response.output_text.delta"), false);
+      // 壓縮後的下一輪仍能重播摘要；非壓縮回合不改走 Chat Completions。
+      const meta = {};
+      const next = { model: native.pickerSlug, input: [done.response.output[0], user("繼續")] };
+      await instance.fetchModelUpstream(headers, new URL("http://localhost/v1/responses"), next,
+        Buffer.from(JSON.stringify(next)), undefined, meta);
+      assert.equal(sent[1].href, "https://gateway.example/v1/responses");
+      assert.ok(JSON.stringify(sent[1].body.input).includes("保留的工作摘要"));
+    });
+  }
 }
 
 test("HTTP：送到 /chat/completions、轉回 Responses 事件；下一輪由歷史重建出工具往返與推理", async (t) => {

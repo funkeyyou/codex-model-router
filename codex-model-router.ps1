@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.12";
+const INSTALLER_VERSION = "1.44.13";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -11723,8 +11723,12 @@ export function usesCodexToolShapes(body) {
 export function needsDeepseekChat(body, route) {
   if (route?.translate) return false;
   // Gemini 的 Responses 相容閘道（例如 sharkora）不拒絕 additional_tools／namespace／custom，
-  // 卻直接丟掉，模型只看到空的工具清單。帶 Codex 工具格式時一律改走 Chat 轉譯。
-  if (/(?:^|\/)gemini(?:[-/]|$)/i.test(route?.upstreamModel || "")) return usesCodexToolShapes(body);
+  // 卻直接丟掉，模型只看到空的工具清單；compaction_trigger 也會被忽略，回傳普通訊息。
+  // 壓縮即使沒有工具也要走 Chat，由 bridge 封裝 Codex 要求的 compaction 項目。
+  if (/(?:^|\/)gemini(?:[-/]|$)/i.test(route?.upstreamModel || "")) {
+    return usesCodexToolShapes(body) || (Array.isArray(body?.input) &&
+      body.input.some((item) => item?.type === "compaction_trigger" || isChatReasoning(item)));
+  }
   if (!/(?:^|\/)deepseek(?:[-/]|$)/i.test(route?.upstreamModel || "")) return false;
   const input = Array.isArray(body?.input) ? body.input : [];
   // 有些 Responses 相容閘道不拒絕 custom/namespace，卻將 DSML 當成一般文字
