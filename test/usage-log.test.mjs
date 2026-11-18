@@ -2,8 +2,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { loadPayloads, loadRouterInDir } from "./helpers/payloads.mjs";
 
 const { installer } = await loadPayloads();
@@ -38,24 +39,47 @@ test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", as
   t.after(() => new Promise((resolve) => router.routerServer.close(resolve)));
   const origin = `http://127.0.0.1:${router.routerServer.address().port}`;
   const realFetch = globalThis.fetch;
+  const secret = "這段提示詞不該出現在使用記錄裡";
+  const result = { id: "resp_1", object: "response", status: "completed", output: [], model: "gpt-6.1-sol",
+    usage: { input_tokens: 500, input_tokens_details: { cached_tokens: 400 }, output_tokens: 30, output_tokens_details: { reasoning_tokens: 5 } } };
+  const delta = (type, text) => `data: ${JSON.stringify({ type, delta: text })}\n\n`;
+  let toolOnly = false;
   t.mock.method(globalThis, "fetch", async (url) => {
     if (String(url).endsWith("/models")) return new Response("missing client_version", { status: 400 });
-    return new Response(JSON.stringify({ id: "resp_1", object: "response", status: "completed", output: [], model: "gpt-6.1-sol",
-      usage: { input_tokens: 500, input_tokens_details: { cached_tokens: 400 }, output_tokens: 30, output_tokens_details: { reasoning_tokens: 5 } } }),
-      { headers: { "content-type": "application/json" } });
+    return new Response(new ReadableStream({
+      async start(controller) {
+        const send = (text) => controller.enqueue(Buffer.from(text));
+        send(delta("response.reasoning_summary_text.delta", "private reasoning"));
+        await delay(20);
+        if (toolOnly) {
+          send(`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "custom_tool_call", input: "" } })}\n\n`);
+          send(delta("response.custom_tool_call_input.delta", "private tool input"));
+        } else {
+          send(delta("response.output_text.delta", "private output"));
+        }
+        await delay(20);
+        send(`data: ${JSON.stringify({ type: "response.completed", response: result })}\n\n`);
+        controller.close();
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
   });
-  const secret = "這段提示詞不該出現在使用記錄裡";
-  const response = await realFetch(origin + "/v1/responses", {
+  const path = join(dir, "usage.jsonl");
+  const yesterday = new Date(Date.now() - 86400000);
+  writeFileSync(path, JSON.stringify({ at: yesterday.toISOString(), model: "previous-day" }) + "\n");
+  utimesSync(path, yesterday, yesterday);
+  const sendRequest = () => realFetch(origin + "/v1/responses", {
     method: "POST",
     headers: { authorization: "Bearer fixture", "chatgpt-account-id": "acct", "session-id": "usage-test", "content-type": "application/json" },
-    body: JSON.stringify({ model: "custom/owo-gpt", input: secret, stream: false }),
+    body: JSON.stringify({ model: "custom/owo-gpt", input: secret, stream: true }),
   });
+  const response = await sendRequest();
   assert.equal(response.status, 200, await response.clone().text());
   await response.text();
-  const path = join(dir, "usage.jsonl");
   assert.ok(existsSync(path));
   const text = readFileSync(path, "utf8");
-  assert.ok(!text.includes(secret));
+  for (const privateText of [secret, "private reasoning", "private output"]) assert.ok(!text.includes(privateText));
+  const archive = readdirSync(dir).find((name) => name.startsWith("usage.jsonl." + yesterday.toISOString().slice(0, 10)));
+  assert.equal(JSON.parse(readFileSync(join(dir, archive), "utf8")).model, "previous-day");
   const record = JSON.parse(text.trim().split("\n").pop());
   assert.equal(record.model, "custom/owo-gpt");
   assert.equal(record.status, "completed");
@@ -63,4 +87,19 @@ test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", as
   assert.equal(record.cached, 400);
   assert.equal(record.output, 30);
   assert.equal(record.thread, "usage-test");
+  assert.ok(record.firstTextMs >= 15);
+  assert.ok(record.durationMs - record.firstTextMs >= 15);
+  assert.equal(record.outputTps, 30000 / (record.durationMs - record.firstTextMs));
+  assert.equal(record.firstOutputMs, record.firstTextMs);
+
+  toolOnly = true;
+  const toolResponse = await sendRequest();
+  assert.equal(toolResponse.status, 200);
+  await toolResponse.text();
+  const updated = readFileSync(path, "utf8");
+  assert.ok(!updated.includes("private tool input"));
+  const toolRecord = JSON.parse(updated.trim().split("\n").at(-1));
+  assert.equal(toolRecord.firstTextMs, null);
+  assert.ok(toolRecord.firstOutputMs >= 15);
+  assert.equal(toolRecord.outputTps, 30000 / (toolRecord.durationMs - toolRecord.firstOutputMs));
 });

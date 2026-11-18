@@ -328,6 +328,7 @@ export function desktopRoute(settings, model) {
 // but not retained by the observer. Lifecycle and usage frames are small.
 export function desktopUsageObserver() {
   let buffer = "", skip = false, started = false, stopped = false, failed = false, stopReason = null, usage = null;
+  let firstTextAt = null, firstOutputAt = null;
   const decoder = new TextDecoder();
   const frame = (text) => {
     const data = text.split("\n").filter((line) => line.startsWith("data:"))
@@ -336,6 +337,15 @@ export function desktopUsageObserver() {
     try {
       const event = JSON.parse(data);
       if (event.type === "message_start") { started = true; usage = { ...event.message?.usage }; }
+      const text = event.type === "content_block_delta" && event.delta?.type === "text_delta" ? event.delta.text
+        : event.type === "content_block_start" && event.content_block?.type === "text" ? event.content_block.text : null;
+      if (typeof text === "string" && text.length) {
+        firstTextAt ??= Date.now();
+        firstOutputAt ??= firstTextAt;
+      }
+      if (event.type === "content_block_start" && ["tool_use", "server_tool_use"].includes(event.content_block?.type)) {
+        firstOutputAt ??= Date.now();
+      }
       if (event.type === "message_delta") {
         if (event.usage) usage = { ...usage, ...event.usage };
         stopReason = event.delta?.stop_reason || stopReason;
@@ -357,7 +367,7 @@ export function desktopUsageObserver() {
       if (buffer.length > 64 * 1024) { buffer = buffer.slice(-3); skip = true; }
     },
     result() {
-      return { usage, status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
+      return { usage, firstTextAt, firstOutputAt, status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
     },
   };
 }
@@ -382,6 +392,7 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
     response.end(JSON.stringify(body));
   };
   return async (request, response, url) => {
+    const startedAt = Date.now();
     const controller = new AbortController();
     const abort = () => controller.abort();
     const closed = () => { if (!response.writableFinished) abort(); };
@@ -393,6 +404,8 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
     const report = (result, code) => {
       if (!context || recorded) return;
       recorded = true;
+      context.firstTextAt = result.firstTextAt;
+      context.firstOutputAt = result.firstOutputAt;
       recordUsage(context, desktopUsageEvent(result, context.upstreamModel, code));
     };
     try {
@@ -413,7 +426,7 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
       catch (error) { if (error.status) throw error; throw failure(400, "invalid_request_error", "Invalid JSON request."); }
       if (!body || Array.isArray(body) || typeof body !== "object" || typeof body.model !== "string") throw failure(400, "invalid_request_error", "A model is required.");
       const route = desktopRoute(settings, body.model);
-      context = { startedAt: Date.now(), model: route.pickerSlug, upstreamModel: route.upstreamModel,
+      context = { startedAt, model: route.pickerSlug, upstreamModel: route.upstreamModel,
         route: "custom", provider: route.providerId || "default", transport: "claude-desktop", backgroundKind: null, thread: null, recorded: false };
       const upstream = await fetchUpstream(route, countTokens ? "/messages/count_tokens" : "/messages", request.headers,
         Buffer.from(JSON.stringify({ ...body, model: route.upstreamModel })), controller.signal);

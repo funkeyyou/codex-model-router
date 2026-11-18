@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
-import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync, readdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1178,11 +1178,12 @@ function rejectQuotaModeOfficial() {
 // 回頭排查用量或快取命中率時不必翻錯誤記錄。只記數字與識別，不記提示詞或回覆內容。
 const usageLogPath = join(routerDirectory, "usage.jsonl");
 const usageLogMaxBytes = 5 * 1024 * 1024;
+let usageArchiveDay = null;
 
-function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind }) {
+function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind, startedAt = Date.now() }) {
   const thread = requestHeaders?.["thread-id"] || requestHeaders?.["session-id"];
   return {
-    startedAt: Date.now(), model: typeof model === "string" ? model.slice(0, 160) : null,
+    startedAt, model: typeof model === "string" ? model.slice(0, 160) : null,
     route, provider, transport, backgroundKind,
     thread: typeof thread === "string" ? thread.slice(0, 64) : null, recorded: false,
   };
@@ -1196,33 +1197,78 @@ export function usageRecord(context, event, now = Date.now()) {
     : event?.type === "response.failed" ? "failed" : null;
   if (!status) return null;
   const usage = event.response?.usage || null;
+  const durationMs = Math.max(0, now - context.startedAt);
+  const firstTextMs = Number.isFinite(context.firstTextAt)
+    ? Math.min(durationMs, Math.max(0, context.firstTextAt - context.startedAt))
+    : null;
+  const firstOutputAt = context.firstOutputAt ?? context.firstTextAt;
+  const firstOutputMs = Number.isFinite(firstOutputAt)
+    ? Math.min(durationMs, Math.max(0, firstOutputAt - context.startedAt))
+    : null;
+  const output = usageNumber(usage?.output_tokens);
+  const generationMs = firstOutputMs === null ? 0 : durationMs - firstOutputMs;
   return {
     at: new Date(now).toISOString(),
     model: context.model,
     upstreamModel: typeof event.response?.model === "string" ? event.response.model.slice(0, 160) : null,
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
-    durationMs: Math.max(0, now - context.startedAt),
+    durationMs, firstTextMs, firstOutputMs,
+    outputTps: status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
     cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
-    output: usageNumber(usage?.output_tokens),
+    output,
     reasoning: usageNumber(usage?.output_tokens_details?.reasoning_tokens),
     hasUsage: Boolean(usage),
     ...(status === "failed" && event.response?.error?.code ? { error: String(event.response.error.code).slice(0, 80) } : {}),
   };
 }
 
+function rotateUsageLog(at) {
+  const day = at.slice(0, 10);
+  try {
+    const info = statSync(usageLogPath);
+    const lastWriteDay = info.mtime.toISOString().slice(0, 10);
+    if (lastWriteDay !== day || info.size >= usageLogMaxBytes) {
+      renameSync(usageLogPath, `${usageLogPath}.${lastWriteDay}.${randomBytes(8).toString("hex")}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (usageArchiveDay === day) return;
+  const cutoff = new Date(Date.parse(day) - 30 * 86400000).toISOString().slice(0, 10);
+  for (const name of readdirSync(routerDirectory)) {
+    const match = /^usage\.jsonl\.(\d{4}-\d{2}-\d{2})\.[a-f0-9]{16}$/.exec(name);
+    if (match && match[1] < cutoff) {
+      try { unlinkSync(join(routerDirectory, name)); } catch { /* Retry on the next cleanup. */ }
+    }
+  }
+  usageArchiveDay = day;
+}
+
+const usageToolItems = new Set(["function_call", "custom_tool_call", "tool_search_call", "mcp_call",
+  "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "local_shell_call",
+  "shell_call", "apply_patch_call", "computer_call"]);
+
 function recordUsageEvent(context, event) {
   if (context.recorded || settings.usageLog === false) return;
+  if (event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) {
+    context.firstTextAt ??= Date.now();
+    context.firstOutputAt ??= context.firstTextAt;
+  }
+  if (context.firstOutputAt == null && (
+    ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)) ||
+    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta") && event.delta?.length)
+  )) {
+    context.firstOutputAt = Date.now();
+  }
   const record = usageRecord(context, event);
   if (!record) return;
   context.recorded = true;
   stats.usageRecords += 1;
   try {
-    try {
-      if (statSync(usageLogPath).size > usageLogMaxBytes) renameSync(usageLogPath, usageLogPath + ".1");
-    } catch { /* 檔案還不存在。 */ }
+    rotateUsageLog(record.at);
     appendFileSync(usageLogPath, JSON.stringify(record) + "\n", { mode: 0o600 });
   } catch {
     stats.usageLogFailures += 1;
@@ -2207,6 +2253,7 @@ export async function fetchModelUpstream(
   signal,
   meta = {},
 ) {
+  const startedAt = meta.startedAt ?? Date.now();
   meta.backgroundKind = body?.[BACKGROUND_KIND] ?? backgroundTaskKind(body);
   body = applyBackgroundModel(body);
   const route = chooseRoute(requestHeaders, body);
@@ -2243,7 +2290,7 @@ export async function fetchModelUpstream(
   meta.history.usage = usageContext({
     requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
     provider: route?.transport === "claude-cli" ? "claude-cli" : provider?.id ?? null,
-    transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null,
+    transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null, startedAt,
   });
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
@@ -2590,6 +2637,7 @@ async function handleImages(request, response, incomingUrl) {
 }
 
 async function handleResponses(request, response, incomingUrl) {
+  const startedAt = Date.now();
   const encoding = request.headers["content-encoding"];
   if (encoding && encoding !== "identity" && encoding !== "zstd") {
     writeJson(response, 415, {
@@ -2621,7 +2669,7 @@ async function handleResponses(request, response, incomingUrl) {
     if (!finished) abortController.abort();
   });
 
-  const meta = { transport: "http" };
+  const meta = { transport: "http", startedAt };
   // 擷取原本只蓋 WebSocket 路徑。但 Codex 反覆握手失敗後會退回 HTTPS，之後所有
   // 請求都走這裡——上游在這條路上出錯時，開了擷取也一個檔案都拿不到。
   const captureId = captureNext(
@@ -3549,6 +3597,7 @@ async function tryUpstreamWebSocketTurn(
   message,
   abortController,
   connectionState,
+  startedAt,
 ) {
   const probe = { ...message };
   delete probe.type;
@@ -3593,7 +3642,7 @@ async function tryUpstreamWebSocketTurn(
     history.recoveryIds = historyRecoveryCandidates(probe, request.headers);
     history.usage = usageContext({
       requestHeaders: request.headers, model: message?.model, route: "official", provider: null,
-      transport: "upstream-websocket", backgroundKind: null,
+      transport: "upstream-websocket", backgroundKind: null, startedAt,
     });
     if (chain) {
       stats.upstreamWebSocketIncremental += 1;
@@ -3710,6 +3759,7 @@ export async function handleWebSocketResponseInner(
   abortController,
   connectionState = null,
 ) {
+  const startedAt = Date.now();
   message = applyBackgroundModel(message);
   const prewarm = isPrewarmRequest(message);
   let route;
@@ -3744,6 +3794,7 @@ export async function handleWebSocketResponseInner(
       message,
       abortController,
       connectionState,
+      startedAt,
     );
     if (handled) return;
   }
@@ -3767,7 +3818,7 @@ export async function handleWebSocketResponseInner(
   );
   if (captureId) captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
   const stopHeartbeat = startWebSocketHeartbeat(socket);
-  const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null, transport: "websocket" };
+  const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null, transport: "websocket", startedAt };
   try {
     const upstream = await fetchModelUpstream(
       request.headers,

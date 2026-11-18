@@ -70,6 +70,8 @@ test("Usage observer handles split UTF-8/CRLF and huge tool frames, preserving c
   for (let offset = 0; offset < bytes.length; offset += 31) observer.push(bytes.subarray(offset, offset + 31));
   const result = observer.result();
   assert.equal(result.status, "completed");
+  assert.equal(result.firstTextAt, null);
+  assert.ok(Number.isFinite(result.firstOutputAt));
   const usage = desktopUsageEvent(result, a.upstreamModel).response.usage;
   assert.equal(usage.input_tokens, 430);
   assert.deepEqual(usage.input_tokens_details, { cached_tokens: 400, cache_write_tokens: 20 });

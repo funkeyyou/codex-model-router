@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.13";
+const INSTALLER_VERSION = "1.44.14";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8814,9 +8814,10 @@ async function managerSetUpstreamImageGuard({ enabled } = {}) {
     restartDesktop: builtinResult.changed };
 }
 //
-// 路由器每一輪結束時把用量寫進 usage.jsonl（超過 5 MB 輪替成 usage.jsonl.1）。管理頁讀最近的
-// 記錄並彙整：各模型的請求數、token、快取命中率與耗時。只有數字與識別，沒有對話內容。
+// 讀取現行記錄、日期歸檔和舊版的 usage.jsonl.1。用量統計與最近請求各用自己的時間範圍。
 const usageLogPath = join(installRoot, "usage.jsonl");
+const usagePageSize = 100;
+const hourMs = 3600000;
 
 export function summarizeUsage(records) {
   const byModel = new Map();
@@ -8842,22 +8843,44 @@ export function summarizeUsage(records) {
   };
 }
 
-function managerUsage({ limit = 300, sinceHours = 24 } = {}) {
-  const records = [];
-  for (const path of [usageLogPath + ".1", usageLogPath]) {
-    if (!existsSync(path)) continue;
+function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
+  const now = Date.now();
+  const snapshot = Number.isSafeInteger(asOf) && asOf <= now && asOf >= now - hourMs ? asOf : now;
+  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), 24 * 30);
+  const summarySince = snapshot - hours * hourMs;
+  const recentSince = snapshot - 7 * 24 * hourMs;
+  const cutoffDay = new Date(Math.min(summarySince, recentSince)).toISOString().slice(0, 10);
+  const summaryRecords = [];
+  const recent = [];
+  let archives = [];
+  try {
+    archives = readdirSync(installRoot).filter((name) =>
+      /^usage\.jsonl\.\d{4}-\d{2}-\d{2}\.[a-f0-9]{16}$/.test(name) && name.slice(12, 22) >= cutoffDay);
+  } catch { /* The router may not be installed yet. */ }
+  for (const path of [usageLogPath + ".1", ...archives.map((name) => join(installRoot, name)), usageLogPath]) {
     let text;
-    try { text = readFileTail(path, 2 * 1024 * 1024); } catch { continue; }
+    try { text = readFileSync(path, "utf8"); } catch { continue; }
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
-      try { records.push(JSON.parse(line)); } catch { /* 寫到一半的行 */ }
+      try {
+        const record = JSON.parse(line);
+        const at = Date.parse(record?.at);
+        if (!Number.isFinite(at) || at > snapshot) continue;
+        if (at >= summarySince) summaryRecords.push(record);
+        if (at >= recentSince) recent.push(record);
+      } catch { /* 寫到一半的行 */ }
     }
   }
-  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), 24 * 30);
-  const since = Date.now() - hours * 3600 * 1000;
-  const recent = records.filter((record) => Date.parse(record.at) >= since);
-  const cap = Math.min(Math.max(Number(limit) || 300, 1), 2000);
-  return { sinceHours: hours, summary: summarizeUsage(recent), entries: recent.slice(-cap).reverse(), logPath: usageLogPath };
+  recent.sort((left, right) => right.at.localeCompare(left.at));
+  const pages = Math.max(1, Math.ceil(recent.length / usagePageSize));
+  const current = Number.isSafeInteger(page) ? Math.min(Math.max(1, page), pages) : 1;
+  const offset = (current - 1) * usagePageSize;
+  return {
+    sinceHours: hours, summary: summarizeUsage(summaryRecords), asOf: snapshot,
+    entries: recent.slice(offset, offset + usagePageSize),
+    pagination: { page: current, pages, total: recent.length },
+    logPath: usageLogPath,
+  };
 }
 
 async function managerSetQuotaMode({ enabled } = {}) {

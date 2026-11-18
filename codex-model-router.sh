@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.13";
+const INSTALLER_VERSION = "1.44.14";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8892,9 +8892,10 @@ async function managerSetUpstreamImageGuard({ enabled } = {}) {
     restartDesktop: builtinResult.changed };
 }
 //
-// 路由器每一輪結束時把用量寫進 usage.jsonl（超過 5 MB 輪替成 usage.jsonl.1）。管理頁讀最近的
-// 記錄並彙整：各模型的請求數、token、快取命中率與耗時。只有數字與識別，沒有對話內容。
+// 讀取現行記錄、日期歸檔和舊版的 usage.jsonl.1。用量統計與最近請求各用自己的時間範圍。
 const usageLogPath = join(installRoot, "usage.jsonl");
+const usagePageSize = 100;
+const hourMs = 3600000;
 
 export function summarizeUsage(records) {
   const byModel = new Map();
@@ -8920,22 +8921,44 @@ export function summarizeUsage(records) {
   };
 }
 
-function managerUsage({ limit = 300, sinceHours = 24 } = {}) {
-  const records = [];
-  for (const path of [usageLogPath + ".1", usageLogPath]) {
-    if (!existsSync(path)) continue;
+function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
+  const now = Date.now();
+  const snapshot = Number.isSafeInteger(asOf) && asOf <= now && asOf >= now - hourMs ? asOf : now;
+  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), 24 * 30);
+  const summarySince = snapshot - hours * hourMs;
+  const recentSince = snapshot - 7 * 24 * hourMs;
+  const cutoffDay = new Date(Math.min(summarySince, recentSince)).toISOString().slice(0, 10);
+  const summaryRecords = [];
+  const recent = [];
+  let archives = [];
+  try {
+    archives = readdirSync(installRoot).filter((name) =>
+      /^usage\.jsonl\.\d{4}-\d{2}-\d{2}\.[a-f0-9]{16}$/.test(name) && name.slice(12, 22) >= cutoffDay);
+  } catch { /* The router may not be installed yet. */ }
+  for (const path of [usageLogPath + ".1", ...archives.map((name) => join(installRoot, name)), usageLogPath]) {
     let text;
-    try { text = readFileTail(path, 2 * 1024 * 1024); } catch { continue; }
+    try { text = readFileSync(path, "utf8"); } catch { continue; }
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
-      try { records.push(JSON.parse(line)); } catch { /* 寫到一半的行 */ }
+      try {
+        const record = JSON.parse(line);
+        const at = Date.parse(record?.at);
+        if (!Number.isFinite(at) || at > snapshot) continue;
+        if (at >= summarySince) summaryRecords.push(record);
+        if (at >= recentSince) recent.push(record);
+      } catch { /* 寫到一半的行 */ }
     }
   }
-  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), 24 * 30);
-  const since = Date.now() - hours * 3600 * 1000;
-  const recent = records.filter((record) => Date.parse(record.at) >= since);
-  const cap = Math.min(Math.max(Number(limit) || 300, 1), 2000);
-  return { sinceHours: hours, summary: summarizeUsage(recent), entries: recent.slice(-cap).reverse(), logPath: usageLogPath };
+  recent.sort((left, right) => right.at.localeCompare(left.at));
+  const pages = Math.max(1, Math.ceil(recent.length / usagePageSize));
+  const current = Number.isSafeInteger(page) ? Math.min(Math.max(1, page), pages) : 1;
+  const offset = (current - 1) * usagePageSize;
+  return {
+    sinceHours: hours, summary: summarizeUsage(summaryRecords), asOf: snapshot,
+    entries: recent.slice(offset, offset + usagePageSize),
+    pagination: { page: current, pages, total: recent.length },
+    logPath: usageLogPath,
+  };
 }
 
 async function managerSetQuotaMode({ enabled } = {}) {
@@ -10212,7 +10235,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import tls from "node:tls";
-import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renameSync, readdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11386,11 +11409,12 @@ function rejectQuotaModeOfficial() {
 // 回頭排查用量或快取命中率時不必翻錯誤記錄。只記數字與識別，不記提示詞或回覆內容。
 const usageLogPath = join(routerDirectory, "usage.jsonl");
 const usageLogMaxBytes = 5 * 1024 * 1024;
+let usageArchiveDay = null;
 
-function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind }) {
+function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind, startedAt = Date.now() }) {
   const thread = requestHeaders?.["thread-id"] || requestHeaders?.["session-id"];
   return {
-    startedAt: Date.now(), model: typeof model === "string" ? model.slice(0, 160) : null,
+    startedAt, model: typeof model === "string" ? model.slice(0, 160) : null,
     route, provider, transport, backgroundKind,
     thread: typeof thread === "string" ? thread.slice(0, 64) : null, recorded: false,
   };
@@ -11404,33 +11428,78 @@ export function usageRecord(context, event, now = Date.now()) {
     : event?.type === "response.failed" ? "failed" : null;
   if (!status) return null;
   const usage = event.response?.usage || null;
+  const durationMs = Math.max(0, now - context.startedAt);
+  const firstTextMs = Number.isFinite(context.firstTextAt)
+    ? Math.min(durationMs, Math.max(0, context.firstTextAt - context.startedAt))
+    : null;
+  const firstOutputAt = context.firstOutputAt ?? context.firstTextAt;
+  const firstOutputMs = Number.isFinite(firstOutputAt)
+    ? Math.min(durationMs, Math.max(0, firstOutputAt - context.startedAt))
+    : null;
+  const output = usageNumber(usage?.output_tokens);
+  const generationMs = firstOutputMs === null ? 0 : durationMs - firstOutputMs;
   return {
     at: new Date(now).toISOString(),
     model: context.model,
     upstreamModel: typeof event.response?.model === "string" ? event.response.model.slice(0, 160) : null,
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
-    durationMs: Math.max(0, now - context.startedAt),
+    durationMs, firstTextMs, firstOutputMs,
+    outputTps: status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
     cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
-    output: usageNumber(usage?.output_tokens),
+    output,
     reasoning: usageNumber(usage?.output_tokens_details?.reasoning_tokens),
     hasUsage: Boolean(usage),
     ...(status === "failed" && event.response?.error?.code ? { error: String(event.response.error.code).slice(0, 80) } : {}),
   };
 }
 
+function rotateUsageLog(at) {
+  const day = at.slice(0, 10);
+  try {
+    const info = statSync(usageLogPath);
+    const lastWriteDay = info.mtime.toISOString().slice(0, 10);
+    if (lastWriteDay !== day || info.size >= usageLogMaxBytes) {
+      renameSync(usageLogPath, `${usageLogPath}.${lastWriteDay}.${randomBytes(8).toString("hex")}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (usageArchiveDay === day) return;
+  const cutoff = new Date(Date.parse(day) - 30 * 86400000).toISOString().slice(0, 10);
+  for (const name of readdirSync(routerDirectory)) {
+    const match = /^usage\.jsonl\.(\d{4}-\d{2}-\d{2})\.[a-f0-9]{16}$/.exec(name);
+    if (match && match[1] < cutoff) {
+      try { unlinkSync(join(routerDirectory, name)); } catch { /* Retry on the next cleanup. */ }
+    }
+  }
+  usageArchiveDay = day;
+}
+
+const usageToolItems = new Set(["function_call", "custom_tool_call", "tool_search_call", "mcp_call",
+  "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "local_shell_call",
+  "shell_call", "apply_patch_call", "computer_call"]);
+
 function recordUsageEvent(context, event) {
   if (context.recorded || settings.usageLog === false) return;
+  if (event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) {
+    context.firstTextAt ??= Date.now();
+    context.firstOutputAt ??= context.firstTextAt;
+  }
+  if (context.firstOutputAt == null && (
+    ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)) ||
+    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta") && event.delta?.length)
+  )) {
+    context.firstOutputAt = Date.now();
+  }
   const record = usageRecord(context, event);
   if (!record) return;
   context.recorded = true;
   stats.usageRecords += 1;
   try {
-    try {
-      if (statSync(usageLogPath).size > usageLogMaxBytes) renameSync(usageLogPath, usageLogPath + ".1");
-    } catch { /* 檔案還不存在。 */ }
+    rotateUsageLog(record.at);
     appendFileSync(usageLogPath, JSON.stringify(record) + "\n", { mode: 0o600 });
   } catch {
     stats.usageLogFailures += 1;
@@ -12415,6 +12484,7 @@ export async function fetchModelUpstream(
   signal,
   meta = {},
 ) {
+  const startedAt = meta.startedAt ?? Date.now();
   meta.backgroundKind = body?.[BACKGROUND_KIND] ?? backgroundTaskKind(body);
   body = applyBackgroundModel(body);
   const route = chooseRoute(requestHeaders, body);
@@ -12451,7 +12521,7 @@ export async function fetchModelUpstream(
   meta.history.usage = usageContext({
     requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
     provider: route?.transport === "claude-cli" ? "claude-cli" : provider?.id ?? null,
-    transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null,
+    transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null, startedAt,
   });
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
@@ -12798,6 +12868,7 @@ async function handleImages(request, response, incomingUrl) {
 }
 
 async function handleResponses(request, response, incomingUrl) {
+  const startedAt = Date.now();
   const encoding = request.headers["content-encoding"];
   if (encoding && encoding !== "identity" && encoding !== "zstd") {
     writeJson(response, 415, {
@@ -12829,7 +12900,7 @@ async function handleResponses(request, response, incomingUrl) {
     if (!finished) abortController.abort();
   });
 
-  const meta = { transport: "http" };
+  const meta = { transport: "http", startedAt };
   // 擷取原本只蓋 WebSocket 路徑。但 Codex 反覆握手失敗後會退回 HTTPS，之後所有
   // 請求都走這裡——上游在這條路上出錯時，開了擷取也一個檔案都拿不到。
   const captureId = captureNext(
@@ -13757,6 +13828,7 @@ async function tryUpstreamWebSocketTurn(
   message,
   abortController,
   connectionState,
+  startedAt,
 ) {
   const probe = { ...message };
   delete probe.type;
@@ -13801,7 +13873,7 @@ async function tryUpstreamWebSocketTurn(
     history.recoveryIds = historyRecoveryCandidates(probe, request.headers);
     history.usage = usageContext({
       requestHeaders: request.headers, model: message?.model, route: "official", provider: null,
-      transport: "upstream-websocket", backgroundKind: null,
+      transport: "upstream-websocket", backgroundKind: null, startedAt,
     });
     if (chain) {
       stats.upstreamWebSocketIncremental += 1;
@@ -13918,6 +13990,7 @@ export async function handleWebSocketResponseInner(
   abortController,
   connectionState = null,
 ) {
+  const startedAt = Date.now();
   message = applyBackgroundModel(message);
   const prewarm = isPrewarmRequest(message);
   let route;
@@ -13952,6 +14025,7 @@ export async function handleWebSocketResponseInner(
       message,
       abortController,
       connectionState,
+      startedAt,
     );
     if (handled) return;
   }
@@ -13975,7 +14049,7 @@ export async function handleWebSocketResponseInner(
   );
   if (captureId) captureWrite(captureId, "request.json", JSON.stringify(body, null, 2));
   const stopHeartbeat = startWebSocketHeartbeat(socket);
-  const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null, transport: "websocket" };
+  const meta = { connectionNamespace: connectionState?.connectionNamespace ?? null, transport: "websocket", startedAt };
   try {
     const upstream = await fetchModelUpstream(
       request.headers,
@@ -18470,6 +18544,7 @@ export function desktopRoute(settings, model) {
 // but not retained by the observer. Lifecycle and usage frames are small.
 export function desktopUsageObserver() {
   let buffer = "", skip = false, started = false, stopped = false, failed = false, stopReason = null, usage = null;
+  let firstTextAt = null, firstOutputAt = null;
   const decoder = new TextDecoder();
   const frame = (text) => {
     const data = text.split("\n").filter((line) => line.startsWith("data:"))
@@ -18478,6 +18553,15 @@ export function desktopUsageObserver() {
     try {
       const event = JSON.parse(data);
       if (event.type === "message_start") { started = true; usage = { ...event.message?.usage }; }
+      const text = event.type === "content_block_delta" && event.delta?.type === "text_delta" ? event.delta.text
+        : event.type === "content_block_start" && event.content_block?.type === "text" ? event.content_block.text : null;
+      if (typeof text === "string" && text.length) {
+        firstTextAt ??= Date.now();
+        firstOutputAt ??= firstTextAt;
+      }
+      if (event.type === "content_block_start" && ["tool_use", "server_tool_use"].includes(event.content_block?.type)) {
+        firstOutputAt ??= Date.now();
+      }
       if (event.type === "message_delta") {
         if (event.usage) usage = { ...usage, ...event.usage };
         stopReason = event.delta?.stop_reason || stopReason;
@@ -18499,7 +18583,7 @@ export function desktopUsageObserver() {
       if (buffer.length > 64 * 1024) { buffer = buffer.slice(-3); skip = true; }
     },
     result() {
-      return { usage, status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
+      return { usage, firstTextAt, firstOutputAt, status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
     },
   };
 }
@@ -18524,6 +18608,7 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
     response.end(JSON.stringify(body));
   };
   return async (request, response, url) => {
+    const startedAt = Date.now();
     const controller = new AbortController();
     const abort = () => controller.abort();
     const closed = () => { if (!response.writableFinished) abort(); };
@@ -18535,6 +18620,8 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
     const report = (result, code) => {
       if (!context || recorded) return;
       recorded = true;
+      context.firstTextAt = result.firstTextAt;
+      context.firstOutputAt = result.firstOutputAt;
       recordUsage(context, desktopUsageEvent(result, context.upstreamModel, code));
     };
     try {
@@ -18555,7 +18642,7 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
       catch (error) { if (error.status) throw error; throw failure(400, "invalid_request_error", "Invalid JSON request."); }
       if (!body || Array.isArray(body) || typeof body !== "object" || typeof body.model !== "string") throw failure(400, "invalid_request_error", "A model is required.");
       const route = desktopRoute(settings, body.model);
-      context = { startedAt: Date.now(), model: route.pickerSlug, upstreamModel: route.upstreamModel,
+      context = { startedAt, model: route.pickerSlug, upstreamModel: route.upstreamModel,
         route: "custom", provider: route.providerId || "default", transport: "claude-desktop", backgroundKind: null, thread: null, recorded: false };
       const upstream = await fetchUpstream(route, countTokens ? "/messages/count_tokens" : "/messages", request.headers,
         Buffer.from(JSON.stringify({ ...body, model: route.upstreamModel })), controller.signal);
@@ -19993,7 +20080,16 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "快取寫入": "Cache writes",
 "官方": "Official",
 "最近的請求": "Recent requests",
-"耗時": "Duration",
+"首次輸出": "First output",
+"總耗時": "Total duration",
+"輸出 TPS": "Output TPS",
+"從路由器收到請求到第一段串流文字或第一個工具呼叫。": "From router request receipt to the first streamed text or tool call.",
+"上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。": "Upstream-reported output tokens divided by seconds from first output to completion.",
+"近 7 天 · 每頁 100 筆": "Last 7 days · 100 per page",
+"上一頁": "Previous",
+"下一頁": "Next",
+"第 {page} / {pages} 頁 · 共 {total} 筆": "Page {page} of {pages} · {total} total",
+"近 7 天沒有請求記錄。": "No requests in the last 7 days.",
 "未完成": "Incomplete",
 "原本選的模型已刪除，目前使用官方模型。": "The previously selected model was deleted; official models are used for now.",
 "Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。": "Whichever model you pick, Codex runs a few background tasks on small official models. They use your ChatGPT usage and are blocked in API key mode. Pick a third-party model to handle them instead.",
@@ -20324,8 +20420,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強彙後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說誰調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强汇后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说谁调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說誰調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说谁调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -21263,12 +21359,12 @@ function backgroundKindLabel(kind) {
   return labels[kind] || kind;
 }
 
-async function loadUsage() {
+async function loadUsage(page = 1, asOf) {
   if (usageLoading) return;
   usageLoading = true;
   renderView();
   try {
-    usageData = await api("/api/query", { method: "POST", body: { type: "usage", params: { sinceHours: usageHours, limit: 300 } } });
+    usageData = await api("/api/query", { method: "POST", body: { type: "usage", params: { sinceHours: usageHours, page, asOf } } });
   } catch (error) {
     usageData = { error: error.message };
   } finally {
@@ -21291,14 +21387,18 @@ function formatDuration(ms) {
   return ms < 1000 ? t("{value} 毫秒", { value: Math.round(ms) }) : t("{value} 秒", { value: (ms / 1000).toFixed(ms < 10000 ? 1 : 0) });
 }
 
+function formatRequestDuration(ms) {
+  return Number.isFinite(ms) ? t("{value} 秒", { value: (ms / 1000).toFixed(2) }) : "—";
+}
+
 function renderUsage() {
   if (!usageData && !usageLoading) loadUsage();
-  const range = h("select", { "aria-label": t("時間範圍"), onchange: (event) => { usageHours = Number(event.target.value); usageData = null; loadUsage(); } },
+  const range = h("select", { "aria-label": t("時間範圍"), disabled: usageLoading, onchange: (event) => { usageHours = Number(event.target.value); loadUsage(); } },
     [[1, t("最近 1 小時")], [24, t("最近 24 小時")], [168, t("最近 7 天")], [720, t("最近 30 天")]].map(([value, label]) =>
       h("option", { value: String(value), selected: value === usageHours, text: label })));
   const head = pageHead(sectionTitle("使用記錄"), t("每一輪對話的模型、token 用量、快取命中與耗時；只記數字，不記對話內容。最近的錯誤在「總覽」。"),
     range,
-    h("button", { type: "button", class: "icon-button", title: t("重新整理"), "aria-label": t("重新整理使用記錄"), onclick: () => loadUsage() }, icon("refresh")));
+    h("button", { type: "button", class: "icon-button", title: t("重新整理"), "aria-label": t("重新整理使用記錄"), disabled: usageLoading, onclick: () => loadUsage() }, icon("refresh")));
   if (!usageData) return [head, h("div", { class: "panel" }, h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("讀取中…")))];
   if (usageData.error) return [head, h("div", { class: "panel" }, h("div", { class: "empty", text: serverText(usageData.error) }))];
   const total = usageData.summary.total;
@@ -21308,12 +21408,10 @@ function renderUsage() {
     card(t("輸出 tokens"), formatTokens(total.output), t("其中推理 {value}", { value: formatTokens(total.reasoning) })),
     card(t("平均耗時"), total.requests ? formatDuration(total.durationMs / total.requests) : "—", t("每一輪從送出到結束")));
   const parts = [head, cards];
+  const num = (value) => h("td", { class: "nowrap num", text: value });
   if (total.requests === 0) {
     parts.push(h("div", { class: "panel" }, h("div", { class: "empty", text: t("這段時間沒有使用記錄。") })));
-    return parts;
-  }
-  const num = (value) => h("td", { class: "nowrap num", text: value });
-  parts.push(h("div", { class: "panel" },
+  } else parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: t("各模型") })),
     h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出"), t("平均耗時")].map((label) => h("th", { text: label })))),
@@ -21323,11 +21421,23 @@ function renderUsage() {
         num(formatNumber(item.requests) + (item.failed ? " / " + t("失敗 {count}", { count: item.failed }) : "")),
         num(formatTokens(item.input)), num(percent(item.cacheHitRate)), num(formatTokens(item.cacheWrite)),
         num(formatTokens(item.output)), num(formatDuration(item.avgDurationMs)))))))));
-  const entries = usageData.entries.slice(0, 150);
+  const { entries, pagination, asOf } = usageData;
+  const paging = pagination.pages > 1 ? h("div", { class: "actions", "aria-busy": String(usageLoading) },
+    h("span", { class: "faint", "aria-live": "polite", text: t("第 {page} / {pages} 頁 · 共 {total} 筆", pagination) }),
+    h("div", { class: "actions" },
+      h("button", { type: "button", class: "button small", disabled: usageLoading || pagination.page <= 1,
+        onclick: () => loadUsage(pagination.page - 1, asOf) }, t("上一頁")),
+      h("button", { type: "button", class: "button small", disabled: usageLoading || pagination.page >= pagination.pages,
+        onclick: () => loadUsage(pagination.page + 1, asOf) }, t("下一頁")))) : null;
   parts.push(h("div", { class: "panel" },
-    h("div", { class: "panel-head" }, h("h2", { text: t("最近的請求") })),
-    h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出"), t("耗時")].map((label) => h("th", { text: label })))),
+    h("div", { class: "panel-head" },
+      h("div", {}, h("h2", { text: t("最近的請求") }), h("span", { class: "faint", text: t("近 7 天 · 每頁 100 筆") })),
+      paging),
+    entries.length === 0 ? h("div", { class: "empty", text: t("近 7 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出")].map((label) => h("th", { text: label })),
+        h("th", { title: t("從路由器收到請求到第一段串流文字或第一個工具呼叫。"), text: t("首次輸出") }),
+        h("th", { text: t("總耗時") }),
+        h("th", { title: t("上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。"), text: t("輸出 TPS") }))),
       h("tbody", {}, entries.map((entry) => h("tr", {},
         h("td", { class: "nowrap mono", text: formatTime(entry.at) }),
         h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(entry.model) }),
@@ -21337,7 +21447,9 @@ function renderUsage() {
         num(entry.hasUsage ? formatTokens(entry.input) : "—"),
         num(entry.hasUsage && entry.input ? percent(entry.cached / entry.input) : "—"),
         num(entry.hasUsage ? formatTokens(entry.output) : "—"),
-        num(formatDuration(entry.durationMs)))))))));
+        num(formatRequestDuration(entry.firstOutputMs ?? entry.firstTextMs)),
+        num(formatRequestDuration(entry.durationMs)),
+        num(Number.isFinite(entry.outputTps) ? entry.outputTps.toFixed(1) + " tok/s" : "—"))))))));
   parts.push(h("div", { class: "note mono", text: usageData.logPath || "" }));
   return parts;
 }

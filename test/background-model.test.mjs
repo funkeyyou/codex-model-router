@@ -80,18 +80,20 @@ test("大小相同、修改時間也相同的改寫一樣會生效（Windows 同
 
 test("使用記錄：完成、失敗與沒有用量的終止事件都記成一筆，非終止事件不記", async (t) => {
   const { router } = await setup(t);
-  const context = { startedAt: 1000, model: "custom/owo-gpt", route: "custom", provider: "owo", transport: "websocket",
+  const context = { startedAt: 1000, firstTextAt: 1500, model: "custom/owo-gpt", route: "custom", provider: "owo", transport: "websocket",
     backgroundKind: "title", thread: "th-1" };
   const done = router.usageRecord(context, { type: "response.completed", response: { model: "gpt-6.1-sol",
     usage: { input_tokens: 1200, input_tokens_details: { cached_tokens: 900, cache_write_tokens: 100 }, output_tokens: 50,
       output_tokens_details: { reasoning_tokens: 20 } } } }, 3500);
   assert.deepEqual({ ...done, at: undefined }, { at: undefined, model: "custom/owo-gpt", upstreamModel: "gpt-6.1-sol", route: "custom",
     provider: "owo", transport: "websocket", background: "title", thread: "th-1", status: "completed", durationMs: 2500,
-    input: 1200, cached: 900, cacheWrite: 100, output: 50, reasoning: 20, hasUsage: true });
+    firstTextMs: 500, firstOutputMs: 500, outputTps: 25, input: 1200, cached: 900, cacheWrite: 100, output: 50, reasoning: 20, hasUsage: true });
   const failed = router.usageRecord(context, { type: "response.failed", response: { error: { code: "rate_limit_exceeded" } } }, 2000);
   assert.equal(failed.status, "failed");
   assert.equal(failed.error, "rate_limit_exceeded");
   assert.equal(failed.hasUsage, false);
+  assert.equal(failed.outputTps, null);
+  assert.equal(router.usageRecord({ ...context, firstTextAt: 3500 }, { type: "response.completed", response: { usage: { output_tokens: 50 } } }, 3500).outputTps, null);
   assert.equal(router.usageRecord(context, { type: "response.output_text.delta" }), null);
 });
 

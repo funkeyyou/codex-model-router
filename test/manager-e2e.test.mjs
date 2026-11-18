@@ -170,6 +170,36 @@ async function startManager(defer, env, { foreground = true, args = ["ui"] } = {
   return { child, waitExit, port, token, call, runJob, output: () => output, url: match[1] };
 }
 
+test("最近請求固定顯示七天，以 100 筆分頁，並可讀取新舊歸檔", async (t) => {
+  const defer = cleanupStack(t);
+  const root = mkdtempSync(join(tmpdir(), "router-manager-usage-"));
+  defer(() => removeTree(root));
+  const runtime = join(root, "model-router");
+  mkdirSync(runtime);
+  const now = Date.now();
+  const hour = 3600000;
+  const row = (index, age) => ({ model: "model-" + index, at: new Date(now - age).toISOString(), status: "completed" });
+  const write = (file, rows) => writeFileSync(join(runtime, file), rows.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  const day = new Date(now - 2 * hour).toISOString().slice(0, 10);
+  write("usage.jsonl", [row(0, 1000), row(999, 8 * 24 * hour)]);
+  write("usage.jsonl." + day + ".1234567890abcdef", Array.from({ length: 100 }, (_, index) => row(index + 1, 2 * hour + index)));
+  write("usage.jsonl.1", [row(101, 6 * 24 * hour)]);
+  const ui = await startManager(defer, baseEnv(root, runtime));
+  const query = async (params) => {
+    const result = await ui.call("/api/query", { method: "POST", body: { type: "usage", params } });
+    assert.equal(result.status, 200, JSON.stringify(result.json));
+    return result.json;
+  };
+  const first = await query({ sinceHours: 1 });
+  assert.deepEqual(first.pagination, { page: 1, pages: 2, total: 102 });
+  assert.equal(first.summary.total.requests, 1);
+  assert.deepEqual(first.entries.map((entry) => entry.model), Array.from({ length: 100 }, (_, index) => "model-" + index));
+  write("usage.jsonl", [row(0, 1000), { ...row(200, 0), at: new Date(first.asOf + 1).toISOString() }]);
+  const second = await query({ sinceHours: 720, page: 2, asOf: first.asOf });
+  assert.deepEqual(second.pagination, { page: 2, pages: 2, total: 102 });
+  assert.deepEqual(second.entries.map((entry) => entry.model), ["model-100", "model-101"]);
+});
+
 test("背景管理頁：啟動命令退出後仍可存取，重複開啟沿用同一程序，結束後清理短期檔案", { timeout: 60000 }, async (t) => {
   const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-background-"));
