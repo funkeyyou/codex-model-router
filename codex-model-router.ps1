@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.14";
+const INSTALLER_VERSION = "1.44.15";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8965,27 +8965,53 @@ async function managerSetUpstreamImageGuard({ enabled } = {}) {
 const usageLogPath = join(installRoot, "usage.jsonl");
 const usagePageSize = 100;
 const hourMs = 3600000;
+const usageHistoryHours = 30 * 24;
+
+function usageAverage(sum, count) {
+  return count > 0 ? sum / count : null;
+}
 
 export function summarizeUsage(records) {
   const byModel = new Map();
   const total = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0 };
+  let totalDurationSamples = 0;
   for (const record of records) {
     const key = record.model || "-";
     const entry = byModel.get(key) || { model: key, provider: record.provider || null, route: record.route || null,
-      requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0, background: 0 };
+      requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0, background: 0,
+      durationSamples: 0, firstOutputMs: 0, firstOutputSamples: 0, outputTps: 0, outputTpsSamples: 0 };
     for (const target of [entry, total]) {
       target.requests += 1;
-      for (const field of ["input", "cached", "cacheWrite", "output", "reasoning", "durationMs"]) target[field] += Number(record[field]) || 0;
+      for (const field of ["input", "cached", "cacheWrite", "output", "reasoning"]) target[field] += Number(record[field]) || 0;
       if (record.status === "failed") target.failed += 1;
+    }
+    if (Number.isFinite(record.durationMs) && record.durationMs >= 0) {
+      entry.durationMs += record.durationMs;
+      total.durationMs += record.durationMs;
+      entry.durationSamples += 1;
+      totalDurationSamples += 1;
+    }
+    const firstOutputMs = record.firstOutputMs ?? record.firstTextMs;
+    if (Number.isFinite(firstOutputMs) && firstOutputMs >= 0) {
+      entry.firstOutputMs += firstOutputMs;
+      entry.firstOutputSamples += 1;
+    }
+    if (Number.isFinite(record.outputTps) && record.outputTps >= 0) {
+      entry.outputTps += record.outputTps;
+      entry.outputTpsSamples += 1;
     }
     if (record.background) entry.background += 1;
     byModel.set(key, entry);
   }
   const rate = (item) => (item.input > 0 ? item.cached / item.input : null);
   return {
-    total: { ...total, cacheHitRate: rate(total) },
-    models: [...byModel.values()].map((item) => ({ ...item, cacheHitRate: rate(item),
-      avgDurationMs: item.requests ? Math.round(item.durationMs / item.requests) : null }))
+    total: { ...total, cacheHitRate: rate(total), avgDurationMs: usageAverage(total.durationMs, totalDurationSamples) },
+    models: [...byModel.values()].map(({ durationSamples, firstOutputMs, firstOutputSamples, outputTps, outputTpsSamples, ...item }) => ({
+      ...item, cacheHitRate: rate(item),
+      avgDurationMs: usageAverage(item.durationMs, durationSamples),
+      avgFirstOutputMs: usageAverage(firstOutputMs, firstOutputSamples),
+      avgOutputTps: usageAverage(outputTps, outputTpsSamples),
+    }))
       .sort((left, right) => right.input + right.output - (left.input + left.output)),
   };
 }
@@ -8993,10 +9019,10 @@ export function summarizeUsage(records) {
 function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
   const now = Date.now();
   const snapshot = Number.isSafeInteger(asOf) && asOf <= now && asOf >= now - hourMs ? asOf : now;
-  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), 24 * 30);
+  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), usageHistoryHours);
   const summarySince = snapshot - hours * hourMs;
-  const recentSince = snapshot - 7 * 24 * hourMs;
-  const cutoffDay = new Date(Math.min(summarySince, recentSince)).toISOString().slice(0, 10);
+  const recentSince = snapshot - usageHistoryHours * hourMs;
+  const cutoffDay = new Date(recentSince).toISOString().slice(0, 10);
   const summaryRecords = [];
   const recent = [];
   let archives = [];
@@ -20144,6 +20170,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "每一輪從送出到結束": "Per turn, from send to finish",
 "這段時間沒有使用記錄。": "No usage recorded in this period.",
 "各模型": "By model",
+"平均首次輸出": "Average time to first output",
+"平均總耗時": "Average total duration",
+"平均輸出 TPS": "Average output TPS",
+"對有量測的請求逐筆取平均。": "Arithmetic mean across requests with a measurement.",
 "輸入": "Input",
 "快取命中": "Cache hits",
 "快取寫入": "Cache writes",
@@ -20154,11 +20184,11 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "輸出 TPS": "Output TPS",
 "從路由器收到請求到第一段串流文字或第一個工具呼叫。": "From router request receipt to the first streamed text or tool call.",
 "上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。": "Upstream-reported output tokens divided by seconds from first output to completion.",
-"近 7 天 · 每頁 100 筆": "Last 7 days · 100 per page",
+"近 30 天 · 每頁 100 筆": "Last 30 days · 100 per page",
 "上一頁": "Previous",
 "下一頁": "Next",
 "第 {page} / {pages} 頁 · 共 {total} 筆": "Page {page} of {pages} · {total} total",
-"近 7 天沒有請求記錄。": "No requests in the last 7 days.",
+"近 30 天沒有請求記錄。": "No requests in the last 30 days.",
 "未完成": "Incomplete",
 "原本選的模型已刪除，目前使用官方模型。": "The previously selected model was deleted; official models are used for now.",
 "Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。": "Whichever model you pick, Codex runs a few background tasks on small official models. They use your ChatGPT usage and are blocked in API key mode. Pick a third-party model to handle them instead.",
@@ -21460,6 +21490,10 @@ function formatRequestDuration(ms) {
   return Number.isFinite(ms) ? t("{value} 秒", { value: (ms / 1000).toFixed(2) }) : "—";
 }
 
+function formatOutputTps(value) {
+  return Number.isFinite(value) ? value.toFixed(1) + " tok/s" : "—";
+}
+
 function renderUsage() {
   if (!usageData && !usageLoading) loadUsage();
   const range = h("select", { "aria-label": t("時間範圍"), disabled: usageLoading, onchange: (event) => { usageHours = Number(event.target.value); loadUsage(); } },
@@ -21475,7 +21509,7 @@ function renderUsage() {
     card(t("請求"), formatNumber(total.requests), t("失敗 {count}", { count: formatNumber(total.failed) })),
     card(t("輸入 tokens"), formatTokens(total.input), t("快取命中 {rate} · 快取寫入 {write}", { rate: percent(total.cacheHitRate), write: formatTokens(total.cacheWrite) })),
     card(t("輸出 tokens"), formatTokens(total.output), t("其中推理 {value}", { value: formatTokens(total.reasoning) })),
-    card(t("平均耗時"), total.requests ? formatDuration(total.durationMs / total.requests) : "—", t("每一輪從送出到結束")));
+    card(t("平均耗時"), formatDuration(total.avgDurationMs), t("每一輪從送出到結束")));
   const parts = [head, cards];
   const num = (value) => h("td", { class: "nowrap num", text: value });
   if (total.requests === 0) {
@@ -21483,13 +21517,17 @@ function renderUsage() {
   } else parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: t("各模型") })),
     h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出"), t("平均耗時")].map((label) => h("th", { text: label })))),
+      h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出")].map((label) => h("th", { text: label })),
+        h("th", { text: t("平均首次輸出") }),
+        h("th", { text: t("平均總耗時") }),
+        h("th", { text: t("平均輸出 TPS"), title: t("對有量測的請求逐筆取平均。") }))),
       h("tbody", {}, usageData.summary.models.map((item) => h("tr", {},
         h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(item.model) }),
           h("span", { class: "faint mono", text: item.route === "custom" ? (item.provider || "") : t("官方") }))),
         num(formatNumber(item.requests) + (item.failed ? " / " + t("失敗 {count}", { count: item.failed }) : "")),
         num(formatTokens(item.input)), num(percent(item.cacheHitRate)), num(formatTokens(item.cacheWrite)),
-        num(formatTokens(item.output)), num(formatDuration(item.avgDurationMs)))))))));
+        num(formatTokens(item.output)), num(formatRequestDuration(item.avgFirstOutputMs)),
+        num(formatRequestDuration(item.avgDurationMs)), num(formatOutputTps(item.avgOutputTps)))))))));
   const { entries, pagination, asOf } = usageData;
   const paging = pagination.pages > 1 ? h("div", { class: "actions", "aria-busy": String(usageLoading) },
     h("span", { class: "faint", "aria-live": "polite", text: t("第 {page} / {pages} 頁 · 共 {total} 筆", pagination) }),
@@ -21500,9 +21538,9 @@ function renderUsage() {
         onclick: () => loadUsage(pagination.page + 1, asOf) }, t("下一頁")))) : null;
   parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" },
-      h("div", {}, h("h2", { text: t("最近的請求") }), h("span", { class: "faint", text: t("近 7 天 · 每頁 100 筆") })),
+      h("div", {}, h("h2", { text: t("最近的請求") }), h("span", { class: "faint", text: t("近 30 天 · 每頁 100 筆") })),
       paging),
-    entries.length === 0 ? h("div", { class: "empty", text: t("近 7 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
+    entries.length === 0 ? h("div", { class: "empty", text: t("近 30 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出")].map((label) => h("th", { text: label })),
         h("th", { title: t("從路由器收到請求到第一段串流文字或第一個工具呼叫。"), text: t("首次輸出") }),
         h("th", { text: t("總耗時") }),
@@ -21518,7 +21556,7 @@ function renderUsage() {
         num(entry.hasUsage ? formatTokens(entry.output) : "—"),
         num(formatRequestDuration(entry.firstOutputMs ?? entry.firstTextMs)),
         num(formatRequestDuration(entry.durationMs)),
-        num(Number.isFinite(entry.outputTps) ? entry.outputTps.toFixed(1) + " tok/s" : "—"))))))));
+        num(formatOutputTps(entry.outputTps)))))))));
   parts.push(h("div", { class: "note mono", text: usageData.logPath || "" }));
   return parts;
 }

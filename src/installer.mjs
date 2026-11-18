@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.14";
+const INSTALLER_VERSION = "1.44.15";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -8818,27 +8818,53 @@ async function managerSetUpstreamImageGuard({ enabled } = {}) {
 const usageLogPath = join(installRoot, "usage.jsonl");
 const usagePageSize = 100;
 const hourMs = 3600000;
+const usageHistoryHours = 30 * 24;
+
+function usageAverage(sum, count) {
+  return count > 0 ? sum / count : null;
+}
 
 export function summarizeUsage(records) {
   const byModel = new Map();
   const total = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0 };
+  let totalDurationSamples = 0;
   for (const record of records) {
     const key = record.model || "-";
     const entry = byModel.get(key) || { model: key, provider: record.provider || null, route: record.route || null,
-      requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0, background: 0 };
+      requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0, background: 0,
+      durationSamples: 0, firstOutputMs: 0, firstOutputSamples: 0, outputTps: 0, outputTpsSamples: 0 };
     for (const target of [entry, total]) {
       target.requests += 1;
-      for (const field of ["input", "cached", "cacheWrite", "output", "reasoning", "durationMs"]) target[field] += Number(record[field]) || 0;
+      for (const field of ["input", "cached", "cacheWrite", "output", "reasoning"]) target[field] += Number(record[field]) || 0;
       if (record.status === "failed") target.failed += 1;
+    }
+    if (Number.isFinite(record.durationMs) && record.durationMs >= 0) {
+      entry.durationMs += record.durationMs;
+      total.durationMs += record.durationMs;
+      entry.durationSamples += 1;
+      totalDurationSamples += 1;
+    }
+    const firstOutputMs = record.firstOutputMs ?? record.firstTextMs;
+    if (Number.isFinite(firstOutputMs) && firstOutputMs >= 0) {
+      entry.firstOutputMs += firstOutputMs;
+      entry.firstOutputSamples += 1;
+    }
+    if (Number.isFinite(record.outputTps) && record.outputTps >= 0) {
+      entry.outputTps += record.outputTps;
+      entry.outputTpsSamples += 1;
     }
     if (record.background) entry.background += 1;
     byModel.set(key, entry);
   }
   const rate = (item) => (item.input > 0 ? item.cached / item.input : null);
   return {
-    total: { ...total, cacheHitRate: rate(total) },
-    models: [...byModel.values()].map((item) => ({ ...item, cacheHitRate: rate(item),
-      avgDurationMs: item.requests ? Math.round(item.durationMs / item.requests) : null }))
+    total: { ...total, cacheHitRate: rate(total), avgDurationMs: usageAverage(total.durationMs, totalDurationSamples) },
+    models: [...byModel.values()].map(({ durationSamples, firstOutputMs, firstOutputSamples, outputTps, outputTpsSamples, ...item }) => ({
+      ...item, cacheHitRate: rate(item),
+      avgDurationMs: usageAverage(item.durationMs, durationSamples),
+      avgFirstOutputMs: usageAverage(firstOutputMs, firstOutputSamples),
+      avgOutputTps: usageAverage(outputTps, outputTpsSamples),
+    }))
       .sort((left, right) => right.input + right.output - (left.input + left.output)),
   };
 }
@@ -8846,10 +8872,10 @@ export function summarizeUsage(records) {
 function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
   const now = Date.now();
   const snapshot = Number.isSafeInteger(asOf) && asOf <= now && asOf >= now - hourMs ? asOf : now;
-  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), 24 * 30);
+  const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), usageHistoryHours);
   const summarySince = snapshot - hours * hourMs;
-  const recentSince = snapshot - 7 * 24 * hourMs;
-  const cutoffDay = new Date(Math.min(summarySince, recentSince)).toISOString().slice(0, 10);
+  const recentSince = snapshot - usageHistoryHours * hourMs;
+  const cutoffDay = new Date(recentSince).toISOString().slice(0, 10);
   const summaryRecords = [];
   const recent = [];
   let archives = [];

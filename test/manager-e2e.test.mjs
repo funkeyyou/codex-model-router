@@ -170,7 +170,7 @@ async function startManager(defer, env, { foreground = true, args = ["ui"] } = {
   return { child, waitExit, port, token, call, runJob, output: () => output, url: match[1] };
 }
 
-test("最近請求固定顯示七天，以 100 筆分頁，並可讀取新舊歸檔", async (t) => {
+test("最近請求固定顯示 30 天，以 100 筆分頁，並可讀取新舊歸檔", async (t) => {
   const defer = cleanupStack(t);
   const root = mkdtempSync(join(tmpdir(), "router-manager-usage-"));
   defer(() => removeTree(root));
@@ -180,10 +180,11 @@ test("最近請求固定顯示七天，以 100 筆分頁，並可讀取新舊歸
   const hour = 3600000;
   const row = (index, age) => ({ model: "model-" + index, at: new Date(now - age).toISOString(), status: "completed" });
   const write = (file, rows) => writeFileSync(join(runtime, file), rows.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
-  const day = new Date(now - 2 * hour).toISOString().slice(0, 10);
-  write("usage.jsonl", [row(0, 1000), row(999, 8 * 24 * hour)]);
-  write("usage.jsonl." + day + ".1234567890abcdef", Array.from({ length: 100 }, (_, index) => row(index + 1, 2 * hour + index)));
-  write("usage.jsonl.1", [row(101, 6 * 24 * hour)]);
+  const archiveAge = 8 * 24 * hour;
+  const day = new Date(now - archiveAge).toISOString().slice(0, 10);
+  write("usage.jsonl", [row(0, 1000)]);
+  write("usage.jsonl." + day + ".1234567890abcdef", Array.from({ length: 100 }, (_, index) => row(index + 1, archiveAge + index)));
+  write("usage.jsonl.1", [row(101, 30 * 24 * hour - hour), row(999, 30 * 24 * hour + hour)]);
   const ui = await startManager(defer, baseEnv(root, runtime));
   const query = async (params) => {
     const result = await ui.call("/api/query", { method: "POST", body: { type: "usage", params } });

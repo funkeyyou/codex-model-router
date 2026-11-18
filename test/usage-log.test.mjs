@@ -27,6 +27,28 @@ test("summarizeUsage 依模型彙整並計算快取命中率", () => {
   assert.equal(installer.summarizeUsage([]).total.cacheHitRate, null);
 });
 
+test("各模型的三項效能平均分別採計有數值的請求", () => {
+  const { models, total } = installer.summarizeUsage([
+    { model: "custom/a", durationMs: 3000, firstOutputMs: 1000, firstTextMs: 1500, outputTps: 10 },
+    { model: "custom/a", durationMs: 10000, firstOutputMs: null, firstTextMs: 3000, outputTps: 50 },
+    { model: "custom/a", durationMs: 0, firstOutputMs: 0, status: "failed", outputTps: null },
+    { model: "custom/a", firstOutputMs: -1, outputTps: -1 },
+    { model: "custom/b", durationMs: 7000, firstOutputMs: null, outputTps: null },
+    { model: "custom/c", durationMs: null },
+  ]);
+  const a = models.find((item) => item.model === "custom/a");
+  const b = models.find((item) => item.model === "custom/b");
+  const c = models.find((item) => item.model === "custom/c");
+  assert.equal(a.avgDurationMs, 13000 / 3);
+  assert.equal(a.avgFirstOutputMs, 4000 / 3);
+  assert.equal(a.avgOutputTps, 30);
+  assert.equal(b.avgDurationMs, 7000);
+  assert.equal(b.avgFirstOutputMs, null);
+  assert.equal(b.avgOutputTps, null);
+  assert.equal(c.avgDurationMs, null);
+  assert.equal(total.avgDurationMs, 5000);
+});
+
 test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", async (t) => {
   const previous = process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
   process.env.CODEX_MODEL_ROUTER_TEST_API_KEY = "fixture-provider-key";

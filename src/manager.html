@@ -870,6 +870,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "每一輪從送出到結束": "Per turn, from send to finish",
 "這段時間沒有使用記錄。": "No usage recorded in this period.",
 "各模型": "By model",
+"平均首次輸出": "Average time to first output",
+"平均總耗時": "Average total duration",
+"平均輸出 TPS": "Average output TPS",
+"對有量測的請求逐筆取平均。": "Arithmetic mean across requests with a measurement.",
 "輸入": "Input",
 "快取命中": "Cache hits",
 "快取寫入": "Cache writes",
@@ -880,11 +884,11 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "輸出 TPS": "Output TPS",
 "從路由器收到請求到第一段串流文字或第一個工具呼叫。": "From router request receipt to the first streamed text or tool call.",
 "上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。": "Upstream-reported output tokens divided by seconds from first output to completion.",
-"近 7 天 · 每頁 100 筆": "Last 7 days · 100 per page",
+"近 30 天 · 每頁 100 筆": "Last 30 days · 100 per page",
 "上一頁": "Previous",
 "下一頁": "Next",
 "第 {page} / {pages} 頁 · 共 {total} 筆": "Page {page} of {pages} · {total} total",
-"近 7 天沒有請求記錄。": "No requests in the last 7 days.",
+"近 30 天沒有請求記錄。": "No requests in the last 30 days.",
 "未完成": "Incomplete",
 "原本選的模型已刪除，目前使用官方模型。": "The previously selected model was deleted; official models are used for now.",
 "Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。": "Whichever model you pick, Codex runs a few background tasks on small official models. They use your ChatGPT usage and are blocked in API key mode. Pick a third-party model to handle them instead.",
@@ -2186,6 +2190,10 @@ function formatRequestDuration(ms) {
   return Number.isFinite(ms) ? t("{value} 秒", { value: (ms / 1000).toFixed(2) }) : "—";
 }
 
+function formatOutputTps(value) {
+  return Number.isFinite(value) ? value.toFixed(1) + " tok/s" : "—";
+}
+
 function renderUsage() {
   if (!usageData && !usageLoading) loadUsage();
   const range = h("select", { "aria-label": t("時間範圍"), disabled: usageLoading, onchange: (event) => { usageHours = Number(event.target.value); loadUsage(); } },
@@ -2201,7 +2209,7 @@ function renderUsage() {
     card(t("請求"), formatNumber(total.requests), t("失敗 {count}", { count: formatNumber(total.failed) })),
     card(t("輸入 tokens"), formatTokens(total.input), t("快取命中 {rate} · 快取寫入 {write}", { rate: percent(total.cacheHitRate), write: formatTokens(total.cacheWrite) })),
     card(t("輸出 tokens"), formatTokens(total.output), t("其中推理 {value}", { value: formatTokens(total.reasoning) })),
-    card(t("平均耗時"), total.requests ? formatDuration(total.durationMs / total.requests) : "—", t("每一輪從送出到結束")));
+    card(t("平均耗時"), formatDuration(total.avgDurationMs), t("每一輪從送出到結束")));
   const parts = [head, cards];
   const num = (value) => h("td", { class: "nowrap num", text: value });
   if (total.requests === 0) {
@@ -2209,13 +2217,17 @@ function renderUsage() {
   } else parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: t("各模型") })),
     h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出"), t("平均耗時")].map((label) => h("th", { text: label })))),
+      h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出")].map((label) => h("th", { text: label })),
+        h("th", { text: t("平均首次輸出") }),
+        h("th", { text: t("平均總耗時") }),
+        h("th", { text: t("平均輸出 TPS"), title: t("對有量測的請求逐筆取平均。") }))),
       h("tbody", {}, usageData.summary.models.map((item) => h("tr", {},
         h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(item.model) }),
           h("span", { class: "faint mono", text: item.route === "custom" ? (item.provider || "") : t("官方") }))),
         num(formatNumber(item.requests) + (item.failed ? " / " + t("失敗 {count}", { count: item.failed }) : "")),
         num(formatTokens(item.input)), num(percent(item.cacheHitRate)), num(formatTokens(item.cacheWrite)),
-        num(formatTokens(item.output)), num(formatDuration(item.avgDurationMs)))))))));
+        num(formatTokens(item.output)), num(formatRequestDuration(item.avgFirstOutputMs)),
+        num(formatRequestDuration(item.avgDurationMs)), num(formatOutputTps(item.avgOutputTps)))))))));
   const { entries, pagination, asOf } = usageData;
   const paging = pagination.pages > 1 ? h("div", { class: "actions", "aria-busy": String(usageLoading) },
     h("span", { class: "faint", "aria-live": "polite", text: t("第 {page} / {pages} 頁 · 共 {total} 筆", pagination) }),
@@ -2226,9 +2238,9 @@ function renderUsage() {
         onclick: () => loadUsage(pagination.page + 1, asOf) }, t("下一頁")))) : null;
   parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" },
-      h("div", {}, h("h2", { text: t("最近的請求") }), h("span", { class: "faint", text: t("近 7 天 · 每頁 100 筆") })),
+      h("div", {}, h("h2", { text: t("最近的請求") }), h("span", { class: "faint", text: t("近 30 天 · 每頁 100 筆") })),
       paging),
-    entries.length === 0 ? h("div", { class: "empty", text: t("近 7 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
+    entries.length === 0 ? h("div", { class: "empty", text: t("近 30 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出")].map((label) => h("th", { text: label })),
         h("th", { title: t("從路由器收到請求到第一段串流文字或第一個工具呼叫。"), text: t("首次輸出") }),
         h("th", { text: t("總耗時") }),
@@ -2244,7 +2256,7 @@ function renderUsage() {
         num(entry.hasUsage ? formatTokens(entry.output) : "—"),
         num(formatRequestDuration(entry.firstOutputMs ?? entry.firstTextMs)),
         num(formatRequestDuration(entry.durationMs)),
-        num(Number.isFinite(entry.outputTps) ? entry.outputTps.toFixed(1) + " tok/s" : "—"))))))));
+        num(formatOutputTps(entry.outputTps)))))))));
   parts.push(h("div", { class: "note mono", text: usageData.logPath || "" }));
   return parts;
 }
