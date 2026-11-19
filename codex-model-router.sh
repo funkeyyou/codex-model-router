@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.20";
+const INSTALLER_VERSION = "1.44.21";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -18979,6 +18979,7 @@ const hookCommand = "node deny.cjs";
 const instructions = [
   "Answer the coding agent request encoded as chat messages and host tool definitions.",
   "Use no local actions. Return one JSON object with text (string) and calls (array).",
+  "JSON-escape quotes, backslashes and line breaks inside strings, including inside Markdown code and tool arguments.",
   "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
   "When requesting host tools during multi-step work, put a brief user-facing progress update in text before calls: what you found or what the next action will check. Use the user's language.",
   "Request independent actions together when parallel_tool_calls permits. The host executes all calls.",
@@ -19096,8 +19097,95 @@ function settingsUpdate(previous, current) {
   }) + callLimit(current) + "\n" + reminder;
 }
 
+class EnvelopeSyntaxError extends SyntaxError {
+  constructor(kind) {
+    super("Invalid Antigravity response JSON");
+    this.kind = kind;
+  }
+}
+
+function jsonEscapeLength(text, index) {
+  const next = text[index + 1];
+  if (next === "u") return /^[0-9a-f]{4}$/i.test(text.slice(index + 2, index + 6)) ? 6 : 0;
+  return next && '"\\/bfnrt'.includes(next) ? 2 : 0;
+}
+
+// Diagnose a strictly decoded text prefix followed by the calls field. Never salvage calls:
+// a repeated envelope could repeat an action, and guessing an escape can change a command.
+function rejectMalformedCalls(tail) {
+  const field = /^[ \t\r\n]*,[ \t\r\n]*"calls"[ \t\r\n]*:[ \t\r\n]*\[/.exec(tail);
+  if (!field) return;
+  let depth = 1, quoted = false;
+  for (let index = field[0].length; index < tail.length; index++) {
+    const char = tail[index];
+    if (quoted) {
+      if (char === "\\") index++;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === "[") depth++;
+    else if (char === "]" && --depth === 0) {
+      const rest = tail.slice(index + 1).trimStart();
+      if (!rest.startsWith("}")) return;
+      try { JSON.parse(tail.slice(field[0].length - 1, index + 1)); }
+      catch { throw new EnvelopeSyntaxError("invalid_tool_call_json"); }
+      if (rest.length > 1 && rest.slice(1).trim()) throw new EnvelopeSyntaxError("extra_response_content");
+      return;
+    }
+  }
+}
+
+// On JSON syntax failure, only repair the first string of a single, otherwise exact
+// text-only envelope. Stop at the *first* plausible object boundary; looking for the
+// last `calls: []` could swallow an earlier envelope or an invalid tool call as prose.
+function recoverTextOnlyEnvelope(payload) {
+  if (payload.length > 1024 * 1024) return null; // Bound work on malformed replies, not valid JSON.
+  const head = /^\{[ \t\r\n]*"text"[ \t\r\n]*:[ \t\r\n]*"/.exec(payload);
+  if (!head) return null;
+  const boundary = /[ \t\r\n]*(?:\}|,[ \t\r\n]*"(?:[^"\\]|\\[\s\S])*"[ \t\r\n]*:)/y;
+  let encoded = "", changed = false;
+  for (let index = head[0].length; index < payload.length; index++) {
+    const char = payload[index];
+    if (char === '"') {
+      boundary.lastIndex = index + 1;
+      if (boundary.test(payload)) {
+        const tail = payload.slice(index + 1);
+        if (changed && /^[ \t\r\n]*,[ \t\r\n]*"calls"[ \t\r\n]*:[ \t\r\n]*\[[ \t\r\n]*\][ \t\r\n]*\}$/.test(tail)) {
+          return { text: JSON.parse('"' + encoded + '"'), calls: [] };
+        }
+        if (!changed) rejectMalformedCalls(tail);
+        return null;
+      }
+      encoded += '\\"';
+      changed = true;
+    } else if (char === "\\") {
+      const length = jsonEscapeLength(payload, index);
+      if (length) {
+        encoded += payload.slice(index, index + length);
+        index += length - 1;
+      } else {
+        encoded += "\\\\";
+        changed = true;
+      }
+    } else if (char.charCodeAt(0) < 32) {
+      encoded += JSON.stringify(char).slice(1, -1);
+      changed = true;
+    } else encoded += char;
+  }
+  return null;
+}
+
+export function parseAntigravityEnvelope(raw) {
+  const payload = raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
+  try { return { reply: JSON.parse(payload), recovered: false }; }
+  catch {
+    const reply = recoverTextOnlyEnvelope(payload);
+    if (reply) return { reply, recovered: true };
+    throw new EnvelopeSyntaxError("invalid_response_json");
+  }
+}
+
 function chatMessage(raw, request) {
-  const reply = JSON.parse(raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
+  const { reply, recovered } = parseAntigravityEnvelope(raw);
   if (typeof reply?.text !== "string" || !Array.isArray(reply.calls)) throw Error("Invalid Antigravity response format");
   const allowed = new Set(request.tools?.map(tool => tool.function.name));
   if (request.parallel_tool_calls === false && reply.calls.length > 1) throw Error("Parallel calls disabled");
@@ -19110,7 +19198,8 @@ function chatMessage(raw, request) {
   if ((choice === "none" && toolCalls.length) || (choice === "required" && !toolCalls.length) ||
       (choice?.function && (!toolCalls.length || toolCalls.some(call => call.function.name !== choice.function.name))))
     throw Error("Antigravity did not respect tool_choice");
-  return { role: "assistant", content: reply.text, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
+  const message = { role: "assistant", content: reply.text, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
+  return { message, recovered };
 }
 
 // Only decode the text field at the beginning of the envelope. Calls remain buffered
@@ -19175,22 +19264,42 @@ export function antigravityFailureKind(error, { stage, abortReason, closeReason 
   if (abortReason === "timeout") return "turn_timeout";
   if (abortReason === "local_tool") return "local_tool_attempt";
   if (abortReason === "cancelled") return "request_cancelled";
+  if (abortReason === "response_limit") return "response_too_large";
   if (closeReason === "invalid_json") return "acp_invalid_json";
   if (closeReason === "buffer_limit") return "acp_buffer_limit";
   if (closeReason === "stdin_error") return "acp_stdin_error";
   if (closeReason === "process_error") return "acp_process_error";
   if (closeReason === "process_exit") return "acp_process_exit";
+  // JSON.parse error messages can quote model text. Do not look for provider keywords there.
+  if (stage === "parse_response") {
+    if (error instanceof EnvelopeSyntaxError) return error.kind;
+    return error instanceof SyntaxError ? "invalid_response_json" : "invalid_response_format";
+  }
+  if (stage === "stream_consistency") return "stream_changed";
+  if (stage === "stop_reason") return "early_stop";
   const message = typeof error?.message === "string" ? error.message : "";
   if (/\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b/i.test(message)) return "rate_limited";
   if (/\bUNAUTHENTICATED\b|\b(?:HTTP|code)\s+401\b/i.test(message)) return "auth_required";
   if (/\bPERMISSION_DENIED\b|\b(?:HTTP|code)\s+403\b/i.test(message)) return "permission_denied";
   if (/\bSAFETY\b|\bpolicy.violation\b|\bblocked.by.policy\b/i.test(message)) return "policy_rejected";
-  if (stage === "stop_reason") return "early_stop";
-  if (stage === "parse_response") return error instanceof SyntaxError ? "invalid_response_json" : "invalid_response_format";
-  if (stage === "stream_consistency") return "stream_changed";
   if (stage === "set_model" || stage === "prompt") return "acp_request_failed";
   return "unexpected_failure";
 }
+
+const turnFailureMessages = {
+  turn_timeout: "Antigravity CLI did not finish within 5 minutes. Try a shorter request or a lower reasoning effort.",
+  local_tool_attempt: "Antigravity CLI tried to use its own tools, so the turn was stopped. Retry; if it repeats, start a new task.",
+  invalid_response_json: "Antigravity CLI returned an invalid JSON reply. No tool calls from this turn were forwarded.",
+  invalid_tool_call_json: "Antigravity CLI returned malformed host tool call JSON. No tool calls from this turn were forwarded.",
+  extra_response_content: "Antigravity CLI sent extra content after its JSON reply. No tool calls from this turn were forwarded.",
+  invalid_response_format: "Antigravity CLI returned a reply or tool call that did not match the host settings. No tool calls from this turn were forwarded.",
+  stream_changed: "The completed Antigravity CLI reply did not match the streamed text. Start a new task if it repeats.",
+  rate_limited: "Antigravity CLI reported a quota or rate limit (429). Try again later.",
+  auth_required: "Antigravity CLI reported that sign-in is required. Open agy and sign in, then retry.",
+  permission_denied: "Antigravity CLI reported that access was denied. Check the account's access to this model.",
+  policy_rejected: "Antigravity CLI reported a policy rejection.",
+  response_too_large: "The Antigravity CLI reply exceeded the router's size limit. Try a shorter request.",
+};
 
 function divergence(history, incoming) {
   if (incoming.length <= history.length) return { reason: "shorter", history: history.length, incoming: incoming.length };
@@ -19452,7 +19561,7 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
           send({ choices: [{ index: 0, delta: { reasoning_content: delta } }] });
         } else if (update.sessionUpdate === "agent_message_chunk") {
           raw += delta;
-          if (raw.length > 16 * 1024 * 1024) { abort(); return; }
+          if (raw.length > 16 * 1024 * 1024) { abort("response_limit"); return; }
           const text = envelopeText(raw);
           if (text.length > sent.length) {
             send({ choices: [{ index: 0, delta: { content: text.slice(sent.length) } }] });
@@ -19475,9 +19584,10 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
         if (violation) throw Error("Antigravity attempted a local action");
         if (result?.stopReason !== "end_turn") throw Error("Antigravity turn ended early: " + result?.stopReason);
         stage = "parse_response";
-        const message = chatMessage(raw, request);
+        const { message, recovered } = chatMessage(raw, request);
         stage = "stream_consistency";
         if (!message.content.startsWith(sent)) throw Error("Antigravity response changed during streaming");
+        if (recovered) logSession("envelope-recovered", { responseChars: raw.length, emittedChars: sent.length });
         stage = "emit_final";
         send({ choices: [{ index: 0, delta: { ...message, content: message.content.slice(sent.length) },
           finish_reason: message.tool_calls ? "tool_calls" : "stop" }] });
@@ -19497,11 +19607,9 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
           elapsedMs: Date.now() - startedAt, responseChars: raw.length, emittedChars: sent.length, reasoningChunks });
         closeSession(key, session);
         if (!signal?.aborted) {
-          const message = violation
-            ? "Antigravity CLI tried to use its own tools, so the turn was stopped. Retry; if it repeats, start a new task."
-            : "Antigravity CLI turn failed. Check CLI login, quota and compatibility.";
-          const limited = !violation && kind === "rate_limited";
-          try { send({ error: limited ? { code: "rate_limit_exceeded", message: "Antigravity CLI reported a quota or rate limit (429). Try again later." } : { message } }); controller.close(); } catch { /* canceled */ }
+          const code = kind === "rate_limited" ? "rate_limit_exceeded" : kind;
+          const message = turnFailureMessages[kind] || "Antigravity CLI turn failed. Check the router log for its failure stage.";
+          try { send({ error: { code, message } }); controller.close(); } catch { /* canceled */ }
         } else { try { controller.error(Error("Request aborted")); } catch { /* canceled */ } }
       }).finally(() => {
         clearTimeout(timeout);
