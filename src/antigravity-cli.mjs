@@ -201,6 +201,29 @@ function logSession(event, detail = {}) {
   process.stderr.write("model-router-antigravity:" + event + " " + JSON.stringify(detail) + "\n");
 }
 
+// Only fixed categories reach router.err.log. ACP errors can echo request content, so never
+// record an exception message, response text, tool arguments, or a raw stop reason here.
+export function antigravityFailureKind(error, { stage, abortReason, closeReason } = {}) {
+  if (abortReason === "timeout") return "turn_timeout";
+  if (abortReason === "local_tool") return "local_tool_attempt";
+  if (abortReason === "cancelled") return "request_cancelled";
+  if (closeReason === "invalid_json") return "acp_invalid_json";
+  if (closeReason === "buffer_limit") return "acp_buffer_limit";
+  if (closeReason === "stdin_error") return "acp_stdin_error";
+  if (closeReason === "process_error") return "acp_process_error";
+  if (closeReason === "process_exit") return "acp_process_exit";
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (/\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b/i.test(message)) return "rate_limited";
+  if (/\bUNAUTHENTICATED\b|\b(?:HTTP|code)\s+401\b/i.test(message)) return "auth_required";
+  if (/\bPERMISSION_DENIED\b|\b(?:HTTP|code)\s+403\b/i.test(message)) return "permission_denied";
+  if (/\bSAFETY\b|\bpolicy.violation\b|\bblocked.by.policy\b/i.test(message)) return "policy_rejected";
+  if (stage === "stop_reason") return "early_stop";
+  if (stage === "parse_response") return error instanceof SyntaxError ? "invalid_response_json" : "invalid_response_format";
+  if (stage === "stream_consistency") return "stream_changed";
+  if (stage === "set_model" || stage === "prompt") return "acp_request_failed";
+  return "unexpected_failure";
+}
+
 function divergence(history, incoming) {
   if (incoming.length <= history.length) return { reason: "shorter", history: history.length, incoming: incoming.length };
   const index = history.findIndex((message, position) => !isDeepStrictEqual(incoming[position], message));
@@ -227,11 +250,12 @@ function startAcp(binary, directory) {
     stdio: ["pipe", "pipe", "pipe"] });
   const pending = new Map();
   let nextId = 0, buffer = "";
-  const client = { closed: false, onUpdate: null, onViolation: null };
+  const client = { closed: false, closeReason: null, exitCode: null, onUpdate: null, onViolation: null };
   const reply = (id, payload) => { if (!client.closed) child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, ...payload }) + "\n"); };
-  client.close = () => {
+  client.close = (reason = "requested") => {
     if (client.closed) return;
     client.closed = true;
+    client.closeReason = reason;
     child.kill("SIGKILL");
     for (const request of pending.values()) request.reject(Error("Antigravity CLI session ended"));
     pending.clear();
@@ -243,19 +267,22 @@ function startAcp(binary, directory) {
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
   });
   child.stderr.resume();
-  child.stdin.on("error", client.close);
-  child.on("error", client.close);
-  child.on("close", client.close);
+  child.stdin.on("error", () => client.close("stdin_error"));
+  child.on("error", () => client.close("process_error"));
+  child.on("close", code => {
+    client.exitCode = Number.isInteger(code) ? code : null;
+    client.close("process_exit");
+  });
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", chunk => {
     buffer += chunk;
-    if (buffer.length > 16 * 1024 * 1024) { client.close(); return; }
+    if (buffer.length > 16 * 1024 * 1024) { client.close("buffer_limit"); return; }
     let end;
     while ((end = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
       if (!line.trim()) continue;
       let message;
-      try { message = JSON.parse(line); } catch { client.close(); return; }
+      try { message = JSON.parse(line); } catch { client.close("invalid_json"); return; }
       if (message.method === "session/update") {
         client.onUpdate?.(message.params?.update);
       } else if (message.method) {
@@ -270,7 +297,8 @@ function startAcp(binary, directory) {
       } else if (pending.has(message.id)) {
         const request = pending.get(message.id);
         pending.delete(message.id);
-        if (message.error) request.reject(Error(message.error.message || "Antigravity CLI request failed"));
+        if (message.error) request.reject(Object.assign(Error(message.error.message || "Antigravity CLI request failed"),
+          { acpCode: Number.isInteger(message.error.code) ? message.error.code : null }));
         else request.resolve(message.result ?? {});
       }
     }
@@ -304,7 +332,9 @@ function findResumable(key) {
 async function openSession(binary, record, system) {
   const directory = await sharedWorkspace();
   let client;
-  const timer = setTimeout(() => client?.close(), 60000);
+  let stage = "initialize";
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; client?.close("timeout"); }, 60000);
   try {
     client = startAcp(binary, directory);
     const init = await client.call("initialize", { protocolVersion: 1,
@@ -316,10 +346,12 @@ async function openSession(binary, record, system) {
     const meta = text => ({ _meta: { antigravity: { systemPrompt: { append: text } } } });
     let result = null;
     if (record && capabilities.sessionCapabilities?.resume) {
+      stage = "resume";
       result = await client.call("session/resume", { sessionId: record.sessionId, cwd: directory, mcpServers: [],
         ...meta(record.system) }).catch(() => null);
     }
     const resumed = Boolean(result);
+    stage = "new";
     if (!result) result = await client.call("session/new", { cwd: directory, mcpServers: [], ...meta(system) });
     const sessionId = result.sessionId || (resumed ? record.sessionId : null);
     if (!sessionId) throw Error("Antigravity CLI did not create a session");
@@ -329,6 +361,8 @@ async function openSession(binary, record, system) {
       model: null, history: resumed ? record.history : [], settings: resumed ? record.settings : null,
       system: resumed ? record.system : system, busy: false, closed: false, timer: null };
   } catch (error) {
+    logSession("init-failed", { stage, kind: antigravityFailureKind(error, { stage, abortReason: timedOut ? "timeout" : null,
+      closeReason: client?.closeReason }), acpCode: error?.acpCode ?? null, exitCode: client?.exitCode ?? null });
     client?.close();
     throw error;
   } finally { clearTimeout(timer); }
@@ -422,22 +456,31 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
   session.busy = true;
   const { client } = session;
   const encoder = new TextEncoder();
-  const abort = () => closeSession(key, session);
+  let abortReason = null;
+  const abort = (reason = "cancelled") => {
+    abortReason ||= reason;
+    closeSession(key, session);
+  };
+  const onAbort = () => abort("cancelled");
   const stream = new ReadableStream({
     start(controller) {
       const send = chunk => controller.enqueue(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
       let raw = "", sent = "", violation = null;
-      const timeout = setTimeout(abort, 300000);
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted) abort();
-      client.onViolation = method => { violation ||= method; abort(); };
+      let stage = session.model === model ? "prompt" : "set_model";
+      let reasoningChunks = 0, stopReason = null;
+      const startedAt = Date.now();
+      const timeout = setTimeout(() => abort("timeout"), 300000);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      client.onViolation = method => { violation ||= method; abort("local_tool"); };
       client.onUpdate = update => {
         if (update?.sessionUpdate === "tool_call" || update?.sessionUpdate === "tool_call_update") {
-          violation ||= "tool:" + (update.name || update.title || "unknown"); abort(); return;
+          violation ||= "tool"; abort("local_tool"); return;
         }
         const delta = typeof update?.content?.text === "string" ? update.content.text : "";
         if (!delta) return;
         if (update.sessionUpdate === "agent_thought_chunk") {
+          reasoningChunks += 1;
           send({ choices: [{ index: 0, delta: { reasoning_content: delta } }] });
         } else if (update.sessionUpdate === "agent_message_chunk") {
           raw += delta;
@@ -455,13 +498,19 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
           await client.call("session/set_model", { sessionId: session.sessionId, modelId: model });
           session.model = model;
         }
+        stage = "prompt";
         return client.call("session/prompt", { sessionId: session.sessionId, prompt: blocks });
       })();
       task.then(result => {
+        stage = "stop_reason";
+        stopReason = ["end_turn", "cancelled", "error", "max_turns"].includes(result?.stopReason) ? result.stopReason : "other";
         if (violation) throw Error("Antigravity attempted a local action");
         if (result?.stopReason !== "end_turn") throw Error("Antigravity turn ended early: " + result?.stopReason);
+        stage = "parse_response";
         const message = chatMessage(raw, request);
+        stage = "stream_consistency";
         if (!message.content.startsWith(sent)) throw Error("Antigravity response changed during streaming");
+        stage = "emit_final";
         send({ choices: [{ index: 0, delta: { ...message, content: message.content.slice(sent.length) },
           finish_reason: message.tool_calls ? "tool_calls" : "stop" }] });
         const usage = result.usage;
@@ -475,17 +524,20 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       }).catch(error => {
+        const kind = antigravityFailureKind(error, { stage, abortReason, closeReason: client.closeReason });
+        logSession("turn-failed", { stage, kind, stopReason, acpCode: error?.acpCode ?? null, exitCode: client.exitCode,
+          elapsedMs: Date.now() - startedAt, responseChars: raw.length, emittedChars: sent.length, reasoningChunks });
         closeSession(key, session);
         if (!signal?.aborted) {
           const message = violation
             ? "Antigravity CLI tried to use its own tools, so the turn was stopped. Retry; if it repeats, start a new task."
             : "Antigravity CLI turn failed. Check CLI login, quota and compatibility.";
-          const limited = !violation && /\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b/i.test(error?.message || "");
+          const limited = !violation && kind === "rate_limited";
           try { send({ error: limited ? { code: "rate_limit_exceeded", message: "Antigravity CLI reported a quota or rate limit (429). Try again later." } : { message } }); controller.close(); } catch { /* canceled */ }
         } else { try { controller.error(Error("Request aborted")); } catch { /* canceled */ } }
       }).finally(() => {
         clearTimeout(timeout);
-        signal?.removeEventListener("abort", abort);
+        signal?.removeEventListener("abort", onAbort);
         client.onUpdate = null;
         client.onViolation = null;
         session.busy = false;
@@ -495,7 +547,7 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
         session.timer.unref?.();
       });
     },
-    cancel: abort,
+    cancel: onAbort,
   });
   return new Response(stream, { headers: { "content-type": "text/event-stream" } });
 }
