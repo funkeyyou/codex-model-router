@@ -35,6 +35,7 @@ export const SECTIONS = [
   { marker: "__CODEX_MODEL_ROUTER_IMAGEGEN_JS__", file: "imagegen.mjs" },
   { marker: "__CODEX_MODEL_ROUTER_CLAUDE_CLI_JS__", file: "claude-cli.mjs" },
   { marker: "__CODEX_MODEL_ROUTER_CLAUDE_DESKTOP_JS__", file: "claude-desktop.mjs" },
+  { marker: "__CODEX_MODEL_ROUTER_AGY_JS__", file: "antigravity-cli.mjs" },
   // 網頁管理介面：伺服器端模組與頁面。安裝器執行 ui 命令時才取出來用，不會寫進路由器目錄。
   { marker: "__CODEX_MODEL_ROUTER_MANAGER_JS__", file: "manager.mjs" },
   { marker: "__CODEX_MODEL_ROUTER_MANAGER_HTML__", file: "manager.html" },

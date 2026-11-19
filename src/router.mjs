@@ -50,6 +50,10 @@ const providerById = new Map(providers.map((provider) => [provider.id, provider]
 const primaryProvider = providers[0] || null;
 const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route]));
 
+function isLocalCli(route) {
+  return route?.transport === "claude-cli" || route?.transport === "antigravity-cli";
+}
+
 export function providerForRoute(route, registry = providerById) {
   const id = route?.providerId || DEFAULT_PROVIDER_ID;
   const provider = registry.get(id);
@@ -1217,7 +1221,7 @@ export function usageRecord(context, event, now = Date.now()) {
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
     durationMs, firstTextMs, firstOutputMs, hasText,
-    outputTps: hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
+    outputTps: !context.bufferedOutput && hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
     cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
@@ -1442,7 +1446,7 @@ function contextProvider(context) {
   const route = typeof context.model === "string" ? routeMap.get(context.model) : null;
   // 未配置或已刪除的自訂模型不屬於任何供應商，不能記成主要供應商。
   if (!route && typeof context.model === "string" && context.model.startsWith("custom/")) return null;
-  if (route?.transport === "claude-cli") return null;
+  if (isLocalCli(route)) return null;
   return (route && providerById.get(route.providerId || DEFAULT_PROVIDER_ID)) || primaryProvider;
 }
 
@@ -2297,7 +2301,7 @@ export async function fetchModelUpstream(
     stats.quotaModeRequests += 1;
     if (!isCustom) throw rejectQuotaModeOfficial();
   }
-  const provider = isCustom && route.transport !== "claude-cli" ? providerForRoute(route) : null;
+  const provider = isCustom && !isLocalCli(route) ? providerForRoute(route) : null;
   rememberRoute(requestHeaders, route);
 
   // HTTP 回退與第三方上游不保證支援 previous_response_id，從對應的成功回合重播。
@@ -2324,7 +2328,7 @@ export async function fetchModelUpstream(
   meta.history.recoveryIds = historyRecoveryCandidates(body, requestHeaders);
   meta.history.usage = usageContext({
     requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
-    provider: route?.transport === "claude-cli" ? "claude-cli" : provider?.id ?? null,
+    provider: isLocalCli(route) ? route.transport : provider?.id ?? null,
     transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null, startedAt,
   });
 
@@ -2437,6 +2441,24 @@ export async function fetchModelUpstream(
       const chatBody = Buffer.from(JSON.stringify(chatRequest));
       if (upstreamRequestTooLarge(chatBody.length)) {
         return oversizeResponse(chatBody.length);
+      }
+      if (chatRoute.transport === "antigravity-cli") {
+        const { fetchAntigravityChat } = await import("./antigravity-cli.mjs");
+        let textDeltas = 0;
+        meta.history.usage.bufferedOutput = true;
+        const translated = await fetchAntigravityChat(chatRequest, chatRoute, settings.antigravityCli?.binary,
+          translatedInput.reasoning?.effort, signal, meta.historyKey, () => {
+            textDeltas += 1;
+            if (textDeltas > 1) meta.history.usage.bufferedOutput = false;
+          });
+        stats.lastCustomStatus = translated.status;
+        stats.lastProvider = chatRoute.transport;
+        if (translated.status >= 400) {
+          const error = (await translated.clone().json()).error;
+          recordRouterError(new RouterRequestError(translated.status, "antigravity_cli_error", error.message, "upstream"),
+            { transport: meta.transport, route: "custom", model: body.model });
+        }
+        return translated;
       }
       const translated = await fetchCustom(
         provider,
@@ -3539,7 +3561,7 @@ function recordClaudeBridgeFailure(event, meta) {
     at: new Date().toISOString(),
     model: typeof meta.model === "string" ? meta.model.slice(0, 160) : null,
     transport: meta.transport || null,
-    provider: route?.transport === "claude-cli" ? "claude-cli" : route?.providerId || null,
+    provider: isLocalCli(route) ? route.transport : route?.providerId || null,
     kind: meta.claudeFailureKind || "upstream_error",
     ...meta.claudeFailureDiagnostic,
   };

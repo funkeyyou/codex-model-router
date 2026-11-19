@@ -25,6 +25,7 @@ It is a small router that runs on your computer (a local LLM proxy) with a web m
 - **Web manager**: add or remove models, manage providers and API keys, and update in one click from your browser.
 - **Official model visibility**: hide or restore official models under **Codex settings → Hide official models in the picker** when signed in with ChatGPT. This option is disabled in API key mode.
 - **Optional**: relay image generation and Claude Code subscription routing.
+- **Antigravity CLI**: install `agy` and sign in, then select Antigravity CLI under “Add provider” or “Add model” in the manager. Available reasoning levels are grouped by model and selectable in Codex. Supports text, Codex tool calls, continuing conversations and per-turn cache usage. Image input is currently unsupported; cache hits depend on the upstream service.
 - **Claude Desktop integration**: use “Claude → Claude Desktop” to connect your Claude API models or restore the previous configuration in one click. Settings are backed up; chats and unrelated preferences are preserved. GPT and CLI subscription routes are not supported in Claude Desktop yet. [Setup and limitations](docs/claude-desktop.md)
 
 ## Install

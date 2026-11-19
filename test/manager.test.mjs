@@ -399,8 +399,8 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   const jobTypes = new Set([...managerPage.matchAll(/runJob\("([a-z-]+)"/g)].map((match) => match[1]));
   jobTypes.add("update");
   jobTypes.add("apply-update");
-  assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "apply-update", "chatgpt-login", "claude-cli-add", "claude-cli-install",
-    "claude-cli-login", "claude-cli-update", "connect-claude-desktop", "connect-codex", "detect-fast", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-claude", "remove-backup-key", "remove-models",
+  assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "antigravity-add", "apply-update", "chatgpt-login", "claude-cli-add", "claude-cli-install",
+    "claude-cli-login", "claude-cli-update", "connect-claude-desktop", "connect-codex", "detect-fast", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-antigravity", "install-claude", "remove-backup-key", "remove-models",
     "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "restore-claude-desktop",
     "set-background-model", "set-claude-desktop", "set-global-context", "set-hidden-models", "set-keysmith", "set-official-model-visibility", "set-quota-mode",
     "set-tool-output-budget", "set-upstream-image-guard",
@@ -408,7 +408,7 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   // 頁面用到的查詢都要是安裝器提供的。
   const queryTypes = new Set([...managerPage.matchAll(/(?:ensureQuery|refreshButton|reloadQuery)\("([a-z-]+)"/g)].map((match) => match[1]));
   for (const match of managerPage.matchAll(/type: "([a-z-]+)" \} \}\)/g)) queryTypes.add(match[1]);
-  assert.deepEqual([...queryTypes].sort(), ["claude-cli", "claude-cli-models", "claude-desktop", "claude-desktop-connection", "diagnostics", "global-context", "hidden-models", "imagegen",
+  assert.deepEqual([...queryTypes].sort(), ["antigravity-models", "claude-cli", "claude-cli-models", "claude-desktop", "claude-desktop-connection", "diagnostics", "global-context", "hidden-models", "imagegen",
     "provider-preview", "tool-output-budget"]);
 });
 

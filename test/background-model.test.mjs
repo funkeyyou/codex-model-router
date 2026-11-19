@@ -93,6 +93,9 @@ test("使用記錄：完成、失敗與沒有用量的終止事件都記成一�
   assert.equal(failed.error, "rate_limit_exceeded");
   assert.equal(failed.hasUsage, false);
   assert.equal(failed.outputTps, null);
+  assert.equal(router.usageRecord({ ...context, bufferedOutput: true }, {
+    type: "response.completed", response: { usage: { output_tokens: 50 } },
+  }, 3500).outputTps, null, "buffered CLI replies must not report a fabricated generation speed");
   assert.equal(router.usageRecord({ ...context, firstTextAt: 3500 }, { type: "response.completed", response: { usage: { output_tokens: 50 } } }, 3500).outputTps, null);
   assert.equal(router.usageRecord(context, { type: "response.output_text.delta" }), null);
 });

@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.17";
+const INSTALLER_VERSION = "1.44.18";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -218,6 +218,7 @@ const routerPath = join(installRoot, "router.mjs");
 const bridgePath = join(installRoot, "claude-bridge.mjs");
 const chatBridgePath = join(installRoot, "chat-bridge.mjs");
 const claudeCliPath = join(installRoot, "claude-cli.mjs");
+const agyPath = join(installRoot, "antigravity-cli.mjs");
 const claudeDesktopPath = join(installRoot, "claude-desktop.mjs");
 const claudeDesktopConfigPath = join(installRoot, "claude-desktop.json");
 const claudeDesktopBackupPath = join(backupsRoot, "claude-desktop-active.json");
@@ -787,17 +788,20 @@ function writeBridgeSources() {
   chmodSync(chatBridgePath, 0o600);
   writeFileSync(claudeCliPath, loadClaudeCliSource(), { mode: 0o600 });
   chmodSync(claudeCliPath, 0o600);
+  writeFileSync(agyPath, loadAntigravitySource(), { mode: 0o600 });
   writeFileSync(claudeDesktopPath, loadClaudeDesktopSource(), { mode: 0o600 });
   chmodSync(claudeDesktopPath, 0o600);
 }
 
 function backupChatBridge(directory) {
+  copyIfExists(agyPath, join(directory, "antigravity-cli.mjs"));
   copyIfExists(chatBridgePath, join(directory, "chat-bridge.mjs"));
   copyIfExists(claudeCliPath, join(directory, "claude-cli.mjs"));
   copyIfExists(claudeDesktopPath, join(directory, "claude-desktop.mjs"));
 }
 
 function restoreChatBridge(directory) {
+  if (!copyIfExists(join(directory, "antigravity-cli.mjs"), agyPath)) rmSync(agyPath, { force: true });
   if (!copyIfExists(join(directory, "chat-bridge.mjs"), chatBridgePath)) rmSync(chatBridgePath, { force: true });
   if (!copyIfExists(join(directory, "claude-cli.mjs"), claudeCliPath)) rmSync(claudeCliPath, { force: true });
   if (!copyIfExists(join(directory, "claude-desktop.mjs"), claudeDesktopPath)) rmSync(claudeDesktopPath, { force: true });
@@ -825,8 +829,17 @@ export function loadClaudeDesktopSource(sourcePath = scriptPath) {
   const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
   const marker = "\n__CODEX_MODEL_ROUTER_CLAUDE_DESKTOP_JS__\n";
   const start = source.indexOf(marker);
-  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_MANAGER_JS__");
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_AGY_JS__");
   if (start < 0 || end <= start) fail("Missing Claude Desktop gateway payload.");
+  return source.slice(start + marker.length, end) + "\n";
+}
+
+export function loadAntigravitySource(sourcePath = scriptPath) {
+  const source = readFileSync(sourcePath, "utf8").replaceAll("\r\n", "\n");
+  const marker = "\n__CODEX_MODEL_ROUTER_AGY_JS__\n";
+  const start = source.indexOf(marker);
+  const end = source.lastIndexOf("\n__CODEX_MODEL_ROUTER_MANAGER_JS__");
+  if (start < 0 || end <= start) fail("Missing Antigravity CLI payload.");
   return source.slice(start + marker.length, end) + "\n";
 }
 
@@ -2059,7 +2072,7 @@ function fixedReasoningEffort(model) {
 }
 
 function normalizeFixedReasoningRoute(route) {
-  if (!fixedReasoningEffort(route.upstreamModel)) return route;
+  if (route.transport === "antigravity-cli" || !fixedReasoningEffort(route.upstreamModel)) return route;
   const updated = { ...route, efforts: [], stripReasoning: true, fixedReasoning: true };
   delete updated.effortsManual;
   return updated;
@@ -2079,7 +2092,7 @@ export const DEFAULT_PROVIDER_ID = "default";
 export const CLAUDE_CLI_PROVIDER_ID = "claude-cli";
 const LEGACY_PROVIDER_FIELDS = ["apiRoot", "baseUrl", "keychainService", "keychainAccount", "credentialPath"];
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
-const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official", CLAUDE_CLI_PROVIDER_ID]);
+const RESERVED_PROVIDER_IDS = new Set([DEFAULT_PROVIDER_ID, "api", "custom", "official", CLAUDE_CLI_PROVIDER_ID, "antigravity-cli"]);
 
 function providerRecord(source, id) {
   return {
@@ -2624,6 +2637,7 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // 路由器讀取的每一個可調設定都要列在這裡；test/settings-keys.test.mjs 會核對。
 export const preservedSettingKeys = [
   "claudeCli",
+  "antigravityCli",
   // false 時路由器不寫 usage.jsonl（使用記錄）。
   "usageLog",
   "authProbeGraceMs",
@@ -2762,7 +2776,7 @@ export function mergeAddedModels(officialModels, current, routes, newRoutes) {
 // 在管理頁手動開啟（route.fast === true）才顯示；路由器只對這些路由轉送 service_tier。
 // Claude API 路由不支援。
 export function fastConfigurable(route) {
-  return Boolean(route) && route.transport !== "claude-cli" && route.translate !== "anthropic";
+  return Boolean(route) && route.transport !== "antigravity-cli" && route.transport !== "claude-cli" && route.translate !== "anthropic";
 }
 
 export function customSpeedTiers(route) {
@@ -2788,14 +2802,26 @@ export function refreshCustomCatalogCapabilities(catalog, routes) {
     const route = bySlug.get(model.slug);
     if (!route) return model;
     const tiers = customSpeedTiers(route);
-    const effortFields = fixedReasoningEffort(route.upstreamModel) ? catalogEffortFields([]) : {};
+    const effortFields = route.transport === "antigravity-cli" ? catalogEffortFields(route.efforts)
+      : fixedReasoningEffort(route.upstreamModel) ? catalogEffortFields([]) : {};
+    const instructions = modelIdentityInstructions(model.base_instructions, route);
     const tiersMatch = isDeepStrictEqual(model.additional_speed_tiers ?? [], tiers.additional_speed_tiers)
       && isDeepStrictEqual(model.service_tiers ?? [], tiers.service_tiers);
-    if (tiersMatch && Object.entries(effortFields).every(([key, value]) => isDeepStrictEqual(model[key], value))) return model;
+    if (tiersMatch && instructions === model.base_instructions
+      && Object.entries(effortFields).every(([key, value]) => isDeepStrictEqual(model[key], value))) return model;
     changed = true;
-    return { ...model, ...tiers, ...effortFields };
+    return { ...model, ...tiers, ...effortFields, ...(instructions === undefined ? {} : { base_instructions: instructions }) };
   });
   return changed ? { ...catalog, models } : catalog;
+}
+
+// 模板的模型身分改用上游 ID。只調整已知開場，不替換使用者另外寫的指令。
+const MODEL_IDENTITY = /^You are Codex, (?:a coding agent|an agent based on [^\r\n]+?)\.(?= You and the user|$)/;
+
+function modelIdentityInstructions(instructions, route) {
+  const model = String(route.upstreamModel || "").split("/").at(-1);
+  if (typeof instructions !== "string" || !model) return instructions;
+  return instructions.replace(MODEL_IDENTITY, () => `You are Codex, an agent based on ${model}.`);
 }
 
 export function orderCustomModelsByDiscovery(officialModels, customModels, routes, discoveredModels) {
@@ -3095,7 +3121,7 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
 }
 
 export function effortsConfigurable(route) {
-  return route?.transport !== "claude-cli" && !fixedReasoningEffort(route?.upstreamModel);
+  return route?.transport !== "antigravity-cli" && route?.transport !== "claude-cli" && !fixedReasoningEffort(route?.upstreamModel);
 }
 
 function catalogEffortFields(efforts) {
@@ -3153,7 +3179,8 @@ export function customCatalogEntry(officialModels, route, index) {
   entry.slug = route.pickerSlug;
   entry.display_name = withDefaultModelPrefix(route).displayName;
   entry.description = `${route.upstreamModel}，由 ${route.providerHost} 提供`;
-  Object.assign(entry, catalogEffortFields(fixedReasoningEffort(route.upstreamModel) ? [] : route.efforts));
+  if (entry.base_instructions !== undefined) entry.base_instructions = modelIdentityInstructions(entry.base_instructions, route);
+  Object.assign(entry, catalogEffortFields(route.transport !== "antigravity-cli" && fixedReasoningEffort(route.upstreamModel) ? [] : route.efforts));
   entry.priority =
     Math.max(0, ...officialModels.map((model) => Number(model.priority || 0))) +
     index +
@@ -3163,6 +3190,10 @@ export function customCatalogEntry(officialModels, route, index) {
   Object.assign(entry, customSpeedTiers(route));
   entry.availability_nux = null;
   entry.upgrade = null;
+  if (route.transport === "antigravity-cli") {
+    entry.input_modalities = ["text"];
+    entry.supports_parallel_tool_calls = true;
+  }
   entry.supports_search_tool = false;
   delete entry.web_search_tool_type;
   // 只有 Chat Completions 的模型改用一般函式工具，不用 Code Mode：Code Mode 要模型把整段
@@ -5714,13 +5745,14 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
   const routes = settings.routes.map(updateRoute);
   const providers = installedProviders(settings, manifest);
   // 只連接 Claude 訂閱時沒有 API 供應商，路由仍完整。
-  if (providers.length === 0 && !settings.claudeCli?.binary &&
+  if (providers.length === 0 && !settings.claudeCli?.binary && !settings.antigravityCli?.binary &&
       !(Array.isArray(settings.providers) && Array.isArray(settings.routes) && settings.routes.length === 0)) {
     return { ok: false, reason: "no-providers" };
   }
   const providerIds = new Set(providers.map((provider) => provider.id));
   if (routes.some((route) => route.transport === "claude-cli"
     ? route.translate !== "anthropic" || !settings.claudeCli?.binary
+    : route.transport === "antigravity-cli" ? route.translate !== "chat" || !settings.antigravityCli?.binary
     : !providerIds.has(routeProviderId(route)))) {
     return { ok: false, reason: "unknown-provider" };
   }
@@ -7425,6 +7457,7 @@ async function routerHealth(port) {
 }
 
 function routeTransport(route) {
+  if (route.transport === "antigravity-cli") return route.transport;
   if (route.transport === "claude-cli") return "claude-cli";
   if (route.translate === "anthropic") return "anthropic";
   if (route.translate === "chat") return "chat";
@@ -7513,7 +7546,8 @@ async function managerState() {
       fastProbe: typeof route.fastProbe === "string" ? route.fastProbe : null,
       fastManual: route.fastManual === true,
       effortsConfigurable: effortsConfigurable(route),
-      fixedEffort: fixedReasoningEffort(route.upstreamModel),
+      fixedEffort: route.transport === "antigravity-cli"
+        ? (route.efforts.length ? null : fixedReasoningEffort(route.defaultCliModel)) : fixedReasoningEffort(route.upstreamModel),
       effortsManual: route.effortsManual === true,
       inCatalog: Boolean(entry),
     };
@@ -7852,6 +7886,7 @@ export async function collectDiagnostics() {
     files: {
       "router.mjs": diagnosticFile(routerPath), "claude-bridge.mjs": diagnosticFile(bridgePath),
       "chat-bridge.mjs": diagnosticFile(chatBridgePath), "claude-cli.mjs": diagnosticFile(claudeCliPath),
+      "antigravity-cli.mjs": diagnosticFile(agyPath),
       "settings.json": diagnosticFile(settingsPath), "models.json": diagnosticFile(catalogPath),
       "install.json": diagnosticFile(manifestPath), "key-pool.json": diagnosticFile(keyPoolPath),
       "router.err.log": diagnosticFile(logPath),
@@ -9469,6 +9504,75 @@ async function managerImagegenDisable() {
 
 const CLAUDE_CLI_MODEL_PATTERN = /^(?:opus|sonnet|haiku|fable|claude-[a-zA-Z0-9._-]+)$/;
 
+export function antigravityModelGroups(output) {
+  const groups = new Map();
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^([a-z0-9][a-z0-9._-]*)\t(.+)$/.exec(line.trim());
+    if (!match) continue;
+    const [, slug, label] = match;
+    const tier = /-(low|medium|high|xhigh|max)$/.exec(slug)?.[1];
+    const id = tier ? slug.slice(0, -tier.length - 1) : slug;
+    const group = groups.get(id) || { id, label: label.replace(/ \((?:low|medium|high|xhigh|max)\)$/i, ""), effortModels: {}, defaultCliModel: null };
+    if (tier) group.effortModels[tier] = slug;
+    else group.defaultCliModel = slug;
+    groups.set(id, group);
+  }
+  return [...groups.values()].map(group => {
+    const efforts = EFFORTS.filter(effort => group.effortModels[effort]);
+    return { ...group, efforts, defaultCliModel: group.defaultCliModel || group.effortModels[defaultEffort(efforts)] };
+  });
+}
+
+async function managerAntigravityModels() {
+  const name = isWindows ? "agy.exe" : "agy";
+  const binary = findExecutable([readSettingsIfExists()?.antigravityCli?.binary,
+    join(homeDir, ".local", "bin", name), commandPath(name)]);
+  if (!binary) fail("Install Antigravity CLI and sign in with agy first.");
+  const result = await commandOutput(binary, ["models"]);
+  const groups = antigravityModelGroups(result.stdout);
+  if (result.status !== 0 || !groups.length) fail("Antigravity CLI returned no models. Check agy models and sign in again.");
+  return { binary, groups };
+}
+
+async function managerAntigravityAdd({ models, firstInstall = false } = {}) {
+  if (firstInstall && readManifest()) fail("請重新整理管理頁。");
+  if (!firstInstall) assertManagerWritable();
+  const { binary, groups } = await managerAntigravityModels();
+  if (!Array.isArray(models) || !models.length || models.some(id => !groups.some(group => group.id === id)))
+    fail("模型清單已變更，請重新選擇。");
+  const login = firstInstall ? await withCodexLock(() => verifyLogin()) : null;
+  if (firstInstall) await install({ bare: true });
+  const state = requireInstallation();
+  if (state.providers.some(p => p.id === "antigravity-cli")) fail("Antigravity CLI provider ID already in use.");
+  const selected = groups.filter(group => models.includes(group.id));
+  const added = selected.map(({ id, efforts, effortModels, defaultCliModel }) => {
+    const previous = state.settings.routes.find(route => route.transport === "antigravity-cli" && route.upstreamModel === id);
+    return { contextWindow: NEW_MODEL_DEFAULTS.contextWindow, ...previous, pickerSlug: previous?.pickerSlug || pickerSlug(id, "antigravity-cli"),
+      displayName: previous?.displayName || "antigravity-cli/" + id, upstreamModel: id, providerId: "antigravity-cli",
+      providerHost: "Antigravity CLI", transport: "antigravity-cli", translate: "chat",
+      efforts: efforts.length > 1 ? efforts : [], effortModels, defaultCliModel };
+  });
+  const slugs = new Set(added.map(route => route.pickerSlug));
+  const routes = [...state.settings.routes.filter(route => !slugs.has(route.pickerSlug)), ...added];
+  const official = state.catalog.models.filter(model => !model.slug.startsWith("custom/"));
+  const priorities = new Map(state.catalog.models.map(model => [model.slug, model.priority]));
+  let priority = Math.max(0, ...priorities.values().map(value => Number(value) || 0));
+  const entries = state.catalog.models.filter(model => !slugs.has(model.slug));
+  for (const [index, route] of added.entries()) {
+    entries.push({ ...customCatalogEntry(official, route, index),
+      priority: priorities.get(route.pickerSlug) ?? ++priority });
+  }
+  const patch = { routes, antigravityCli: { binary } };
+  const backupDir = await commitRouterChange("antigravity-cli", {
+    settings: { ...state.settings, ...patch }, manifest: { ...state.manifest, ...patch },
+    catalog: { ...state.catalog, models: entries }, autoApiKeyMode: true,
+  });
+  if (firstInstall) await enableApiKeyModeIfLoggedOut(login);
+  const names = added.map(route => route.displayName);
+  console.log(`已添加：${names.join("、")}`);
+  return { added: names, backupDir, restartDesktop: codexIntegrationEnabled() };
+}
+
 async function managerClaudeCliStatus() {
   const settings = readSettingsIfExists();
   const routes = (Array.isArray(settings.routes) ? settings.routes : []).filter((route) => route.transport === "claude-cli");
@@ -9738,6 +9842,7 @@ function managerOperations() {
       imagegen: () => managerImagegenStatus(),
       "imagegen-detect": (params) => managerImagegenDetect(params || {}),
       "claude-cli": () => managerClaudeCliStatus(),
+      "antigravity-models": managerAntigravityModels,
       "claude-cli-models": () => managerClaudeCliModels(),
       usage: (params) => managerUsage(params || {}),
       "provider-preview": (params) => managerProviderPreview(params),
@@ -9755,6 +9860,8 @@ function managerOperations() {
       "detect-fast": job("偵測 Fast", managerDetectFast),
       "add-provider": addJob("新增供應商", managerAddProvider),
       install: addJob("首次設定", managerFirstInstall),
+      "install-antigravity": addJob("Antigravity CLI", params => managerAntigravityAdd({ ...params, firstInstall: true })),
+      "antigravity-add": addJob("Antigravity CLI", params => managerAntigravityAdd({ models: params.models })),
       "install-claude": addJob("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
       "edit-provider": job("修改供應商", managerEditProvider),
       "remove-provider": job("移除供應商", managerRemoveProvider),
@@ -10411,6 +10518,10 @@ const providerById = new Map(providers.map((provider) => [provider.id, provider]
 // 第一家是主要供應商：Codex 內建 image_gen 與沒有指定供應商的生圖請求都送到這裡。
 const primaryProvider = providers[0] || null;
 const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route]));
+
+function isLocalCli(route) {
+  return route?.transport === "claude-cli" || route?.transport === "antigravity-cli";
+}
 
 export function providerForRoute(route, registry = providerById) {
   const id = route?.providerId || DEFAULT_PROVIDER_ID;
@@ -11579,7 +11690,7 @@ export function usageRecord(context, event, now = Date.now()) {
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
     durationMs, firstTextMs, firstOutputMs, hasText,
-    outputTps: hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
+    outputTps: !context.bufferedOutput && hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
     cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
@@ -11804,7 +11915,7 @@ function contextProvider(context) {
   const route = typeof context.model === "string" ? routeMap.get(context.model) : null;
   // 未配置或已刪除的自訂模型不屬於任何供應商，不能記成主要供應商。
   if (!route && typeof context.model === "string" && context.model.startsWith("custom/")) return null;
-  if (route?.transport === "claude-cli") return null;
+  if (isLocalCli(route)) return null;
   return (route && providerById.get(route.providerId || DEFAULT_PROVIDER_ID)) || primaryProvider;
 }
 
@@ -12659,7 +12770,7 @@ export async function fetchModelUpstream(
     stats.quotaModeRequests += 1;
     if (!isCustom) throw rejectQuotaModeOfficial();
   }
-  const provider = isCustom && route.transport !== "claude-cli" ? providerForRoute(route) : null;
+  const provider = isCustom && !isLocalCli(route) ? providerForRoute(route) : null;
   rememberRoute(requestHeaders, route);
 
   // HTTP 回退與第三方上游不保證支援 previous_response_id，從對應的成功回合重播。
@@ -12686,7 +12797,7 @@ export async function fetchModelUpstream(
   meta.history.recoveryIds = historyRecoveryCandidates(body, requestHeaders);
   meta.history.usage = usageContext({
     requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
-    provider: route?.transport === "claude-cli" ? "claude-cli" : provider?.id ?? null,
+    provider: isLocalCli(route) ? route.transport : provider?.id ?? null,
     transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null, startedAt,
   });
 
@@ -12799,6 +12910,24 @@ export async function fetchModelUpstream(
       const chatBody = Buffer.from(JSON.stringify(chatRequest));
       if (upstreamRequestTooLarge(chatBody.length)) {
         return oversizeResponse(chatBody.length);
+      }
+      if (chatRoute.transport === "antigravity-cli") {
+        const { fetchAntigravityChat } = await import("./antigravity-cli.mjs");
+        let textDeltas = 0;
+        meta.history.usage.bufferedOutput = true;
+        const translated = await fetchAntigravityChat(chatRequest, chatRoute, settings.antigravityCli?.binary,
+          translatedInput.reasoning?.effort, signal, meta.historyKey, () => {
+            textDeltas += 1;
+            if (textDeltas > 1) meta.history.usage.bufferedOutput = false;
+          });
+        stats.lastCustomStatus = translated.status;
+        stats.lastProvider = chatRoute.transport;
+        if (translated.status >= 400) {
+          const error = (await translated.clone().json()).error;
+          recordRouterError(new RouterRequestError(translated.status, "antigravity_cli_error", error.message, "upstream"),
+            { transport: meta.transport, route: "custom", model: body.model });
+        }
+        return translated;
       }
       const translated = await fetchCustom(
         provider,
@@ -13901,7 +14030,7 @@ function recordClaudeBridgeFailure(event, meta) {
     at: new Date().toISOString(),
     model: typeof meta.model === "string" ? meta.model.slice(0, 160) : null,
     transport: meta.transport || null,
-    provider: route?.transport === "claude-cli" ? "claude-cli" : route?.providerId || null,
+    provider: isLocalCli(route) ? route.transport : route?.providerId || null,
     kind: meta.claudeFailureKind || "upstream_error",
     ...meta.claudeFailureDiagnostic,
   };
@@ -18862,6 +18991,257 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
     }
   };
 }
+__CODEX_MODEL_ROUTER_AGY_JS__
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
+import { isDeepStrictEqual, promisify } from "node:util";
+
+const execute = promisify(execFile);
+const agent = "coding-host";
+const hookCommand = "node deny.cjs";
+const policy = JSON.stringify({ toolPermission: "strict", allowNonWorkspaceAccess: false });
+const instructions = [
+  "Answer the coding agent request encoded as chat messages and host tool definitions.",
+  "Use no local actions. Return one JSON object with text (string) and calls (array).",
+  "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
+  "Request independent actions together when parallel_tool_calls permits. The host executes all calls.",
+  "Use the supplied tool results to continue. For a final answer set calls to [].",
+].join("\n");
+
+// A nonempty, explicit allowlist avoids CLI versions treating an empty list as the default.
+export async function writeAntigravityPolicy(directory) {
+  const root = join(directory, ".agents");
+  await mkdir(join(root, "agents"), { recursive: true });
+  await writeFile(join(root, "agents", agent + ".md"), [
+    "---", "name: " + agent, "description: Respond to the coding agent host", "mainAgent: true",
+    "subagent: false", "tools: [send_message]", 'commandExecutionPolicy: "off"',
+    "inheritMcp: false", "inheritCustomizations: false", "---", instructions,
+  ].join("\n"));
+  await writeFile(join(root, "deny.cjs"), 'process.stdout.write(JSON.stringify({decision:"deny",reason:"The host owns tool execution"}))');
+  await writeFile(join(root, "hooks.json"), JSON.stringify({ [agent]: { enabled: true,
+    PreToolUse: [{ matcher: ".*", hooks: [{ type: "command", command: hookCommand }] }] } }));
+}
+
+// Adapt only instruction prose. User messages, tool names, schemas and results are data
+// and must remain byte-for-byte intact for host calls and history replay.
+export function antigravityPrompt(request) {
+  const messages = request.messages.map(message => {
+    if (!["system", "developer"].includes(message.role)) return message;
+    const replaceName = text => text.replace(/\bYou are Codex\b/gi, "You are a coding agent")
+      .replace(/\bCodex\b/gi, "coding agent");
+    const content = typeof message.content === "string" ? replaceName(message.content)
+      : message.content.map(part => part.type === "text" ? { ...part, text: replaceName(part.text) } : part);
+    return { ...message, content };
+  });
+  const callLimit = request.parallel_tool_calls === false
+    ? "\nReturn at most ONE call this turn, even if the user asks for several. Wait for its result before the next call."
+    : "";
+  return instructions + callLimit + "\n" + JSON.stringify({ ...request, messages });
+}
+
+function chatMessage(raw, request) {
+  const reply = JSON.parse(raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
+  if (typeof reply?.text !== "string" || !Array.isArray(reply.calls)) throw Error("Invalid Antigravity response format");
+  const allowed = new Set(request.tools?.map(tool => tool.function.name));
+  if (request.parallel_tool_calls === false && reply.calls.length > 1) throw Error("Parallel calls disabled");
+  const toolCalls = reply.calls.map(call => {
+    if (!allowed.has(call?.name) || !call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments))
+      throw Error("Invalid Antigravity host tool call");
+    return { id: "call_" + randomUUID(), type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } };
+  });
+  const choice = request.tool_choice;
+  if ((choice === "none" && toolCalls.length) || (choice === "required" && !toolCalls.length) ||
+      (choice?.function && (!toolCalls.length || toolCalls.some(call => call.function.name !== choice.function.name))))
+    throw Error("Antigravity did not respect tool_choice");
+  return { role: "assistant", content: reply.text, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
+}
+
+const sessions = new Map();
+const initializing = new Set();
+const idleMs = 5 * 60 * 1000;
+
+function canonicalMessages(messages) {
+  return messages.map(message => structuredClone({ ...message, content: message.content ?? "" }));
+}
+
+// Only decode the text field at the beginning of the envelope. Calls remain buffered
+// until the entire response has been validated, so partial arguments never execute.
+export function envelopeText(buffer) {
+  const match = /^\s*(?:```json\s*)?\{\s*"text"\s*:\s*"/.exec(buffer);
+  if (!match) return "";
+  let encoded = "";
+  for (let index = match[0].length; index < buffer.length; index += 1) {
+    const char = buffer[index];
+    if (char === '"') break;
+    if (char === "\\") {
+      const length = buffer[index + 1] === "u" ? 6 : 2;
+      if (index + length > buffer.length) break;
+      encoded += buffer.slice(index, index + length);
+      index += length - 1;
+    } else encoded += char;
+  }
+  try { return JSON.parse('"' + encoded + '"'); } catch { return ""; }
+}
+
+async function createSession(binary, model) {
+  const directory = await mkdtemp(join(tmpdir(), "codex-agy-"));
+  const options = { cwd: directory, windowsHide: true,
+    env: { ...process.env, PATH: dirname(process.execPath) + delimiter + (process.env.PATH || "") } };
+  let child;
+  const state = { history: [], usage: {}, busy: false, closed: false, timer: null, pending: null };
+  state.close = () => {
+    if (state.closed) return;
+    state.closed = true;
+    clearTimeout(state.timer);
+    child?.kill("SIGKILL");
+    state.pending?.reject(Error("Antigravity CLI session ended"));
+    state.pending = null;
+    void rm(directory, { recursive: true, force: true, maxRetries: 3 }).catch(() => {});
+  };
+  try {
+    await writeAntigravityPolicy(directory);
+    const base = ["--agent", agent, "--settings", policy, "--model", model];
+    const hooks = await execute(binary, [...base, "-p", "/hooks", "--output-format", "json"], { ...options, timeout: 15000 });
+    const loaded = JSON.parse(hooks.stdout).command?.data?.hooks?.find(h => h.name === agent && h.enabled);
+    if (!loaded || await realpath(loaded.source) !== await realpath(join(directory, ".agents", "hooks.json")) ||
+        !loaded.actions?.some(a => a.event === "PreToolUse" && a.matcher === ".*" && a.command === hookCommand))
+      throw Error("Antigravity CLI tool guard is unavailable");
+    child = spawn(binary, [...base, "--disable-slash-commands", "--input-format", "stream-json",
+      "--output-format", "stream-json", "--print-timeout", "180s"], { ...options, stdio: ["pipe", "pipe", "pipe"] });
+    child.stderr.resume();
+    child.stdin.on("error", state.close);
+    child.on("error", state.close);
+    child.on("close", state.close);
+    child.stdout.setEncoding("utf8");
+    let buffer = "";
+    child.stdout.on("data", chunk => {
+      buffer += chunk;
+      if (buffer.length > 16 * 1024 * 1024) { state.close(); return; }
+      let end;
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+        if (!line.trim()) continue;
+        try {
+          const record = JSON.parse(line);
+          if (record.event === "init") {
+            const init = record.init;
+            if (init?.model !== model || init.agent !== agent || init.permission_mode !== "strict") throw Error("Session mismatch");
+            state.initialized = true;
+          } else if (record.event === "step_update") {
+            if (record.step_update?.step_type === "tool") throw Error("Local tool attempted");
+            state.pending?.onStep(record.step_update);
+          } else if (record.event === "result") {
+            if (!state.initialized || record.result?.status !== "SUCCESS") throw Error("Incomplete turn");
+            const pending = state.pending;
+            state.pending = null;
+            pending?.resolve(record.result);
+          }
+        } catch { state.close(); return; }
+      }
+    });
+    state.ask = (prompt, onStep) => new Promise((resolve, reject) => {
+      state.pending = { resolve, reject, onStep };
+      child.stdin.write(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n");
+    });
+    return state;
+  } catch (error) { state.close(); throw error; }
+}
+
+export function closeAntigravitySessions() {
+  for (const session of sessions.values()) session.close();
+  sessions.clear();
+}
+
+export async function fetchAntigravityChat(request, route, binary, effort, signal, sessionKey = null, onTextDelta = () => {}) {
+  const model = (effort && route.effortModels?.[effort]) || route.defaultCliModel;
+  if (!binary || !model) throw Error("Antigravity CLI model configuration is incomplete");
+  if (request.messages.some(m => Array.isArray(m.content) && m.content.some(part => part.type !== "text")))
+    return Response.json({ error: { message: "Antigravity CLI currently accepts text input only." } }, { status: 422 });
+  const key = JSON.stringify([sessionKey || randomUUID(), binary, model]);
+  const signature = antigravityPrompt({ ...request, messages: [] });
+  const incoming = canonicalMessages(request.messages);
+  if (initializing.has(key)) return Response.json({ error: { message: "Antigravity session is starting." } }, { status: 409 });
+  let session = sessions.get(key);
+  if (session?.busy) return Response.json({ error: { message: "Antigravity conversation already has an active request." } }, { status: 409 });
+  if (session && (session.closed || session.signature !== signature ||
+      !session.history.every((message, index) => isDeepStrictEqual(incoming[index], message)))) {
+    session.close(); sessions.delete(key); session = null;
+  }
+  try {
+    if (!session) {
+      for (const [oldKey, oldSession] of sessions) {
+        if (oldSession.closed) sessions.delete(oldKey);
+      }
+      if (sessions.size >= 16) throw Error("Too many active Antigravity conversations. Retry after an idle session expires.");
+      initializing.add(key);
+      try { session = await createSession(binary, model); }
+      finally { initializing.delete(key); }
+      session.signature = signature;
+      sessions.set(key, session);
+    }
+  } catch (error) {
+    return Response.json({ error: { message: error.cmd ? "Antigravity CLI initialization failed." : error.message } }, { status: 502 });
+  }
+  clearTimeout(session.timer);
+  session.busy = true;
+  const prompt = session.history.length
+    ? "Continue using the same instructions and tools. New chat messages:\n" + JSON.stringify(request.messages.slice(session.history.length))
+    : antigravityPrompt(request);
+  const encoder = new TextEncoder();
+  const abort = () => session.close();
+  const stream = new ReadableStream({
+    start(controller) {
+      const send = chunk => controller.enqueue(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
+      let raw = "", sent = "";
+      const timeout = setTimeout(abort, 190000);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      const task = session.closed ? Promise.reject(Error("Session aborted")) : session.ask(prompt, step => {
+        if (step?.step_type !== "agent_response" || typeof step.text_delta !== "string") return;
+        raw += step.text_delta;
+        if (raw.length > 16 * 1024 * 1024) throw Error("Antigravity reply too large");
+        const text = envelopeText(raw);
+        if (text.length > sent.length) {
+          send({ choices: [{ index: 0, delta: { content: text.slice(sent.length) } }] });
+          onTextDelta();
+          sent = text;
+        }
+      });
+      task.then(result => {
+        const message = chatMessage(result.response, request);
+        if (!message.content.startsWith(sent)) throw Error("Antigravity response changed during streaming");
+        send({ choices: [{ index: 0, delta: { ...message, content: message.content.slice(sent.length) },
+          finish_reason: message.tool_calls ? "tool_calls" : "stop" }] });
+        if (result.usage) {
+          const delta = field => Math.max(0, (result.usage[field] || 0) - (session.usage[field] || 0));
+          send({ choices: [], usage: { prompt_tokens: delta("input_tokens") + delta("cache_read_tokens"),
+            completion_tokens: delta("output_tokens"), prompt_tokens_details: { cached_tokens: delta("cache_read_tokens") },
+            completion_tokens_details: { reasoning_tokens: delta("thinking_tokens") } } });
+          session.usage = result.usage;
+        }
+        session.history = canonicalMessages([...request.messages, message]);
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }).catch(() => {
+        session.close();
+        if (!signal?.aborted) {
+          try { send({ error: { message: "Antigravity CLI turn failed. Check CLI login, quota and compatibility." } }); controller.close(); } catch { /* canceled */ }
+        } else { try { controller.error(Error("Request aborted")); } catch { /* canceled */ } }
+      }).finally(() => {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
+        session.busy = false;
+        if (!sessionKey || session.closed) { session.close(); sessions.delete(key); }
+        else session.timer = setTimeout(() => { session.close(); sessions.delete(key); }, idleMs).unref();
+      });
+    },
+    cancel: abort,
+  });
+  return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+}
 __CODEX_MODEL_ROUTER_MANAGER_JS__
 // 網頁管理介面的伺服器端：本機 HTTP、存取權杖、背景工作與輸出擷取。
 //
@@ -19755,6 +20135,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 <script type="application/json" id="i18n-data">
 {
 "en": {
+"使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。": "Use the account already signed in to agy. Reasoning levels come from its model list. Supports text and Codex tool calls.",
+"重新讀取 Antigravity 模型": "Reload Antigravity models",
+"準備讀取 Antigravity CLI 模型清單": "Loading the Antigravity CLI model list",
+
 "管理頁與 Claude 接入不需要 Codex。只有 Codex 的全域上下文、隱藏官方模型與帳號模式等功能需要安裝並連接 Codex。": "The manager and Claude integration do not require Codex. Install and connect Codex to use its global context, hidden official models, account mode, and related settings.",
 "已偵測到 Codex，尚未連接這個路由器。": "Codex was detected but is not connected to this router.",
 "未偵測到 Codex。安裝後重新開啟管理頁即可連接。": "Codex was not detected. Install it and reopen the manager to connect.",
@@ -20599,8 +20983,8 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說誰調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说谁调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報場塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說誰調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报场块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说谁调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -20744,7 +21128,7 @@ const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const NEW_MODEL_DEFAULTS = { contextWindow: 1000000, maxOutputTokens: 128000 };
 const TOKEN_LIMITS = { minContext: 16000, maxContext: 4000000, minOutput: 4096, maxOutput: 1000000 };
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,22}[a-z0-9])?$/;
-const RESERVED_PROVIDER_IDS = new Set(["default", "api", "custom", "official", "claude-cli"]);
+const RESERVED_PROVIDER_IDS = new Set(["default", "api", "custom", "official", "claude-cli", "antigravity-cli"]);
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/;
 // 與安裝器的 normalizeModelPrefix 及 PROVIDER_NAME_MAX_LENGTH 相同；伺服器端會再驗證一次。
 const MODEL_PREFIX_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,30}[A-Za-z0-9])?$/;
@@ -20992,6 +21376,7 @@ function effortText(efforts) {
 
 // 供應商的顯示名稱：另外取過名稱就用名稱，否則用 id；Claude 訂閱的名稱固定。
 function providerLabel(id) {
+  if (id === "antigravity-cli") return "Antigravity CLI";
   if (id === "claude-cli") return t("Claude 訂閱");
   const provider = state && (state.providers || []).find((item) => item.id === id);
   return (provider && provider.name) || id;
@@ -21007,6 +21392,7 @@ function transports() {
     responses: ["Responses", "cyan", t("直接轉發 OpenAI Responses API")],
     chat: [t("Chat 轉譯"), "amber", t("上游只有 Chat Completions，由路由器在本機轉譯")],
     anthropic: [t("Claude 轉譯"), "violet", t("以 Anthropic Messages API 轉譯")],
+    "antigravity-cli": ["Antigravity CLI", "amber", t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。")],
     "claude-cli": ["Claude CLI", "violet", t("透過 Claude Code 登入的訂閱帳號")],
   };
 }
@@ -21828,6 +22214,15 @@ function renderProviders() {
   // Claude 訂閱有模型時才顯示卡片；還沒連接時，從「新增供應商」或「新增模型」選擇它。
   const cliModels = (state.models || []).filter((model) => model.transport === "claude-cli").length;
   if (cliModels) cards.push(claudeCliCard(blocked, cliModels));
+  const agyModels = (state.models || []).filter(model => model.transport === "antigravity-cli");
+  if (agyModels.length) cards.push(h("div", { class: "provider-card" },
+    h("div", { class: "head" }, h("span", { class: "title", text: "Antigravity CLI" }),
+      h("span", { class: "chip", text: t("{count} 個模型", { count: agyModels.length }) })),
+    h("div", { class: "body" }, paragraph(t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。"))),
+    h("div", { class: "foot" },
+      h("button", { type: "button", class: "button small", disabled: blocked, onclick: () => openAntigravityModels() }, icon("plus"), t("添加模型")),
+      h("button", { type: "button", class: "button small danger", disabled: blocked,
+        onclick: () => confirmRemoveModels(agyModels.map(model => model.slug)) }, icon("trash"), t("移除")))));
   return [head, h("div", { class: "provider-grid" }, cards)];
 }
 
@@ -23168,7 +23563,7 @@ async function restartManager({ alreadyRequested = false } = {}) {
 
 // allowConfigured：已添加的模型也能再選（Claude CLI 可重新設定）；idPattern：手動輸入的格式。
 function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_PATTERN,
-  manualPlaceholder = t("清單沒有列出的模型 ID，可用逗號分隔") } = {}) {
+  manualPlaceholder = t("清單沒有列出的模型 ID，可用逗號分隔"), allowManual = true } = {}) {
   let models = [];
   let filter = "";
   const chosen = new Set();
@@ -23187,7 +23582,7 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
   const element = h("div", { class: "field" },
     h("div", { class: "list-toolbar" }, search, toggleAll),
     list,
-    h("label", { class: "field" }, h("span", { text: t("手動輸入模型 ID（選填）") }), manual));
+    allowManual ? h("label", { class: "field" }, h("span", { text: t("手動輸入模型 ID（選填）") }), manual) : null);
   function draw(statusNode) {
     if (statusNode) {
       list.replaceChildren(statusNode);
@@ -23195,7 +23590,7 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
     }
     const visible = models.filter(matches);
     if (visible.length === 0) {
-      list.replaceChildren(h("div", { class: "empty", text: models.length ? t("沒有符合搜尋的模型。") : t("清單是空的；仍可在下方手動輸入模型 ID。") }));
+      list.replaceChildren(h("div", { class: "empty", text: models.length || !allowManual ? t("沒有符合搜尋的模型。") : t("清單是空的；仍可在下方手動輸入模型 ID。") }));
       return;
     }
     list.replaceChildren(...visible.map((model) => {
@@ -23290,6 +23685,43 @@ function newModelLimitFields() {
   });
 }
 
+function openAntigravityModels({ firstInstall = false } = {}) {
+  const modal = openModal({ title: "Antigravity CLI", wide: true });
+  const add = h("button", { type: "button", class: "button primary", disabled: true, text: t("添加模型") });
+  const reload = h("button", { type: "button", class: "button", text: t("重新讀取 Antigravity 模型"), onclick: load });
+  const picker = modelPicker({ allowManual: false, allowConfigured: true, onChange: () => {
+    add.disabled = picker.selection().length === 0;
+  } });
+  modal.setBody(paragraph(t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。"), "muted"), picker.element);
+  modal.setFoot(reload, h("span", { class: "grow" }),
+    h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }), add);
+  add.onclick = () => {
+    const models = picker.selection();
+    if (!models.length) return;
+    modal.close();
+    if (firstInstall) runJob("install-antigravity", { models }, { title: "Antigravity CLI" });
+    else runJob("antigravity-add", { models }, { title: "Antigravity CLI" });
+  };
+  load();
+
+  async function load() {
+    reload.disabled = true;
+    add.disabled = true;
+    picker.setLoading(t("準備讀取 Antigravity CLI 模型清單"));
+    try {
+      const data = await api("/api/query", { method: "POST", body: { type: "antigravity-models" } });
+      picker.setModels(data.groups.map(model => ({
+        id: model.id, label: model.label, note: model.efforts.join(" / "),
+        configured: (state.models || []).some(item => item.transport === "antigravity-cli" && item.upstreamModel === model.id),
+      })));
+    } catch (error) {
+      picker.setError(error.message);
+    } finally {
+      reload.disabled = false;
+    }
+  }
+}
+
 function openAddModels(initialProviderId) {
   const providers = state.providers || [];
   let providerId = initialProviderId || (providers[0] ? providers[0].id : CLAUDE_CLI_ID);
@@ -23301,9 +23733,13 @@ function openAddModels(initialProviderId) {
   const picker = modelPicker({ onChange: updateCount });
   const cli = claudeCliChooser({ onChange: updateCount });
   const providerSelect = h("label", { class: "field" }, h("span", { text: t("供應商") }),
-    h("select", { onchange: (event) => { providerId = event.target.value; showStepOne(); load(); } },
+    h("select", { onchange: (event) => {
+      if (event.target.value === "antigravity-cli") { modal.close(); openAntigravityModels(); return; }
+      providerId = event.target.value; showStepOne(); load();
+    } },
       providers.map((provider) => h("option", { value: provider.id, selected: provider.id === providerId, text: providerOption(provider) })),
-      h("option", { value: CLAUDE_CLI_ID, selected: isCli(), text: t("Claude 訂閱（Claude CLI）") })));
+      h("option", { value: CLAUDE_CLI_ID, selected: isCli(), text: t("Claude 訂閱（Claude CLI）") }),
+      h("option", { value: "antigravity-cli", text: "Antigravity CLI" })));
   const intro = paragraph(t("選擇供應商與要添加的模型。"), "muted");
   const limits = newModelLimitFields();
   const modal = openModal({ title: t("新增模型"), wide: true, body: stepOneBody() });
@@ -23616,7 +24052,10 @@ function openAddProvider({ firstInstall = false } = {}) {
         typeOption("claude", t("Claude 訂閱帳號（Claude CLI）"), null,
           t("透過 Claude Code 登入的 Pro／Max 訂閱帳號使用 Claude 模型，不需要 API Key；用量依帳號方案計算。") +
             (connected ? t("已連接 {count} 個模型，可以再添加。", { count: connected }) : ""),
-          showClaudeCli)));
+          showClaudeCli),
+        typeOption("providers", "Antigravity CLI", null,
+          t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。"),
+          () => { modal.close(); openAntigravityModels({ firstInstall }); })));
     modal.setFoot(h("span", { class: "grow" }), cancelButton);
   }
   function showRelayForm() {
