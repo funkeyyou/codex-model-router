@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.16";
+const INSTALLER_VERSION = "1.44.17";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -16761,11 +16761,14 @@ function mapChatUsage(usage) {
 }
 
 // 有些模型（例如沒開推理解析器的 vLLM、Ollama 上的 R1 類模型）把推理包在內文開頭的
-// <think>…</think> 裡。拆出來當推理顯示，不然整段思考會混進回答。
-const THINK_OPEN = "<think>";
-const THINK_CLOSE = "</think>";
+// <think> 或 <thinking> 標記裡。拆出來當推理顯示，不然整段思考會混進回答。
+const THINK_TAGS = [
+  { open: "<think>", close: "</think>" },
+  { open: "<thinking>", close: "</thinking>" },
+];
 
 function createThinkSplitter() {
+  let closingTag;
   let state = "start";
   let buffer = "";
   return {
@@ -16776,27 +16779,29 @@ function createThinkSplitter() {
         if (state === "start") {
           const trimmed = buffer.trimStart();
           if (!trimmed) return out;
-          if (trimmed.startsWith(THINK_OPEN)) {
+          const tag = THINK_TAGS.find(({ open }) => trimmed.startsWith(open));
+          if (tag) {
+            closingTag = tag.close;
             state = "inside";
-            buffer = trimmed.slice(THINK_OPEN.length);
+            buffer = trimmed.slice(tag.open.length);
             continue;
           }
-          if (THINK_OPEN.startsWith(trimmed)) return out;
+          if (THINK_TAGS.some(({ open }) => open.startsWith(trimmed))) return out;
           state = "content";
           continue;
         }
         if (state === "inside") {
-          const end = buffer.indexOf(THINK_CLOSE);
+          const end = buffer.indexOf(closingTag);
           if (end >= 0) {
             if (end > 0) out.push({ kind: "reasoning", text: buffer.slice(0, end) });
-            buffer = buffer.slice(end + THINK_CLOSE.length).replace(/^\s+/, "");
+            buffer = buffer.slice(end + closingTag.length).replace(/^\s+/, "");
             state = "content";
             continue;
           }
           // 結束標記可能被切在兩個片段之間：留下可能是標記開頭的尾巴。
           let keep = 0;
-          for (let length = Math.min(THINK_CLOSE.length - 1, buffer.length); length > 0; length -= 1) {
-            if (THINK_CLOSE.startsWith(buffer.slice(-length))) { keep = length; break; }
+          for (let length = Math.min(closingTag.length - 1, buffer.length); length > 0; length -= 1) {
+            if (closingTag.startsWith(buffer.slice(-length))) { keep = length; break; }
           }
           if (buffer.length > keep) out.push({ kind: "reasoning", text: buffer.slice(0, buffer.length - keep) });
           buffer = buffer.slice(buffer.length - keep);

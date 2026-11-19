@@ -298,6 +298,26 @@ test("內文開頭的 <think> 區塊拆成推理，標記被切在兩個片段�
   assert.equal(plain.response.output[0].content[0].text, "<b>粗體</b>");
 });
 
+test("Neon 的 <thinking> 串流與整包 JSON 都把前置思考送到 Codex 思考區", async () => {
+  const thought = "第一段，含不同結尾 </think>。";
+  const answer = "正式回答：範例中的 <thinking> 是文字。";
+  const content = "  <thinking>" + thought + "</thinking>" + answer;
+  const streams = [
+    sse(Array.from(content, (char) => delta({ content: char }))),
+    [JSON.stringify({ choices: [{ index: 0, message: { content }, finish_reason: "stop" }] })],
+  ];
+  for (const stream of streams) {
+    const events = await run(stream);
+    const deltas = (type) => events.filter((event) => event.type === type).map((event) => event.delta).join("");
+    assert.equal(deltas("response.reasoning_summary_text.delta"), thought);
+    assert.equal(deltas("response.output_text.delta"), answer);
+    const [done] = terminal(events);
+    assert.deepEqual(done.response.output.map((item) => item.type), ["reasoning", "message"]);
+    assert.equal(done.response.output[0].summary[0].text, thought);
+    assert.equal(done.response.output[1].content[0].text, answer);
+  }
+});
+
 test("工具呼叫的片段依 index 拼回；namespace 與自由格式工具還原成 Codex 的形狀", async () => {
   const context = ctx({
     freeform: new Set(["apply_patch"]),

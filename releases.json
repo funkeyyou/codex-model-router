@@ -1,6 +1,13 @@
 {
-  "latest": "1.44.16",
+  "latest": "1.44.17",
   "releases": [
+    {
+      "version": "1.44.17",
+      "date": "2026-11-19",
+      "changes": [
+        "修正 Gemini Neon 等 Chat Completions 模型回覆開頭的 <thinking> 區塊混入正文。即使標籤分段傳送，思考內容也會顯示在 Codex 思考區，正文保留正式回答。"
+      ]
+    },
     {
       "version": "1.44.16",
       "date": "2026-11-19",
