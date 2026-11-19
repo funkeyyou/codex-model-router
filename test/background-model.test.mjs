@@ -21,7 +21,7 @@ async function setup(t) {
   return { router, choose: (model) => writeFileSync(path, JSON.stringify({ model })), clear: () => rmSync(path, { force: true }), dir };
 }
 
-test("辨認 Codex 固定的背景任務提示詞，一般對話與自訂模型不算", async (t) => {
+test("辨認 Codex 固定的背景任務提示詞（含自訂模型與預測分支），一般對話不算", async (t) => {
   const { router } = await setup(t);
   const kind = (body) => router.backgroundTaskKind(body);
   assert.equal(kind({ model: "gpt-6-luna", input: userText(titlePrompt) }), "title");
@@ -31,7 +31,16 @@ test("辨認 Codex 固定的背景任務提示詞，一般對話與自訂模型�
   assert.equal(kind({ model: "gpt-5.6-terra", instructions: "Consolidate the supplied rollout summaries into `memory_summary.md` so another" }), "memory");
   assert.equal(kind({ model: "gpt-6-luna", input: userText("幫我取個標題") }), null);
   assert.equal(kind({ model: "gpt-6.1-sol", input: userText("hello " + titlePrompt) }), null);
-  assert.equal(kind({ model: "custom/owo-gpt", input: userText(titlePrompt) }), null);
+  assert.equal(kind({ model: "custom/owo-gpt", input: userText(titlePrompt) }), "title");
+  // 預測分支：Codex Desktop 用聊天目前的模型複製整段聊天，標題提示詞是最後一則使用者訊息。
+  const chat = [...userText("<environment_context>cwd</environment_context>"), ...userText("這作品還有哪些角色？"),
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "芙莉蓮…" }] },
+    { type: "function_call", call_id: "c1", name: "shell", arguments: "{}" }, { type: "function_call_output", call_id: "c1", output: "ok" }];
+  assert.equal(kind({ model: "custom/antigravity-neon", input: [...chat, ...userText(titlePrompt)] }), "title");
+  assert.equal(kind({ model: "custom/antigravity-neon", input: [...chat,
+    ...userText("You are in a fork of an existing Codex thread.\nFill the structured description field")] }), "fork-description");
+  assert.equal(kind({ model: "custom/antigravity-neon", input: chat }), null);
+  assert.equal(kind({ model: "custom/antigravity-neon", input: [...chat, ...userText("請幫我" + titlePrompt)] }), null);
 });
 
 test("選了代答模型才改送；模型已刪除或未設定時維持原樣", async (t) => {
@@ -42,6 +51,10 @@ test("選了代答模型才改送；模型已刪除或未設定時維持原樣",
   assert.equal(router.applyBackgroundModel(body).model, "custom/owo-gpt");
   const normal = { model: "gpt-6.1-sol", input: userText("hi") };
   assert.equal(router.applyBackgroundModel(normal), normal);
+  const customTitle = { model: "custom/other", input: [...userText("聊天內容"), ...userText(titlePrompt)] };
+  assert.equal(router.applyBackgroundModel(customTitle).model, "custom/owo-gpt", "custom-model chats reroute background tasks too");
+  const sameModel = { model: "custom/owo-gpt", input: userText(titlePrompt) };
+  assert.equal(router.applyBackgroundModel(sameModel), sameModel);
   choose("custom/deleted-model");
   assert.equal(router.applyBackgroundModel(body), body);
   clear();
@@ -98,6 +111,23 @@ test("使用記錄：完成、失敗與沒有用量的終止事件都記成一�
   }, 3500).outputTps, null, "buffered CLI replies must not report a fabricated generation speed");
   assert.equal(router.usageRecord({ ...context, firstTextAt: 3500 }, { type: "response.completed", response: { usage: { output_tokens: 50 } } }, 3500).outputTps, null);
   assert.equal(router.usageRecord(context, { type: "response.output_text.delta" }), null);
+});
+
+test("使用記錄：串流的思考算首次輸出，TPS 不把思考 tokens 擠進正文的時間", async (t) => {
+  const { router } = await setup(t);
+  const realNow = Date.now;
+  t.after(() => { Date.now = realNow; });
+  const context = { startedAt: 0, model: "custom/agy", route: "custom", provider: "antigravity-cli", transport: "websocket" };
+  const at = (ms, event) => { Date.now = () => ms; router.recordUsageEvent(context, event); };
+  at(6000, { type: "response.reasoning_summary_text.delta", delta: "thinking" });
+  at(22000, { type: "response.output_text.delta", delta: "answer" });
+  at(23000, { type: "response.completed", response: { usage: { output_tokens: 2550, output_tokens_details: { reasoning_tokens: 2500 } } } });
+  assert.equal(context.firstOutputAt, 6000);
+  assert.equal(context.firstTextAt, 22000);
+  const record = router.usageRecord(context, { type: "response.completed", response: { usage: { output_tokens: 2550 } } }, 23000);
+  assert.equal(record.firstOutputMs, 6000);
+  assert.equal(record.firstTextMs, 22000);
+  assert.equal(Math.round(record.outputTps), 150);
 });
 
 test("背景任務經過路由器時改送第三方上游，API Key 模式下也不被擋", async (t) => {

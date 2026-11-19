@@ -25,7 +25,7 @@
 - **网页管理页**：在浏览器里增删模型、管理供应商和 API Key、一键更新。
 - **官方模型显示**：在「Codex设置 → 隐藏官方模型选项」整理账号模式的模型菜单，随时恢复；API Key 模式下此功能停用。
 - **可选功能**：中转 API 生图、Claude Code 订阅路由。
-- **Antigravity CLI**：先安装 `agy` 并登录，再从管理页「新增供应商」或「新增模型」选择 Antigravity CLI。同一模型的推理档位自动合并，可在 Codex 中切换；支持文字、Codex 工具调用、连续对话与缓存用量记录。暂不支持图片输入，缓存命中由上游决定。
+- **Antigravity CLI**：先安装 `agy` 并登录，再从管理页「新增供应商」或「新增模型」选择 Antigravity CLI。同一模型的推理档位自动合并，可在 Codex 中切换；支持文字、图片、Codex 工具调用与缓存用量记录。同一聊天闲置后再追问会接回原对话，只发送新增消息。
 - **Claude Desktop 接入**：在「Claude → Claude 客户端」一键配置第三方 Claude API 模型，也可一键回退。设置自动备份，聊天和其他偏好保留；暂不支持在 Claude 客户端使用 GPT 或 CLI 订阅路由。[使用说明](docs/claude-desktop.md)
 
 ## 安装

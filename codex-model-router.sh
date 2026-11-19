@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.18";
+const INSTALLER_VERSION = "1.44.19";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2725,6 +2725,8 @@ export function customSpeedTiers(route) {
 }
 
 // 更新既有自訂項目的速度等級及固定推理模型的選擇器資料。
+// Antigravity CLI 走 ACP，文字與圖片都能送；舊版只宣告文字，更新時一併補上。
+const ANTIGRAVITY_INPUT_MODALITIES = ["text", "image"];
 export function refreshCustomCatalogCapabilities(catalog, routes) {
   if (!Array.isArray(catalog?.models)) return catalog;
   const bySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
@@ -2733,7 +2735,8 @@ export function refreshCustomCatalogCapabilities(catalog, routes) {
     const route = bySlug.get(model.slug);
     if (!route) return model;
     const tiers = customSpeedTiers(route);
-    const effortFields = route.transport === "antigravity-cli" ? catalogEffortFields(route.efforts)
+    const effortFields = route.transport === "antigravity-cli"
+      ? { ...catalogEffortFields(route.efforts), input_modalities: ANTIGRAVITY_INPUT_MODALITIES }
       : fixedReasoningEffort(route.upstreamModel) ? catalogEffortFields([]) : {};
     const instructions = modelIdentityInstructions(model.base_instructions, route);
     const tiersMatch = isDeepStrictEqual(model.additional_speed_tiers ?? [], tiers.additional_speed_tiers)
@@ -3122,7 +3125,7 @@ export function customCatalogEntry(officialModels, route, index) {
   entry.availability_nux = null;
   entry.upgrade = null;
   if (route.transport === "antigravity-cli") {
-    entry.input_modalities = ["text"];
+    entry.input_modalities = ANTIGRAVITY_INPUT_MODALITIES;
     entry.supports_parallel_tool_calls = true;
   }
   entry.supports_search_tool = false;
@@ -11664,7 +11667,7 @@ function hasOutputText(item) {
   );
 }
 
-function recordUsageEvent(context, event) {
+export function recordUsageEvent(context, event) {
   if (context.recorded || settings.usageLog === false) return;
   if ((event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) ||
       (event?.type === "response.output_text.done" && typeof event.text === "string" && event.text.length) ||
@@ -11672,9 +11675,12 @@ function recordUsageEvent(context, event) {
     context.firstTextAt ??= Date.now();
     context.firstOutputAt ??= context.firstTextAt;
   }
+  // 串流出來的思考也是輸出：模型先想 20 秒、正文 1 秒就送完時，只從正文起算會把思考的
+  // tokens 擠進那 1 秒，TPS 變成數千。首次輸出因此從第一段可見的思考或正文起算。
   if (context.firstOutputAt == null && (
     ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)) ||
-    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta") && event.delta?.length)
+    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta" ||
+      event?.type === "response.reasoning_summary_text.delta" || event?.type === "response.reasoning_text.delta") && event.delta?.length)
   )) {
     context.firstOutputAt = Date.now();
   }
@@ -11731,24 +11737,29 @@ function backgroundModelFor(kind) {
   return kind === "memory" ? setting.memory : setting.light;
 }
 
+// 背景任務的固定提示詞出現在兩種位置：獨立請求放在第一則使用者訊息；Codex Desktop 的
+// 「預測分支」（例如用目前聊天的模型產生或更新標題）會複製整段聊天，提示詞變成最後一則。
+function userText(item) {
+  if (typeof item === "string") return item;
+  if ((item?.type && item.type !== "message") || item?.role !== "user") return null;
+  const content = typeof item.content === "string" ? [{ text: item.content }] : Array.isArray(item.content) ? item.content : [];
+  return content.find((entry) => typeof entry?.text === "string")?.text ?? null;
+}
+
 function firstPromptTexts(body) {
   const texts = [];
   if (typeof body?.instructions === "string") texts.push(body.instructions);
   const input = Array.isArray(body?.input) ? body.input : typeof body?.input === "string" ? [body.input] : [];
-  for (const item of input) {
-    if (typeof item === "string") { texts.push(item); break; }
-    if (item?.type && item.type !== "message") continue;
-    if (item?.role !== "user") continue;
-    const content = typeof item.content === "string" ? [{ text: item.content }] : Array.isArray(item.content) ? item.content : [];
-    const part = content.find((entry) => typeof entry?.text === "string");
-    if (part) texts.push(part.text);
-    break;
-  }
+  const first = input.findIndex((item) => userText(item) !== null);
+  const last = input.findLastIndex((item) => userText(item) !== null);
+  if (first >= 0) texts.push(userText(input[first]));
+  if (last > first) texts.push(userText(input[last]));
   return texts.map((text) => text.trimStart());
 }
 
+// 選了自訂模型的聊天，Codex 也會用同一個自訂模型跑這些背景任務，同樣辨識、記錄與改送。
 export function backgroundTaskKind(body) {
-  if (typeof body?.model !== "string" || body.model.startsWith("custom/")) return null;
+  if (typeof body?.model !== "string") return null;
   for (const text of firstPromptTexts(body)) {
     for (const [kind, pattern] of BACKGROUND_TASK_PATTERNS) if (pattern.test(text)) return kind;
   }
@@ -11762,7 +11773,7 @@ export function applyBackgroundModel(body) {
   const kind = backgroundTaskKind(body);
   if (!kind) return body;
   const target = backgroundModelFor(kind);
-  if (!target || !routeMap.has(target)) return body;
+  if (!target || target === body.model || !routeMap.has(target)) return body;
   stats.backgroundRerouted += 1;
   stats.backgroundReroutedByKind[kind] = (stats.backgroundReroutedByKind[kind] || 0) + 1;
   return { ...body, model: target, [BACKGROUND_KIND]: kind };
@@ -18923,17 +18934,16 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
   };
 }
 __CODEX_MODEL_ROUTER_AGY_JS__
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { isDeepStrictEqual, promisify } from "node:util";
+import { isDeepStrictEqual } from "node:util";
 
-const execute = promisify(execFile);
 const agent = "coding-host";
 const hookCommand = "node deny.cjs";
-const policy = JSON.stringify({ toolPermission: "strict", allowNonWorkspaceAccess: false });
 const instructions = [
   "Answer the coding agent request encoded as chat messages and host tool definitions.",
   "Use no local actions. Return one JSON object with text (string) and calls (array).",
@@ -18956,21 +18966,101 @@ export async function writeAntigravityPolicy(directory) {
     PreToolUse: [{ matcher: ".*", hooks: [{ type: "command", command: hookCommand }] }] } }));
 }
 
+const renameAgent = text => text.replace(/\bYou are Codex\b/gi, "You are a coding agent").replace(/\bCodex\b/gi, "coding agent");
+
 // Adapt only instruction prose. User messages, tool names, schemas and results are data
 // and must remain byte-for-byte intact for host calls and history replay.
-export function antigravityPrompt(request) {
-  const messages = request.messages.map(message => {
+function adaptMessages(messages) {
+  return messages.map(({ reasoning_content: _thoughts, ...message }) => {
     if (!["system", "developer"].includes(message.role)) return message;
-    const replaceName = text => text.replace(/\bYou are Codex\b/gi, "You are a coding agent")
-      .replace(/\bCodex\b/gi, "coding agent");
-    const content = typeof message.content === "string" ? replaceName(message.content)
-      : message.content.map(part => part.type === "text" ? { ...part, text: replaceName(part.text) } : part);
+    const content = typeof message.content === "string" ? renameAgent(message.content)
+      : Array.isArray(message.content)
+        ? message.content.map(part => part?.type === "text" ? { ...part, text: renameAgent(part.text) } : part)
+        : message.content;
     return { ...message, content };
   });
-  const callLimit = request.parallel_tool_calls === false
-    ? "\nReturn at most ONE call this turn, even if the user asks for several. Wait for its result before the next call."
-    : "";
-  return instructions + callLimit + "\n" + JSON.stringify({ ...request, messages });
+}
+
+function hostSettings(request) {
+  const settings = {};
+  for (const field of ["tools", "tool_choice", "parallel_tool_calls", "response_format"]) {
+    if (request[field] !== undefined) settings[field] = request[field];
+  }
+  return settings;
+}
+
+const callLimit = request => request.parallel_tool_calls === false
+  ? "\nReturn at most ONE call this turn, even if the user asks for several. Wait for its result before the next call."
+  : "";
+
+// agy truncates one user message near 190 KB (text and embedded resources together), while the
+// session system prompt has no such cap. Instructions, tools and handled history go there.
+const promptByteLimit = 150000;
+const isStanding = message => ["system", "developer"].includes(message.role);
+// The CLI's own system prompt outweighs appended text, so every user prompt restates the reply
+// format; tool definitions and handled history stay in the system context.
+const protocol = request => instructions + callLimit(request) +
+  "\nThe host tool definitions and earlier chat messages are in the system context.\n";
+const respondTo = messages => "New chat messages (respond to these):\n" + JSON.stringify(messages);
+const toolName = tool => tool?.function?.name ?? tool?.name;
+
+// Images travel as ACP image blocks with the user prompt; the JSON keeps a numbered marker in place.
+function attachImages(messages, images) {
+  if (!images) return messages;
+  return messages.map(message => {
+    if (!Array.isArray(message.content)) return message;
+    return { ...message, content: message.content.map(part => {
+      if (part?.type === "text") return part;
+      const url = part?.type === "image_url" ? (typeof part.image_url === "string" ? part.image_url : part.image_url?.url) : null;
+      const data = typeof url === "string" && /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(url);
+      if (data) {
+        images.push({ type: "image", mimeType: data[1].toLowerCase(), data: data[2].replace(/\s+/g, "") });
+        return { type: "text", text: "[Image " + images.length + ": attached to the latest user prompt]" };
+      }
+      if (typeof url === "string") return { type: "text", text: "[Image URL: " + url + "]" };
+      return { type: "text", text: "[" + (part?.type || "content") + " omitted]" };
+    }) };
+  });
+}
+
+// A new session separates handled history (system prompt) from the messages awaiting an
+// answer (user prompt), so a rebuilt conversation answers the newest request, not the first.
+export function antigravityPrompt(request, images = null) {
+  const messages = attachImages(adaptMessages(request.messages), images);
+  const split = messages.findLastIndex(message => message.role === "assistant") + 1;
+  const latest = messages.slice(split);
+  const earlier = [...messages.slice(0, split), ...latest.filter(isStanding)];
+  const system = instructions + callLimit(request) +
+    "\nHost settings and tools:\n" + JSON.stringify(hostSettings(request)) +
+    (earlier.length ? "\nEarlier chat messages (standing instructions and context; earlier requests were already answered):\n" +
+      JSON.stringify(earlier) : "");
+  const prompt = protocol(request) + respondTo(latest.filter(message => !isStanding(message)));
+  if (Buffer.byteLength(prompt) <= promptByteLimit) return { system, prompt };
+  return { system: system + "\n" + respondTo(latest.filter(message => !isStanding(message))),
+    prompt: protocol(request) + "Respond to the new chat messages at the end of the system context." };
+}
+
+// Tool lists grow during a Codex task (tool search, MCP startup). Only the difference is sent so
+// the conversation and its cache continue. Codex also rewrites top-level descriptions of nearly
+// every app tool once plugins load (appending plugin attribution); those edits are not resent.
+const toolShape = tool => tool?.function
+  ? { ...tool, function: { ...tool.function, description: undefined } }
+  : { ...tool, description: undefined };
+const settingsShape = settings => ({ ...settings, tools: settings?.tools?.map(toolShape) });
+
+function settingsUpdate(previous, current) {
+  const reminder = "Reply with one JSON object with text and calls, as instructed.\n";
+  if (isDeepStrictEqual(settingsShape(previous), settingsShape(current))) return "Continue using the same instructions and tools. " + reminder;
+  const before = new Map((previous?.tools || []).map(tool => [toolName(tool), tool]));
+  const names = new Set((current.tools || []).map(toolName));
+  const changed = (current.tools || []).filter(tool => !before.has(toolName(tool)) ||
+    !isDeepStrictEqual(toolShape(before.get(toolName(tool))), toolShape(tool)));
+  const removed = [...before.keys()].filter(name => !names.has(name));
+  return "Host settings changed. Use these from now on:\n" + JSON.stringify({
+    tool_choice: current.tool_choice ?? "auto", parallel_tool_calls: current.parallel_tool_calls ?? true,
+    response_format: current.response_format ?? null,
+    ...(changed.length ? { added_or_updated_tools: changed } : {}), ...(removed.length ? { removed_tools: removed } : {}),
+  }) + callLimit(current) + "\n" + reminder;
 }
 
 function chatMessage(raw, request) {
@@ -18988,14 +19078,6 @@ function chatMessage(raw, request) {
       (choice?.function && (!toolCalls.length || toolCalls.some(call => call.function.name !== choice.function.name))))
     throw Error("Antigravity did not respect tool_choice");
   return { role: "assistant", content: reply.text, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
-}
-
-const sessions = new Map();
-const initializing = new Set();
-const idleMs = 5 * 60 * 1000;
-
-function canonicalMessages(messages) {
-  return messages.map(message => structuredClone({ ...message, content: message.content ?? "" }));
 }
 
 // Only decode the text field at the beginning of the envelope. Calls remain buffered
@@ -19017,156 +19099,334 @@ export function envelopeText(buffer) {
   try { return JSON.parse('"' + encoded + '"'); } catch { return ""; }
 }
 
-async function createSession(binary, model) {
-  const directory = await mkdtemp(join(tmpdir(), "codex-agy-"));
-  const options = { cwd: directory, windowsHide: true,
-    env: { ...process.env, PATH: dirname(process.execPath) + delimiter + (process.env.PATH || "") } };
-  let child;
-  const state = { history: [], usage: {}, busy: false, closed: false, timer: null, pending: null };
-  state.close = () => {
-    if (state.closed) return;
-    state.closed = true;
-    clearTimeout(state.timer);
-    child?.kill("SIGKILL");
-    state.pending?.reject(Error("Antigravity CLI session ended"));
-    state.pending = null;
-    void rm(directory, { recursive: true, force: true, maxRetries: 3 }).catch(() => {});
+// History comparison covers what the CLI conversation actually depends on: instructions,
+// user input, tool results and the call IDs the model produced. Assistant prose may come back
+// reformatted (thinking moved to the reasoning panel, reasoning replay fields), and the router's
+// image budget may swap old screenshots for a note; neither means the conversation branched.
+const imageBudgetNote = "(較舊的工具截圖已移出本輪請求";
+function comparable(message) {
+  if (message.role === "assistant") return { role: "assistant", calls: (message.tool_calls || []).map(call => call.id) };
+  const parts = typeof message.content === "string" ? [message.content]
+    : Array.isArray(message.content)
+      ? message.content.filter(part => part?.type === "text" && !part.text.startsWith(imageBudgetNote)).map(part => part.text)
+      : [];
+  return { role: message.role, text: parts.join("\n"), id: message.tool_call_id ?? null };
+}
+
+// Codex appends developer text mid-task (for example an incremental tool update), and the Chat
+// translation merges it into the leading system message. Appended standing text continues the
+// conversation and is sent as an addition.
+function sameOrExtended(previous, next) {
+  if (isDeepStrictEqual(previous, next)) return true;
+  return isStanding(previous) && previous.role === next?.role && previous.id === next.id &&
+    typeof next.text === "string" && next.text.startsWith(previous.text);
+}
+
+const continues = (history, incoming) => incoming.length > history.length &&
+  history.every((message, index) => sameOrExtended(message, incoming[index]));
+
+function standingAdditions(history, incoming) {
+  return history.flatMap((message, index) => isStanding(message) && incoming[index].text !== message.text
+    ? [incoming[index].text.slice(message.text.length).trim()] : []).filter(Boolean);
+}
+
+// One stderr line per session decision, like the router's image budget log, so cache misses can
+// be traced to a rebuild and its cause.
+function logSession(event, detail = {}) {
+  process.stderr.write("model-router-antigravity:" + event + " " + JSON.stringify(detail) + "\n");
+}
+
+function divergence(history, incoming) {
+  if (incoming.length <= history.length) return { reason: "shorter", history: history.length, incoming: incoming.length };
+  const index = history.findIndex((message, position) => !isDeepStrictEqual(incoming[position], message));
+  const role = message => message?.role + (message?.calls ? ":" + message.calls.length : "") + (message?.text !== undefined ? ":" + message.text.length : "");
+  return { reason: "changed", index, history: role(history[index]), incoming: role(incoming[index]) };
+}
+
+// Every session shares one workspace. The CLI's own system prompt names the workspace path, so a
+// shared path keeps that prefix, the host instructions and tool definitions cacheable across
+// Codex tasks and across resumes. The policy is written once, not while other sessions read it.
+let policyWrite = null;
+async function sharedWorkspace() {
+  const directory = join(tmpdir(), "codex-model-router-agy");
+  if (!policyWrite || !existsSync(join(directory, ".agents", "hooks.json"))) {
+    policyWrite = writeAntigravityPolicy(directory).catch(error => { policyWrite = null; throw error; });
+  }
+  await policyWrite;
+  return directory;
+}
+
+function startAcp(binary, directory) {
+  const child = spawn(binary, ["acp", "--agent", agent], { cwd: directory, windowsHide: true,
+    env: { ...process.env, PATH: dirname(process.execPath) + delimiter + (process.env.PATH || "") },
+    stdio: ["pipe", "pipe", "pipe"] });
+  const pending = new Map();
+  let nextId = 0, buffer = "";
+  const client = { closed: false, onUpdate: null, onViolation: null };
+  const reply = (id, payload) => { if (!client.closed) child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, ...payload }) + "\n"); };
+  client.close = () => {
+    if (client.closed) return;
+    client.closed = true;
+    child.kill("SIGKILL");
+    for (const request of pending.values()) request.reject(Error("Antigravity CLI session ended"));
+    pending.clear();
   };
-  try {
-    await writeAntigravityPolicy(directory);
-    const base = ["--agent", agent, "--settings", policy, "--model", model];
-    const hooks = await execute(binary, [...base, "-p", "/hooks", "--output-format", "json"], { ...options, timeout: 15000 });
-    const loaded = JSON.parse(hooks.stdout).command?.data?.hooks?.find(h => h.name === agent && h.enabled);
-    if (!loaded || await realpath(loaded.source) !== await realpath(join(directory, ".agents", "hooks.json")) ||
-        !loaded.actions?.some(a => a.event === "PreToolUse" && a.matcher === ".*" && a.command === hookCommand))
-      throw Error("Antigravity CLI tool guard is unavailable");
-    child = spawn(binary, [...base, "--disable-slash-commands", "--input-format", "stream-json",
-      "--output-format", "stream-json", "--print-timeout", "180s"], { ...options, stdio: ["pipe", "pipe", "pipe"] });
-    child.stderr.resume();
-    child.stdin.on("error", state.close);
-    child.on("error", state.close);
-    child.on("close", state.close);
-    child.stdout.setEncoding("utf8");
-    let buffer = "";
-    child.stdout.on("data", chunk => {
-      buffer += chunk;
-      if (buffer.length > 16 * 1024 * 1024) { state.close(); return; }
-      let end;
-      while ((end = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
-        if (!line.trim()) continue;
-        try {
-          const record = JSON.parse(line);
-          if (record.event === "init") {
-            const init = record.init;
-            if (init?.model !== model || init.agent !== agent || init.permission_mode !== "strict") throw Error("Session mismatch");
-            state.initialized = true;
-          } else if (record.event === "step_update") {
-            if (record.step_update?.step_type === "tool") throw Error("Local tool attempted");
-            state.pending?.onStep(record.step_update);
-          } else if (record.event === "result") {
-            if (!state.initialized || record.result?.status !== "SUCCESS") throw Error("Incomplete turn");
-            const pending = state.pending;
-            state.pending = null;
-            pending?.resolve(record.result);
-          }
-        } catch { state.close(); return; }
+  client.call = (method, params) => new Promise((resolve, reject) => {
+    if (client.closed) { reject(Error("Antigravity CLI session ended")); return; }
+    const id = ++nextId;
+    pending.set(id, { resolve, reject });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  });
+  child.stderr.resume();
+  child.stdin.on("error", client.close);
+  child.on("error", client.close);
+  child.on("close", client.close);
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", chunk => {
+    buffer += chunk;
+    if (buffer.length > 16 * 1024 * 1024) { client.close(); return; }
+    let end;
+    while ((end = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+      if (!line.trim()) continue;
+      let message;
+      try { message = JSON.parse(line); } catch { client.close(); return; }
+      if (message.method === "session/update") {
+        client.onUpdate?.(message.params?.update);
+      } else if (message.method) {
+        // The host owns every action: permission prompts and client file or terminal requests
+        // are refused, and the turn is stopped.
+        if (message.id !== undefined) {
+          reply(message.id, message.method === "session/request_permission"
+            ? { result: { outcome: { outcome: "cancelled" } } }
+            : { error: { code: -32601, message: "Not supported by the coding agent host" } });
+        }
+        client.onViolation?.(message.method);
+      } else if (pending.has(message.id)) {
+        const request = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) request.reject(Error(message.error.message || "Antigravity CLI request failed"));
+        else request.resolve(message.result ?? {});
       }
-    });
-    state.ask = (prompt, onStep) => new Promise((resolve, reject) => {
-      state.pending = { resolve, reject, onStep };
-      child.stdin.write(JSON.stringify({ event: "user", message: { content: prompt } }) + "\n");
-    });
-    return state;
-  } catch (error) { state.close(); throw error; }
+    }
+  });
+  return client;
+}
+
+const sessions = new Map();
+const resumable = new Map();
+const initializing = new Set();
+const idleMs = 10 * 60 * 1000;
+const resumableMs = 12 * 60 * 60 * 1000;
+const maxResumable = 64;
+
+function rememberResumable(key, session) {
+  resumable.delete(key);
+  resumable.set(key, { sessionId: session.sessionId, history: session.history,
+    settings: session.settings, system: session.system, at: Date.now() });
+  for (const [oldKey, record] of resumable) {
+    if (resumable.size <= maxResumable && Date.now() - record.at < resumableMs) break;
+    resumable.delete(oldKey);
+  }
+}
+
+function findResumable(key) {
+  const record = resumable.get(key);
+  if (record && Date.now() - record.at >= resumableMs) { resumable.delete(key); return null; }
+  return record || null;
+}
+
+async function openSession(binary, record, system) {
+  const directory = await sharedWorkspace();
+  let client;
+  const timer = setTimeout(() => client?.close(), 60000);
+  try {
+    client = startAcp(binary, directory);
+    const init = await client.call("initialize", { protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
+    const capabilities = init?.agentCapabilities;
+    if (!capabilities?._meta?.antigravity?.systemPrompt?.append) {
+      throw Object.assign(Error("Antigravity CLI is too old for the router. Run agy update and try again."), { code: "AGY_OUTDATED" });
+    }
+    const meta = text => ({ _meta: { antigravity: { systemPrompt: { append: text } } } });
+    let result = null;
+    if (record && capabilities.sessionCapabilities?.resume) {
+      result = await client.call("session/resume", { sessionId: record.sessionId, cwd: directory, mcpServers: [],
+        ...meta(record.system) }).catch(() => null);
+    }
+    const resumed = Boolean(result);
+    if (!result) result = await client.call("session/new", { cwd: directory, mcpServers: [], ...meta(system) });
+    const sessionId = result.sessionId || (resumed ? record.sessionId : null);
+    if (!sessionId) throw Error("Antigravity CLI did not create a session");
+    return { client, sessionId, resumed,
+      imageInput: capabilities.promptCapabilities?.image === true,
+      models: new Set((result.models?.availableModels || []).map(model => model.modelId)),
+      model: null, history: resumed ? record.history : [], settings: resumed ? record.settings : null,
+      system: resumed ? record.system : system, busy: false, closed: false, timer: null };
+  } catch (error) {
+    client?.close();
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
+function closeSession(key, session, { keepResumable = false } = {}) {
+  clearTimeout(session.timer);
+  session.closed = true;
+  session.client.close();
+  if (sessions.get(key) === session) sessions.delete(key);
+  if (keepResumable && session.history.length) rememberResumable(key, session);
+  else resumable.delete(key);
 }
 
 export function closeAntigravitySessions() {
-  for (const session of sessions.values()) session.close();
+  for (const [key, session] of sessions) closeSession(key, session);
   sessions.clear();
+  resumable.clear();
+}
+
+// Ends idle CLI processes while keeping their conversations resumable.
+export function suspendAntigravitySessions() {
+  for (const [key, session] of sessions) if (!session.busy) closeSession(key, session, { keepResumable: true });
 }
 
 export async function fetchAntigravityChat(request, route, binary, effort, signal, sessionKey = null, onTextDelta = () => {}) {
   const model = (effort && route.effortModels?.[effort]) || route.defaultCliModel;
   if (!binary || !model) throw Error("Antigravity CLI model configuration is incomplete");
-  if (request.messages.some(m => Array.isArray(m.content) && m.content.some(part => part.type !== "text")))
-    return Response.json({ error: { message: "Antigravity CLI currently accepts text input only." } }, { status: 422 });
-  const key = JSON.stringify([sessionKey || randomUUID(), binary, model]);
-  const signature = antigravityPrompt({ ...request, messages: [] });
-  const incoming = canonicalMessages(request.messages);
+  const key = JSON.stringify([sessionKey || randomUUID(), binary]);
+  const settings = hostSettings(request);
+  const incoming = request.messages.map(comparable);
   if (initializing.has(key)) return Response.json({ error: { message: "Antigravity session is starting." } }, { status: 409 });
   let session = sessions.get(key);
   if (session?.busy) return Response.json({ error: { message: "Antigravity conversation already has an active request." } }, { status: 409 });
-  if (session && (session.closed || session.signature !== signature ||
-      !session.history.every((message, index) => isDeepStrictEqual(incoming[index], message)))) {
-    session.close(); sessions.delete(key); session = null;
+  if (session && (session.closed || !continues(session.history, incoming))) {
+    logSession("rebuild", session.closed ? { reason: "closed" } : divergence(session.history, incoming));
+    closeSession(key, session); session = null;
   }
+  const replay = () => { const images = []; return { ...antigravityPrompt(request, images), images }; };
+  const open = async resume => {
+    if (sessions.size >= 16) throw Error("Too many active Antigravity conversations. Retry after an idle session expires.");
+    const fresh = replay();
+    initializing.add(key);
+    try { session = await openSession(binary, resume, fresh.system); }
+    finally { initializing.delete(key); }
+    sessions.set(key, session);
+    return session.resumed ? null : fresh;
+  };
+  let plan = null;
   try {
     if (!session) {
-      for (const [oldKey, oldSession] of sessions) {
-        if (oldSession.closed) sessions.delete(oldKey);
+      const record = findResumable(key);
+      const resume = record && continues(record.history, incoming) ? record : null;
+      resumable.delete(key);
+      if (record && !resume) logSession("rebuild", { ...divergence(record.history, incoming), resumable: true });
+      plan = await open(resume);
+      logSession(session.resumed ? "resume" : "new", { messages: incoming.length, keyed: Boolean(sessionKey),
+        ...(resume && !session.resumed ? { reason: "resume-failed" } : {}) });
+    }
+    if (!plan) {
+      const images = [];
+      const additions = standingAdditions(session.history, incoming);
+      const prompt = (additions.length ? "Standing instructions were extended:\n" + renameAgent(additions.join("\n\n")) + "\n" : "") +
+        settingsUpdate(session.settings, settings) +
+        respondTo(attachImages(adaptMessages(request.messages.slice(session.history.length)), images));
+      if (Buffer.byteLength(prompt) <= promptByteLimit) {
+        plan = { prompt, images };
+        logSession("continue", { messages: incoming.length - session.history.length,
+          settingsChanged: !isDeepStrictEqual(settingsShape(session.settings), settingsShape(settings)), standingAdditions: additions.length });
+      } else {
+        logSession("rebuild", { reason: "oversize", bytes: Buffer.byteLength(prompt) });
+        closeSession(key, session); session = null; plan = await open(null);
       }
-      if (sessions.size >= 16) throw Error("Too many active Antigravity conversations. Retry after an idle session expires.");
-      initializing.add(key);
-      try { session = await createSession(binary, model); }
-      finally { initializing.delete(key); }
-      session.signature = signature;
-      sessions.set(key, session);
     }
   } catch (error) {
-    return Response.json({ error: { message: error.cmd ? "Antigravity CLI initialization failed." : error.message } }, { status: 502 });
+    if (session) closeSession(key, session);
+    return Response.json({ error: { message: error.code === "AGY_OUTDATED" ? error.message : "Antigravity CLI initialization failed." } }, { status: 502 });
   }
+  if (session.models.size && !session.models.has(model)) {
+    closeSession(key, session);
+    return Response.json({ error: { message: "Antigravity CLI no longer offers " + model + ". Refresh the model list in the manager." } }, { status: 422 });
+  }
+  const { prompt, images } = plan;
+  if (images.length && !session.imageInput) {
+    closeSession(key, session, { keepResumable: true });
+    return Response.json({ error: { message: "This Antigravity CLI version does not accept images. Update agy and try again." } }, { status: 422 });
+  }
+  const blocks = [{ type: "text", text: prompt }];
+  images.forEach((image, index) => blocks.push({ type: "text", text: "Image " + (index + 1) + ":" }, image));
   clearTimeout(session.timer);
   session.busy = true;
-  const prompt = session.history.length
-    ? "Continue using the same instructions and tools. New chat messages:\n" + JSON.stringify(request.messages.slice(session.history.length))
-    : antigravityPrompt(request);
+  const { client } = session;
   const encoder = new TextEncoder();
-  const abort = () => session.close();
+  const abort = () => closeSession(key, session);
   const stream = new ReadableStream({
     start(controller) {
       const send = chunk => controller.enqueue(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
-      let raw = "", sent = "";
-      const timeout = setTimeout(abort, 190000);
+      let raw = "", sent = "", violation = null;
+      const timeout = setTimeout(abort, 300000);
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
-      const task = session.closed ? Promise.reject(Error("Session aborted")) : session.ask(prompt, step => {
-        if (step?.step_type !== "agent_response" || typeof step.text_delta !== "string") return;
-        raw += step.text_delta;
-        if (raw.length > 16 * 1024 * 1024) throw Error("Antigravity reply too large");
-        const text = envelopeText(raw);
-        if (text.length > sent.length) {
-          send({ choices: [{ index: 0, delta: { content: text.slice(sent.length) } }] });
-          onTextDelta();
-          sent = text;
+      client.onViolation = method => { violation ||= method; abort(); };
+      client.onUpdate = update => {
+        if (update?.sessionUpdate === "tool_call" || update?.sessionUpdate === "tool_call_update") {
+          violation ||= "tool:" + (update.name || update.title || "unknown"); abort(); return;
         }
-      });
+        const delta = typeof update?.content?.text === "string" ? update.content.text : "";
+        if (!delta) return;
+        if (update.sessionUpdate === "agent_thought_chunk") {
+          send({ choices: [{ index: 0, delta: { reasoning_content: delta } }] });
+        } else if (update.sessionUpdate === "agent_message_chunk") {
+          raw += delta;
+          if (raw.length > 16 * 1024 * 1024) { abort(); return; }
+          const text = envelopeText(raw);
+          if (text.length > sent.length) {
+            send({ choices: [{ index: 0, delta: { content: text.slice(sent.length) } }] });
+            onTextDelta();
+            sent = text;
+          }
+        }
+      };
+      const task = session.closed ? Promise.reject(Error("Session aborted")) : (async () => {
+        if (session.model !== model) {
+          await client.call("session/set_model", { sessionId: session.sessionId, modelId: model });
+          session.model = model;
+        }
+        return client.call("session/prompt", { sessionId: session.sessionId, prompt: blocks });
+      })();
       task.then(result => {
-        const message = chatMessage(result.response, request);
+        if (violation) throw Error("Antigravity attempted a local action");
+        if (result?.stopReason !== "end_turn") throw Error("Antigravity turn ended early: " + result?.stopReason);
+        const message = chatMessage(raw, request);
         if (!message.content.startsWith(sent)) throw Error("Antigravity response changed during streaming");
         send({ choices: [{ index: 0, delta: { ...message, content: message.content.slice(sent.length) },
           finish_reason: message.tool_calls ? "tool_calls" : "stop" }] });
-        if (result.usage) {
-          const delta = field => Math.max(0, (result.usage[field] || 0) - (session.usage[field] || 0));
-          send({ choices: [], usage: { prompt_tokens: delta("input_tokens") + delta("cache_read_tokens"),
-            completion_tokens: delta("output_tokens"), prompt_tokens_details: { cached_tokens: delta("cache_read_tokens") },
-            completion_tokens_details: { reasoning_tokens: delta("thinking_tokens") } } });
-          session.usage = result.usage;
+        const usage = result.usage;
+        if (usage) {
+          send({ choices: [], usage: { prompt_tokens: (usage.inputTokens || 0) + (usage.cachedReadTokens || 0),
+            completion_tokens: usage.outputTokens || 0, prompt_tokens_details: { cached_tokens: usage.cachedReadTokens || 0 },
+            completion_tokens_details: { reasoning_tokens: usage.thoughtTokens || 0 } } });
         }
-        session.history = canonicalMessages([...request.messages, message]);
+        session.history = [...request.messages, message].map(comparable);
+        session.settings = settings;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       }).catch(() => {
-        session.close();
+        closeSession(key, session);
         if (!signal?.aborted) {
-          try { send({ error: { message: "Antigravity CLI turn failed. Check CLI login, quota and compatibility." } }); controller.close(); } catch { /* canceled */ }
+          const message = violation
+            ? "Antigravity CLI tried to use its own tools, so the turn was stopped. Retry; if it repeats, start a new task."
+            : "Antigravity CLI turn failed. Check CLI login, quota and compatibility.";
+          try { send({ error: { message } }); controller.close(); } catch { /* canceled */ }
         } else { try { controller.error(Error("Request aborted")); } catch { /* canceled */ } }
       }).finally(() => {
         clearTimeout(timeout);
         signal?.removeEventListener("abort", abort);
+        client.onUpdate = null;
+        client.onViolation = null;
         session.busy = false;
-        if (!sessionKey || session.closed) { session.close(); sessions.delete(key); }
-        else session.timer = setTimeout(() => { session.close(); sessions.delete(key); }, idleMs).unref();
+        if (session.closed) return;
+        if (!sessionKey) { closeSession(key, session); return; }
+        session.timer = setTimeout(() => closeSession(key, session, { keepResumable: true }), idleMs);
+        session.timer.unref?.();
       });
     },
     cancel: abort,
@@ -20577,7 +20837,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "首次輸出": "First output",
 "總耗時": "Total duration",
 "輸出 TPS": "Output TPS",
-"從路由器收到請求到第一段串流文字或第一個工具呼叫。": "From router request receipt to the first streamed text or tool call.",
+"從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。": "From router request receipt to the first streamed thinking, text or tool call.",
 "上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。": "Upstream-reported output tokens divided by seconds from first output to completion.",
 "近 30 天 · 每頁 100 筆": "Last 30 days · 100 per page",
 "上一頁": "Previous",
@@ -20586,10 +20846,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "近 30 天沒有請求記錄。": "No requests in the last 30 days.",
 "未完成": "Incomplete",
 "原本選的模型已刪除，目前使用官方模型。": "The previously selected model was deleted; official models are used for now.",
-"Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。": "Whichever model you pick, Codex runs a few background tasks on small official models. They use your ChatGPT usage and are blocked in API key mode. Pick a third-party model to handle them instead.",
+"Codex 會用官方小模型，或你目前聊天選的模型，跑標題、後續建議、分支描述和記憶整理等背景任務。官方模型會消耗 ChatGPT 額度，API Key 模式下則會被擋下；聊天選了自訂模型時，這些任務也會用同一個模型，帶著整段聊天跑。選第三方模型代答後，改由它處理。": "Codex runs background tasks such as titles, follow-up suggestions, fork descriptions and memory consolidation on small official models or on the model your chat uses. Official models use your ChatGPT usage and are blocked in API key mode; with a custom model, these tasks run on that model with the whole chat attached. Pick a third-party model to handle them instead.",
 "任務標題、後續建議、分支描述": "Task titles, follow-up suggestions, fork descriptions",
 "記憶整理（會呼叫工具、內容較長，用量較多）": "Memory consolidation (calls tools and is longer, so it uses more)",
-"只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。": "Only these background tasks' fixed prompts are recognized; conversations where you pick an official model yourself aren't affected. Changes apply immediately, no restart needed.",
+"只辨認這幾種背景任務固定的提示詞；你在選擇器手動選的模型，一般對話不受影響。變更立即生效，不必重新啟動。": "Only these background tasks' fixed prompts are recognized; regular conversations keep the model you pick. Changes apply immediately, no restart needed.",
 "官方模型（Codex 預設）": "Official models (Codex default)",
 "已改由第三方模型處理 {count} 個背景任務。": "{count} background tasks handled by the third-party model so far.",
 "設定背景任務模型": "Set background task model",
@@ -21939,7 +22199,7 @@ function renderUsage() {
       paging),
     entries.length === 0 ? h("div", { class: "empty", text: t("近 30 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出")].map((label) => h("th", { text: label })),
-        h("th", { title: t("從路由器收到請求到第一段串流文字或第一個工具呼叫。"), text: t("首次輸出") }),
+        h("th", { title: t("從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。"), text: t("首次輸出") }),
         h("th", { text: t("總耗時") }),
         h("th", { title: t("上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。"), text: t("輸出 TPS") }))),
       h("tbody", {}, entries.map((entry) => h("tr", {},
@@ -21989,12 +22249,12 @@ function renderBackgroundModelPanel(models, blocked) {
   };
   return h("div", { class: "panel compact" }, bar,
     h("div", { class: "panel-body stack" },
-      paragraph(t("Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。"), "note"),
+      paragraph(t("Codex 會用官方小模型，或你目前聊天選的模型，跑標題、後續建議、分支描述和記憶整理等背景任務。官方模型會消耗 ChatGPT 額度，API Key 模式下則會被擋下；聊天選了自訂模型時，這些任務也會用同一個模型，帶著整段聊天跑。選第三方模型代答後，改由它處理。"), "note"),
       h("div", { class: "field-row" },
         selector("light", t("任務標題、後續建議、分支描述")),
         selector("memory", t("記憶整理（會呼叫工具、內容較長，用量較多）"))),
       (current.light || current.memory) && handled ? paragraph(t("已改由第三方模型處理 {count} 個背景任務。", { count: formatNumber(handled) }), "note") : null,
-      paragraph(t("只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。"), "note")));
+      paragraph(t("只辨認這幾種背景任務固定的提示詞；你在選擇器手動選的模型，一般對話不受影響。變更立即生效，不必重新啟動。"), "note")));
 }
 
 function contextCell(model) {

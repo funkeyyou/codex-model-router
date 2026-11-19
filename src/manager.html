@@ -887,7 +887,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "首次輸出": "First output",
 "總耗時": "Total duration",
 "輸出 TPS": "Output TPS",
-"從路由器收到請求到第一段串流文字或第一個工具呼叫。": "From router request receipt to the first streamed text or tool call.",
+"從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。": "From router request receipt to the first streamed thinking, text or tool call.",
 "上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。": "Upstream-reported output tokens divided by seconds from first output to completion.",
 "近 30 天 · 每頁 100 筆": "Last 30 days · 100 per page",
 "上一頁": "Previous",
@@ -896,10 +896,10 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "近 30 天沒有請求記錄。": "No requests in the last 30 days.",
 "未完成": "Incomplete",
 "原本選的模型已刪除，目前使用官方模型。": "The previously selected model was deleted; official models are used for now.",
-"Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。": "Whichever model you pick, Codex runs a few background tasks on small official models. They use your ChatGPT usage and are blocked in API key mode. Pick a third-party model to handle them instead.",
+"Codex 會用官方小模型，或你目前聊天選的模型，跑標題、後續建議、分支描述和記憶整理等背景任務。官方模型會消耗 ChatGPT 額度，API Key 模式下則會被擋下；聊天選了自訂模型時，這些任務也會用同一個模型，帶著整段聊天跑。選第三方模型代答後，改由它處理。": "Codex runs background tasks such as titles, follow-up suggestions, fork descriptions and memory consolidation on small official models or on the model your chat uses. Official models use your ChatGPT usage and are blocked in API key mode; with a custom model, these tasks run on that model with the whole chat attached. Pick a third-party model to handle them instead.",
 "任務標題、後續建議、分支描述": "Task titles, follow-up suggestions, fork descriptions",
 "記憶整理（會呼叫工具、內容較長，用量較多）": "Memory consolidation (calls tools and is longer, so it uses more)",
-"只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。": "Only these background tasks' fixed prompts are recognized; conversations where you pick an official model yourself aren't affected. Changes apply immediately, no restart needed.",
+"只辨認這幾種背景任務固定的提示詞；你在選擇器手動選的模型，一般對話不受影響。變更立即生效，不必重新啟動。": "Only these background tasks' fixed prompts are recognized; regular conversations keep the model you pick. Changes apply immediately, no restart needed.",
 "官方模型（Codex 預設）": "Official models (Codex default)",
 "已改由第三方模型處理 {count} 個背景任務。": "{count} background tasks handled by the third-party model so far.",
 "設定背景任務模型": "Set background task model",
@@ -2249,7 +2249,7 @@ function renderUsage() {
       paging),
     entries.length === 0 ? h("div", { class: "empty", text: t("近 30 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出")].map((label) => h("th", { text: label })),
-        h("th", { title: t("從路由器收到請求到第一段串流文字或第一個工具呼叫。"), text: t("首次輸出") }),
+        h("th", { title: t("從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。"), text: t("首次輸出") }),
         h("th", { text: t("總耗時") }),
         h("th", { title: t("上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。"), text: t("輸出 TPS") }))),
       h("tbody", {}, entries.map((entry) => h("tr", {},
@@ -2299,12 +2299,12 @@ function renderBackgroundModelPanel(models, blocked) {
   };
   return h("div", { class: "panel compact" }, bar,
     h("div", { class: "panel-body stack" },
-      paragraph(t("Codex 不論你選了哪個模型，都會固定用官方小模型跑幾種背景任務。這些請求會消耗 ChatGPT 額度，API Key 模式下則會被擋下。選第三方模型代答後，改由它處理。"), "note"),
+      paragraph(t("Codex 會用官方小模型，或你目前聊天選的模型，跑標題、後續建議、分支描述和記憶整理等背景任務。官方模型會消耗 ChatGPT 額度，API Key 模式下則會被擋下；聊天選了自訂模型時，這些任務也會用同一個模型，帶著整段聊天跑。選第三方模型代答後，改由它處理。"), "note"),
       h("div", { class: "field-row" },
         selector("light", t("任務標題、後續建議、分支描述")),
         selector("memory", t("記憶整理（會呼叫工具、內容較長，用量較多）"))),
       (current.light || current.memory) && handled ? paragraph(t("已改由第三方模型處理 {count} 個背景任務。", { count: formatNumber(handled) }), "note") : null,
-      paragraph(t("只辨認這幾種背景任務固定的提示詞；你在選擇器手動選官方模型的對話不受影響。變更立即生效，不必重新啟動。"), "note")));
+      paragraph(t("只辨認這幾種背景任務固定的提示詞；你在選擇器手動選的模型，一般對話不受影響。變更立即生效，不必重新啟動。"), "note")));
 }
 
 function contextCell(model) {

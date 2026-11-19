@@ -12,15 +12,40 @@ test("Antigravity changes instruction prose while preserving user input and host
     { role: "developer", content: [{ type: "text", text: "CODEX tools are available." }] },
     { role: "user", content: "Read Codex.txt" },
     { role: "tool", content: "Codex", tool_call_id: "Codex_call" },
-  ], tools: [{ name: "Codex_tool", description: "Codex", parameters: {} }] };
+  ], tools: [{ name: "Codex_tool", description: "Codex", parameters: {} }], model: "ignored", stream: true };
   const before = structuredClone(request);
-  const prompt = antigravityPrompt(request);
-  const adapted = JSON.parse(prompt.slice(prompt.indexOf("{")));
-  assert.doesNotMatch(JSON.stringify(adapted.messages.slice(0, 2)), /codex/i);
-  assert.match(adapted.messages[0].content, /^You are a coding agent\./);
-  assert.deepEqual(adapted.messages.slice(2), request.messages.slice(2));
-  assert.deepEqual(adapted.tools, request.tools);
+  const { system, prompt } = antigravityPrompt(request);
+  const section = (text, title) => JSON.parse(text.split("\n" + title + "\n")[1].split("\n")[0]);
+  const settings = section(system, "Host settings and tools:");
+  const standing = section(system, "Earlier chat messages (standing instructions and context; earlier requests were already answered):");
+  assert.match(prompt, /^Answer the coding agent request[\s\S]*in the system context\.\nNew chat messages/);
+  const messages = JSON.parse(prompt.split("New chat messages (respond to these):\n")[1]);
+  assert.doesNotMatch(JSON.stringify(standing), /codex/i);
+  assert.match(standing[0].content, /^You are a coding agent\./);
+  assert.deepEqual(messages, request.messages.slice(2));
+  assert.deepEqual(settings, { tools: request.tools });
+  assert.doesNotMatch(prompt, /Codex_tool"\s*,\s*"description/);
   assert.deepEqual(request, before);
+});
+
+test("Antigravity full replay marks handled history apart from the newest request", () => {
+  const images = [];
+  const { system, prompt } = antigravityPrompt({ messages: [
+    { role: "system", content: "rules" }, { role: "user", content: "compare A and B" },
+    { role: "assistant", content: "A wins", reasoning_content: "long thoughts" },
+    { role: "user", content: [{ type: "text", text: "is high close to xhigh?" },
+      { type: "image_url", image_url: { url: "data:image/jpeg;base64,/9j/AA==" } }] },
+  ] }, images);
+  const earlier = system.split(/\nEarlier chat messages[^\n]*\n/)[1];
+  const latest = prompt.split("New chat messages (respond to these):\n")[1];
+  assert.match(earlier, /rules.*compare A and B.*A wins/);
+  assert.doesNotMatch(earlier, /long thoughts|xhigh/);
+  assert.deepEqual(JSON.parse(latest)[0].content, [{ type: "text", text: "is high close to xhigh?" },
+    { type: "text", text: "[Image 1: attached to the latest user prompt]" }]);
+  assert.deepEqual(images, [{ type: "image", mimeType: "image/jpeg", data: "/9j/AA==" }]);
+  const huge = antigravityPrompt({ messages: [{ role: "user", content: "x".repeat(200000) }] });
+  assert.match(huge.system, /New chat messages \(respond to these\)/);
+  assert.ok(huge.prompt.length < 1000);
 });
 
 test("Antigravity workspace agent and tool guard use neutral names", async t => {

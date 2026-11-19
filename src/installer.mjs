@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.18";
+const INSTALLER_VERSION = "1.44.19";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2647,6 +2647,8 @@ export function customSpeedTiers(route) {
 }
 
 // 更新既有自訂項目的速度等級及固定推理模型的選擇器資料。
+// Antigravity CLI 走 ACP，文字與圖片都能送；舊版只宣告文字，更新時一併補上。
+const ANTIGRAVITY_INPUT_MODALITIES = ["text", "image"];
 export function refreshCustomCatalogCapabilities(catalog, routes) {
   if (!Array.isArray(catalog?.models)) return catalog;
   const bySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
@@ -2655,7 +2657,8 @@ export function refreshCustomCatalogCapabilities(catalog, routes) {
     const route = bySlug.get(model.slug);
     if (!route) return model;
     const tiers = customSpeedTiers(route);
-    const effortFields = route.transport === "antigravity-cli" ? catalogEffortFields(route.efforts)
+    const effortFields = route.transport === "antigravity-cli"
+      ? { ...catalogEffortFields(route.efforts), input_modalities: ANTIGRAVITY_INPUT_MODALITIES }
       : fixedReasoningEffort(route.upstreamModel) ? catalogEffortFields([]) : {};
     const instructions = modelIdentityInstructions(model.base_instructions, route);
     const tiersMatch = isDeepStrictEqual(model.additional_speed_tiers ?? [], tiers.additional_speed_tiers)
@@ -3044,7 +3047,7 @@ export function customCatalogEntry(officialModels, route, index) {
   entry.availability_nux = null;
   entry.upgrade = null;
   if (route.transport === "antigravity-cli") {
-    entry.input_modalities = ["text"];
+    entry.input_modalities = ANTIGRAVITY_INPUT_MODALITIES;
     entry.supports_parallel_tool_calls = true;
   }
   entry.supports_search_tool = false;

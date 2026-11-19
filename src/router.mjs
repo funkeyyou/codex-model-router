@@ -1264,7 +1264,7 @@ function hasOutputText(item) {
   );
 }
 
-function recordUsageEvent(context, event) {
+export function recordUsageEvent(context, event) {
   if (context.recorded || settings.usageLog === false) return;
   if ((event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) ||
       (event?.type === "response.output_text.done" && typeof event.text === "string" && event.text.length) ||
@@ -1272,9 +1272,12 @@ function recordUsageEvent(context, event) {
     context.firstTextAt ??= Date.now();
     context.firstOutputAt ??= context.firstTextAt;
   }
+  // 串流出來的思考也是輸出：模型先想 20 秒、正文 1 秒就送完時，只從正文起算會把思考的
+  // tokens 擠進那 1 秒，TPS 變成數千。首次輸出因此從第一段可見的思考或正文起算。
   if (context.firstOutputAt == null && (
     ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)) ||
-    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta") && event.delta?.length)
+    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta" ||
+      event?.type === "response.reasoning_summary_text.delta" || event?.type === "response.reasoning_text.delta") && event.delta?.length)
   )) {
     context.firstOutputAt = Date.now();
   }
@@ -1331,24 +1334,29 @@ function backgroundModelFor(kind) {
   return kind === "memory" ? setting.memory : setting.light;
 }
 
+// 背景任務的固定提示詞出現在兩種位置：獨立請求放在第一則使用者訊息；Codex Desktop 的
+// 「預測分支」（例如用目前聊天的模型產生或更新標題）會複製整段聊天，提示詞變成最後一則。
+function userText(item) {
+  if (typeof item === "string") return item;
+  if ((item?.type && item.type !== "message") || item?.role !== "user") return null;
+  const content = typeof item.content === "string" ? [{ text: item.content }] : Array.isArray(item.content) ? item.content : [];
+  return content.find((entry) => typeof entry?.text === "string")?.text ?? null;
+}
+
 function firstPromptTexts(body) {
   const texts = [];
   if (typeof body?.instructions === "string") texts.push(body.instructions);
   const input = Array.isArray(body?.input) ? body.input : typeof body?.input === "string" ? [body.input] : [];
-  for (const item of input) {
-    if (typeof item === "string") { texts.push(item); break; }
-    if (item?.type && item.type !== "message") continue;
-    if (item?.role !== "user") continue;
-    const content = typeof item.content === "string" ? [{ text: item.content }] : Array.isArray(item.content) ? item.content : [];
-    const part = content.find((entry) => typeof entry?.text === "string");
-    if (part) texts.push(part.text);
-    break;
-  }
+  const first = input.findIndex((item) => userText(item) !== null);
+  const last = input.findLastIndex((item) => userText(item) !== null);
+  if (first >= 0) texts.push(userText(input[first]));
+  if (last > first) texts.push(userText(input[last]));
   return texts.map((text) => text.trimStart());
 }
 
+// 選了自訂模型的聊天，Codex 也會用同一個自訂模型跑這些背景任務，同樣辨識、記錄與改送。
 export function backgroundTaskKind(body) {
-  if (typeof body?.model !== "string" || body.model.startsWith("custom/")) return null;
+  if (typeof body?.model !== "string") return null;
   for (const text of firstPromptTexts(body)) {
     for (const [kind, pattern] of BACKGROUND_TASK_PATTERNS) if (pattern.test(text)) return kind;
   }
@@ -1362,7 +1370,7 @@ export function applyBackgroundModel(body) {
   const kind = backgroundTaskKind(body);
   if (!kind) return body;
   const target = backgroundModelFor(kind);
-  if (!target || !routeMap.has(target)) return body;
+  if (!target || target === body.model || !routeMap.has(target)) return body;
   stats.backgroundRerouted += 1;
   stats.backgroundReroutedByKind[kind] = (stats.backgroundReroutedByKind[kind] || 0) + 1;
   return { ...body, model: target, [BACKGROUND_KIND]: kind };

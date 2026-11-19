@@ -115,9 +115,10 @@ test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", as
   assert.equal(record.output, 30);
   assert.equal(record.thread, "usage-test");
   assert.ok(record.firstTextMs >= 15);
-  assert.ok(record.durationMs - record.firstTextMs >= 15);
-  assert.equal(record.outputTps, 30000 / (record.durationMs - record.firstTextMs));
-  assert.equal(record.firstOutputMs, record.firstTextMs);
+  // 串流的思考就是第一段輸出；TPS 從那裡算到結束。
+  assert.ok(record.firstTextMs - record.firstOutputMs >= 15);
+  assert.ok(record.durationMs - record.firstOutputMs >= 30);
+  assert.equal(record.outputTps, 30000 / (record.durationMs - record.firstOutputMs));
 
   toolOnly = true;
   const toolResponse = await sendRequest();
@@ -127,7 +128,7 @@ test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", as
   assert.ok(!updated.includes("private tool input"));
   const toolRecord = JSON.parse(updated.trim().split("\n").at(-1));
   assert.equal(toolRecord.firstTextMs, null);
-  assert.ok(toolRecord.firstOutputMs >= 15);
+  assert.ok(toolRecord.durationMs - toolRecord.firstOutputMs >= 30, "streamed thinking starts the output clock");
   assert.equal(toolRecord.output, 30);
   assert.equal(toolRecord.outputTps, null);
 });
