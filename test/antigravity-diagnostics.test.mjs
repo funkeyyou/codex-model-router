@@ -14,6 +14,8 @@ test("Antigravity failure classifications distinguish timeout, process exit, ACP
     [Error("UNAUTHENTICATED (code 401)"), { stage: "prompt" }, "auth_required"],
     [Error("PERMISSION_DENIED (code 403)"), { stage: "prompt" }, "permission_denied"],
     [Error("blocked by policy"), { stage: "prompt" }, "policy_rejected"],
+    [Error("generating and executing: serializing trajectory: no messages fit within the context token budget"), { stage: "prompt" }, "context_length_exceeded"],
+    [Error("generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0"), { stage: "prompt" }, "context_length_exceeded"],
     [Error("Antigravity turn ended early"), { stage: "stop_reason" }, "early_stop"],
     [new SyntaxError("secret response bytes"), { stage: "parse_response" }, "invalid_response_json"],
     [new SyntaxError('Unexpected token in model text: "SAFETY code 429"'), { stage: "parse_response" }, "invalid_response_json"],

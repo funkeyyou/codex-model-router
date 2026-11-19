@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.21";
+const INSTALLER_VERSION = "1.44.22";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -19104,6 +19104,26 @@ class EnvelopeSyntaxError extends SyntaxError {
   }
 }
 
+class CliExecutionError extends Error {
+  constructor(kind) {
+    // The CLI can include arbitrary request content after its executor error prefix.
+    // Keep only the classification, not that message, in exceptions, logs and SSE.
+    super("Antigravity CLI execution failed");
+    this.kind = kind;
+  }
+}
+
+const contextBudgetError = message => /^(?:generating and executing: )?serializing trajectory: (?:no messages fit within the context token budget|maxMessageTokens must be positive, got -?\d+)$/.test(message);
+
+function cliExecutionFailure(raw) {
+  // agy 1.5.12 sends executor failures as a single ordinary agent_message_chunk and
+  // reports end_turn, even when no model was called. Match the whole CLI banner only:
+  // quoted examples in valid envelopes and malformed JSON must keep their own handling.
+  const match = /^\s*⚠\uFE0F? agent executor error: ([^\r\n]+)[ \t]*(?:\r?\n)?$/.exec(raw);
+  if (!match) return null;
+  return new CliExecutionError(contextBudgetError(match[1].trim()) ? "context_length_exceeded" : "cli_execution_error");
+}
+
 function jsonEscapeLength(text, index) {
   const next = text[index + 1];
   if (next === "u") return /^[0-9a-f]{4}$/i.test(text.slice(index + 2, index + 6)) ? 6 : 0;
@@ -19175,6 +19195,8 @@ function recoverTextOnlyEnvelope(payload) {
 }
 
 export function parseAntigravityEnvelope(raw) {
+  const cliError = cliExecutionFailure(raw);
+  if (cliError) throw cliError;
   const payload = raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
   try { return { reply: JSON.parse(payload), recovered: false }; }
   catch {
@@ -19272,12 +19294,13 @@ export function antigravityFailureKind(error, { stage, abortReason, closeReason 
   if (closeReason === "process_exit") return "acp_process_exit";
   // JSON.parse error messages can quote model text. Do not look for provider keywords there.
   if (stage === "parse_response") {
-    if (error instanceof EnvelopeSyntaxError) return error.kind;
+    if (error instanceof EnvelopeSyntaxError || error instanceof CliExecutionError) return error.kind;
     return error instanceof SyntaxError ? "invalid_response_json" : "invalid_response_format";
   }
   if (stage === "stream_consistency") return "stream_changed";
   if (stage === "stop_reason") return "early_stop";
   const message = typeof error?.message === "string" ? error.message : "";
+  if ((stage === "prompt" || stage === "set_model") && contextBudgetError(message.trim())) return "context_length_exceeded";
   if (/\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b/i.test(message)) return "rate_limited";
   if (/\bUNAUTHENTICATED\b|\b(?:HTTP|code)\s+401\b/i.test(message)) return "auth_required";
   if (/\bPERMISSION_DENIED\b|\b(?:HTTP|code)\s+403\b/i.test(message)) return "permission_denied";
@@ -19287,6 +19310,8 @@ export function antigravityFailureKind(error, { stage, abortReason, closeReason 
 }
 
 const turnFailureMessages = {
+  context_length_exceeded: "Antigravity CLI could not fit this conversation, tools and images within the model's context token budget. Compact or shorten the conversation, or start a new task with a brief summary. Retrying the same request will not help.",
+  cli_execution_error: "Antigravity CLI reported an executor failure before a valid reply. No tool calls from this turn were forwarded.",
   turn_timeout: "Antigravity CLI did not finish within 5 minutes. Try a shorter request or a lower reasoning effort.",
   local_tool_attempt: "Antigravity CLI tried to use its own tools, so the turn was stopped. Retry; if it repeats, start a new task.",
   invalid_response_json: "Antigravity CLI returned an invalid JSON reply. No tool calls from this turn were forwarded.",
