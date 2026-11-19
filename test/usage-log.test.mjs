@@ -35,10 +35,13 @@ test("各模型的三項效能平均分別採計有數值的請求", () => {
     { model: "custom/a", firstOutputMs: -1, outputTps: -1 },
     { model: "custom/b", durationMs: 7000, firstOutputMs: null, outputTps: null },
     { model: "custom/c", durationMs: null },
+    { model: "custom/d", durationMs: 4000, firstOutputMs: 1000, firstTextMs: null, outputTps: 500 },
+    { model: "custom/d", durationMs: 5000, firstOutputMs: 2000, firstTextMs: null, hasText: true, outputTps: 20 },
   ]);
   const a = models.find((item) => item.model === "custom/a");
   const b = models.find((item) => item.model === "custom/b");
   const c = models.find((item) => item.model === "custom/c");
+  const d = models.find((item) => item.model === "custom/d");
   assert.equal(a.avgDurationMs, 13000 / 3);
   assert.equal(a.avgFirstOutputMs, 4000 / 3);
   assert.equal(a.avgOutputTps, 30);
@@ -46,7 +49,9 @@ test("各模型的三項效能平均分別採計有數值的請求", () => {
   assert.equal(b.avgFirstOutputMs, null);
   assert.equal(b.avgOutputTps, null);
   assert.equal(c.avgDurationMs, null);
-  assert.equal(total.avgDurationMs, 5000);
+  assert.equal(d.avgFirstOutputMs, 1500);
+  assert.equal(d.avgOutputTps, 20);
+  assert.equal(total.avgDurationMs, 29000 / 6);
 });
 
 test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", async (t) => {
@@ -123,5 +128,6 @@ test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", as
   const toolRecord = JSON.parse(updated.trim().split("\n").at(-1));
   assert.equal(toolRecord.firstTextMs, null);
   assert.ok(toolRecord.firstOutputMs >= 15);
-  assert.equal(toolRecord.outputTps, 30000 / (toolRecord.durationMs - toolRecord.firstOutputMs));
+  assert.equal(toolRecord.output, 30);
+  assert.equal(toolRecord.outputTps, null);
 });

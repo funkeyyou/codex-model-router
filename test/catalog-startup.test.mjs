@@ -76,6 +76,15 @@ test("Codex 連續重啟同步新增官方模型；離線仍保留自訂模型",
   let result = await picker("gpt-6-sol");
   assert.ok(result.includes("gpt-6-sol"));
   assert.ok(result.includes(custom.slug));
+  const neon = installer.customCatalogEntry(bundled.models, {
+    pickerSlug: "custom/gemini-neon", upstreamModel: "ark/gemini-4-neon-xhigh",
+    providerHost: "gateway.example", efforts: ["low", "medium", "high"], contextWindow: 1000000,
+  }, 0);
+  writeFileSync(catalogPath, JSON.stringify({ models: [entry("old-model"), custom, neon] }));
+  const catalogWithNeon = await installer.codexRpc("model/list", { includeHidden: true },
+    response => installer.hasExpectedModels(response, [neon.slug]), bin, root);
+  assert.deepEqual(catalogWithNeon.data.find(model => model.id === neon.slug).supportedReasoningEfforts, []);
+  writeFileSync(catalogPath, JSON.stringify({ models: [entry("old-model"), custom] }));
   const before = queries;
   models = [...models, entry("gpt-6-luna")];
   result = await picker("gpt-6-luna");

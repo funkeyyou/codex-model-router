@@ -750,6 +750,7 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 "勾選要在選擇器顯示的推理強度。上游不支援某個檔位時，可能被拒或落回模型預設。": "Select the reasoning efforts to show in the picker. If the provider doesn't support an effort, it may reject it or fall back to the model default.",
 "目前：手動設定，更新或重新探測時不會被覆蓋。": "Currently: set manually; updates and re-tests won't overwrite it.",
 "目前：探測結果。": "Currently: from testing.",
+"固定為 {effort}": "Fixed at {effort}",
 "至少要保留一個推理強度。": "Keep at least one reasoning effort.",
 "選擇器會顯示 Fast（service_tier=priority）": "The picker shows Fast (service_tier=priority)",
 "開啟後，選擇 Fast 會送出 service_tier=priority：通常更快，費用依供應商計算（多半較貴）。上游不支援時可能被拒或沒有效果。": "When on, choosing Fast sends service_tier=priority: usually faster, billed by the provider (often at a higher rate). Providers that don't support it may reject it or ignore it.",
@@ -2325,6 +2326,7 @@ function outputCell(model) {
 
 function modelRow(model, index, count, blocked) {
   const isDefault = state.config && state.config.model === model.slug;
+  const reasoning = model.fixedEffort ? t("固定為 {effort}", { effort: model.fixedEffort }) : effortText(model.efforts);
   const handle = h("span", {
     class: "drag-handle" + (blocked ? " disabled" : ""), title: blocked ? null : t("按住拖曳調整順序"), "aria-hidden": "true",
   }, icon("grip"));
@@ -2341,10 +2343,10 @@ function modelRow(model, index, count, blocked) {
       h("div", { class: "model-sub", text: model.upstreamModel, title: t("選擇器 ID：{slug}", { slug: model.slug }) }),
       h("div", { class: "model-meta" }, h("span", { class: "chip", text: providerLabel(model.providerId) }), transportChip(model.transport),
         model.fast ? h("span", { class: "chip violet", text: "Fast", title: t("選擇器會顯示 Fast（service_tier=priority）") }) : null,
-        h("span", { class: "faint", text: effortText(model.efforts) }))),
+        h("span", { class: "faint", text: reasoning }))),
     h("td", { class: "col-provider" }, h("span", { class: "chip", text: providerLabel(model.providerId) })),
     h("td", { class: "col-transport" }, transportChip(model.transport)),
-    h("td", { class: "col-effort muted nowrap", text: effortText(model.efforts), title: (model.efforts || []).join(", ") }),
+    h("td", { class: "col-effort muted nowrap", text: reasoning, title: model.fixedEffort ? reasoning : (model.efforts || []).join(", ") }),
     contextCell(model),
     outputCell(model),
     h("td", { class: "tight" }, h("div", { class: "row-actions" },

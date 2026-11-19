@@ -1,6 +1,15 @@
 {
-  "latest": "1.44.15",
+  "latest": "1.44.16",
   "releases": [
+    {
+      "version": "1.44.16",
+      "date": "2026-11-19",
+      "changes": [
+        "修正 Claude CLI、Claude API 與 Chat Completions 路由在接續含推理深度設定更新（configuration_update）的對話時回傳 422。",
+        "上游模型名稱含獨立推理檔位（例如 model-high、model-xhigh-preview）時，Codex 隱藏推理強度選項，管理頁顯示固定檔位。已添加的模型在更新時自動套用。",
+        "純工具呼叫的輸出 TPS 顯示為「—」，並從各模型的平均 TPS 排除。首次輸出時間與總耗時仍會記錄。"
+      ]
+    },
     {
       "version": "1.44.15",
       "date": "2026-11-18",

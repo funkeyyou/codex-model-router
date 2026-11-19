@@ -40,13 +40,13 @@ test("update migrates speed tiers of existing custom entries without touching ot
     { slug: "custom/opus", display_name: "手動", additional_speed_tiers: [], service_tiers: [] },
     { slug: "custom/sonnet", additional_speed_tiers: [], service_tiers: [] },
   ] };
-  const updated = installer.refreshCustomSpeedTiers(catalog, routes);
+  const updated = installer.refreshCustomCatalogCapabilities(catalog, routes);
   assert.notEqual(updated, catalog);
   assert.deepEqual(updated.models[1].additional_speed_tiers, ["fast"]);
   assert.equal(updated.models[1].display_name, "手動");
   assert.equal(updated.models[0], catalog.models[0]);
   assert.equal(updated.models[2], catalog.models[2]);
-  assert.equal(installer.refreshCustomSpeedTiers(updated, routes), updated);
+  assert.equal(installer.refreshCustomCatalogCapabilities(updated, routes), updated);
 });
 
 test("fastMode is opted in through --settings only when requested", () => {

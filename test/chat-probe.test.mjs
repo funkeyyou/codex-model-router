@@ -9,7 +9,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
-const { installer } = await loadPayloads();
+const { installer, router } = await loadPayloads();
 const delta = (value, finish = null) => ({ choices: [{ index: 0, delta: value, finish_reason: finish }] });
 const chatRoute = {
   pickerSlug: "custom/deepseek-chat", upstreamModel: "deepseek-chat", displayName: "api/deepseek-chat",
@@ -67,6 +67,41 @@ test("探測：已知支援 xhigh 的模型（gemini-4-hydrogen）額外加入�
   assert.deepEqual(installer.knownChatExtraEfforts("google/Gemini-4-Hydrogen"), ["xhigh"]);
   assert.ok(!gateway.requests.some((request) => ["xhigh", "max"].includes(request.body?.reasoning_effort)),
     "閘道多半照收不存在的檔位，不靠探測判斷 xhigh／max");
+});
+
+test("模型名稱含獨立檔位時，新增及更新時隱藏檔位，轉送時保留摘要設定", async (t) => {
+  for (const upstreamModel of ["high/base", "highway", "minimax-m2", "flashlight"]) {
+    assert.equal(installer.effortsConfigurable({ upstreamModel }), true);
+  }
+  const gateway = await fakeGateway(t);
+  for (const model of ["ark/gemini-4-neon-high", "gemini-4-neon-xhigh", "demo_LOW", "m.medium.preview", "other/model:MAX", "demo-extra-high"]) {
+    const { route } = await installer.buildRouteForModel({ apiRoot: gateway.apiRoot }, "key", model, silent);
+    assert.deepEqual(route.efforts, []);
+    assert.equal(route.fixedReasoning, true);
+    assert.equal(route.chatTools, true);
+    assert.ok(gateway.requests.filter(({ body }) => body?.model === model).every(
+      ({ body }) => !("reasoning" in body) && !("reasoning_effort" in body)));
+
+    const entry = installer.customCatalogEntry([], { ...route, contextWindow: 1000000 }, 0);
+    const oldRoute = { ...route, efforts: ["low", "medium", "high"], stripReasoning: false, effortsManual: true };
+    delete oldRoute.fixedReasoning;
+    const { settings, manifest } = installer.planUpdate({ routes: [oldRoute] }, {
+      port: 48953, routes: [oldRoute], apiRoot: gateway.apiRoot,
+    });
+    assert.deepEqual(settings.routes, [route]);
+    assert.deepEqual(manifest.routes, [route]);
+    const oldCatalog = { models: [{ ...entry, default_reasoning_level: "medium", supported_reasoning_levels: [{ effort: "medium" }] }] };
+    const catalog = installer.refreshCustomCatalogCapabilities(oldCatalog, settings.routes);
+    assert.deepEqual(catalog.models, [entry]);
+    assert.equal(entry.default_reasoning_level, "none");
+    assert.deepEqual(entry.supported_reasoning_levels, []);
+    assert.equal(installer.effortsConfigurable(route), false);
+    assert.throws(() => installer.planEditModel(manifest, settings, catalog, route.pickerSlug, { efforts: ["low"] }), /不支援/);
+    assert.deepEqual(router.rewriteCustomBody({ reasoning: { effort: "low", summary: "auto" } }, route), {
+      model, reasoning: { summary: "auto" },
+    });
+    assert.deepEqual(router.rewriteCustomBody({ reasoning: { effort: "xhigh" } }, route), { model });
+  }
 });
 
 test("修改模型：手動調整推理強度會寫進路由與目錄，重新探測時沿用", () => {

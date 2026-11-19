@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.15";
+const INSTALLER_VERSION = "1.44.16";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1701,7 +1701,8 @@ export function fastFieldsFromProbe(fastProbe) {
 async function probeModel(apiRoot, apiKey, model, log = consoleProbeLog) {
   const supportedEfforts = [];
   const transientEfforts = [];
-  for (const effort of EFFORTS) {
+  const fixedEffort = fixedReasoningEffort(model);
+  for (const effort of fixedEffort ? [] : EFFORTS) {
     log.write(`  ${effort.padEnd(7)} `);
     try {
       const result = await testResponse(apiRoot, apiKey, model, effort);
@@ -1734,7 +1735,7 @@ async function probeModel(apiRoot, apiKey, model, log = consoleProbeLog) {
   try {
     const result = await testResponse(apiRoot, apiKey, model, null);
     if (result.ok) {
-      log.line("支援，但不提供推理強度控制");
+      log.line(fixedEffort ? `支援，上游模型固定為 ${fixedEffort}` : "支援，但不提供推理強度控制");
       return { supported: true, efforts: [], stripReasoning: true, transientEfforts };
     }
     log.line(`不支持（HTTP ${result.status}）`);
@@ -1865,21 +1866,25 @@ export async function probeChatModel(apiRoot, apiKey, model, log = consoleProbeL
     log.line(`暫時無法確認（${describe(error)}），先當作支援`);
   }
 
-  log.write("  推理強度控制     ");
   let efforts = [];
-  try {
-    const probe = await testChatCompletion(apiRoot, apiKey, model, { ...base, reasoning_effort: "low" });
-    if (probe.ok) {
-      efforts = ["low", "medium", "high"];
-      efforts.push(...knownChatExtraEfforts(model));
-      log.line(`reasoning_effort（${efforts.join("／")}）`);
-    } else {
-      log.line(isTransientProbeStatus(probe.status)
-        ? `暫時無法確認（HTTP ${probe.status}），使用模型預設`
-        : "不支持，使用模型預設");
+  const fixedEffort = fixedReasoningEffort(model);
+  log.write("  推理強度控制     ");
+  if (fixedEffort) {
+    log.line(`上游模型固定為 ${fixedEffort}`);
+  } else {
+    try {
+      const probe = await testChatCompletion(apiRoot, apiKey, model, { ...base, reasoning_effort: "low" });
+      if (probe.ok) {
+        efforts = ["low", "medium", "high", ...knownChatExtraEfforts(model)];
+        log.line(`reasoning_effort（${efforts.join("／")}）`);
+      } else {
+        log.line(isTransientProbeStatus(probe.status)
+          ? `暫時無法確認（HTTP ${probe.status}），使用模型預設`
+          : "不支持，使用模型預設");
+      }
+    } catch (error) {
+      log.line(`暫時無法確認（${describe(error)}），使用模型預設`);
     }
-  } catch (error) {
-    log.line(`暫時無法確認（${describe(error)}），使用模型預設`);
   }
   const fastProbe = await probeServiceTier(
     (tier) => testChatCompletion(apiRoot, apiKey, model, { ...base, service_tier: tier }), log);
@@ -1897,6 +1902,20 @@ const KNOWN_CHAT_EXTRA_EFFORTS = Object.freeze({
 export function knownChatExtraEfforts(model) {
   const key = String(model || "").split("/").at(-1).toLowerCase();
   return [...(KNOWN_CHAT_EXTRA_EFFORTS[key] || [])];
+}
+
+// 辨識上游模型 ID 中獨立的推理檔位，忽略供應商前綴和大小寫。
+function fixedReasoningEffort(model) {
+  const id = String(model || "").split("/").at(-1).toLowerCase();
+  const words = id.replace(/extra[-_.:]high/g, "xhigh").split(/[-_.:]+/);
+  return words.findLast(word => EFFORTS.includes(word) || ["none", "minimal", "ultra"].includes(word)) ?? null;
+}
+
+function normalizeFixedReasoningRoute(route) {
+  if (!fixedReasoningEffort(route.upstreamModel)) return route;
+  const updated = { ...route, efforts: [], stripReasoning: true, fixedReasoning: true };
+  delete updated.effortsManual;
+  return updated;
 }
 
 // --- 中轉供應商 ---------------------------------------------------------------
@@ -2613,8 +2632,8 @@ export function customSpeedTiers(route) {
   };
 }
 
-// 更新時把既有自訂項目的速度等級改成依路由計算的結果；沒有變動就回傳原物件。
-export function refreshCustomSpeedTiers(catalog, routes) {
+// 更新既有自訂項目的速度等級及固定推理模型的選擇器資料。
+export function refreshCustomCatalogCapabilities(catalog, routes) {
   if (!Array.isArray(catalog?.models)) return catalog;
   const bySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
   let changed = false;
@@ -2622,10 +2641,12 @@ export function refreshCustomSpeedTiers(catalog, routes) {
     const route = bySlug.get(model.slug);
     if (!route) return model;
     const tiers = customSpeedTiers(route);
-    if (JSON.stringify(model.additional_speed_tiers ?? []) === JSON.stringify(tiers.additional_speed_tiers)
-      && JSON.stringify(model.service_tiers ?? []) === JSON.stringify(tiers.service_tiers)) return model;
+    const effortFields = fixedReasoningEffort(route.upstreamModel) ? catalogEffortFields([]) : {};
+    const tiersMatch = isDeepStrictEqual(model.additional_speed_tiers ?? [], tiers.additional_speed_tiers)
+      && isDeepStrictEqual(model.service_tiers ?? [], tiers.service_tiers);
+    if (tiersMatch && Object.entries(effortFields).every(([key, value]) => isDeepStrictEqual(model[key], value))) return model;
     changed = true;
-    return { ...model, ...tiers };
+    return { ...model, ...tiers, ...effortFields };
   });
   return changed ? { ...catalog, models } : catalog;
 }
@@ -2835,7 +2856,8 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
   // Claude 訂閱（CLI）固定支援全部檔位，不在這裡改。
   let effortsPatch = null;
   if (efforts !== undefined && efforts !== null) {
-    if (!effortsConfigurable(route)) fail("這個模型的推理強度由 Claude CLI 決定，無法在這裡修改。");
+    if (route.transport === "claude-cli") fail("這個模型的推理強度由 Claude CLI 決定，無法在這裡修改。");
+    if (!effortsConfigurable(route)) fail("這個模型不支援在管理頁修改推理強度。");
     if (!Array.isArray(efforts) || efforts.some((effort) => !EFFORTS.includes(effort))) {
       fail(`推理強度只能是 ${EFFORTS.join("、")}。`);
     }
@@ -2926,7 +2948,7 @@ export function planEditModel(manifest, settings, catalog, slug, { displayName, 
 }
 
 export function effortsConfigurable(route) {
-  return route?.transport !== "claude-cli";
+  return route?.transport !== "claude-cli" && !fixedReasoningEffort(route?.upstreamModel);
 }
 
 function catalogEffortFields(efforts) {
@@ -2984,7 +3006,7 @@ export function customCatalogEntry(officialModels, route, index) {
   entry.slug = route.pickerSlug;
   entry.display_name = withDefaultModelPrefix(route).displayName;
   entry.description = `${route.upstreamModel}，由 ${route.providerHost} 提供`;
-  Object.assign(entry, catalogEffortFields(route.efforts));
+  Object.assign(entry, catalogEffortFields(fixedReasoningEffort(route.upstreamModel) ? [] : route.efforts));
   entry.priority =
     Math.max(0, ...officialModels.map((model) => Number(model.priority || 0))) +
     index +
@@ -3946,6 +3968,7 @@ export function resolveRouteWithPrevious(outcome, previous) {
 
 // 使用者在管理頁手動改過推理強度的，重新探測時沿用手動設定。
 export function keepManualEfforts(route, previous) {
+  if (fixedReasoningEffort(route.upstreamModel)) return normalizeFixedReasoningRoute(route);
   if (!previous?.effortsManual || route === previous || !Array.isArray(previous.efforts)) return route;
   return { ...route, efforts: [...previous.efforts], stripReasoning: false, effortsManual: true };
 }
@@ -3991,6 +4014,7 @@ function resolveRouteWithPreviousEfforts(outcome, previous) {
 //   transientEfforts 這次暫時問不到的推理強度
 export async function buildRouteForModel(discovery, apiKey, model, log = consoleProbeLog, providerId = DEFAULT_PROVIDER_ID) {
   log.line(`\n正在測試 ${model}`);
+  const fixedReasoning = fixedReasoningEffort(model) !== null;
   const owner = modelOwners.get(model) || "unknown";
   const ownerIsAnthropic = owner === "anthropic";
   // /models 沒標供應商時按模型名推斷，否則 Claude 會靜默落到通用 Responses
@@ -4081,7 +4105,7 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
         promptCache: supportsCache === true,
         reasoningSummary: supportsSummary === true,
       };
-      return { route, transient: false, transientEfforts: [] };
+      return { route: normalizeFixedReasoningRoute(route), transient: false, transientEfforts: [] };
     }
 
     log.line(`失敗（HTTP ${probeResult.status}）${probeResult.detail ? "：" + probeResult.detail : ""}`);
@@ -4114,6 +4138,7 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
     ...(providerId !== DEFAULT_PROVIDER_ID ? { providerId } : {}),
     efforts: chat.efforts,
     stripReasoning: chat.efforts.length === 0,
+    ...(fixedReasoning ? { fixedReasoning } : {}),
     contextWindow: null,
     translate: "chat",
     chatTools: chat.tools,
@@ -4164,6 +4189,7 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
     ...(providerId !== DEFAULT_PROVIDER_ID ? { providerId } : {}),
     efforts: probe.efforts,
     stripReasoning: probe.stripReasoning,
+    ...(fixedReasoning ? { fixedReasoning } : {}),
     contextWindow: null,
     ...fastFieldsFromProbe(fastProbe),
   };
@@ -4988,14 +5014,14 @@ export function planClaudeCliModels(state, binary, models, contextWindow = 20000
     if (previous && outputLimit > contextWindow) fail("既有最大輸出超過新的上下文上限，請一併調整輸出設定。");
     // 重新設定時保留使用者手動取的名稱；自動名稱一律依目前的前綴重算。
     const manualName = previous?.displayName && !isAutoDisplayName(previous.displayName, previous, prefix) ? previous.displayName : null;
-    return {
+    return normalizeFixedReasoningRoute({
       pickerSlug: previous?.pickerSlug || pickerSlug(resolved, "claude-cli"), upstreamModel: resolved,
       requestedModel: requested,
       displayName: manualName || `claude-cli/${resolved}`, providerId: "claude-cli", providerHost: "Claude Code（訂閱帳號）",
       transport: "claude-cli", translate: "anthropic", efforts: [...EFFORTS],
       contextWindow, maxOutputTokens: outputLimit,
       ...(defaultOutput ? { defaultMaxOutputTokens: defaultOutput } : {}),
-    };
+    });
   }), prefix, state.settings.routes);
   const replaced = new Set(newRoutes.map((route) => route.pickerSlug));
   const routes = [...state.settings.routes.filter((route) => !replaced.has(route.pickerSlug)), ...newRoutes];
@@ -5537,7 +5563,8 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
   if (!settings || typeof settings !== "object") return { ok: false, reason: "missing-settings" };
 
   if (!Array.isArray(settings.routes)) return { ok: false, reason: "no-routes" };
-  const routes = settings.routes.map(withDefaultModelPrefix);
+  const updateRoute = (route) => normalizeFixedReasoningRoute(withDefaultModelPrefix(route));
+  const routes = settings.routes.map(updateRoute);
   const providers = installedProviders(settings, manifest);
   // 只連接 Claude 訂閱時沒有 API 供應商，路由仍完整。
   if (providers.length === 0 && !settings.claudeCli?.binary &&
@@ -5569,12 +5596,12 @@ export function planUpdate(manifest, settings, installerVersion = INSTALLER_VERS
     port,
     routes,
     providers,
-    // 只有預設顯示名稱會補 api/；所有上游 ID、憑證、模型能力與使用者旋鈕保留。
+    // 補上預設顯示名稱，並同步已知固定推理深度模型的能力。
     // 舊版放在頂層的單一供應商欄位搬進 providers（見 installedProviders）。
     settings: withProviders({ ...settings, routes, version: installerVersion }, providers),
     manifest: manifestWithProviders({
       ...manifest, version: installerVersion,
-      ...(Array.isArray(manifest.routes) ? { routes: manifest.routes.map(withDefaultModelPrefix) } : {}),
+      ...(Array.isArray(manifest.routes) ? { routes: manifest.routes.map(updateRoute) } : {}),
     }, providers),
   };
 }
@@ -5617,8 +5644,9 @@ async function update() {
     fail(UPDATE_FAILURES[plan.reason] || "無法更新現有安裝。");
   }
   const currentCatalog = existsSync(catalogPath) ? JSON.parse(readFileSync(catalogPath, "utf8")) : null;
-  const updatedCatalog = refreshCustomSpeedTiers(prefixCatalogDisplayNames(currentCatalog, plan.routes), plan.routes);
-  const namesChanged = updatedCatalog !== currentCatalog;
+  const namedCatalog = prefixCatalogDisplayNames(currentCatalog, plan.routes);
+  const updatedCatalog = refreshCustomCatalogCapabilities(namedCatalog, plan.routes);
+  const catalogChanged = updatedCatalog !== currentCatalog;
   // 只遷移本工具管理的固定目錄，不移除使用者自行指定的其他目錄。
   const useCodex = codexIntegrationEnabled(manifest);
   if (useCodex) requireCodex();
@@ -5657,7 +5685,7 @@ async function update() {
   copyIfExists(settingsPath, join(backupDir, "settings.json"));
   copyIfExists(manifestPath, join(backupDir, "install.json"));
   if (migrateCatalog || (useCodex && quotaModeEnabled())) copyIfExists(userConfig.filePath, join(backupDir, "config.toml"));
-  if (namesChanged) copyIfExists(catalogPath, join(backupDir, "models.json"));
+  if (catalogChanged) copyIfExists(catalogPath, join(backupDir, "models.json"));
   for (const path of serviceArchivePaths()) {
     copyIfExists(path, join(backupDir, basename(path)));
   }
@@ -5670,7 +5698,7 @@ async function update() {
     chmodSync(routerPath, 0o600);
     writeBridgeSources();
     writeJsonAtomic(settingsPath, { ...plan.settings, codexBin: useCodex ? codexBin : null });
-    if (namesChanged) writeJsonAtomic(catalogPath, updatedCatalog);
+    if (catalogChanged) writeJsonAtomic(catalogPath, updatedCatalog);
     writeJsonAtomic(manifestPath, {
       ...plan.manifest,
       codexBin: useCodex ? codexBin : null,
@@ -5724,7 +5752,7 @@ async function update() {
     restoreChatBridge(backupDir);
     copyIfExists(join(backupDir, "settings.json"), settingsPath);
     copyIfExists(join(backupDir, "install.json"), manifestPath);
-    if (namesChanged) copyIfExists(join(backupDir, "models.json"), catalogPath);
+    if (catalogChanged) copyIfExists(join(backupDir, "models.json"), catalogPath);
     invalidatePickerCacheAfterFailure();
     for (const path of serviceArchivePaths()) {
       copyIfExists(join(backupDir, basename(path)), path);
@@ -5749,7 +5777,7 @@ async function update() {
   console.log(`版本：${health?.version || plan.target}`);
   console.log(`健康檢查：${health?.status || "未知"}`);
   console.log(`保留 ${plan.routes.length} 個自訂模型，上游 ID、模型能力與 API Key 未變動。`);
-  if (namesChanged) console.log("沒有上游前綴的預設模型名稱已補上 api/。");
+  if (namedCatalog !== currentCatalog) console.log("沒有上游前綴的預設模型名稱已補上 api/。");
   if (migrateCatalog) console.log("已移除舊版固定模型目錄；重新開啟 Codex 時會同步官方清單並合併自訂模型。");
   else if (previousCatalogPath) console.log("注意：保留了您自行設定的 model_catalog_json；該設定會停用啟動時同步模型清單。");
   console.log(`備份：${backupDir}`);
@@ -7338,6 +7366,7 @@ async function managerState() {
       fastProbe: typeof route.fastProbe === "string" ? route.fastProbe : null,
       fastManual: route.fastManual === true,
       effortsConfigurable: effortsConfigurable(route),
+      fixedEffort: fixedReasoningEffort(route.upstreamModel),
       effortsManual: route.effortsManual === true,
       inCatalog: Boolean(entry),
     };
@@ -8824,6 +8853,12 @@ function usageAverage(sum, count) {
   return count > 0 ? sum / count : null;
 }
 
+function recordedOutputTps(record) {
+  // 舊版有首次輸出時間、明確沒有首次文字時間的紀錄，是由工具呼叫觸發的。
+  const hasText = record.hasText ?? !(record.firstTextMs === null && Number.isFinite(record.firstOutputMs));
+  return hasText ? record.outputTps : null;
+}
+
 export function summarizeUsage(records) {
   const byModel = new Map();
   const total = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0 };
@@ -8849,8 +8884,9 @@ export function summarizeUsage(records) {
       entry.firstOutputMs += firstOutputMs;
       entry.firstOutputSamples += 1;
     }
-    if (Number.isFinite(record.outputTps) && record.outputTps >= 0) {
-      entry.outputTps += record.outputTps;
+    const outputTps = recordedOutputTps(record);
+    if (Number.isFinite(outputTps) && outputTps >= 0) {
+      entry.outputTps += outputTps;
       entry.outputTpsSamples += 1;
     }
     if (record.background) entry.background += 1;
@@ -8903,7 +8939,7 @@ function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
   const offset = (current - 1) * usagePageSize;
   return {
     sinceHours: hours, summary: summarizeUsage(summaryRecords), asOf: snapshot,
-    entries: recent.slice(offset, offset + usagePageSize),
+    entries: recent.slice(offset, offset + usagePageSize).map((record) => ({ ...record, outputTps: recordedOutputTps(record) })),
     pagination: { page: current, pages, total: recent.length },
     logPath: usageLogPath,
   };

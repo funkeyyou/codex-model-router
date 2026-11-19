@@ -182,7 +182,8 @@ test("最近請求固定顯示 30 天，以 100 筆分頁，並可讀取新舊�
   const write = (file, rows) => writeFileSync(join(runtime, file), rows.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
   const archiveAge = 8 * 24 * hour;
   const day = new Date(now - archiveAge).toISOString().slice(0, 10);
-  write("usage.jsonl", [row(0, 1000)]);
+  const legacyToolOnly = { ...row(0, 1000), firstOutputMs: 100, firstTextMs: null, durationMs: 500, outputTps: 75 };
+  write("usage.jsonl", [legacyToolOnly]);
   write("usage.jsonl." + day + ".1234567890abcdef", Array.from({ length: 100 }, (_, index) => row(index + 1, archiveAge + index)));
   write("usage.jsonl.1", [row(101, 30 * 24 * hour - hour), row(999, 30 * 24 * hour + hour)]);
   const ui = await startManager(defer, baseEnv(root, runtime));
@@ -194,6 +195,8 @@ test("最近請求固定顯示 30 天，以 100 筆分頁，並可讀取新舊�
   const first = await query({ sinceHours: 1 });
   assert.deepEqual(first.pagination, { page: 1, pages: 2, total: 102 });
   assert.equal(first.summary.total.requests, 1);
+  assert.equal(first.summary.models[0].avgOutputTps, null);
+  assert.deepEqual(first.entries[0], { ...legacyToolOnly, outputTps: null });
   assert.deepEqual(first.entries.map((entry) => entry.model), Array.from({ length: 100 }, (_, index) => "model-" + index));
   write("usage.jsonl", [row(0, 1000), { ...row(200, 0), at: new Date(first.asOf + 1).toISOString() }]);
   const second = await query({ sinceHours: 720, page: 2, asOf: first.asOf });

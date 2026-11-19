@@ -1207,14 +1207,17 @@ export function usageRecord(context, event, now = Date.now()) {
     : null;
   const output = usageNumber(usage?.output_tokens);
   const generationMs = firstOutputMs === null ? 0 : durationMs - firstOutputMs;
+  // 結束事件可補足只在完整回應中提供文字的上游。
+  const finalOutput = event.response?.output;
+  const hasText = firstTextMs !== null || (Array.isArray(finalOutput) && finalOutput.some(hasOutputText));
   return {
     at: new Date(now).toISOString(),
     model: context.model,
     upstreamModel: typeof event.response?.model === "string" ? event.response.model.slice(0, 160) : null,
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
-    durationMs, firstTextMs, firstOutputMs,
-    outputTps: status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
+    durationMs, firstTextMs, firstOutputMs, hasText,
+    outputTps: hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
     cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
@@ -1251,9 +1254,17 @@ const usageToolItems = new Set(["function_call", "custom_tool_call", "tool_searc
   "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "local_shell_call",
   "shell_call", "apply_patch_call", "computer_call"]);
 
+function hasOutputText(item) {
+  return item?.type === "message" && Array.isArray(item.content) && item.content.some(
+    (part) => part?.type === "output_text" && typeof part.text === "string" && part.text.length > 0,
+  );
+}
+
 function recordUsageEvent(context, event) {
   if (context.recorded || settings.usageLog === false) return;
-  if (event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) {
+  if ((event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) ||
+      (event?.type === "response.output_text.done" && typeof event.text === "string" && event.text.length) ||
+      (event?.type === "response.output_item.done" && hasOutputText(event.item))) {
     context.firstTextAt ??= Date.now();
     context.firstOutputAt ??= context.firstTextAt;
   }
@@ -2072,6 +2083,23 @@ function fallbackEffort(efforts) {
   return null;
 }
 
+// A configuration_update with only reasoning.effort is a Codex control item.
+// Keep other shapes in input for the bridge's normal unsupported-item validation.
+export function resolveReasoningUpdates(body) {
+  if (!Array.isArray(body.input) || !body.input.some(item => item?.type === "configuration_update")) return body;
+  let lastEffort;
+  const input = body.input.filter(item => {
+    if (item?.type !== "configuration_update" ||
+        !Object.keys(item).every(key => ["type", "id", "reasoning"].includes(key)) ||
+        !item.reasoning || Object.keys(item.reasoning).length !== 1 ||
+        typeof item.reasoning.effort !== "string") return true;
+    lastEffort = item.reasoning.effort;
+    return false;
+  });
+  if (lastEffort === undefined) return body;
+  return { ...body, input, reasoning: { effort: lastEffort, ...body.reasoning } };
+}
+
 export function rewriteCustomBody(body, route) {
   const rewritten = { ...body, model: route.upstreamModel };
   // service_tier 只轉送給確認支援 Fast 的路由（Claude CLI 另外在轉送時讀取）。其他上游
@@ -2085,6 +2113,13 @@ export function rewriteCustomBody(body, route) {
     }
   }
   const requestedEffort = body?.reasoning?.effort;
+  if (route.fixedReasoning && body?.reasoning && typeof body.reasoning === "object") {
+    const { effort: _effort, ...reasoning } = body.reasoning;
+    if (Object.keys(reasoning).length) rewritten.reasoning = reasoning;
+    else delete rewritten.reasoning;
+    if (requestedEffort !== undefined) stats.reasoningRewrites += 1;
+    return rewritten;
+  }
   if (route.stripReasoning || route.efforts.length === 0) {
     delete rewritten.reasoning;
     if (body?.reasoning) stats.reasoningRewrites += 1;
@@ -2296,6 +2331,7 @@ export async function fetchModelUpstream(
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
   const deepseekChat = needsDeepseekChat(effectiveBody, route);
+  if (route?.translate || deepseekChat || route?.fixedReasoning) effectiveBody = resolveReasoningUpdates(effectiveBody);
   if (route?.translate !== "anthropic") {
     // Chat Completions 路由在同一輪的工具往返裡要送回自己產生的推理。
     effectiveBody = stripBridgeArtifacts(effectiveBody, { keepChatReasoning: route?.translate === "chat" || deepseekChat });
@@ -2324,7 +2360,7 @@ export async function fetchModelUpstream(
       // 部分閘道的 Responses 相容層對 Claude 有缺陷，改走原生 /messages 並本機轉譯。
       const { request: anthropicRequest, freeform, toolTargets, compaction, imagesOmitted,
         thinkingTrimmed, toolContext, toolOutputsMerged, lateToolOutputs,
-        toolResultsReordered } = toAnthropicRequest(effectiveBody, route);
+        toolResultsReordered } = toAnthropicRequest(route.fixedReasoning ? outboundBodyObject : effectiveBody, route);
       if (imagesOmitted > 0) stats.imagesOmitted += imagesOmitted;
       if (thinkingTrimmed > 0) stats.trailingThinkingTrimmed += thinkingTrimmed;
       // 同一個 call_id 的多筆輸出（例如 Code Mode 的 notify()）如何被收斂成
@@ -2383,8 +2419,10 @@ export async function fetchModelUpstream(
     const sendChat = async (chatRoute) => {
       // 只有 /chat/completions 的模型：本機轉譯成 Chat Completions，回應再轉回 Responses 事件。
       // 圖片預算先在 Responses 形狀上做，舊的工具截圖與其他路由用同一套規則縮減。
+      const chatBodyInput = chatRoute.chatFallback ? resolveReasoningUpdates(budget.request) : budget.request;
+      const translatedInput = chatBodyInput === budget.request ? chatBodyInput : rewriteCustomBody(chatBodyInput, chatRoute);
       const { request: chatRequest, freeform, toolTargets, compaction,
-        toolOutputsMerged, lateToolOutputs, placeholderToolResults } = toChatRequest(budget.request, chatRoute);
+        toolOutputsMerged, lateToolOutputs, placeholderToolResults } = toChatRequest(translatedInput, chatRoute);
       stats.chatToolOutputsMerged += toolOutputsMerged;
       stats.chatLateToolOutputs += lateToolOutputs;
       stats.chatPlaceholderToolResults += placeholderToolResults;

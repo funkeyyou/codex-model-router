@@ -87,7 +87,7 @@ test("使用記錄：完成、失敗與沒有用量的終止事件都記成一�
       output_tokens_details: { reasoning_tokens: 20 } } } }, 3500);
   assert.deepEqual({ ...done, at: undefined }, { at: undefined, model: "custom/owo-gpt", upstreamModel: "gpt-6.1-sol", route: "custom",
     provider: "owo", transport: "websocket", background: "title", thread: "th-1", status: "completed", durationMs: 2500,
-    firstTextMs: 500, firstOutputMs: 500, outputTps: 25, input: 1200, cached: 900, cacheWrite: 100, output: 50, reasoning: 20, hasUsage: true });
+    firstTextMs: 500, firstOutputMs: 500, hasText: true, outputTps: 25, input: 1200, cached: 900, cacheWrite: 100, output: 50, reasoning: 20, hasUsage: true });
   const failed = router.usageRecord(context, { type: "response.failed", response: { error: { code: "rate_limit_exceeded" } } }, 2000);
   assert.equal(failed.status, "failed");
   assert.equal(failed.error, "rate_limit_exceeded");

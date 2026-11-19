@@ -20,6 +20,16 @@ function responseSink() {
 }
 const translate = (body) => bridge.toAnthropicRequest(body, { upstreamModel: "claude-test" });
 
+test("歷史推理設定取最後一筆，本輪明確指定的深度優先，陌生配置仍交由轉譯層檢查", () => {
+  const update = effort => ({ type: "configuration_update", reasoning: { effort } });
+  const input = [update("low"), user("continue"), update("high")];
+  assert.deepEqual(router.resolveReasoningUpdates({ input }), { input: [input[1]], reasoning: { effort: "high" } });
+  const reasoning = { effort: "medium", summary: "auto" };
+  assert.deepEqual(router.resolveReasoningUpdates({ input, reasoning }), { input: [input[1]], reasoning });
+  const unknown = { ...update("low"), other_settings: {} };
+  assert.throws(() => translate(router.resolveReasoningUpdates({ input: [...input, unknown] })), /configuration_update/);
+});
+
 test("取消官方 WS 後銷毀舊 session，遲到的事件不能完成下一輪", async () => {
   const session = { responseIds: new Set(), sent: [], send(p) { this.sent.push(p); }, destroy() { this.closed = true; } };
   const controller = new AbortController();
@@ -224,7 +234,7 @@ test("Claude 工具完成及失敗經真實 HTTP 返回 Codex 格式，未知附
   const server = instance.routerServer;
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   t.after(() => { server.closeAllConnections(); server.close(); });
-  const body = { model: "custom/claude-test", stream: true, instructions: "Keep files safe", input: [user("read report")],
+  const body = { model: "custom/claude-test", stream: true, instructions: "Keep files safe", input: [{ type: "configuration_update", reasoning: { effort: "low" } }, user("read report")],
     tools: [{ type: "namespace", name: "files", tools: [fn("read__text")] }] };
   const post = (body) => fetch(`http://127.0.0.1:${server.address().port}/v1/responses`, { method: "POST", headers,
     body: JSON.stringify(body), signal: AbortSignal.timeout(3000) });
@@ -234,6 +244,8 @@ test("Claude 工具完成及失敗經真實 HTTP 返回 Codex 格式，未知附
   assert.equal(call.name, "read__text"); assert.equal(call.namespace, "files");
   assert.equal(call.arguments, '{"path":"report.txt"}');
   assert.equal(requests[0].system[0].text, "Keep files safe");
+  assert.ok(requests[0].thinking.budget_tokens > 0);
+  assert.doesNotMatch(JSON.stringify(requests[0].messages), /configuration_update/);
   const id = events.at(-1).response.id;
   await (await post({ ...body, previous_response_id: id, input: [{ type: "function_call_output", call_id: "call_local", output: "content" }] })).text();
   const history = requests[1].messages.flatMap((m) => m.content);
