@@ -12,6 +12,7 @@ const instructions = [
   "Answer the coding agent request encoded as chat messages and host tool definitions.",
   "Use no local actions. Return one JSON object with text (string) and calls (array).",
   "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
+  "When requesting host tools during multi-step work, put a brief user-facing progress update in text before calls: what you found or what the next action will check. Use the user's language.",
   "Request independent actions together when parallel_tool_calls permits. The host executes all calls.",
   "Use the supplied tool results to continue. For a final answer set calls to [].",
 ].join("\n");
@@ -473,13 +474,14 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
         session.settings = settings;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
-      }).catch(() => {
+      }).catch(error => {
         closeSession(key, session);
         if (!signal?.aborted) {
           const message = violation
             ? "Antigravity CLI tried to use its own tools, so the turn was stopped. Retry; if it repeats, start a new task."
             : "Antigravity CLI turn failed. Check CLI login, quota and compatibility.";
-          try { send({ error: { message } }); controller.close(); } catch { /* canceled */ }
+          const limited = !violation && /\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b/i.test(error?.message || "");
+          try { send({ error: limited ? { code: "rate_limit_exceeded", message: "Antigravity CLI reported a quota or rate limit (429). Try again later." } : { message } }); controller.close(); } catch { /* canceled */ }
         } else { try { controller.error(Error("Request aborted")); } catch { /* canceled */ } }
       }).finally(() => {
         clearTimeout(timeout);

@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.19";
+const INSTALLER_VERSION = "1.44.20";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5271,7 +5271,21 @@ export function claudeCliInstallCommand(platform, directory) {
     args: windows ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file, "latest"] : [file, "latest"] };
 }
 
-async function runClaudeCliSetup(command, args, directory, environment) {
+async function installOfficialCli(makeCommand, environment, label) {
+  const directory = mkdtempSync(join(tmpdir(), "codex-cli-install-"));
+  try {
+    const command = makeCommand(process.platform, directory);
+    console.log(`從 ${command.url} 下載官方安裝程式。`);
+    const response = await fetch(command.url, { signal: AbortSignal.timeout(60000) });
+    if (!response.ok) fail(`無法下載官方安裝程式（HTTP ${response.status}），路由配置未修改。`);
+    const script = await response.text();
+    if (!script.trim() || script.length > 2 * 1024 * 1024 || /^\s*<(?:!doctype|html)/i.test(script)) fail("官方安裝程式內容異常，已取消執行。");
+    writeFileSync(command.file, script, { mode: 0o600 });
+    await runCliSetup(command.binary, command.args, directory, environment, label);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+}
+
+async function runCliSetup(command, args, directory, environment, label) {
   // 網頁管理介面沒有終端機可以直接顯示，改以管線收集輸出，顯示在操作記錄裡。
   const capture = managerMode;
   await new Promise((resolve, reject) => {
@@ -5283,18 +5297,19 @@ async function runClaudeCliSetup(command, args, directory, environment) {
     }
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, 300000);
-    child.once("error", () => { clearTimeout(timer); reject(new Error("無法啟動 Claude 安裝／更新程式，路由配置未修改。")); });
+    child.once("error", () => { clearTimeout(timer); reject(new Error(`無法啟動 ${label} 安裝／更新程式，路由配置未修改。`)); });
     child.once("close", (code) => {
       clearTimeout(timer);
       if (code === 0 && !timedOut) resolve();
-      else reject(new Error(timedOut ? "Claude 安裝／更新逾時，路由配置未修改。" : "Claude 安裝／更新未完成，請查看上方輸出；路由配置未修改。"));
+      else reject(new Error(timedOut ? `${label} 安裝／更新逾時，路由配置未修改。` : `${label} 安裝／更新未完成，請查看上方輸出；路由配置未修改。`));
     });
   });
 }
 
 function claudeCliBinaryCandidates(settings) {
   return [env.CODEX_MODEL_ROUTER_CLAUDE_BIN, settings?.claudeCli?.binary,
-    join(homeDir, ".local", "bin", isWindows ? "claude.exe" : "claude"), commandPath(isWindows ? "claude.exe" : "claude")];
+    join(homeDir, ".local", "bin", isWindows ? "claude.exe" : "claude"),
+    isWindows && join(localAppData(), "Microsoft", "WinGet", "Links", "claude.exe"), commandPath(isWindows ? "claude.exe" : "claude")];
 }
 
 const claudeCliVersionOf = (output) => /\b(\d+\.\d+\.\d+)\b/.exec(output || "")?.[1] || null;
@@ -5324,24 +5339,14 @@ function loadClaudeCliTransport() {
 function claudeCliSetupActions(transport) {
   return {
     install: async () => {
-      const directory = mkdtempSync(join(tmpdir(), "codex-claude-install-"));
-      try {
-        const command = claudeCliInstallCommand(process.platform, directory);
-        console.log(`從 ${command.url} 下載官方安裝程式。`);
-        const response = await fetch(command.url, { signal: AbortSignal.timeout(60000) });
-        if (!response.ok) fail(`無法下載官方安裝程式（HTTP ${response.status}），路由配置未修改。`);
-        const script = await response.text();
-        if (!script.trim() || script.length > 2 * 1024 * 1024 || /^\s*<(?:!doctype|html)/i.test(script)) fail("官方安裝程式內容異常，已取消執行。");
-        writeFileSync(command.file, script, { mode: 0o600 });
-        await runClaudeCliSetup(command.binary, command.args, directory, transport.claudeCliEnvironment());
-      } finally { rmSync(directory, { recursive: true, force: true }); }
+      await installOfficialCli(claudeCliInstallCommand, transport.claudeCliEnvironment(), "Claude");
     },
     update: async (binary) => {
       const backup = join(backupsRoot, `claude-cli-update-${timestamp()}`);
       ensureDirectory(backup);
       copyFileSync(binary, join(backup, isWindows ? "claude.exe" : "claude"));
       console.log(`Claude CLI 執行檔已備份：${backup}`);
-      await runClaudeCliSetup(binary, ["update"], backup, transport.claudeCliEnvironment());
+      await runCliSetup(binary, ["update"], backup, transport.claudeCliEnvironment(), "Claude");
     },
   };
 }
@@ -9526,21 +9531,47 @@ export function antigravityModelGroups(output) {
   });
 }
 
-async function managerAntigravityModels() {
+export function antigravityInstallCommand(platform, directory) {
+  const windows = platform === "win32";
+  const script = windows ? "install.ps1" : "install.sh";
+  const file = join(directory, script);
+  return { url: "https://antigravity.google/cli/" + script, file, binary: windows ? "powershell.exe" : "bash",
+    args: windows ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file] : [file] };
+}
+
+export function findAntigravityBinary(settings = readSettingsIfExists()) {
   const name = isWindows ? "agy.exe" : "agy";
-  const binary = findExecutable([readSettingsIfExists()?.antigravityCli?.binary,
-    join(homeDir, ".local", "bin", name), commandPath(name)]);
-  if (!binary) fail("Install Antigravity CLI and sign in with agy first.");
+  const defaults = isWindows ? [
+    join(localAppData(), "Microsoft", "WinGet", "Links", name),
+    join(localAppData(), "agy", "bin", name),
+    join(localAppData(), "Microsoft", "WinGet", "Packages", "Google.AntigravityCLI_Microsoft.Winget.Source_8wekyb3d8bbwe", name),
+  ] : [];
+  return findExecutable([settings?.antigravityCli?.binary, join(homeDir, ".local", "bin", name), ...defaults]) || commandPath(name);
+}
+
+async function managerAntigravityInstall() {
+  if (findAntigravityBinary()) fail("已經安裝 Antigravity CLI。");
+  await installOfficialCli(antigravityInstallCommand, managerBackgroundEnvironment(env), "Antigravity");
+  const binary = findAntigravityBinary();
+  if (!binary) fail("安裝後仍找不到 agy，請檢查上方安裝程式輸出。");
+  console.log("請在終端機執行 agy 完成登入，再重新讀取模型。");
+  return { binary };
+}
+
+async function managerAntigravityModels() {
+  const binary = findAntigravityBinary();
+  if (!binary) return { installed: false, binary: null, groups: [], installerUrl: antigravityInstallCommand(process.platform, tmpdir()).url };
   const result = await commandOutput(binary, ["models"]);
   const groups = antigravityModelGroups(result.stdout);
   if (result.status !== 0 || !groups.length) fail("Antigravity CLI returned no models. Check agy models and sign in again.");
-  return { binary, groups };
+  return { installed: true, binary, groups };
 }
 
 async function managerAntigravityAdd({ models, firstInstall = false } = {}) {
   if (firstInstall && readManifest()) fail("請重新整理管理頁。");
   if (!firstInstall) assertManagerWritable();
   const { binary, groups } = await managerAntigravityModels();
+  if (!binary) fail("找不到 Antigravity CLI，請先安裝。");
   if (!Array.isArray(models) || !models.length || models.some(id => !groups.some(group => group.id === id)))
     fail("模型清單已變更，請重新選擇。");
   const login = firstInstall ? await withCodexLock(() => verifyLogin()) : null;
@@ -9864,6 +9895,7 @@ function managerOperations() {
       "add-provider": addJob("新增供應商", managerAddProvider),
       install: addJob("首次設定", managerFirstInstall),
       "install-antigravity": addJob("Antigravity CLI", params => managerAntigravityAdd({ ...params, firstInstall: true })),
+      "antigravity-cli-install": job("安裝 Antigravity CLI", managerAntigravityInstall),
       "antigravity-add": addJob("Antigravity CLI", params => managerAntigravityAdd({ models: params.models })),
       "install-claude": addJob("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
       "edit-provider": job("修改供應商", managerEditProvider),
@@ -19017,6 +19049,7 @@ const instructions = [
   "Answer the coding agent request encoded as chat messages and host tool definitions.",
   "Use no local actions. Return one JSON object with text (string) and calls (array).",
   "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
+  "When requesting host tools during multi-step work, put a brief user-facing progress update in text before calls: what you found or what the next action will check. Use the user's language.",
   "Request independent actions together when parallel_tool_calls permits. The host executes all calls.",
   "Use the supplied tool results to continue. For a final answer set calls to [].",
 ].join("\n");
@@ -19478,13 +19511,14 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
         session.settings = settings;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
-      }).catch(() => {
+      }).catch(error => {
         closeSession(key, session);
         if (!signal?.aborted) {
           const message = violation
             ? "Antigravity CLI tried to use its own tools, so the turn was stopped. Retry; if it repeats, start a new task."
             : "Antigravity CLI turn failed. Check CLI login, quota and compatibility.";
-          try { send({ error: { message } }); controller.close(); } catch { /* canceled */ }
+          const limited = !violation && /\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b/i.test(error?.message || "");
+          try { send({ error: limited ? { code: "rate_limit_exceeded", message: "Antigravity CLI reported a quota or rate limit (429). Try again later." } : { message } }); controller.close(); } catch { /* canceled */ }
         } else { try { controller.error(Error("Request aborted")); } catch { /* canceled */ } }
       }).finally(() => {
         clearTimeout(timeout);
@@ -20396,6 +20430,9 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 {
 "en": {
 "使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。": "Use the account already signed in to agy. Reasoning levels come from its model list. Supports text and Codex tool calls.",
+"安裝 Antigravity CLI": "Install Antigravity CLI",
+"找不到 {cli}，要現在安裝嗎？": "Couldn't find {cli}. Would you like to install it?",
+"會從 {url} 下載並執行 Google 官方安裝程式。完成後請在終端機執行 agy 登入，再重新讀取模型。": "Downloads and runs Google's official installer from {url}. After installation, run agy in a terminal to sign in, then reload the models.",
 "重新讀取 Antigravity 模型": "Reload Antigravity models",
 "準備讀取 Antigravity CLI 模型清單": "Loading the Antigravity CLI model list",
 
@@ -22951,7 +22988,7 @@ function claudeCliChooser({ onChange }) {
     if (current !== request) return;
     if (!(info.installed && info.upToDate && info.subscription)) {
       phase = "blocked";
-      host.replaceChildren(paragraph(t("添加模型前需要先完成以下準備："), "note"),
+      host.replaceChildren(paragraph(info.installed ? t("添加模型前需要先完成以下準備：") : t("找不到 {cli}，要現在安裝嗎？", { cli: "Claude CLI" }), "note"),
         claudeCliChecklist(info, (run) => run().then((view) => { if (view) load(); })));
       onChange();
       return;
@@ -23952,7 +23989,8 @@ function openAntigravityModels({ firstInstall = false } = {}) {
   const picker = modelPicker({ allowManual: false, allowConfigured: true, onChange: () => {
     add.disabled = picker.selection().length === 0;
   } });
-  modal.setBody(paragraph(t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。"), "muted"), picker.element);
+  const setup = h("div", {});
+  modal.setBody(paragraph(t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。"), "muted"), setup, picker.element);
   modal.setFoot(reload, h("span", { class: "grow" }),
     h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }), add);
   add.onclick = () => {
@@ -23967,9 +24005,24 @@ function openAntigravityModels({ firstInstall = false } = {}) {
   async function load() {
     reload.disabled = true;
     add.disabled = true;
+    setup.replaceChildren();
+    picker.element.hidden = false;
+    picker.setModels([]);
     picker.setLoading(t("準備讀取 Antigravity CLI 模型清單"));
     try {
       const data = await api("/api/query", { method: "POST", body: { type: "antigravity-models" } });
+      if (data.installed === false) {
+        picker.element.hidden = true;
+        const title = t("安裝 Antigravity CLI");
+        const install = h("button", { type: "button", class: "button primary", text: title, onclick: async () => {
+          const ok = await confirmDialog({ title, confirmLabel: t("下載並安裝"), body: [
+            paragraph(t("會從 {url} 下載並執行 Google 官方安裝程式。完成後請在終端機執行 agy 登入，再重新讀取模型。", { url: data.installerUrl })),
+          ] });
+          if (ok && await runJob("antigravity-cli-install", {}, { title })) await load();
+        } });
+        setup.replaceChildren(paragraph(t("找不到 {cli}，要現在安裝嗎？", { cli: "Antigravity CLI" })), install);
+        return;
+      }
       picker.setModels(data.groups.map(model => ({
         id: model.id, label: model.label, note: model.efforts.join(" / "),
         configured: (state.models || []).some(item => item.transport === "antigravity-cli" && item.upstreamModel === model.id),

@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.19";
+const INSTALLER_VERSION = "1.44.20";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -5124,7 +5124,21 @@ export function claudeCliInstallCommand(platform, directory) {
     args: windows ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file, "latest"] : [file, "latest"] };
 }
 
-async function runClaudeCliSetup(command, args, directory, environment) {
+async function installOfficialCli(makeCommand, environment, label) {
+  const directory = mkdtempSync(join(tmpdir(), "codex-cli-install-"));
+  try {
+    const command = makeCommand(process.platform, directory);
+    console.log(`從 ${command.url} 下載官方安裝程式。`);
+    const response = await fetch(command.url, { signal: AbortSignal.timeout(60000) });
+    if (!response.ok) fail(`無法下載官方安裝程式（HTTP ${response.status}），路由配置未修改。`);
+    const script = await response.text();
+    if (!script.trim() || script.length > 2 * 1024 * 1024 || /^\s*<(?:!doctype|html)/i.test(script)) fail("官方安裝程式內容異常，已取消執行。");
+    writeFileSync(command.file, script, { mode: 0o600 });
+    await runCliSetup(command.binary, command.args, directory, environment, label);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+}
+
+async function runCliSetup(command, args, directory, environment, label) {
   // 網頁管理介面沒有終端機可以直接顯示，改以管線收集輸出，顯示在操作記錄裡。
   const capture = managerMode;
   await new Promise((resolve, reject) => {
@@ -5136,18 +5150,19 @@ async function runClaudeCliSetup(command, args, directory, environment) {
     }
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, 300000);
-    child.once("error", () => { clearTimeout(timer); reject(new Error("無法啟動 Claude 安裝／更新程式，路由配置未修改。")); });
+    child.once("error", () => { clearTimeout(timer); reject(new Error(`無法啟動 ${label} 安裝／更新程式，路由配置未修改。`)); });
     child.once("close", (code) => {
       clearTimeout(timer);
       if (code === 0 && !timedOut) resolve();
-      else reject(new Error(timedOut ? "Claude 安裝／更新逾時，路由配置未修改。" : "Claude 安裝／更新未完成，請查看上方輸出；路由配置未修改。"));
+      else reject(new Error(timedOut ? `${label} 安裝／更新逾時，路由配置未修改。` : `${label} 安裝／更新未完成，請查看上方輸出；路由配置未修改。`));
     });
   });
 }
 
 function claudeCliBinaryCandidates(settings) {
   return [env.CODEX_MODEL_ROUTER_CLAUDE_BIN, settings?.claudeCli?.binary,
-    join(homeDir, ".local", "bin", isWindows ? "claude.exe" : "claude"), commandPath(isWindows ? "claude.exe" : "claude")];
+    join(homeDir, ".local", "bin", isWindows ? "claude.exe" : "claude"),
+    isWindows && join(localAppData(), "Microsoft", "WinGet", "Links", "claude.exe"), commandPath(isWindows ? "claude.exe" : "claude")];
 }
 
 const claudeCliVersionOf = (output) => /\b(\d+\.\d+\.\d+)\b/.exec(output || "")?.[1] || null;
@@ -5177,24 +5192,14 @@ function loadClaudeCliTransport() {
 function claudeCliSetupActions(transport) {
   return {
     install: async () => {
-      const directory = mkdtempSync(join(tmpdir(), "codex-claude-install-"));
-      try {
-        const command = claudeCliInstallCommand(process.platform, directory);
-        console.log(`從 ${command.url} 下載官方安裝程式。`);
-        const response = await fetch(command.url, { signal: AbortSignal.timeout(60000) });
-        if (!response.ok) fail(`無法下載官方安裝程式（HTTP ${response.status}），路由配置未修改。`);
-        const script = await response.text();
-        if (!script.trim() || script.length > 2 * 1024 * 1024 || /^\s*<(?:!doctype|html)/i.test(script)) fail("官方安裝程式內容異常，已取消執行。");
-        writeFileSync(command.file, script, { mode: 0o600 });
-        await runClaudeCliSetup(command.binary, command.args, directory, transport.claudeCliEnvironment());
-      } finally { rmSync(directory, { recursive: true, force: true }); }
+      await installOfficialCli(claudeCliInstallCommand, transport.claudeCliEnvironment(), "Claude");
     },
     update: async (binary) => {
       const backup = join(backupsRoot, `claude-cli-update-${timestamp()}`);
       ensureDirectory(backup);
       copyFileSync(binary, join(backup, isWindows ? "claude.exe" : "claude"));
       console.log(`Claude CLI 執行檔已備份：${backup}`);
-      await runClaudeCliSetup(binary, ["update"], backup, transport.claudeCliEnvironment());
+      await runCliSetup(binary, ["update"], backup, transport.claudeCliEnvironment(), "Claude");
     },
   };
 }
@@ -9379,21 +9384,47 @@ export function antigravityModelGroups(output) {
   });
 }
 
-async function managerAntigravityModels() {
+export function antigravityInstallCommand(platform, directory) {
+  const windows = platform === "win32";
+  const script = windows ? "install.ps1" : "install.sh";
+  const file = join(directory, script);
+  return { url: "https://antigravity.google/cli/" + script, file, binary: windows ? "powershell.exe" : "bash",
+    args: windows ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file] : [file] };
+}
+
+export function findAntigravityBinary(settings = readSettingsIfExists()) {
   const name = isWindows ? "agy.exe" : "agy";
-  const binary = findExecutable([readSettingsIfExists()?.antigravityCli?.binary,
-    join(homeDir, ".local", "bin", name), commandPath(name)]);
-  if (!binary) fail("Install Antigravity CLI and sign in with agy first.");
+  const defaults = isWindows ? [
+    join(localAppData(), "Microsoft", "WinGet", "Links", name),
+    join(localAppData(), "agy", "bin", name),
+    join(localAppData(), "Microsoft", "WinGet", "Packages", "Google.AntigravityCLI_Microsoft.Winget.Source_8wekyb3d8bbwe", name),
+  ] : [];
+  return findExecutable([settings?.antigravityCli?.binary, join(homeDir, ".local", "bin", name), ...defaults]) || commandPath(name);
+}
+
+async function managerAntigravityInstall() {
+  if (findAntigravityBinary()) fail("已經安裝 Antigravity CLI。");
+  await installOfficialCli(antigravityInstallCommand, managerBackgroundEnvironment(env), "Antigravity");
+  const binary = findAntigravityBinary();
+  if (!binary) fail("安裝後仍找不到 agy，請檢查上方安裝程式輸出。");
+  console.log("請在終端機執行 agy 完成登入，再重新讀取模型。");
+  return { binary };
+}
+
+async function managerAntigravityModels() {
+  const binary = findAntigravityBinary();
+  if (!binary) return { installed: false, binary: null, groups: [], installerUrl: antigravityInstallCommand(process.platform, tmpdir()).url };
   const result = await commandOutput(binary, ["models"]);
   const groups = antigravityModelGroups(result.stdout);
   if (result.status !== 0 || !groups.length) fail("Antigravity CLI returned no models. Check agy models and sign in again.");
-  return { binary, groups };
+  return { installed: true, binary, groups };
 }
 
 async function managerAntigravityAdd({ models, firstInstall = false } = {}) {
   if (firstInstall && readManifest()) fail("請重新整理管理頁。");
   if (!firstInstall) assertManagerWritable();
   const { binary, groups } = await managerAntigravityModels();
+  if (!binary) fail("找不到 Antigravity CLI，請先安裝。");
   if (!Array.isArray(models) || !models.length || models.some(id => !groups.some(group => group.id === id)))
     fail("模型清單已變更，請重新選擇。");
   const login = firstInstall ? await withCodexLock(() => verifyLogin()) : null;
@@ -9717,6 +9748,7 @@ function managerOperations() {
       "add-provider": addJob("新增供應商", managerAddProvider),
       install: addJob("首次設定", managerFirstInstall),
       "install-antigravity": addJob("Antigravity CLI", params => managerAntigravityAdd({ ...params, firstInstall: true })),
+      "antigravity-cli-install": job("安裝 Antigravity CLI", managerAntigravityInstall),
       "antigravity-add": addJob("Antigravity CLI", params => managerAntigravityAdd({ models: params.models })),
       "install-claude": addJob("首次設定", (params) => managerClaudeCliAdd({ ...(params || {}), firstInstall: true })),
       "edit-provider": job("修改供應商", managerEditProvider),

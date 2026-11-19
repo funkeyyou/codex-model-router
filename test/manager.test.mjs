@@ -399,7 +399,7 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   const jobTypes = new Set([...managerPage.matchAll(/runJob\("([a-z-]+)"/g)].map((match) => match[1]));
   jobTypes.add("update");
   jobTypes.add("apply-update");
-  assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "antigravity-add", "apply-update", "chatgpt-login", "claude-cli-add", "claude-cli-install",
+  assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "antigravity-add", "antigravity-cli-install", "apply-update", "chatgpt-login", "claude-cli-add", "claude-cli-install",
     "claude-cli-login", "claude-cli-update", "connect-claude-desktop", "connect-codex", "detect-fast", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-antigravity", "install-claude", "remove-backup-key", "remove-models",
     "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "restore-claude-desktop",
     "set-background-model", "set-claude-desktop", "set-global-context", "set-hidden-models", "set-keysmith", "set-official-model-visibility", "set-quota-mode",

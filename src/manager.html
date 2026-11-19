@@ -377,6 +377,9 @@ input:focus, select:focus { outline: none; border-color: rgba(56, 189, 248, .7);
 {
 "en": {
 "使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。": "Use the account already signed in to agy. Reasoning levels come from its model list. Supports text and Codex tool calls.",
+"安裝 Antigravity CLI": "Install Antigravity CLI",
+"找不到 {cli}，要現在安裝嗎？": "Couldn't find {cli}. Would you like to install it?",
+"會從 {url} 下載並執行 Google 官方安裝程式。完成後請在終端機執行 agy 登入，再重新讀取模型。": "Downloads and runs Google's official installer from {url}. After installation, run agy in a terminal to sign in, then reload the models.",
 "重新讀取 Antigravity 模型": "Reload Antigravity models",
 "準備讀取 Antigravity CLI 模型清單": "Loading the Antigravity CLI model list",
 
@@ -2932,7 +2935,7 @@ function claudeCliChooser({ onChange }) {
     if (current !== request) return;
     if (!(info.installed && info.upToDate && info.subscription)) {
       phase = "blocked";
-      host.replaceChildren(paragraph(t("添加模型前需要先完成以下準備："), "note"),
+      host.replaceChildren(paragraph(info.installed ? t("添加模型前需要先完成以下準備：") : t("找不到 {cli}，要現在安裝嗎？", { cli: "Claude CLI" }), "note"),
         claudeCliChecklist(info, (run) => run().then((view) => { if (view) load(); })));
       onChange();
       return;
@@ -3933,7 +3936,8 @@ function openAntigravityModels({ firstInstall = false } = {}) {
   const picker = modelPicker({ allowManual: false, allowConfigured: true, onChange: () => {
     add.disabled = picker.selection().length === 0;
   } });
-  modal.setBody(paragraph(t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。"), "muted"), picker.element);
+  const setup = h("div", {});
+  modal.setBody(paragraph(t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，目前支援文字和 Codex 工具呼叫。"), "muted"), setup, picker.element);
   modal.setFoot(reload, h("span", { class: "grow" }),
     h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }), add);
   add.onclick = () => {
@@ -3948,9 +3952,24 @@ function openAntigravityModels({ firstInstall = false } = {}) {
   async function load() {
     reload.disabled = true;
     add.disabled = true;
+    setup.replaceChildren();
+    picker.element.hidden = false;
+    picker.setModels([]);
     picker.setLoading(t("準備讀取 Antigravity CLI 模型清單"));
     try {
       const data = await api("/api/query", { method: "POST", body: { type: "antigravity-models" } });
+      if (data.installed === false) {
+        picker.element.hidden = true;
+        const title = t("安裝 Antigravity CLI");
+        const install = h("button", { type: "button", class: "button primary", text: title, onclick: async () => {
+          const ok = await confirmDialog({ title, confirmLabel: t("下載並安裝"), body: [
+            paragraph(t("會從 {url} 下載並執行 Google 官方安裝程式。完成後請在終端機執行 agy 登入，再重新讀取模型。", { url: data.installerUrl })),
+          ] });
+          if (ok && await runJob("antigravity-cli-install", {}, { title })) await load();
+        } });
+        setup.replaceChildren(paragraph(t("找不到 {cli}，要現在安裝嗎？", { cli: "Antigravity CLI" })), install);
+        return;
+      }
       picker.setModels(data.groups.map(model => ({
         id: model.id, label: model.label, note: model.efforts.join(" / "),
         configured: (state.models || []).some(item => item.transport === "antigravity-cli" && item.upstreamModel === model.id),

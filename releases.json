@@ -1,6 +1,14 @@
 {
-  "latest": "1.44.19",
+  "latest": "1.44.20",
   "releases": [
+    {
+      "version": "1.44.20",
+      "date": "2026-11-19",
+      "changes": [
+        "Windows 管理頁可在目前 PATH 之外找到 WinGet 安裝的 agy。找不到 Antigravity CLI 或 Claude CLI 時會詢問是否安裝，確認後才執行官方安裝程式。",
+        "Antigravity CLI 執行多步驟任務時會提示模型說明中途進度。CLI 明確回報 429 時，路由器會標示限流。"
+      ]
+    },
     {
       "version": "1.44.19",
       "date": "2026-11-19",

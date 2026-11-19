@@ -72,6 +72,27 @@ test("only fixed official installers are used, without interpolating paths into 
   assert.equal(windows.url, "https://claude.ai/install.ps1");
   assert.deepEqual(windows.args, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(directory, "install.ps1"), "latest"]);
   assert.equal(windows.binary, "powershell.exe");
+  for (const [platform, expected, binary] of [["win32", "install.ps1", "powershell.exe"], ["darwin", "install.sh", "bash"]]) {
+    const agy = installer.antigravityInstallCommand(platform, directory);
+    assert.equal(agy.url, "https://antigravity.google/cli/" + expected);
+    assert.equal(agy.binary, binary);
+    assert.deepEqual(agy.args, [...(platform === "win32" ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"] : []), join(directory, expected)]);
+  }
+});
+
+test("Windows finds the WinGet agy link with no current PATH or saved route", { skip: process.platform !== "win32" }, t => {
+  const root = mkdtempSync(join(tmpdir(), "router-winget-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const links = join(root, "Microsoft", "WinGet", "Links");
+  mkdirSync(links, { recursive: true });
+  const expected = join(links, "agy.exe");
+  writeFileSync(expected, "");
+  const probe = spawnSync(process.execPath, ["--input-type=module", "-e",
+    'import { findAntigravityBinary } from "./installer.mjs"; console.log(findAntigravityBinary({}));'],
+  { cwd: payloadDir, encoding: "utf8", env: { ...process.env, HOME: root, USERPROFILE: root,
+    LOCALAPPDATA: root, Path: "", PATH: "", CODEX_MODEL_ROUTER_IMPORT_ONLY: "1" } });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.equal(probe.stdout.trim(), expected);
 });
 
 test("missing or API-only authentication runs official login and confirms the resulting subscription", async () => {
@@ -111,7 +132,7 @@ test("command-level noninteractive YES cannot authorize a missing CLI install or
     "models.json": { models: [] },
   };
   for (const [name, data] of Object.entries(files)) writeFileSync(join(root, name), JSON.stringify(data));
-  const env = { ...process.env, HOME: home, USERPROFILE: home, PATH: join(home, "no-executables"),
+  const env = { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home, PATH: join(home, "no-executables"),
     CODEX_HOME: home, CODEX_MODEL_ROUTER_HOME: root, CODEX_MODEL_ROUTER_CLAUDE_BIN: join(home, "missing"),
     CODEX_MODEL_ROUTER_CODEX_BIN: process.execPath, CODEX_MODEL_ROUTER_YES: "1",
     CODEX_MODEL_ROUTER_SCRIPT_PATH: fileURLToPath(new URL("../codex-model-router.sh", import.meta.url)),
