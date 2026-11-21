@@ -93,10 +93,12 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
   assert.match(log1[1].text, /^Standing instructions were extended:\ncoding agent tools were updated\.\nHost settings changed[^\n]*\n\{[^\n]*"added_or_updated_tools":\[\{[^\n]*"search"/);
   assert.doesNotMatch(log1[1].text, /"shell"|You are|first|Codex/);
   assert.match(log1[1].text, /New chat messages \(respond to these\):\n\[\{"role":"user","content":"second"\}\]$/);
+  assert.match(log1[1].text, /All progress belongs inside text\. Do not invoke native tools/);
   assert.notEqual(log1[2].pid, log1[1].pid, "idle sessions end their process");
   assert.equal(log1[2].session, log1[0].session, "and resume the same conversation");
   assert.equal(log1[2].system, log1[0].system, "with the same system prompt for cache reuse");
   assert.match(log1[2].text, /^Continue using the same instructions and tools/);
+  assert.match(log1[2].text, /Do not invoke native tools; encode host tool requests only in calls/);
   assert.equal(log1[2].turn, 3);
   assert.equal(log1[2].model, "flash-high");
   assert.equal(log1[2].images, 1);
@@ -112,5 +114,6 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
   const large = log1.at(-1);
   assert.notEqual(large.session, rebuilt.session, "a continuation over the user-message cap rebuilds");
   assert.match(large.system, /New chat messages \(respond to these\):\n.*y{1000}/);
-  assert.ok(large.text.length < 1000);
+  assert.ok(Buffer.byteLength(large.text) < 2000, "only the fixed protocol reminder stays in the user prompt");
+  assert.doesNotMatch(large.text, /y{1000}/);
 });
