@@ -19,6 +19,8 @@ test("Antigravity changes instruction prose while preserving user input and host
   const settings = section(system, "Host settings and tools:");
   const standing = section(system, "Earlier chat messages (standing instructions and context; earlier requests were already answered):");
   assert.match(prompt, /^Answer the coding agent request[\s\S]*in the system context\.\nNew chat messages/);
+  assert.match(prompt, /Do not invoke native tools/);
+  assert.match(prompt, /all progress and answer prose inside text/);
   const messages = JSON.parse(prompt.split("New chat messages (respond to these):\n")[1]);
   assert.doesNotMatch(JSON.stringify(standing), /codex/i);
   assert.match(standing[0].content, /^You are a coding agent\./);
@@ -45,7 +47,8 @@ test("Antigravity full replay marks handled history apart from the newest reques
   assert.deepEqual(images, [{ type: "image", mimeType: "image/jpeg", data: "/9j/AA==" }]);
   const huge = antigravityPrompt({ messages: [{ role: "user", content: "x".repeat(200000) }] });
   assert.match(huge.system, /New chat messages \(respond to these\)/);
-  assert.ok(huge.prompt.length < 1000);
+  assert.ok(Buffer.byteLength(huge.prompt) < 2000, "only the fixed protocol reminder stays in the user prompt");
+  assert.doesNotMatch(huge.prompt, /x{1000}/);
 });
 
 test("Antigravity workspace agent and tool guard use neutral names", async t => {

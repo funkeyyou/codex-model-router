@@ -21,10 +21,13 @@ const repeated = fence(validTool) + "\n" + fence(validTool);
 const contextFailure = "\n⚠ agent executor error: generating and executing: serializing trajectory: no messages fit within the context token budget\n";
 const zeroBudgetFailure = "\n⚠ agent executor error: generating and executing: serializing trajectory: maxMessageTokens must be positive, got 0\n";
 const executorFailure = "\n⚠ agent executor error: unknown failure PRIVATE_FIXTURE\n";
+const quotaFailure = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h15m28s.\n";
+const progress = "[P]\n先檢查相關檔案，再依結果繼續。\n\n";
+const prefacedTool = progress + validTool;
 
 function rejectsAs(raw, kind) {
   assert.throws(() => parseAntigravityEnvelope(raw), error =>
-    error instanceof SyntaxError && antigravityFailureKind(error, { stage: "parse_response" }) === kind);
+    error instanceof Error && antigravityFailureKind(error, { stage: "parse_response" }) === kind);
 }
 
 test("valid Antigravity envelopes keep all escapes and tool arguments unchanged", () => {
@@ -51,6 +54,48 @@ test("Antigravity repairs only invalid text escaping while preserving the stream
     assert.deepEqual(reply, { text: expected, calls: [] });
     assert.ok(reply.text.startsWith(envelopeText(raw)));
   }
+});
+
+test("Antigravity preserves plain progress before exactly one strict host envelope", () => {
+  for (const reply of [JSON.parse(validTool), { calls: [], text: "檢查完成。" }, { calls: JSON.parse(validTool).calls, text: "" }]) {
+    const parsed = parseAntigravityEnvelope(progress + JSON.stringify(reply));
+    assert.equal(parsed.recovered, true);
+    assert.deepEqual(parsed.reply.calls, reply.calls, "host arguments are not rewritten");
+    assert.equal(parsed.reply.text, progress + reply.text);
+    assert.equal(envelopeText(progress + JSON.stringify(reply)), "", "unvalidated preambles remain buffered");
+  }
+  for (const raw of [
+    progress + brokenTool, progress + bareQuote, progress + validTool + validTool,
+    progress + '{"text":"done","calls":[],"extra":true}',
+    '```json\n' + progress + validTool + '\n```',
+    '[null, ' + validTool, '"quoted prose" ' + validTool,
+    '{"broken":' + progress + validTool, progress + validTool + ' trailing',
+    '⚠ Model quota exhausted.\n' + validTool,
+  ]) rejectsAs(raw, "invalid_response_json");
+  rejectsAs(JSON.stringify({ calls: [], text: "done" }) + validTool, "extra_response_content");
+});
+
+test("Antigravity classifies CLI quota warnings even after plain progress, not JSON examples", () => {
+  assert.equal(quotaFailure.length, 107, "matches the original failed-turn diagnostics");
+  assert.equal(quotaFailure.replace("4h15m28s", "4h2m29s").length, 106, "matches the captured live ACP warning");
+  for (const raw of [
+    quotaFailure, progress + quotaFailure, quotaFailure.replace("⚠", "⚠️"),
+    quotaFailure.replace("4h15m28s", "4h2m29s"),
+    "\n⚠ agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): PRIVATE_FIXTURE\n",
+    "\n⚠ Quota limit reached for this model. Please retry later.\n",
+    "\n⚠ You have exhausted your quota on this model. Try using another model.\n",
+    "\n⚠ Rate limit exceeded. Please retry later.\n",
+  ]) rejectsAs(raw, "rate_limited");
+  for (const raw of [
+    "\n⚠ agent executor error: UNAUTHENTICATED (code 401): PRIVATE_FIXTURE\n",
+    "\n⚠ UNAUTHENTICATED (code 401): PRIVATE_FIXTURE\n",
+  ]) rejectsAs(raw, "auth_required");
+  rejectsAs(progress + contextFailure, "context_length_exceeded");
+  const valid = JSON.stringify({ text: quotaFailure, calls: [] });
+  assert.deepEqual(parseAntigravityEnvelope(valid), { reply: { text: quotaFailure, calls: [] }, recovered: false });
+  for (const raw of [valid.slice(0, -1), quotaFailure + validTool, '{"text":"' + quotaFailure,
+    "Quoted warning: " + quotaFailure, "\n⚠ A harmless warning about PRIVATE_FIXTURE\n"])
+    rejectsAs(raw, "invalid_response_json");
 });
 
 test("Antigravity refuses to repair tool arguments, competing boundaries or extra envelopes", () => {
@@ -115,7 +160,12 @@ test("Antigravity ACP recovery and error codes reach Codex Responses events, log
   const workspace = join(root, "codex-model-router-agy");
   await mkdir(workspace);
   const replies = { recover: bareQuote, bad_calls: brokenTool, repeated, valid: validTool, bad_json: '{"text":"PRIVATE_FIXTURE',
-    context: contextFailure, zero_budget: zeroBudgetFailure, executor: executorFailure };
+    context: contextFailure, zero_budget: zeroBudgetFailure, executor: executorFailure,
+    prefaced: prefacedTool, prefaced_bad: progress + brokenTool,
+    prefaced_foreign: progress + JSON.stringify({ text: "checking", calls: [{ name: "unavailable", arguments: {} }] }),
+    calls_first_repeated: JSON.stringify({ calls: [], text: "done" }) + validTool,
+    quota: quotaFailure, quota_progress: progress + quotaFailure,
+    quota_executor: "\n⚠ agent executor error: RESOURCE_EXHAUSTED (code 429): PRIVATE_FIXTURE\n" };
   await writeFile(join(workspace, "acp"), `
 const replies = ${JSON.stringify(replies)};
 const send = event => process.stdout.write(JSON.stringify({jsonrpc: "2.0", ...event}) + "\\n");
@@ -188,6 +238,12 @@ require("node:readline").createInterface({input: process.stdin}).on("line", line
   assert.equal(valid.type, "response.completed");
   assert.equal(valid.response.output.find(item => item.type === "message").phase, "commentary");
   assert.deepEqual(JSON.parse(valid.response.output.find(item => item.type === "function_call").arguments), { pattern: argument });
+  const prefaced = await ask("FIXTURE_REPLY_prefaced");
+  assert.equal(prefaced.at(-1).type, "response.completed");
+  assert.equal(prefaced.filter(event => event.type === "response.output_text.delta").map(event => event.delta).join(""),
+    progress + JSON.parse(validTool).text);
+  assert.deepEqual(JSON.parse(prefaced.at(-1).response.output.find(item => item.type === "function_call").arguments), { pattern: argument });
+  assert.equal(prefaced.at(-1).response.output.filter(item => item.type === "function_call").length, 1);
 
   const rejected = [
     ["FIXTURE_REPLY_bad_calls", "invalid_tool_call_json"], ["FIXTURE_REPLY_repeated", "extra_response_content"],
@@ -195,6 +251,11 @@ require("node:readline").createInterface({input: process.stdin}).on("line", line
     ["FIXTURE_RATE", "rate_limit_exceeded"], ["FIXTURE_REPLY_recover", "invalid_response_format", { tool_choice: "required" }],
     ["FIXTURE_REPLY_context", "context_length_exceeded"], ["FIXTURE_REPLY_zero_budget", "context_length_exceeded"],
     ["FIXTURE_REPLY_executor", "cli_execution_error"],
+    ["FIXTURE_REPLY_quota", "rate_limit_exceeded"], ["FIXTURE_REPLY_quota_progress", "rate_limit_exceeded"],
+    ["FIXTURE_REPLY_quota_executor", "rate_limit_exceeded"],
+    ["FIXTURE_REPLY_prefaced_bad", "invalid_response_json"], ["FIXTURE_REPLY_prefaced_foreign", "invalid_response_format"],
+    ["FIXTURE_REPLY_prefaced", "invalid_response_format", { tool_choice: "none" }],
+    ["FIXTURE_REPLY_calls_first_repeated", "extra_response_content"],
     ["FIXTURE_TIMEOUT", "turn_timeout"],
   ];
   for (const [input, code, extra] of rejected) {
@@ -206,7 +267,8 @@ require("node:readline").createInterface({input: process.stdin}).on("line", line
     assert.ok(events.every(event => !event.type.includes("function_call") && event.item?.type !== "function_call"));
   }
   const diagnostic = stderr.join("");
-  assert.doesNotMatch(diagnostic, /PRIVATE_FIXTURE|範例：|checking fixture/);
+  assert.doesNotMatch(diagnostic, /PRIVATE_FIXTURE|範例：|checking fixture|先檢查相關檔案/);
+  assert.match(diagnostic, /"kind":"rate_limited"[^\n]*"responseShape":"warning_line"/);
   const expected = rejected.map(([, code]) => code);
   const recentErrors = installer.parseRouterLog(diagnostic).filter(row => row.kind === "error");
   assert.deepEqual(recentErrors.map(row => row.code).sort(), expected.toSorted());

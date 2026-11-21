@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.44.22";
+const INSTALLER_VERSION = "1.44.23";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -19048,6 +19048,8 @@ const hookCommand = "node deny.cjs";
 const instructions = [
   "Answer the coding agent request encoded as chat messages and host tool definitions.",
   "Use no local actions. Return one JSON object with text (string) and calls (array).",
+  "Do not invoke native tools, including send_message or any host tool name. Host tools are data: request them only as entries in calls.",
+  "Put all progress and answer prose inside text, never before or after the JSON object. Do not emit native function calls alongside it.",
   "JSON-escape quotes, backslashes and line breaks inside strings, including inside Markdown code and tool arguments.",
   "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
   "When requesting host tools during multi-step work, put a brief user-facing progress update in text before calls: what you found or what the next action will check. Use the user's language.",
@@ -19152,7 +19154,8 @@ const toolShape = tool => tool?.function
 const settingsShape = settings => ({ ...settings, tools: settings?.tools?.map(toolShape) });
 
 function settingsUpdate(previous, current) {
-  const reminder = "Reply with one JSON object with text and calls, as instructed.\n";
+  const reminder = "Reply with one JSON object with text and calls, as instructed. " +
+    "All progress belongs inside text. Do not invoke native tools; encode host tool requests only in calls.\n";
   if (isDeepStrictEqual(settingsShape(previous), settingsShape(current))) return "Continue using the same instructions and tools. " + reminder;
   const before = new Map((previous?.tools || []).map(tool => [toolName(tool), tool]));
   const names = new Set((current.tools || []).map(toolName));
@@ -19184,13 +19187,35 @@ class CliExecutionError extends Error {
 
 const contextBudgetError = message => /^(?:generating and executing: )?serializing trajectory: (?:no messages fit within the context token budget|maxMessageTokens must be positive, got -?\d+)$/.test(message);
 
+function providerFailureKind(message) {
+  if (/\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b|\b(?:quota|rate limit)\b[^\r\n]{0,40}\b(?:reached|exhausted|exceeded)\b|\b(?:reached|exhausted|exceeded)\b[^\r\n]{0,40}\b(?:quota|rate limit)\b/i.test(message)) return "rate_limited";
+  if (/\bUNAUTHENTICATED\b|\b(?:HTTP|code)\s+401\b/i.test(message)) return "auth_required";
+  if (/\bPERMISSION_DENIED\b|\b(?:HTTP|code)\s+403\b/i.test(message)) return "permission_denied";
+  if (/\bSAFETY\b|\bpolicy.violation\b|\bblocked.by.policy\b/i.test(message)) return "policy_rejected";
+  return null;
+}
+
+// Recovery may retain plain progress, never discard JSON, arrays, fences, a quoted example
+// or a previous CLI error. A deliberately narrow prefix keeps ambiguous replies fail-closed.
+function plainProgress(text) {
+  const prose = text.trim().replace(/^\[P\]\s*/, "");
+  return text.length <= 16384 && /^\p{L}/u.test(prose) &&
+    !/[{}[\]⚠]|```|[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(prose) && !prose.endsWith(":");
+}
+
 function cliExecutionFailure(raw) {
-  // agy 1.5.12 sends executor failures as a single ordinary agent_message_chunk and
-  // reports end_turn, even when no model was called. Match the whole CLI banner only:
-  // quoted examples in valid envelopes and malformed JSON must keep their own handling.
-  const match = /^\s*⚠\uFE0F? agent executor error: ([^\r\n]+)[ \t]*(?:\r?\n)?$/.exec(raw);
+  // agy also emits short quota warnings (and may have sent plain progress already)
+  // as ordinary message chunks with end_turn. Only a complete final warning line is
+  // inspected; JSON text, examples, trailing calls and arbitrary prose are not errors.
+  const match = /(?:^|\n)[ \t]*⚠\uFE0F? ([^\r\n]+)[ \t]*(?:\r?\n)?[ \t]*$/.exec(raw);
   if (!match) return null;
-  return new CliExecutionError(contextBudgetError(match[1].trim()) ? "context_length_exceeded" : "cli_execution_error");
+  const prefix = raw.slice(0, match.index);
+  if (prefix.trim() && !plainProgress(prefix)) return null;
+  const message = match[1].trim();
+  const executor = message.startsWith("agent executor error: ");
+  const cause = executor ? message.slice("agent executor error: ".length) : message;
+  const kind = contextBudgetError(cause) ? "context_length_exceeded" : providerFailureKind(cause);
+  return kind || executor ? new CliExecutionError(kind || "cli_execution_error") : null;
 }
 
 function jsonEscapeLength(text, index) {
@@ -19263,14 +19288,48 @@ function recoverTextOnlyEnvelope(payload) {
   return null;
 }
 
+function rejectExtraObjectContent(payload) {
+  if (!payload.startsWith("{") || payload.length > 1024 * 1024) return;
+  let depth = 0, quoted = false;
+  for (let index = 0; index < payload.length; index++) {
+    const char = payload[index];
+    if (quoted) {
+      if (char === "\\") index++;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === "{") depth++;
+    else if (char === "}" && --depth === 0) {
+      if (!payload.slice(index + 1).trim()) return;
+      try { JSON.parse(payload.slice(0, index + 1)); } catch { return; }
+      throw new EnvelopeSyntaxError("extra_response_content");
+    }
+  }
+}
+
+function recoverPrefacedEnvelope(payload) {
+  if (payload.length > 1024 * 1024) return null;
+  const start = payload.indexOf("{");
+  if (start <= 0 || !plainProgress(payload.slice(0, start))) return null;
+  let reply;
+  // Parse the *entire* suffix strictly: never search for a later object, repair tool
+  // arguments, pick one of repeated replies or discard any extra trailing bytes.
+  try { reply = JSON.parse(payload.slice(start)); } catch { return null; }
+  if (typeof reply?.text !== "string" || !Array.isArray(reply.calls) ||
+      Object.keys(reply).length !== 2) return null;
+  return { ...reply, text: payload.slice(0, start) + reply.text };
+}
+
 export function parseAntigravityEnvelope(raw) {
   const cliError = cliExecutionFailure(raw);
   if (cliError) throw cliError;
   const payload = raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
   try { return { reply: JSON.parse(payload), recovered: false }; }
   catch {
+    rejectExtraObjectContent(payload);
     const reply = recoverTextOnlyEnvelope(payload);
     if (reply) return { reply, recovered: true };
+    const prefaced = !raw.trimStart().startsWith("```") && recoverPrefacedEnvelope(payload);
+    if (prefaced) return { reply: prefaced, recovered: true };
     throw new EnvelopeSyntaxError("invalid_response_json");
   }
 }
@@ -19349,6 +19408,15 @@ function logSession(event, detail = {}) {
   process.stderr.write("model-router-antigravity:" + event + " " + JSON.stringify(detail) + "\n");
 }
 
+function responseShape(raw) {
+  const text = raw.trimStart();
+  if (!text) return "empty";
+  if (text.startsWith("{")) return "object_prefix";
+  if (text.startsWith("```")) return "fence_prefix";
+  if (/(?:^|\n)[ \t]*⚠/.test(text)) return "warning_line";
+  return text.includes("{") ? "text_then_object" : "plain_text";
+}
+
 // Only fixed categories reach router.err.log. ACP errors can echo request content, so never
 // record an exception message, response text, tool arguments, or a raw stop reason here.
 export function antigravityFailureKind(error, { stage, abortReason, closeReason } = {}) {
@@ -19370,10 +19438,8 @@ export function antigravityFailureKind(error, { stage, abortReason, closeReason 
   if (stage === "stop_reason") return "early_stop";
   const message = typeof error?.message === "string" ? error.message : "";
   if ((stage === "prompt" || stage === "set_model") && contextBudgetError(message.trim())) return "context_length_exceeded";
-  if (/\bRESOURCE_EXHAUSTED\b|\b(?:HTTP|code)\s+429\b/i.test(message)) return "rate_limited";
-  if (/\bUNAUTHENTICATED\b|\b(?:HTTP|code)\s+401\b/i.test(message)) return "auth_required";
-  if (/\bPERMISSION_DENIED\b|\b(?:HTTP|code)\s+403\b/i.test(message)) return "permission_denied";
-  if (/\bSAFETY\b|\bpolicy.violation\b|\bblocked.by.policy\b/i.test(message)) return "policy_rejected";
+  const providerKind = providerFailureKind(message);
+  if (providerKind) return providerKind;
   if (stage === "set_model" || stage === "prompt") return "acp_request_failed";
   return "unexpected_failure";
 }
@@ -19697,7 +19763,8 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
         controller.close();
       }).catch(error => {
         const kind = antigravityFailureKind(error, { stage, abortReason, closeReason: client.closeReason });
-        logSession("turn-failed", { stage, kind, stopReason, acpCode: error?.acpCode ?? null, exitCode: client.exitCode,
+        logSession("turn-failed", { at: new Date().toISOString(), stage, kind, stopReason, responseShape: responseShape(raw),
+          acpCode: error?.acpCode ?? null, exitCode: client.exitCode,
           elapsedMs: Date.now() - startedAt, responseChars: raw.length, emittedChars: sent.length, reasoningChunks });
         closeSession(key, session);
         if (!signal?.aborted) {
