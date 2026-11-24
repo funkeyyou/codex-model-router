@@ -80,6 +80,12 @@ test("only fixed official installers are used, without interpolating paths into 
   }
 });
 
+test("agy --version output is reduced to the version number", () => {
+  assert.equal(installer.antigravityVersionOf("1.5.16\n"), "1.5.16");
+  assert.equal(installer.antigravityVersionOf("agy version 1.5.16 (abc123)"), "1.5.16");
+  assert.equal(installer.antigravityVersionOf(""), null);
+});
+
 test("Windows finds the WinGet agy link with no current PATH or saved route", { skip: process.platform !== "win32" }, t => {
   const root = mkdtempSync(join(tmpdir(), "router-winget-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

@@ -51,7 +51,7 @@ const primaryProvider = providers[0] || null;
 const routeMap = new Map(settings.routes.map((route) => [route.pickerSlug, route]));
 
 function isLocalCli(route) {
-  return route?.transport === "claude-cli" || route?.transport === "antigravity-cli";
+  return route?.transport === "claude-cli" || route?.transport === "antigravity-cli" || route?.transport === "combo";
 }
 
 export function providerForRoute(route, registry = providerById) {
@@ -365,7 +365,46 @@ export function mergeOfficialCatalog(fresh, current, forceListed = []) {
   const forced = new Set(forceListed);
   const retained = (current.models || []).filter(m => forced.has(m.slug) &&
     !m.slug.startsWith("custom/") && !seen.has(m.slug));
-  return mergeCatalog({ ...fresh, models: [...fresh.models, ...retained] }, current, forceListed);
+  return syncCustomInstructions(mergeCatalog({ ...fresh, models: [...fresh.models, ...retained] }, current, forceListed),
+    [...routeMap.values()]);
+}
+
+// 自訂模型的系統提示詞複製自官方模板（同名模型，否則 gpt-5.6-sol）。官方會改寫提示詞，
+// 所以每次取得新清單時重新同步；只把開場身分句改成上游模型。Codex 0.17x 起實際送出的是
+// model_messages.instructions_template，base_instructions 只是舊版欄位，兩者都要改。
+const MODEL_IDENTITY = /^You are Codex, (?:a coding agent|an agent based on [^\r\n]+?)\.(?= You and the user|$)/;
+export function identityInstructions(text, model) {
+  if (typeof text !== "string" || !model) return text;
+  return text.replace(MODEL_IDENTITY, () => `You are Codex, an agent based on ${model}.`);
+}
+
+export function syncCustomInstructions(catalog, routes) {
+  const official = (catalog?.models || []).filter((model) => !String(model?.slug || "").startsWith("custom/"));
+  if (!official.length) return catalog;
+  const bySlug = new Map(official.map((model) => [model.slug, model]));
+  const fallback = bySlug.get("gpt-5.6-sol") || official.find((model) => model.visibility === "list") || official[0];
+  const routeBySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
+  let changed = false;
+  const models = catalog.models.map((model) => {
+    const route = routeBySlug.get(model.slug);
+    if (!route) return model;
+    const upstream = String(route.upstreamModel || "");
+    const name = upstream.split("/").at(-1);
+    const template = bySlug.get(upstream) || bySlug.get(name) || fallback;
+    if (!template || (template.base_instructions === undefined && template.model_messages === undefined)) return model;
+    const next = { ...model };
+    if (template.base_instructions !== undefined) next.base_instructions = identityInstructions(template.base_instructions, name);
+    if (template.model_messages && typeof template.model_messages === "object") {
+      next.model_messages = structuredClone(template.model_messages);
+      next.model_messages.instructions_template = identityInstructions(next.model_messages.instructions_template, name);
+    }
+    if (JSON.stringify(next.base_instructions) === JSON.stringify(model.base_instructions)
+      && JSON.stringify(next.model_messages) === JSON.stringify(model.model_messages)) return model;
+    changed = true;
+    return next;
+  });
+  if (changed) stats.customInstructionSyncs += 1;
+  return changed ? { ...catalog, models } : catalog;
 }
 
 // 只合併同帳號、同 client_version 同時進行的查詢；完成後立刻移除，不會讓下一次
@@ -684,7 +723,8 @@ function isBridgeReasoning(item) {
       (typeof parsed.thinking === "string" && parsed.signature) ||
       typeof parsed.redacted_thinking === "string" ||
       (parsed.router_reasoning_ref === 1 && /^[a-f0-9]{64}$/.test(parsed.sha256)) ||
-      parsed.router_chat_reasoning === 1
+      parsed.router_chat_reasoning === 1 ||
+      parsed.router_combo_note === 1
     ));
   } catch {
     return false;
@@ -1025,6 +1065,16 @@ const stats = {
   quotaModeOfficialBlocked: 0,
   backgroundRerouted: 0,
   backgroundReroutedByKind: {},
+  comboRequests: 0,
+  comboDirect: 0,
+  comboPlans: 0,
+  comboConsults: 0,
+  comboReviews: 0,
+  comboRevisions: 0,
+  comboPlannerFailures: 0,
+  comboAsksDropped: 0,
+  comboFailures: 0,
+  customInstructionSyncs: 0,
   usageRecords: 0,
   usageLogFailures: 0,
   upstreamErrorCloses: 0,
@@ -1184,12 +1234,13 @@ const usageLogPath = join(routerDirectory, "usage.jsonl");
 const usageLogMaxBytes = 5 * 1024 * 1024;
 let usageArchiveDay = null;
 
-function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind, startedAt = Date.now() }) {
+function usageContext({ requestHeaders, model, route, provider, transport, backgroundKind, startedAt = Date.now(), combo = null }) {
   const thread = requestHeaders?.["thread-id"] || requestHeaders?.["session-id"];
   return {
     startedAt, model: typeof model === "string" ? model.slice(0, 160) : null,
     route, provider, transport, backgroundKind,
     thread: typeof thread === "string" ? thread.slice(0, 64) : null, recorded: false,
+    ...(combo ? { combo: combo.combo, comboRole: combo.role } : {}),
   };
 }
 
@@ -1220,6 +1271,7 @@ export function usageRecord(context, event, now = Date.now()) {
     upstreamModel: typeof event.response?.model === "string" ? event.response.model.slice(0, 160) : null,
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
+    ...(context.combo ? { combo: context.combo, comboRole: context.comboRole } : {}),
     durationMs, firstTextMs, firstOutputMs, hasText,
     outputTps: !context.bufferedOutput && hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
@@ -1374,6 +1426,510 @@ export function applyBackgroundModel(body) {
   stats.backgroundRerouted += 1;
   stats.backgroundReroutedByKind[kind] = (stats.backgroundReroutedByKind[kind] || 0) + 1;
   return { ...body, model: target, [BACKGROUND_KIND]: kind };
+}
+
+// --- 組合模型：大腦（planner）規劃、雙手（executor）執行 ----------------------------
+//
+// 組合模型在 settings.routes 裡是 transport: "combo" 的路由，本身沒有上游。路由器把一輪
+// 請求拆成數次內部請求，送回自己的 /v1/responses（帶 COMBO_HEADER），所以兩個角色各自
+// 沿用原本的轉譯、Key 輪替、圖片預算與用量記錄；這裡只負責合成一個 Responses 串流：
+//
+//   1. 使用者送出新訊息時，先問大腦，計畫以思考摘要顯示，並記在 comboConversations。
+//   2. 雙手的每次請求都在原位置插回計畫與先前的問答（開發者訊息），前綴因此穩定、快取可命中。
+//   3. 雙手可以呼叫路由器自己的 ask_planner；它不會出現在 Codex，路由器轉問大腦後讓雙手接著做。
+//   4. 驗收開啟時，雙手交出最終回答後由大腦審查；不通過就把意見交給雙手繼續，每輪最多兩次。
+//
+// 標題、記憶整理、精簡上下文等背景請求不經過大腦，直接交給雙手。
+const COMBO_HEADER = "x-codex-router-combo";
+const comboToken = randomBytes(16).toString("hex");
+export const COMBO_TOOL = "ask_planner";
+const COMBO_NOTE = Buffer.from(JSON.stringify({ router_combo_note: 1 }), "utf8").toString("base64");
+const COMBO_MAX_ROUNDS = 6;
+export const COMBO_MAX_REVIEWS = 2;
+const COMBO_MAX_TURNS = 40;
+const COMBO_MAX_CONVERSATIONS = 100;
+const comboConversations = new Map();
+const COMBO_DROPPED_HEADERS = new Set(["host", "connection", "upgrade", "content-length", "content-encoding",
+  "transfer-encoding", "keep-alive", "accept-encoding", "origin", "expect", COMBO_HEADER]);
+
+export function comboInternalRole(headers) {
+  const value = headers?.[COMBO_HEADER];
+  if (typeof value !== "string") return null;
+  const [token, role, ...rest] = value.split(":");
+  if (token !== comboToken || !["planner", "executor"].includes(role)) return null;
+  return { role, combo: rest.join(":").slice(0, 160) };
+}
+
+function comboItemText(item) {
+  if (typeof item === "string") return item;
+  if (typeof item?.content === "string") return item.content;
+  if (Array.isArray(item?.content)) {
+    return item.content.map((part) => typeof part?.text === "string" ? part.text
+      : part?.type === "input_image" ? "[image]" : "").join("\n");
+  }
+  if (Array.isArray(item?.summary)) return item.summary.map((part) => part?.text || "").join("\n");
+  if (typeof item?.arguments === "string") return item.arguments;
+  return "";
+}
+
+// 同一段歷史在 WebSocket 重播與 HTTP 重送時欄位不一定相同（id、status、annotations），
+// 只用角色、類型、文字與 call_id 辨識，插入位置才不會因為傳輸方式不同而漂移。
+export function comboFingerprint(item) {
+  if (typeof item === "string") return "message:user:" + createHash("sha256").update(item).digest("hex").slice(0, 24);
+  if (!item || typeof item !== "object") return "other";
+  if (typeof item.call_id === "string" && item.call_id) {
+    return (String(item.type || "").endsWith("_output") ? "out:" : "call:") + item.call_id;
+  }
+  const hash = createHash("sha256").update(comboItemText(item)).digest("hex").slice(0, 24);
+  return (item.type || "message") + ":" + (item.role || "") + ":" + hash;
+}
+
+function comboAnchorAt(fingerprints, index) {
+  const fp = fingerprints[index];
+  let nth = 0;
+  for (let i = 0; i < index; i += 1) if (fingerprints[i] === fp) nth += 1;
+  return { fp, nth };
+}
+
+function comboLocate(fingerprints, anchor) {
+  if (!anchor) return -1;
+  let nth = 0;
+  for (let i = 0; i < fingerprints.length; i += 1) {
+    if (fingerprints[i] !== anchor.fp) continue;
+    if (nth === anchor.nth) return i;
+    nth += 1;
+  }
+  return -1;
+}
+
+// 使用者真正輸入的訊息。Codex 也以 user 角色送環境資訊、AGENTS.md 與中斷標記，
+// 它們都以 "<" 開頭；中途插話（steer）則算新的一則，讓大腦重新規劃。
+export function isComboUserMessage(item) {
+  if (typeof item === "string") return item.trim().length > 0;
+  if ((item?.type && item.type !== "message") || item?.role !== "user") return false;
+  const parts = typeof item.content === "string" ? [{ type: "input_text", text: item.content }]
+    : Array.isArray(item.content) ? item.content : [];
+  if (parts.some((part) => part?.type === "input_image")) return true;
+  const text = parts.filter((part) => typeof part?.text === "string").map((part) => part.text).join("\n").trimStart();
+  return text.length > 0 && !text.startsWith("<");
+}
+
+function comboDeveloperMessage(text) {
+  return { type: "message", role: "developer", content: [{ type: "input_text", text }] };
+}
+
+function comboRoleLabel(route, effort = null) {
+  const name = route?.displayName || route?.upstreamModel || route?.pickerSlug || "?";
+  return effort ? name + "（" + effort + "）" : name;
+}
+
+const COMBO_REVIEW_LEVELS = new Set(["off", "standard", "strict"]);
+export function comboReviewLevel(combo) {
+  return COMBO_REVIEW_LEVELS.has(combo?.review) ? combo.review : "off";
+}
+
+// 使用者給大腦的指令：完成條件、拆解與派工的注意事項等。舊版欄位叫 criteria。
+function comboInstructions(combo) {
+  const raw = typeof combo?.instructions === "string" ? combo.instructions : typeof combo?.criteria === "string" ? combo.criteria : "";
+  const text = raw.trim().slice(0, 4000);
+  return text ? "\nThe user's standing instructions for you as the planner (follow them; they may set the definition of done"
+    + " and how to break down or hand off the work):\n<planner_instructions>\n" + text + "\n</planner_instructions>" : "";
+}
+
+export function comboPlannerInstruction(kind, { combo, executor, question = "" }) {
+  const executorName = comboRoleLabel(executor);
+  const instructions = comboInstructions(combo);
+  const common = "You are the PLANNER in a planner/executor pair working inside Codex. A separate executor model ("
+    + executorName + ") does the hands-on work with the tools listed above. You cannot call tools in this reply; "
+    + "write plain text only, in the language the user writes in." + instructions;
+  if (kind === "plan") {
+    return common + "\nWrite the plan for the latest user request, taking any progress already in the conversation into account:"
+      + "\n- Goal: one sentence."
+      + "\n- Steps: numbered and concrete (files, commands, what to look for)."
+      + "\n- Definition of done: observable checks that prove completion (tests, builds, command output, diffs)."
+      + "\n- Risks or constraints, only if they matter."
+      + "\nKeep it under 300 words. If the request needs no tools (a question or chat), say so and list the points the answer must cover.";
+  }
+  if (kind === "consult") {
+    return common + "\nThe executor asks you:\n" + question
+      + "\nAnswer concretely and briefly, based on the conversation so far. If the plan should change, give the new steps.";
+  }
+  const strict = kind === "review-strict";
+  return common + "\nThe executor reports that the request is finished (its latest message above). Review the work against the user's request"
+    + " and the plan." + (strict
+      ? " Judge only by actual tool output in the conversation (test runs, builds, command output, diffs, file contents),"
+        + " not by the executor's claims. Every definition-of-done item needs evidence; missing or failing evidence means it is not done."
+      : " Check that it is complete and consistent, with no obvious omissions or errors.")
+    + "\nReply with APPROVED on the first line if it is acceptable. Otherwise reply with REVISE on the first line,"
+    + " followed by the specific fixes" + (strict ? " and the exact checks or commands the executor must run." : ".");
+}
+
+export function comboExecutorGuide(planner) {
+  return "You are the EXECUTOR in a planner/executor pair. The planner (" + comboRoleLabel(planner)
+    + ") wrote the plan above. Follow it with the available tools and adapt when the facts differ. "
+    + "If you are stuck, face a decision the plan does not cover, or believe the plan is wrong, call " + COMBO_TOOL
+    + " with one specific question. When you finish, report the evidence for each definition-of-done item.";
+}
+
+export const COMBO_TOOL_DEFINITION = {
+  type: "function",
+  name: COMBO_TOOL,
+  description: "Ask the planner model for guidance when you are stuck, need a decision the plan does not cover, or think the plan is wrong. "
+    + "The planner sees the whole conversation. Call it alone, not in parallel with other tools.",
+  strict: false,
+  parameters: {
+    type: "object",
+    properties: { question: { type: "string", description: "One specific question for the planner." } },
+    required: ["question"],
+    additionalProperties: false,
+  },
+};
+
+// 把記住的計畫與問答插回原本的位置。找不到錨點（例如已被精簡）的項目就略過。
+export function comboInjectInput(input, conversation) {
+  if (!Array.isArray(input) || !conversation?.turns?.length) return input;
+  const fingerprints = input.map(comboFingerprint);
+  const inserts = new Map();
+  const push = (index, text) => {
+    if (!inserts.has(index)) inserts.set(index, []);
+    inserts.get(index).push(comboDeveloperMessage(text));
+  };
+  for (const turn of conversation.turns) {
+    const at = comboLocate(fingerprints, turn.anchor);
+    if (at < 0) continue;
+    if (turn.plan) push(at, turn.plan);
+    for (const note of turn.notes) {
+      const index = note.anchor ? comboLocate(fingerprints, note.anchor) : at;
+      push(index >= 0 ? index : at, note.text);
+    }
+  }
+  if (!inserts.size) return input;
+  const output = [];
+  input.forEach((item, index) => {
+    output.push(item);
+    if (inserts.has(index)) output.push(...inserts.get(index));
+  });
+  return output;
+}
+
+export function comboConversationKey(body, headers, slug) {
+  const candidates = [body?.prompt_cache_key, body?.client_metadata?.session_id, headers?.["thread-id"], headers?.["session-id"]];
+  const logical = candidates.find((value) => typeof value === "string" && value) || "anonymous";
+  return slug + "\0" + logical;
+}
+
+function comboConversation(key) {
+  let conversation = comboConversations.get(key);
+  if (conversation) comboConversations.delete(key);
+  else conversation = { turns: [] };
+  comboConversations.set(key, conversation);
+  while (comboConversations.size > COMBO_MAX_CONVERSATIONS) comboConversations.delete(comboConversations.keys().next().value);
+  return conversation;
+}
+
+export function comboReviewVerdict(text) {
+  const first = String(text || "").split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
+  return /^\**\s*REVISE\b/i.test(first) ? "revise" : "approved";
+}
+
+function comboReviewFeedback(text) {
+  return String(text || "").replace(/^\s*\**\s*REVISE\b\**[:：]?\s*/i, "").trim();
+}
+
+// 背景請求、精簡上下文、結構化輸出等不是一般工作回合，直接交給雙手。
+// Codex 現在把工具放在 input 的 additional_tools 項目，頂層 tools 可能是空的；兩處都算。
+export function comboDirectRequest(body, backgroundKind) {
+  if (backgroundKind) return true;
+  if (!Array.isArray(body?.input)) return true;
+  const hasTools = (Array.isArray(body.tools) && body.tools.length > 0)
+    || body.input.some((item) => item?.type === "additional_tools" && Array.isArray(item.tools) && item.tools.length > 0);
+  if (!hasTools) return true;
+  if (body.text?.format?.type === "json_schema") return true;
+  if (body.input.some((item) => item?.type === "compaction_trigger")) return true;
+  return !body.input.some(isComboUserMessage);
+}
+
+async function* comboEvents(response) {
+  const decoder = new TextDecoder();
+  let pending = "";
+  for await (const chunk of response.body) {
+    pending += decoder.decode(chunk, { stream: true });
+    for (;;) {
+      const match = /\r?\n\r?\n/.exec(pending);
+      if (!match) break;
+      const data = sseData(pending.slice(0, match.index));
+      pending = pending.slice(match.index + match[0].length);
+      if (data && data !== "[DONE]") yield JSON.parse(data);
+    }
+  }
+  pending += decoder.decode();
+  const data = sseData(pending);
+  if (data && data !== "[DONE]") yield JSON.parse(data);
+}
+
+function comboLoopback(requestHeaders, incomingUrl, body, role, slug, signal) {
+  const headers = {};
+  for (const [name, value] of Object.entries(requestHeaders || {})) {
+    const lower = name.toLowerCase();
+    if (typeof value !== "string" || COMBO_DROPPED_HEADERS.has(lower) || lower.startsWith("sec-")) continue;
+    headers[lower] = value;
+  }
+  headers["content-type"] = "application/json";
+  headers.accept = "text/event-stream";
+  headers[COMBO_HEADER] = comboToken + ":" + role + ":" + slug;
+  const path = /\/responses$/.test(incomingUrl?.pathname || "") ? incomingUrl.pathname : "/v1/responses";
+  const outbound = { ...body, stream: true };
+  delete outbound.previous_response_id;
+  // 以實際綁定的埠為準（設定的 port 為 0 時由系統指定）。
+  const address = server.address();
+  const port = address && typeof address === "object" ? address.port : listenPort;
+  return fetch("http://" + listenHost + ":" + port + path, {
+    method: "POST", headers, body: JSON.stringify(outbound), signal,
+  });
+}
+
+async function comboFailure(response) {
+  const text = await response.text().catch(() => "");
+  const details = upstreamErrorDetails(response.status, text, response.headers.get("retry-after"));
+  return { code: details.code || String(response.status), message: details.message || "組合模型的內部請求失敗。" };
+}
+
+export async function fetchCombo(requestHeaders, incomingUrl, body, route, signal, meta = {}) {
+  const combo = route.combo || {};
+  const planner = routeMap.get(combo.planner?.slug);
+  const executor = routeMap.get(combo.executor?.slug);
+  if (!planner || !executor || planner.transport === "combo" || executor.transport === "combo") {
+    throw new RouterRequestError(404, "combo_member_missing",
+      "組合模型「" + (route.displayName || route.pickerSlug) + "」的" + (!planner ? "大腦" : "雙手")
+        + "模型已不存在，請在管理頁修改或刪除這個組合。", "routing");
+  }
+  stats.comboRequests += 1;
+  if (meta.history) meta.history.usage = null;
+  const executorBody = { ...body, model: executor.pickerSlug };
+  if (comboDirectRequest(body, meta.backgroundKind)) {
+    stats.comboDirect += 1;
+    return comboLoopback(requestHeaders, incomingUrl, executorBody, "executor", route.pickerSlug, signal);
+  }
+  const plannerEffort = typeof combo.planner?.effort === "string" && combo.planner.effort ? combo.planner.effort : null;
+  const reviewLevel = comboReviewLevel(combo);
+  const conversation = comboConversation(comboConversationKey(body, requestHeaders, route.pickerSlug));
+  const encoder = new TextEncoder();
+  const inner = new AbortController();
+  const abortInner = () => inner.abort();
+  signal?.addEventListener("abort", abortInner, { once: true });
+  let keepAlive = null;
+
+  const run = async (controller) => {
+    const send = (event) => controller.enqueue(encoder.encode("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n"));
+    keepAlive = setInterval(() => { try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch {} }, 15000);
+    const base = { id: "resp_" + randomBytes(16).toString("hex"), object: "response",
+      created_at: Math.floor(Date.now() / 1000), model: route.pickerSlug };
+    const visible = [];
+    let nextIndex = 0;
+    let lastUsage = null;
+    send({ type: "response.created", response: { ...base, status: "in_progress", output: [] } });
+    send({ type: "response.in_progress", response: { ...base, status: "in_progress", output: [] } });
+    const finish = (type, extra = {}) => send({ type, response: { ...base, output: visible, usage: lastUsage, ...extra } });
+    const fail = (code, message) => {
+      stats.comboFailures += 1;
+      finish("response.failed", { status: "failed", error: { code, message } });
+    };
+
+    const openNote = (title) => {
+      const id = "rs_" + randomBytes(12).toString("hex");
+      const index = nextIndex++;
+      let text = "";
+      send({ type: "response.output_item.added", output_index: index, item: { id, type: "reasoning", summary: [] } });
+      send({ type: "response.reasoning_summary_part.added", item_id: id, output_index: index, summary_index: 0,
+        part: { type: "summary_text", text: "" } });
+      const delta = (piece) => {
+        if (!piece) return;
+        text += piece;
+        send({ type: "response.reasoning_summary_text.delta", item_id: id, output_index: index, summary_index: 0, delta: piece });
+      };
+      delta(title);
+      return {
+        delta,
+        done() {
+          send({ type: "response.reasoning_summary_text.done", item_id: id, output_index: index, summary_index: 0, text });
+          send({ type: "response.reasoning_summary_part.done", item_id: id, output_index: index, summary_index: 0,
+            part: { type: "summary_text", text } });
+          const item = { id, type: "reasoning", summary: [{ type: "summary_text", text }], encrypted_content: COMBO_NOTE };
+          send({ type: "response.output_item.done", output_index: index, item });
+          visible.push(item);
+        },
+      };
+    };
+
+    // 大腦只回文字；它若想呼叫工具，那些呼叫一律忽略。
+    const askPlanner = async (kind, title, extra = {}) => {
+      const note = openNote(title);
+      const currentInput = comboInjectInput([...body.input, ...visible], conversation);
+      const plannerBody = { ...body, model: planner.pickerSlug,
+        input: [...currentInput, comboDeveloperMessage(comboPlannerInstruction(kind, { combo, executor, ...extra }))] };
+      if (plannerEffort) plannerBody.reasoning = { ...(body.reasoning || {}), effort: plannerEffort };
+      let text = "";
+      let error = null;
+      try {
+        const response = await comboLoopback(requestHeaders, incomingUrl, plannerBody, "planner", route.pickerSlug, inner.signal);
+        if (!response.ok) error = (await comboFailure(response)).message;
+        else {
+          for await (const event of comboEvents(response)) {
+            if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+              text += event.delta;
+              note.delta(event.delta);
+            } else if (event.type === "response.output_item.done" && hasOutputText(event.item) && !text) {
+              text = comboItemText(event.item);
+              note.delta(text);
+            } else if (event.type === "response.failed") {
+              error = event.response?.error?.message || "大腦回應失敗。";
+            } else if (event.type === "error") {
+              error = event.error?.message || event.message || "大腦回應失敗。";
+            }
+          }
+        }
+      } catch (caught) {
+        if (inner.signal.aborted) throw caught;
+        error = caught?.message || "無法連線到大腦模型。";
+      }
+      if (error || !text.trim()) {
+        stats.comboPlannerFailures += 1;
+        note.delta("\n\n（大腦沒有回應：" + (error || "回覆是空的") + "。由雙手直接處理。）");
+      }
+      note.done();
+      return error ? "" : text.trim();
+    };
+
+    const input = body.input;
+    const fingerprints = input.map(comboFingerprint);
+    const userIndex = input.findLastIndex(isComboUserMessage);
+    const anchor = comboAnchorAt(fingerprints, userIndex);
+    let turn = conversation.turns.find((item) => item.anchor.fp === anchor.fp && item.anchor.nth === anchor.nth);
+    const fresh = !input.slice(userIndex + 1).some((item) => typeof item?.call_id === "string");
+    if (!turn) {
+      turn = { anchor, plan: null, notes: [], reviews: 0 };
+      conversation.turns.push(turn);
+      while (conversation.turns.length > COMBO_MAX_TURNS) conversation.turns.shift();
+    }
+    if (!turn.plan && (fresh || !turn.attempted)) {
+      turn.attempted = true;
+      stats.comboPlans += 1;
+      const plan = await askPlanner("plan", "**大腦規劃 · " + comboRoleLabel(planner, plannerEffort) + "**\n\n");
+      if (plan) turn.plan = "[Planner plan by " + comboRoleLabel(planner, plannerEffort) + "]\n" + plan + "\n\n" + comboExecutorGuide(planner);
+    }
+
+    const noteAnchor = () => {
+      const all = [...input, ...visible];
+      const prints = all.map(comboFingerprint);
+      for (let i = all.length - 1; i > userIndex; i -= 1) {
+        if (all[i]?.type !== "reasoning") return comboAnchorAt(prints, i);
+      }
+      return null;
+    };
+
+    for (let round = 0; round < COMBO_MAX_ROUNDS; round += 1) {
+      const executorInput = comboInjectInput([...input, ...visible], conversation);
+      const response = await comboLoopback(requestHeaders, incomingUrl,
+        { ...executorBody, input: executorInput, tools: [...(Array.isArray(body.tools) ? body.tools : []), COMBO_TOOL_DEFINITION] },
+        "executor", route.pickerSlug, inner.signal);
+      if (!response.ok) {
+        const failure = await comboFailure(response);
+        fail(failure.code, failure.message);
+        return;
+      }
+      const indexMap = new Map();
+      const suppressed = new Set();
+      let ask = null;
+      let codexCalls = 0;
+      let sawText = false;
+      let terminal = null;
+      for await (const event of comboEvents(response)) {
+        const type = event?.type;
+        if (type === "response.created" || type === "response.in_progress" || type === "response.queued") continue;
+        if (type === "response.completed" || type === "response.incomplete" || type === "response.failed") { terminal = event; break; }
+        if (type === "error") { terminal = responseFailedFromErrorEvent(event); break; }
+        const out = { ...event };
+        delete out.sequence_number;
+        if (Number.isFinite(event.output_index)) {
+          const index = event.output_index;
+          if (type === "response.output_item.added" && event.item?.type === "function_call" && event.item.name === COMBO_TOOL) suppressed.add(index);
+          if (suppressed.has(index)) {
+            if (type === "response.output_item.done") ask = event.item;
+            continue;
+          }
+          if (!indexMap.has(index)) indexMap.set(index, nextIndex++);
+          out.output_index = indexMap.get(index);
+          if (type === "response.output_item.done") {
+            visible.push(event.item);
+            if (usageToolItems.has(event.item?.type)) codexCalls += 1;
+            if (hasOutputText(event.item)) sawText = true;
+          }
+        }
+        send(out);
+      }
+      if (!terminal) {
+        fail("upstream_stream_truncated", truncatedStreamMessage);
+        return;
+      }
+      if (terminal.response?.usage) lastUsage = terminal.response.usage;
+      if (terminal.type === "response.failed") {
+        const error = terminal.response?.error || {};
+        fail(error.code || "upstream_error", error.message || "雙手模型回應失敗。");
+        return;
+      }
+      if (terminal.type === "response.incomplete") {
+        finish("response.incomplete", { status: "incomplete", incomplete_details: terminal.response?.incomplete_details ?? null });
+        return;
+      }
+      if (ask && codexCalls === 0) {
+        let question = "";
+        try { question = String(JSON.parse(ask.arguments || "{}").question || "").trim(); } catch {}
+        if (!question) question = String(ask.arguments || "").slice(0, 2000);
+        stats.comboConsults += 1;
+        const answer = await askPlanner("consult", "**詢問大腦 · " + comboRoleLabel(planner, plannerEffort) + "**\n\n問：" + question + "\n\n答：",
+          { question });
+        turn.notes.push({ anchor: noteAnchor(), text: "[Planner answer to the executor's question]\nQuestion: " + question
+          + "\nAnswer: " + (answer || "(The planner did not answer. Decide on your own.)") });
+        continue;
+      }
+      if (ask) stats.comboAsksDropped += 1;
+      if (codexCalls === 0 && sawText && reviewLevel !== "off" && turn.reviews < COMBO_MAX_REVIEWS) {
+        turn.reviews += 1;
+        stats.comboReviews += 1;
+        const verdictText = await askPlanner(reviewLevel === "strict" ? "review-strict" : "review",
+          "**大腦驗收（" + (reviewLevel === "strict" ? "嚴格" : "一般") + "）· " + comboRoleLabel(planner, plannerEffort) + "**\n\n");
+        if (verdictText && comboReviewVerdict(verdictText) === "revise") {
+          stats.comboRevisions += 1;
+          turn.notes.push({ anchor: noteAnchor(), text: "[Planner review: not accepted yet]\n" + comboReviewFeedback(verdictText)
+            + "\nAddress these points, then report the evidence again." });
+          continue;
+        }
+      }
+      finish("response.completed", { status: "completed" });
+      return;
+    }
+    finish("response.completed", { status: "completed" });
+  };
+
+  const stream = new ReadableStream({
+    start(controller) {
+      run(controller).catch((error) => {
+        if (!inner.signal.aborted) {
+          stats.comboFailures += 1;
+          try {
+            controller.enqueue(encoder.encode("event: response.failed\ndata: "
+              + JSON.stringify(responseFailedEvent("combo_error", "組合模型處理失敗：" + (error?.message || error))) + "\n\n"));
+          } catch {}
+        }
+      }).finally(() => {
+        clearInterval(keepAlive);
+        signal?.removeEventListener("abort", abortInner);
+        try { controller.close(); } catch {}
+      });
+    },
+    cancel() { inner.abort(); },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
 }
 
 // 重試也不會好的路由器錯誤：以 response.failed + invalid_prompt 回給 Codex，它會直接顯示訊息，
@@ -2301,6 +2857,8 @@ export async function fetchModelUpstream(
   meta = {},
 ) {
   const startedAt = meta.startedAt ?? Date.now();
+  // 組合模型送回自己的內部請求：不保存歷史（外層才是 Codex 看到的回應）、不覆寫記住的路由。
+  const comboRole = comboInternalRole(requestHeaders);
   meta.backgroundKind = body?.[BACKGROUND_KIND] ?? backgroundTaskKind(body);
   body = applyBackgroundModel(body);
   const route = chooseRoute(requestHeaders, body);
@@ -2310,7 +2868,7 @@ export async function fetchModelUpstream(
     if (!isCustom) throw rejectQuotaModeOfficial();
   }
   const provider = isCustom && !isLocalCli(route) ? providerForRoute(route) : null;
-  rememberRoute(requestHeaders, route);
+  if (!comboRole) rememberRoute(requestHeaders, route);
 
   // HTTP 回退與第三方上游不保證支援 previous_response_id，從對應的成功回合重播。
   const historyKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
@@ -2327,10 +2885,19 @@ export async function fetchModelUpstream(
       throw historyUnavailableError(historyKey, body, requestHeaders);
     }
   }
+  if (route?.transport === "combo") {
+    meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id) || { disabled: true };
+    meta.history.recoveryIds = historyRecoveryCandidates(body, requestHeaders);
+    stats.lastRoute = "custom";
+    stats.lastProvider = null;
+    stats.lastModel = body?.model ?? null;
+    stats.custom += 1;
+    return fetchCombo(requestHeaders, incomingUrl, effectiveBody, route, signal, meta);
+  }
   // 先重建完整歷史才配對；在剝除選填 item id 之前保留可驗證的識別。
   // Claude/Chat 轉譯各自已有工具結果處理，官方原生 WS 不走此 HTTP 路徑。
   if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
-  meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
+  meta.history = comboRole ? null : prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
   // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
   meta.history = meta.history || { disabled: true };
   meta.history.recoveryIds = historyRecoveryCandidates(body, requestHeaders);
@@ -2338,6 +2905,7 @@ export async function fetchModelUpstream(
     requestHeaders, model: body?.model, route: isCustom ? "custom" : "official",
     provider: isLocalCli(route) ? route.transport : provider?.id ?? null,
     transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null, startedAt,
+    combo: comboRole,
   });
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
