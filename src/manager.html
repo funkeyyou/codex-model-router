@@ -405,10 +405,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、回答詢問和驗收時都會遵守；雙手看到的是大腦據此寫出的計畫。": "Set a definition of done or anything to keep in mind when planning and handing off work. The planner follows these when planning, answering questions and reviewing; the executor sees the plan written from them.",
 "你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。": "When you send a message, the planner reads the whole conversation and writes a plan, shown in Codex's thinking area. The executor then calls tools to do the work, and can ask the planner when stuck.",
 "Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。": "The reasoning level in Codex's picker controls the executor; the planner always uses the level chosen here. The context limit is the smaller of the two. Background tasks such as titles go straight to the executor.",
-"每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。Antigravity CLI 模型目前不能當成員。": "Each new message adds one planner call, so the first words appear a little later. Antigravity CLI models cannot be members yet.",
+"每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。": "Each new message adds one planner call, so the first words appear a little later.",
+"先添加至少一個模型，才能建立組合。": "Add at least one model before creating a combo.",
 "儲存後會重新啟動路由器，重新啟動 {app} 後就能在模型選單選擇。": "Saving restarts the router. Restart {app} to pick the combo in the model menu.",
 "名稱不能是空白。": "The name cannot be empty.",
-"先添加至少一個 API Key 或 Claude 訂閱模型，才能建立組合。": "Add at least one API key or Claude subscription model before creating a combo.",
 "新增組合模型：{name}": "Add combo model: {name}",
 "修改組合模型：{name}": "Edit combo model: {name}",
 "儲存組合模型": "Save combo model",
@@ -2419,7 +2419,7 @@ function modelRow(model, index, count, blocked) {
 // ---- 組合模型 -------------------------------------------------------------------
 // 大腦負責規劃、回答雙手的詢問與驗收；雙手呼叫工具完成工作。選擇器的推理強度控制雙手。
 function comboCandidates() {
-  return (state.models || []).filter((model) => model.transport !== "combo" && model.transport !== "antigravity-cli");
+  return (state.models || []).filter((model) => model.transport !== "combo");
 }
 
 function comboSummary(model) {
@@ -2444,7 +2444,7 @@ function comboReviewHint(level) {
 
 function openComboEditor(model = null) {
   const candidates = comboCandidates();
-  if (!candidates.length) { toast(t("先添加至少一個 API Key 或 Claude 訂閱模型，才能建立組合。"), "error"); return; }
+  if (!candidates.length) { toast(t("先添加至少一個模型，才能建立組合。"), "error"); return; }
   const combo = (model && model.combo) || {};
   const has = (slug) => candidates.some((item) => item.slug === slug);
   const plannerSlug = has(combo.planner && combo.planner.slug) ? combo.planner.slug : candidates[0].slug;
@@ -2485,7 +2485,7 @@ function openComboEditor(model = null) {
       h("span", { class: "hint", text: t("可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、回答詢問和驗收時都會遵守；雙手看到的是大腦據此寫出的計畫。") })),
     paragraph(t("你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。"), "note"),
     paragraph(t("Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。"), "note"),
-    paragraph(t("每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。Antigravity CLI 模型目前不能當成員。"), "note"),
+    paragraph(t("每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。"), "note"),
     paragraph(t("儲存後會重新啟動路由器，重新啟動 {app} 後就能在模型選單選擇。", { app: desktopName() }), "note"),
   ];
   const modal = openModal({ title: model ? t("修改組合模型") : t("新增組合模型"), body, wide: true });

@@ -1456,7 +1456,7 @@ export function comboInternalRole(headers) {
   const value = headers?.[COMBO_HEADER];
   if (typeof value !== "string") return null;
   const [token, role, ...rest] = value.split(":");
-  if (token !== comboToken || !["planner", "executor"].includes(role)) return null;
+  if (token !== comboToken || !["planner", "executor", "direct"].includes(role)) return null;
   return { role, combo: rest.join(":").slice(0, 160) };
 }
 
@@ -1518,6 +1518,14 @@ function comboDeveloperMessage(text) {
   return { type: "message", role: "developer", content: [{ type: "input_text", text }] };
 }
 
+// 給大腦的指令用使用者訊息：Chat 轉譯會把所有開發者訊息併進開頭的 system，指令會脫離它在
+// 對話裡的位置，續接型上游（Antigravity CLI）就會判定對話分岔而重建。
+function comboPlannerMessage(text) {
+  return { type: "message", role: "user", content: [{ type: "input_text", text }] };
+}
+// 大腦的回答後面接一則分隔訊息，避免 Chat 轉譯把它和雙手接下來的助理內容併成同一則。
+const COMBO_PLANNER_SEPARATOR = "(Planner reply recorded. The conversation continues below.)";
+
 function comboRoleLabel(route, effort = null) {
   const name = route?.displayName || route?.upstreamModel || route?.pickerSlug || "?";
   return effort ? name + "（" + effort + "）" : name;
@@ -1539,7 +1547,7 @@ function comboInstructions(combo) {
 export function comboPlannerInstruction(kind, { combo, executor, question = "" }) {
   const executorName = comboRoleLabel(executor);
   const instructions = comboInstructions(combo);
-  const common = "You are the PLANNER in a planner/executor pair working inside Codex. A separate executor model ("
+  const common = "You are the PLANNER in a planner/executor pair. A separate executor model ("
     + executorName + ") does the hands-on work with the tools listed above. You cannot call tools in this reply; "
     + "write plain text only, in the language the user writes in." + instructions;
   if (kind === "plan") {
@@ -1585,23 +1593,35 @@ export const COMBO_TOOL_DEFINITION = {
   },
 };
 
-// 把記住的計畫與問答插回原本的位置。找不到錨點（例如已被精簡）的項目就略過。
-export function comboInjectInput(input, conversation) {
+// 把記住的內容插回原本的位置。找不到錨點（例如已被精簡）的項目就略過。
+//   executor：計畫（開發者訊息）、雙手問大腦的那次呼叫與回答、驗收意見。
+//   planner：大腦過去每次收到的指示與它的回答，依序排在當時的對話結尾之後。
+// 兩種視角都只會往後增加，續接型的上游（例如 Antigravity CLI 的對話）不會因此重建。
+export function comboInjectInput(input, conversation, view = "executor") {
   if (!Array.isArray(input) || !conversation?.turns?.length) return input;
   const fingerprints = input.map(comboFingerprint);
   const inserts = new Map();
-  const push = (index, text) => {
+  const push = (index, items) => {
     if (!inserts.has(index)) inserts.set(index, []);
-    inserts.get(index).push(comboDeveloperMessage(text));
+    inserts.get(index).push(...items);
+  };
+  const position = (anchor, fallback) => {
+    const index = anchor ? comboLocate(fingerprints, anchor) : fallback;
+    return index >= 0 ? index : fallback;
   };
   for (const turn of conversation.turns) {
     const at = comboLocate(fingerprints, turn.anchor);
     if (at < 0) continue;
-    if (turn.plan) push(at, turn.plan);
-    for (const note of turn.notes) {
-      const index = note.anchor ? comboLocate(fingerprints, note.anchor) : at;
-      push(index >= 0 ? index : at, note.text);
+    if (view === "planner") {
+      for (const entry of turn.plannerLog || []) {
+        push(position(entry.anchor, at), [comboPlannerMessage(entry.instruction),
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: entry.answer }] },
+          comboPlannerMessage(COMBO_PLANNER_SEPARATOR)]);
+      }
+      continue;
     }
+    if (turn.plan) push(at, [comboDeveloperMessage(turn.plan)]);
+    for (const note of turn.notes) push(position(note.anchor, at), note.items || [comboDeveloperMessage(note.text)]);
   }
   if (!inserts.size) return input;
   const output = [];
@@ -1708,7 +1728,7 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
   const executorBody = { ...body, model: executor.pickerSlug };
   if (comboDirectRequest(body, meta.backgroundKind)) {
     stats.comboDirect += 1;
-    return comboLoopback(requestHeaders, incomingUrl, executorBody, "executor", route.pickerSlug, signal);
+    return comboLoopback(requestHeaders, incomingUrl, executorBody, "direct", route.pickerSlug, signal);
   }
   const plannerEffort = typeof combo.planner?.effort === "string" && combo.planner.effort ? combo.planner.effort : null;
   const reviewLevel = comboReviewLevel(combo);
@@ -1764,9 +1784,11 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
     // 大腦只回文字；它若想呼叫工具，那些呼叫一律忽略。
     const askPlanner = async (kind, title, extra = {}) => {
       const note = openNote(title);
-      const currentInput = comboInjectInput([...body.input, ...visible], conversation);
+      const anchor = lastAnchor();
+      const instruction = comboPlannerInstruction(kind, { combo, executor, ...extra });
+      const currentInput = comboInjectInput([...body.input, ...visible], conversation, "planner");
       const plannerBody = { ...body, model: planner.pickerSlug,
-        input: [...currentInput, comboDeveloperMessage(comboPlannerInstruction(kind, { combo, executor, ...extra }))] };
+        input: [...currentInput, comboPlannerMessage(instruction)] };
       if (plannerEffort) plannerBody.reasoning = { ...(body.reasoning || {}), effort: plannerEffort };
       let text = "";
       let error = null;
@@ -1797,7 +1819,16 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
         note.delta("\n\n（大腦沒有回應：" + (error || "回覆是空的") + "。由雙手直接處理。）");
       }
       note.done();
-      return error ? "" : text.trim();
+      if (error || !text.trim()) return "";
+      // 記下這次的指示與回答，之後問大腦時照原位置帶回，大腦的對話只會往後增加。
+      (turn.plannerLog ||= []).push({ anchor, instruction, answer: text.trim() });
+      return text.trim();
+    };
+
+    // 目前對話（Codex 看得到的部分）最後一項的錨點。
+    const lastAnchor = () => {
+      const all = [...body.input, ...visible];
+      return all.length ? comboAnchorAt(all.map(comboFingerprint), all.length - 1) : null;
     };
 
     const input = body.input;
@@ -1807,7 +1838,7 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
     let turn = conversation.turns.find((item) => item.anchor.fp === anchor.fp && item.anchor.nth === anchor.nth);
     const fresh = !input.slice(userIndex + 1).some((item) => typeof item?.call_id === "string");
     if (!turn) {
-      turn = { anchor, plan: null, notes: [], reviews: 0 };
+      turn = { anchor, plan: null, notes: [], plannerLog: [], reviews: 0 };
       conversation.turns.push(turn);
       while (conversation.turns.length > COMBO_MAX_TURNS) conversation.turns.shift();
     }
@@ -1817,15 +1848,6 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
       const plan = await askPlanner("plan", "**大腦規劃 · " + comboRoleLabel(planner, plannerEffort) + "**\n\n");
       if (plan) turn.plan = "[Planner plan by " + comboRoleLabel(planner, plannerEffort) + "]\n" + plan + "\n\n" + comboExecutorGuide(planner);
     }
-
-    const noteAnchor = () => {
-      const all = [...input, ...visible];
-      const prints = all.map(comboFingerprint);
-      for (let i = all.length - 1; i > userIndex; i -= 1) {
-        if (all[i]?.type !== "reasoning") return comboAnchorAt(prints, i);
-      }
-      return null;
-    };
 
     for (let round = 0; round < COMBO_MAX_ROUNDS; round += 1) {
       const executorInput = comboInjectInput([...input, ...visible], conversation);
@@ -1881,6 +1903,11 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
         finish("response.incomplete", { status: "incomplete", incomplete_details: terminal.response?.incomplete_details ?? null });
         return;
       }
+      // 雙手呼叫 ask_planner 的那一次，在雙手的視角裡照原樣保留呼叫與回答；
+      // 和其他工具一起呼叫時不轉問，但同樣補上結果，雙手的歷史才與它實際產生的一致。
+      const askAnchor = ask ? lastAnchor() : null;
+      const askResult = (output) => ({ anchor: askAnchor, items: [ask,
+        { type: "function_call_output", call_id: ask.call_id, output }] });
       if (ask && codexCalls === 0) {
         let question = "";
         try { question = String(JSON.parse(ask.arguments || "{}").question || "").trim(); } catch {}
@@ -1888,11 +1915,13 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
         stats.comboConsults += 1;
         const answer = await askPlanner("consult", "**詢問大腦 · " + comboRoleLabel(planner, plannerEffort) + "**\n\n問：" + question + "\n\n答：",
           { question });
-        turn.notes.push({ anchor: noteAnchor(), text: "[Planner answer to the executor's question]\nQuestion: " + question
-          + "\nAnswer: " + (answer || "(The planner did not answer. Decide on your own.)") });
+        turn.notes.push(askResult(answer || "(The planner did not answer. Decide on your own.)"));
         continue;
       }
-      if (ask) stats.comboAsksDropped += 1;
+      if (ask) {
+        stats.comboAsksDropped += 1;
+        turn.notes.push(askResult("Not answered: call " + COMBO_TOOL + " on its own, without other tools in the same turn."));
+      }
       if (codexCalls === 0 && sawText && reviewLevel !== "off" && turn.reviews < COMBO_MAX_REVIEWS) {
         turn.reviews += 1;
         stats.comboReviews += 1;
@@ -1900,7 +1929,7 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
           "**大腦驗收（" + (reviewLevel === "strict" ? "嚴格" : "一般") + "）· " + comboRoleLabel(planner, plannerEffort) + "**\n\n");
         if (verdictText && comboReviewVerdict(verdictText) === "revise") {
           stats.comboRevisions += 1;
-          turn.notes.push({ anchor: noteAnchor(), text: "[Planner review: not accepted yet]\n" + comboReviewFeedback(verdictText)
+          turn.notes.push({ anchor: lastAnchor(), text: "[Planner review: not accepted yet]\n" + comboReviewFeedback(verdictText)
             + "\nAddress these points, then report the evidence again." });
           continue;
         }
@@ -2871,7 +2900,9 @@ export async function fetchModelUpstream(
   if (!comboRole) rememberRoute(requestHeaders, route);
 
   // HTTP 回退與第三方上游不保證支援 previous_response_id，從對應的成功回合重播。
-  const historyKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
+  // 組合的內部請求依角色分開：大腦與雙手若都是 Antigravity CLI，各自續接自己的對話。
+  const baseHistoryKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
+  const historyKey = comboRole ? `${baseHistoryKey ?? "anonymous"}\0combo:${comboRole.combo}:${comboRole.role}` : baseHistoryKey;
   meta.historyKey = historyKey;
   let effectiveBody = body;
   if (body?.previous_response_id) {

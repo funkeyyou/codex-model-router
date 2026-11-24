@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.45.0";
+const INSTALLER_VERSION = "1.46.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -4730,8 +4730,8 @@ export function planRemoveModels(manifest, settings, catalog, selectedSlugs) {
 // --- 組合模型 ---------------------------------------------------------------------
 //
 // 一個組合是 transport: "combo" 的路由：大腦負責規劃、問答與驗收，雙手負責呼叫工具與回答。
-// 選擇器的推理強度控制雙手；大腦固定使用這裡設定的推理強度。Antigravity 模型與其他組合
-// 不能當成員：前者有自己的對話續接機制，後者會形成巢狀。
+// 選擇器的推理強度控制雙手；大腦固定使用這裡設定的推理強度。其他組合不能當成員（會形成巢狀）。
+// Antigravity CLI 與 Claude CLI 都可以：路由器讓兩個角色各自續接自己的對話。
 export const COMBO_REVIEW_LEVELS = ["off", "standard", "strict"];
 
 export function comboDependents(routes, slugs) {
@@ -4743,7 +4743,6 @@ export function comboDependents(routes, slugs) {
 function comboMemberError(route, role) {
   if (!route) return `找不到${role}模型，請重新選擇。`;
   if (route.transport === "combo") return `${role}不能是另一個組合模型。`;
-  if (route.transport === "antigravity-cli") return `Antigravity CLI 模型目前不能當${role}。`;
   return null;
 }
 

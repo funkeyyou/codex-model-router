@@ -4,10 +4,11 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { loadPayloads, loadRouterWith } from "./helpers/payloads.mjs";
 
-const { router, installer } = await loadPayloads();
+const { router, installer, chat } = await loadPayloads();
 
 const user = (text) => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
 const developerTexts = (input) => input.filter((item) => item.type === "message" && item.role === "developer").map((item) => item.content[0].text);
+const userTexts = (input) => input.filter((item) => item.type === "message" && item.role === "user").map((item) => item.content[0].text);
 
 test("計畫插在使用者訊息之後、問答插在錨點之後；欄位差異（id、status）不影響位置", () => {
   const ask = user("修好登入");
@@ -121,7 +122,10 @@ test("建立與修改組合：成員檢查、上下文取較小值、推理強�
   assert.equal(edited.catalog.models.find((model) => model.slug === route.pickerSlug).priority, 13);
   assert.equal(edited.settings.routes.filter((item) => item.transport === "combo").length, 1);
 
-  assert.throws(() => installer.planSaveCombo(manifest, settings, catalog, { ...input, executor: { slug: "custom/agy" } }), /Antigravity/);
+  // Antigravity CLI 可以當大腦或雙手；推理強度跟著 agy 模型。
+  const agyCombo = installer.planSaveCombo(manifest, settings, catalog, { ...input, name: "agy", planner: { slug: "custom/agy", effort: "high" }, executor: { slug: "custom/agy" } });
+  assert.deepEqual(agyCombo.route.efforts, agyRoute.efforts);
+  assert.equal(agyCombo.route.combo.planner.effort, "high");
   assert.throws(() => installer.planSaveCombo(manifest, settings, catalog, { ...input, planner: { slug: "custom/planner", effort: "xhigh" } }), /xhigh/);
   assert.throws(() => installer.planSaveCombo(manifest, plan.settings, plan.catalog, { ...input, planner: { slug: route.pickerSlug } }), /組合/);
   assert.throws(() => installer.planSaveCombo(manifest, plan.settings, plan.catalog, input), /已經有/);
@@ -224,14 +228,18 @@ test("端到端：規劃、詢問大腦、工具呼叫、驗收打回再通過�
   assert.equal(planCall.reasoning.effort, "high");
   assert.equal(planCall.tools, undefined, "大腦收到的工具與 Codex 相同（只有 additional_tools）");
   assert.equal(planCall.input[0].type, "additional_tools");
-  assert.match(developerTexts(planCall.input).at(-1), /PLANNER[\s\S]*Write the plan/);
+  assert.match(userTexts(planCall.input).at(-1), /PLANNER[\s\S]*Write the plan/);
+  assert.deepEqual(developerTexts(planCall.input), [], "給大腦的指令不用開發者訊息，Chat 轉譯才不會把它併進 system");
   assert.equal(exec1.model, "exec-model");
   assert.equal(exec1.reasoning.effort, "medium", "雙手的推理強度跟隨 Codex 選擇器");
   assert.deepEqual(exec1.tools.map((tool) => tool.name), ["ask_planner"]);
   assert.equal(exec1.input[3].role, "developer", "計畫緊接在使用者訊息之後");
   assert.match(exec1.input[3].content[0].text, /PLAN-1[\s\S]*EXECUTOR/);
-  assert.match(developerTexts(consultCall.input).at(-1), /要改哪個檔案？/);
-  assert.match(developerTexts(exec2.input).join("\n"), /ANSWER-1/);
+  assert.match(userTexts(consultCall.input).at(-1), /要改哪個檔案？/);
+  // 雙手的視角：ask_planner 的呼叫與大腦的回答照原樣放回，和它實際產生的歷史一致。
+  const askIndex = exec2.input.findIndex((item) => item.type === "function_call" && item.name === "ask_planner");
+  assert.ok(askIndex > 0);
+  assert.deepEqual(exec2.input[askIndex + 1], { type: "function_call_output", call_id: "ask1", output: "ANSWER-1" });
   assert.ok(!exec2.input.some((item) => item.type === "reasoning"), "路由器的思考摘要不送給上游");
 
   // 第二次請求：Codex 帶回完整歷史與工具結果，雙手交出回答，驗收打回一次後通過。
@@ -245,9 +253,36 @@ test("端到端：規劃、詢問大腦、工具呼叫、驗收打回再通過�
   assert.equal(events2.at(-1).type, "response.completed");
   const exec3 = calls[4];
   const exec4 = calls[6];
-  assert.deepEqual(developerTexts(exec3.input).length, 2, "第二次請求仍帶回同一份計畫與問答，前綴不變");
+  assert.deepEqual(developerTexts(exec3.input).length, 1, "第二次請求仍帶回同一份計畫");
   assert.equal(exec3.input[3].content[0].text, exec1.input[3].content[0].text);
+  assert.deepEqual(exec3.input.slice(0, exec2.input.length).map((item) => JSON.stringify(item)),
+    exec2.input.map((item) => JSON.stringify(item)), "雙手的請求只往後增加");
   assert.match(developerTexts(exec4.input).at(-1), /not accepted yet[\s\S]*補測試/);
+  // 大腦的視角：每次都是上一次請求加上它的回答，再接新的對話與指示，只往後增加。
+  const plannerCalls = calls.filter((call) => call.model === "planner-model");
+  assert.equal(plannerCalls.length, 4);
+  const answers = ["PLAN-1", "ANSWER-1", "REVISE\n補測試"];
+  for (let index = 1; index < plannerCalls.length; index += 1) {
+    const previous = plannerCalls[index - 1].input;
+    const next = plannerCalls[index].input;
+    assert.deepEqual(next.slice(0, previous.length).map((item) => JSON.stringify(item)), previous.map((item) => JSON.stringify(item)),
+      `第 ${index + 1} 次問大腦要延續第 ${index} 次`);
+    assert.equal(next[previous.length].role, "assistant");
+    assert.equal(next[previous.length].content[0].text, answers[index - 1]);
+    assert.equal(next[previous.length + 1].role, "user", "回答後面接分隔訊息");
+  }
+  // 轉成 Chat Completions 後（Antigravity CLI 與 Chat 路由看到的形狀）也必須是延續：前一次的訊息
+  // 加上大腦的回答，是下一次的開頭。比對方式與 Antigravity CLI 判斷能否續接的規則相同。
+  const chatRoute = { upstreamModel: "planner-model", translate: "chat", efforts: [] };
+  const asChat = (body) => chat.toChatRequest(body, chatRoute).request.messages.map((message) => message.role === "assistant"
+    ? { role: "assistant", calls: (message.tool_calls || []).map((call) => call.id) }
+    : { role: message.role, content: JSON.stringify(message.content), id: message.tool_call_id ?? null });
+  for (let index = 1; index < plannerCalls.length; index += 1) {
+    const previous = [...asChat(plannerCalls[index - 1]), { role: "assistant", calls: [] }];
+    const next = asChat(plannerCalls[index]);
+    assert.ok(next.length > previous.length, `第 ${index + 1} 次 Chat 訊息要比上一次多`);
+    assert.deepEqual(next.slice(0, previous.length), previous, `第 ${index + 1} 次轉成 Chat 後仍延續第 ${index} 次`);
+  }
   assert.equal(plannerReplies.length, 0);
   assert.equal(executorReplies.length, 0);
   const health = await realFetch(origin + "/healthz").then((response) => response.json());
