@@ -597,7 +597,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.match(badUrlPreview.error, /http:\/\/ 或 https:\/\//);
   const rejectedKey = await ui.runJob("edit-provider", { providerId: "default", apiKey: "bad-key" });
   assert.equal(rejectedKey.status, "failed");
-  assert.match(rejectedKey.error, /上游拒絕這把 Key（HTTP 401）/); 
+  assert.match(rejectedKey.error, /上游拒絕這把 Key（HTTP 401）/);
   const keyOnly = await ui.runJob("edit-provider", { providerId: "default", apiKey: "good-new-key" });
   assert.equal(keyOnly.status, "succeeded", keyOnly.output);
   assert.deepEqual([keyOnly.result.changed, keyOnly.result.baseUrlChanged, keyOnly.result.keyChanged, keyOnly.result.keyVerified],
@@ -608,7 +608,7 @@ test("網頁管理介面：排序與修改只改模型目錄，Codex 模型清�
   assert.match(brokenUrl.error, /無法連線到新的 Base URL/);
   const rejectedUrlKey = await ui.runJob("edit-provider", { providerId: "default", baseUrl: upstreamRoot + "/p2", apiKey: "bad-key" });
   assert.equal(rejectedUrlKey.status, "failed");
-  assert.match(rejectedUrlKey.error, /新的 Base URL 拒絕這把 API Key（HTTP 401）/); 
+  assert.match(rejectedUrlKey.error, /新的 Base URL 拒絕這把 API Key（HTTP 401）/);
   assert.equal(JSON.parse(readFileSync(join(runtime, "settings.json"), "utf8")).providers[0].baseUrl, upstreamRoot + "/p1", "失敗不應改動 Base URL");
 
   // 全域上下文：經由真的 Codex 設定 API 寫入與移除，其他設定保留。
