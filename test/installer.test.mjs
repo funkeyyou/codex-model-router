@@ -235,6 +235,97 @@ test("註冊排程工作遇到權限不足時給出可操作的提示", () => {
   });
   assert.doesNotMatch(other, /權限不足/);
   assert.match(other, /schtasks\.exe 執行失敗/);
+
+  // update 時遇到權限不足，指引以系統管理員執行 update（保留設定），不誤導成重新安裝／配置。
+  const updateDenied = scheduledTaskCreateFailure({
+    detail: "ERROR: Access is denied.", denied: true, taskExists: true, elevated: false, taskName: name, action: "update",
+  });
+  assert.match(updateDenied, /執行一次 update/);
+  assert.ok(updateDenied.includes(`schtasks /Delete /TN ${name} /F`));
+  assert.doesNotMatch(updateDenied, /重新設定|重新開啟安裝程式|安裝或重新配置/);
+
+  const { serviceUpdateRegistrationWarning } = installer;
+  const wrapped = serviceUpdateRegistrationWarning(new Error(updateDenied), { windows: true });
+  assert.match(wrapped, /已沿用舊定義並重啟/);
+  assert.match(wrapped, /執行一次 update/);
+  assert.equal(wrapped.split("要套用新的服務定義").length - 1, 1, "不重複附上同一句提示");
+  assert.doesNotMatch(wrapped, /安裝或重新配置/);
+
+  const singleLine = serviceUpdateRegistrationWarning(new Error("Windows Script Host 無法執行"), { windows: true });
+  assert.match(singleLine, /以系統管理員身分執行一次 update/);
+  assert.doesNotMatch(singleLine, /安裝或重新配置/);
+
+  const macWarning = serviceUpdateRegistrationWarning(new Error("launchctl failed"), { windows: false });
+  assert.match(macWarning, /請再執行一次 update/);
+  assert.doesNotMatch(macWarning, /系統管理員/);
+});
+
+test("Windows 排程工作 XML 比對忽略顯示描述與系統路徑大小寫，但捕捉實質變更", () => {
+  const { windowsTaskXmlEquivalent } = installer;
+  const bom = (text) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]);
+  const sampleXml = ({
+    description = "模型路由器（本機回送代理）",
+    userId = "desktop-6khouu1\\funke",
+    command = "C:\\WINDOWS\\System32\\wscript.exe",
+    args = "//nologo //B //E:jscript &quot;C:\\Users\\funke\\.codex\\model-router\\router-launcher.js&quot;",
+    workingDirectory = "C:\\Users\\funke\\.codex\\model-router",
+    interval = "PT10M",
+  } = {}) => `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>${description}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>${userId}</UserId>
+      <Repetition>
+        <Interval>${interval}</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>${userId}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${command}</Command>
+      <Arguments>${args}</Arguments>
+      <WorkingDirectory>${workingDirectory}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+`;
+  const expected = sampleXml();
+  assert.equal(windowsTaskXmlEquivalent(bom(expected), expected), true);
+  // v1.38.0 之前與 v1.5.0 的 Description 文案不同，實質定義完全一致。
+  assert.equal(windowsTaskXmlEquivalent(bom(sampleXml({ description: "Codex 模型路由器（本機回送代理）" })), expected), true);
+  assert.equal(windowsTaskXmlEquivalent(bom(sampleXml({ description: "Codex 模型路由器（本机回环代理）" })), expected), true);
+  // 系統大小寫與換行風格不應觸發重新註冊。
+  assert.equal(
+    windowsTaskXmlEquivalent(
+      bom(sampleXml({ userId: "DESKTOP-6KHOUU1\\funke", command: "C:\\Windows\\System32\\wscript.exe" }).replaceAll("\n", "\r\n")),
+      expected,
+    ),
+    true,
+  );
+  // 缺少 UTF-16LE BOM、仍指向舊版 .vbs、或觸發／目錄／命令有實質變化時必須判定為不同。
+  assert.equal(windowsTaskXmlEquivalent(Buffer.from(expected, "utf8"), expected), false);
+  assert.equal(
+    windowsTaskXmlEquivalent(
+      bom(sampleXml({ args: "//nologo //B &quot;C:\\Users\\funke\\.codex\\model-router\\router-launcher.vbs&quot;" })),
+      expected,
+    ),
+    false,
+  );
+  assert.equal(windowsTaskXmlEquivalent(bom(sampleXml({ interval: "PT5M" })), expected), false);
+  assert.equal(windowsTaskXmlEquivalent(bom(sampleXml({ workingDirectory: "D:\\other" })), expected), false);
+  assert.equal(windowsTaskXmlEquivalent(bom(sampleXml({ command: "C:\\Windows\\System32\\cscript.exe" })), expected), false);
 });
 
 test("Codex RPC 逾時訊息分辨沒回應、未回覆與結果不符", () => {

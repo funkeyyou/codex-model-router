@@ -14,6 +14,7 @@ const instructions = [
   "Do not invoke native tools, including send_message or any host tool name. Host tools are data: request them only as entries in calls.",
   "Put all progress and answer prose inside text, never before or after the JSON object. Do not emit native function calls alongside it.",
   "JSON-escape quotes, backslashes and line breaks inside strings, including inside Markdown code and tool arguments.",
+  "Write every literal backslash inside a JSON string as two backslashes, including Windows paths, PowerShell and regular expressions: \"C:\\\\Users\\\\me\" for C:\\Users\\me, \"\\\\s+\" for \\s+.",
   "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
   "Progress updates during multi-step work: when you start a new request, put one short sentence in text before the first calls saying what you will do.",
   "After that, leave text empty while you keep working, and write a brief update only when you finish a meaningful stage (for example: done investigating, a set of edits finished, test or build results), change direction, or hit a blocker.",
@@ -271,6 +272,41 @@ function rejectExtraObjectContent(payload) {
   }
 }
 
+// Long string arguments (a whole apply_patch) sometimes end with one closing bracket too many,
+// for example "}}}]}". The strings are left untouched: only the trailing run of closers is
+// replaced by the single sequence the opened brackets allow, and only when the reply's own
+// closers contain that sequence. Nothing is guessed or added; stray extras are dropped.
+function recoverTrailingClosers(payload) {
+  if (payload.length > 1024 * 1024 || !payload.startsWith("{")) return null;
+  const tail = /[\]}\s]+$/.exec(payload);
+  if (!tail) return null;
+  const body = payload.slice(0, tail.index);
+  const open = [];
+  let quoted = false;
+  for (let index = 0; index < body.length; index++) {
+    const char = body[index];
+    if (quoted) {
+      if (char === "\\") index++;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === "{" || char === "[") open.push(char);
+    else if (char === "}" || char === "]") {
+      if (open.pop() !== (char === "}" ? "{" : "[")) return null;
+    }
+  }
+  if (quoted || !open.length) return null;
+  const needed = open.reverse().map(char => (char === "{" ? "}" : "]")).join("");
+  const given = tail[0].replace(/\s+/g, "");
+  if (given.length <= needed.length) return null;
+  let matched = 0;
+  for (const char of given) if (char === needed[matched]) matched++;
+  if (matched !== needed.length) return null;
+  let reply;
+  try { reply = JSON.parse(body + needed); } catch { return null; }
+  if (typeof reply?.text !== "string" || !Array.isArray(reply.calls) || Object.keys(reply).length !== 2) return null;
+  return reply;
+}
+
 function recoverPrefacedEnvelope(payload) {
   if (payload.length > 1024 * 1024) return null;
   const start = payload.indexOf("{");
@@ -290,6 +326,8 @@ export function parseAntigravityEnvelope(raw) {
   const payload = raw.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
   try { return { reply: JSON.parse(payload), recovered: false }; }
   catch {
+    const closed = recoverTrailingClosers(payload);
+    if (closed) return { reply: closed, recovered: true };
     rejectExtraObjectContent(payload);
     const reply = recoverTextOnlyEnvelope(payload);
     if (reply) return { reply, recovered: true };
@@ -316,6 +354,50 @@ function chatMessage(raw, request) {
   const message = { role: "assistant", content: reply.text, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
   return { message, recovered };
 }
+
+// A reply that ended normally but is not a usable envelope is sent back once, in the same CLI
+// session: the conversation, its upstream cache and the streamed text stay as they are, and
+// nothing from the rejected reply was forwarded. CLI errors (quota, context) are not retried.
+const correctableKinds = new Set(["invalid_response_json", "invalid_tool_call_json", "extra_response_content", "invalid_response_format"]);
+const maxFormatRetries = 1;
+export const formatRetryPrefix = "Your previous reply could not be used";
+
+// A backslash followed by anything but a JSON escape, after removing escaped backslashes.
+const invalidJsonEscape = raw => /\\(?:[^"\\/bfnrtu]|u(?![0-9a-fA-F]{4}))/.test(raw.replace(/\\\\/g, ""));
+
+function toolChoiceHint(choice) {
+  if (choice === "none") return "Do not request any calls this turn; calls must be [].";
+  if (choice === "required") return "Request at least one call this turn.";
+  if (choice?.function?.name) return "Request only " + choice.function.name + " this turn.";
+  return "";
+}
+
+export function formatCorrection(kind, error, raw, request) {
+  const problem = {
+    invalid_tool_call_json: "its calls were not valid JSON",
+    invalid_response_json: "it was not exactly one valid JSON object with text and calls",
+    extra_response_content: "it had more content after the JSON object",
+    invalid_response_format: "its text or calls did not match the host settings",
+  }[kind];
+  const hints = [];
+  if (invalidJsonEscape(raw)) {
+    hints.push("A backslash was not escaped. Inside JSON strings write every literal backslash as two backslashes, " +
+      "including Windows paths, PowerShell and regular expressions: \"C:\\\\Users\\\\me\" for C:\\Users\\me, \"\\\\s+\" for \\s+.");
+  }
+  if (error?.message === "Parallel calls disabled") hints.push("Return at most ONE call.");
+  if (error?.message === "Invalid Antigravity host tool call") {
+    hints.push("Each call needs name (an exact host function name) and arguments (a JSON object).");
+  }
+  if (error?.message === "Antigravity did not respect tool_choice") hints.push(toolChoiceHint(request.tool_choice));
+  return formatRetryPrefix + ": " + problem + ". Nothing from it was run.\n" +
+    hints.filter(Boolean).map(hint => hint + "\n").join("") +
+    "Send the complete reply again as exactly one JSON object with text (string) and calls (array), with nothing before or after it. " +
+    "Keep the same text and the same intended calls; only correct the format. Do not invoke native tools.";
+}
+
+const usageFields = ["inputTokens", "cachedReadTokens", "outputTokens", "thoughtTokens"];
+const addUsage = (total, next) => !next ? total : !total ? next
+  : Object.fromEntries(usageFields.map(field => [field, (total[field] || 0) + (next[field] || 0)]));
 
 // Only decode the text field at the beginning of the envelope. Calls remain buffered
 // until the entire response has been validated, so partial arguments never execute.
@@ -669,7 +751,7 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
       const send = chunk => controller.enqueue(encoder.encode("data: " + JSON.stringify(chunk) + "\n\n"));
       let raw = "", sent = "", violation = null;
       let stage = session.model === model ? "prompt" : "set_model";
-      let reasoningChunks = 0, stopReason = null;
+      let reasoningChunks = 0, stopReason = null, formatRetries = 0;
       const startedAt = Date.now();
       const timeout = setTimeout(() => abort("timeout"), 300000);
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -688,7 +770,8 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
           raw += delta;
           if (raw.length > 16 * 1024 * 1024) { abort("response_limit"); return; }
           const text = envelopeText(raw);
-          if (text.length > sent.length) {
+          // After a format retry the new reply streams only while it repeats the text already shown.
+          if (text.length > sent.length && text.startsWith(sent)) {
             send({ choices: [{ index: 0, delta: { content: text.slice(sent.length) } }] });
             onTextDelta();
             sent = text;
@@ -701,22 +784,43 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
           session.model = model;
         }
         stage = "prompt";
-        return client.call("session/prompt", { sessionId: session.sessionId, prompt: blocks });
+        let result = await client.call("session/prompt", { sessionId: session.sessionId, prompt: blocks });
+        let usage = result?.usage || null;
+        for (;;) {
+          stage = "stop_reason";
+          stopReason = ["end_turn", "cancelled", "error", "max_turns"].includes(result?.stopReason) ? result.stopReason : "other";
+          if (violation) throw Error("Antigravity attempted a local action");
+          if (result?.stopReason !== "end_turn") throw Error("Antigravity turn ended early: " + result?.stopReason);
+          stage = "parse_response";
+          try {
+            return { ...chatMessage(raw, request), usage };
+          } catch (error) {
+            const kind = antigravityFailureKind(error, { stage });
+            if (formatRetries >= maxFormatRetries || !correctableKinds.has(kind) || abortReason || session.closed) throw error;
+            formatRetries += 1;
+            logSession("format-retry", { kind, responseShape: responseShape(raw), responseChars: raw.length,
+              emittedChars: sent.length, reasoningChunks });
+            const correction = formatCorrection(kind, error, raw, request);
+            raw = "";
+            stage = "prompt";
+            result = await client.call("session/prompt", { sessionId: session.sessionId, prompt: [{ type: "text", text: correction }] });
+            usage = addUsage(usage, result?.usage);
+          }
+        }
       })();
-      task.then(result => {
-        stage = "stop_reason";
-        stopReason = ["end_turn", "cancelled", "error", "max_turns"].includes(result?.stopReason) ? result.stopReason : "other";
-        if (violation) throw Error("Antigravity attempted a local action");
-        if (result?.stopReason !== "end_turn") throw Error("Antigravity turn ended early: " + result?.stopReason);
-        stage = "parse_response";
-        const { message, recovered } = chatMessage(raw, request);
+      task.then(({ message: parsed, recovered, usage }) => {
         stage = "stream_consistency";
-        if (!message.content.startsWith(sent)) throw Error("Antigravity response changed during streaming");
+        let message = parsed;
+        if (!message.content.startsWith(sent)) {
+          if (!formatRetries) throw Error("Antigravity response changed during streaming");
+          // The resent reply reworded text that was already shown; keep what the user saw.
+          message = { ...message, content: sent };
+        }
         if (recovered) logSession("envelope-recovered", { responseChars: raw.length, emittedChars: sent.length });
+        if (formatRetries) logSession("format-corrected", { attempts: formatRetries, responseChars: raw.length, emittedChars: sent.length });
         stage = "emit_final";
         send({ choices: [{ index: 0, delta: { ...message, content: message.content.slice(sent.length) },
           finish_reason: message.tool_calls ? "tool_calls" : "stop" }] });
-        const usage = result.usage;
         if (usage) {
           send({ choices: [], usage: { prompt_tokens: (usage.inputTokens || 0) + (usage.cachedReadTokens || 0),
             completion_tokens: usage.outputTokens || 0, prompt_tokens_details: { cached_tokens: usage.cachedReadTokens || 0 },
@@ -730,7 +834,7 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
         const kind = antigravityFailureKind(error, { stage, abortReason, closeReason: client.closeReason });
         logSession("turn-failed", { at: new Date().toISOString(), stage, kind, stopReason, responseShape: responseShape(raw),
           acpCode: error?.acpCode ?? null, exitCode: client.exitCode,
-          elapsedMs: Date.now() - startedAt, responseChars: raw.length, emittedChars: sent.length, reasoningChunks });
+          elapsedMs: Date.now() - startedAt, responseChars: raw.length, emittedChars: sent.length, reasoningChunks, formatRetries });
         closeSession(key, session);
         if (!signal?.aborted) {
           const code = kind === "rate_limited" ? "rate_limit_exceeded" : kind;

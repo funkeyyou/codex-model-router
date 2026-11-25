@@ -6,7 +6,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { antigravityFailureKind, envelopeText, parseAntigravityEnvelope } from "../src/antigravity-cli.mjs";
+import { antigravityFailureKind, envelopeText, formatCorrection, formatRetryPrefix, parseAntigravityEnvelope } from "../src/antigravity-cli.mjs";
 import { loadPayloads, loadRouterInDir } from "./helpers/payloads.mjs";
 import { codexBin } from "./helpers/codex-bin.mjs";
 
@@ -24,6 +24,14 @@ const executorFailure = "\n⚠ agent executor error: unknown failure PRIVATE_FIX
 const quotaFailure = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h15m28s.\n";
 const progress = "[P]\n先檢查相關檔案，再依結果繼續。\n\n";
 const prefacedTool = progress + validTool;
+// Observed on Windows: PowerShell paths and regular expressions with single backslashes.
+const windowsPath = String.raw`C:\Users\me\.codex`;
+const escapeTool = String.raw`{"text":"先檢查設定。","calls":[{"name":"lookup","arguments":{"pattern":"C:\Users\me\.codex"}}]}`;
+const escapeFixed = JSON.stringify({ text: "先檢查設定。", calls: [{ name: "lookup", arguments: { pattern: windowsPath } }] });
+const proseOnly = "我先檢查設定檔，再決定下一步。";
+const proseFixed = JSON.stringify({ text: proseOnly, calls: [{ name: "lookup", arguments: { pattern: "settings" } }] });
+// Observed: a long apply_patch argument closed with one brace too many ("}}}]}").
+const extraBrace = validTool.slice(0, -2) + "}]}";
 
 function rejectsAs(raw, kind) {
   assert.throws(() => parseAntigravityEnvelope(raw), error =>
@@ -100,6 +108,7 @@ test("Antigravity classifies CLI quota warnings even after plain progress, not J
 
 test("Antigravity refuses to repair tool arguments, competing boundaries or extra envelopes", () => {
   rejectsAs(brokenTool, "invalid_tool_call_json");
+  rejectsAs(escapeTool, "invalid_tool_call_json");
   rejectsAs(repeated, "extra_response_content");
   rejectsAs(validTool + bareQuote, "extra_response_content");
   rejectsAs('{"text":"done","calls":[]} trailing bytes', "extra_response_content");
@@ -113,6 +122,43 @@ test("Antigravity refuses to repair tool arguments, competing boundaries or extr
     '{"text":"other: ","other":true and a fake ending","calls":[]}',
     '{"text":"missing ' + 'x'.repeat(1024 * 1024) + ' "quote"","calls":[]}',
   ]) rejectsAs(raw, "invalid_response_json");
+});
+
+test("Antigravity drops only stray trailing closers; strings, missing or reordered closers are never rewritten", () => {
+  for (const [raw, expected] of [
+    [extraBrace, JSON.parse(validTool)],
+    [fence(extraBrace), JSON.parse(validTool)],
+    [validTool + "}", JSON.parse(validTool)],
+    ['{"text":"done","calls":[]}}\n', { text: "done", calls: [] }],
+    [validTool.slice(0, -2) + "} ] }}", JSON.parse(validTool)],
+  ]) {
+    const parsed = parseAntigravityEnvelope(raw);
+    assert.equal(parsed.recovered, true, raw);
+    assert.deepEqual(parsed.reply, expected);
+    assert.equal(parsed.reply.calls[0]?.arguments.pattern ?? null, expected.calls[0]?.arguments.pattern ?? null);
+  }
+  for (const raw of [
+    validTool.slice(0, -1), validTool.slice(0, -4) + "}]]}", validTool.slice(0, -4) + "]}}}",
+    '{"text":"done","calls":[]}' + '{"text":"again","calls":[]}}',
+    '{"text":"done","calls":[],"extra":{}}}',
+  ]) assert.throws(() => parseAntigravityEnvelope(raw), raw);
+  rejectsAs(escapeTool.slice(0, -2) + "}]}", "invalid_tool_call_json");
+});
+
+test("format corrections name the defect without echoing the rejected reply", () => {
+  const escape = formatCorrection("invalid_tool_call_json", null, escapeTool, {});
+  assert.ok(escape.startsWith(formatRetryPrefix));
+  assert.match(escape, /two backslashes[\s\S]*"C:\\\\Users\\\\me" for C:\\Users\\me/);
+  assert.ok(!escape.includes(".codex"), "the rejected reply is not repeated");
+  for (const raw of [validTool, escapeFixed, proseOnly, '{"text":"\\u00e9 \\\\server","calls":[]}']) {
+    assert.doesNotMatch(formatCorrection("invalid_response_json", null, raw, {}), /backslash/, raw);
+  }
+  assert.match(formatCorrection("invalid_response_format", Error("Parallel calls disabled"), validTool, {}), /at most ONE call/);
+  assert.match(formatCorrection("invalid_response_format", Error("Antigravity did not respect tool_choice"), validTool,
+    { tool_choice: "required" }), /at least one call/);
+  assert.match(formatCorrection("invalid_response_format", Error("Antigravity did not respect tool_choice"), validTool,
+    { tool_choice: "none" }), /calls must be \[\]/);
+  assert.match(formatCorrection("extra_response_content", null, repeated, {}), /more content after the JSON object/);
 });
 
 test("Antigravity CLI executor error banners distinguish context budget failures from JSON", () => {
@@ -165,9 +211,12 @@ test("Antigravity ACP recovery and error codes reach Codex Responses events, log
     prefaced_foreign: progress + JSON.stringify({ text: "checking", calls: [{ name: "unavailable", arguments: {} }] }),
     calls_first_repeated: JSON.stringify({ calls: [], text: "done" }) + validTool,
     quota: quotaFailure, quota_progress: progress + quotaFailure,
-    quota_executor: "\n⚠ agent executor error: RESOURCE_EXHAUSTED (code 429): PRIVATE_FIXTURE\n" };
+    quota_executor: "\n⚠ agent executor error: RESOURCE_EXHAUSTED (code 429): PRIVATE_FIXTURE\n",
+    escape: escapeTool, escape_fixed: escapeFixed, prose: proseOnly, prose_fixed: proseFixed, extra_brace: extraBrace };
   await writeFile(join(workspace, "acp"), `
 const replies = ${JSON.stringify(replies)};
+const retryPrefix = ${JSON.stringify(formatRetryPrefix)};
+let last = null;
 const send = event => process.stdout.write(JSON.stringify({jsonrpc: "2.0", ...event}) + "\\n");
 require("node:readline").createInterface({input: process.stdin}).on("line", line => {
   const {id, method, params} = JSON.parse(line);
@@ -181,7 +230,13 @@ require("node:readline").createInterface({input: process.stdin}).on("line", line
   if (input.includes("FIXTURE_LOCAL")) return update({sessionUpdate: "tool_call"});
   if (input.includes("FIXTURE_TIMEOUT")) return;
   if (input.includes("FIXTURE_RATE")) return send({id, error: {code: -32603, message: "HTTP 429 PRIVATE_FIXTURE"}});
-  const raw = replies[/FIXTURE_REPLY_([a-z_]+)/.exec(input)?.[1]];
+  // A format correction answers the previous fixture: with its "_fixed" reply when one exists (the
+  // escape fix only after the backslash hint), otherwise by repeating the same rejected reply.
+  const fixing = input.startsWith(retryPrefix);
+  const key = fixing ? last : /FIXTURE_REPLY_([a-z_]+)/.exec(input)?.[1];
+  last = key;
+  const fixed = fixing && replies[key + "_fixed"] && (key !== "escape" || input.includes("two backslashes"));
+  const raw = fixed ? replies[key + "_fixed"] : replies[key];
   if (typeof raw !== "string") return send({id, error: {code: -32603, message: "unknown fixture input"}});
   update({sessionUpdate: "agent_thought_chunk", content: {type: "text", text: "checking fixture"}});
   const chunk = text => update({sessionUpdate: "agent_message_chunk", content: {type: "text", text}});
@@ -244,6 +299,31 @@ require("node:readline").createInterface({input: process.stdin}).on("line", line
     progress + JSON.parse(validTool).text);
   assert.deepEqual(JSON.parse(prefaced.at(-1).response.output.find(item => item.type === "function_call").arguments), { pattern: argument });
   assert.equal(prefaced.at(-1).response.output.filter(item => item.type === "function_call").length, 1);
+  const functionCalls = events => events.at(-1).response.output.filter(item => item.type === "function_call");
+  const textOf = events => events.filter(event => event.type === "response.output_text.delta").map(event => event.delta).join("");
+
+  // Windows backslashes: rejected once, resent in the same session after the hint; text is not repeated.
+  const escaped = await ask("FIXTURE_REPLY_escape");
+  assert.equal(escaped.at(-1).type, "response.completed");
+  assert.equal(textOf(escaped), "先檢查設定。");
+  assert.equal(functionCalls(escaped).length, 1);
+  assert.deepEqual(JSON.parse(functionCalls(escaped)[0].arguments), { pattern: windowsPath });
+  assert.equal(escaped.at(-1).response.usage.output_tokens, 10, "both attempts are counted");
+  // A progress sentence without the envelope gets its calls on the resend.
+  const prose = await ask("FIXTURE_REPLY_prose");
+  assert.equal(prose.at(-1).type, "response.completed");
+  assert.equal(textOf(prose), proseOnly);
+  assert.deepEqual(JSON.parse(functionCalls(prose)[0].arguments), { pattern: "settings" });
+  // A stray closing brace is dropped locally without another model turn.
+  const braced = await ask("FIXTURE_REPLY_extra_brace");
+  assert.equal(braced.at(-1).type, "response.completed");
+  assert.deepEqual(JSON.parse(functionCalls(braced)[0].arguments), { pattern: argument });
+  assert.equal(braced.at(-1).response.usage.output_tokens, 5);
+  const corrected = stderr.join("");
+  assert.equal(corrected.match(/model-router-antigravity:format-retry /g)?.length, 2);
+  assert.equal(corrected.match(/model-router-antigravity:format-corrected /g)?.length, 2);
+  assert.match(corrected, /format-retry \{"kind":"invalid_tool_call_json"/);
+  assert.match(corrected, /format-retry \{"kind":"invalid_response_json","responseShape":"plain_text"/);
 
   const rejected = [
     ["FIXTURE_REPLY_bad_calls", "invalid_tool_call_json"], ["FIXTURE_REPLY_repeated", "extra_response_content"],
@@ -267,8 +347,13 @@ require("node:readline").createInterface({input: process.stdin}).on("line", line
     assert.ok(events.every(event => !event.type.includes("function_call") && event.item?.type !== "function_call"));
   }
   const diagnostic = stderr.join("");
-  assert.doesNotMatch(diagnostic, /PRIVATE_FIXTURE|範例：|checking fixture|先檢查相關檔案/);
+  assert.doesNotMatch(diagnostic, /PRIVATE_FIXTURE|範例：|checking fixture|先檢查相關檔案|先檢查設定|\.codex/);
   assert.match(diagnostic, /"kind":"rate_limited"[^\n]*"responseShape":"warning_line"/);
+  // Each correctable rejection is resent exactly once before it fails; CLI errors are not resent.
+  const correctable = new Set(["invalid_tool_call_json", "extra_response_content", "invalid_response_json", "invalid_response_format"]);
+  assert.equal(diagnostic.match(/format-retry /g).length, 2 + rejected.filter(([, code]) => correctable.has(code)).length);
+  assert.match(diagnostic, /turn-failed [^\n]*"kind":"invalid_tool_call_json"[^\n]*"formatRetries":1/);
+  assert.match(diagnostic, /turn-failed [^\n]*"kind":"rate_limited"[^\n]*"formatRetries":0/);
   const expected = rejected.map(([, code]) => code);
   const recentErrors = installer.parseRouterLog(diagnostic).filter(row => row.kind === "error");
   assert.deepEqual(recentErrors.map(row => row.code).sort(), expected.toSorted());

@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.48.0";
+const INSTALLER_VERSION = "1.48.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -3811,7 +3811,7 @@ function stopScheduledTask() {
   sleepSync(500);
 }
 
-function startScheduledTask() {
+function startScheduledTask({ action = "install" } = {}) {
   stopScheduledTask();
   sleepSync(300);
   const created = shell("schtasks.exe", ["/Create", "/TN", taskName, "/XML", taskXmlPath, "/F"], {
@@ -3826,7 +3826,7 @@ function startScheduledTask() {
       stdio: ["ignore", "ignore", "ignore"],
     }).status === 0;
     const elevated = denied || taskExists ? isProcessElevated() : true;
-    fail(scheduledTaskCreateFailure({ detail, denied, taskExists, elevated, taskName }));
+    fail(scheduledTaskCreateFailure({ detail, denied, taskExists, elevated, taskName, action }));
   }
   let lastResult = null;
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -3867,7 +3867,7 @@ function isProcessElevated() {
 
 // 首次設定註冊排程工作失敗時的說明。最常見的是同名工作先前以系統管理員身分建立，
 // 一般使用者對它只有讀取權，/Create /F 無法覆蓋。
-export function scheduledTaskCreateFailure({ detail = "", denied = false, taskExists = false, elevated = true, taskName: name }) {
+export function scheduledTaskCreateFailure({ detail = "", denied = false, taskExists = false, elevated = true, taskName: name, action = "install" }) {
   const reason = detail ? `（${detail}）` : "";
   if (!denied && !(taskExists && !elevated)) {
     return `無法註冊背景服務：schtasks.exe 執行失敗${reason}`;
@@ -3878,6 +3878,19 @@ export function scheduledTaskCreateFailure({ detail = "", denied = false, taskEx
       `這台電腦上已有同名的排程工作 ${name}，多半是之前以系統管理員身分安裝時建立的，目前的一般權限無法覆蓋它。`,
     );
   }
+  if (action === "update") {
+    if (taskExists) {
+      lines.push("要套用新的服務定義，請擇一處理：");
+      lines.push("1. 以系統管理員身分開啟 PowerShell 執行一次 update（保留現有設定）。");
+      lines.push(`2. 或在系統管理員 PowerShell 執行 schtasks /Delete /TN ${name} /F 刪除舊工作，再以一般權限執行一次 update。`);
+    } else {
+      lines.push("要套用新的服務定義，請以系統管理員身分開啟 PowerShell 執行一次 update（保留現有設定）。");
+      if (elevated) {
+        lines.push("若已是系統管理員仍失敗，請確認防毒或群組原則未封鎖工作排程器。");
+      }
+    }
+    return lines.join("\n");
+  }
   lines.push("請擇一處理後再重試：");
   lines.push("1. 關閉本視窗，以「以系統管理員身分執行」重新開啟安裝程式。");
   if (taskExists) {
@@ -3886,6 +3899,21 @@ export function scheduledTaskCreateFailure({ detail = "", denied = false, taskEx
     lines.push("2. 若已是系統管理員仍失敗，請確認防毒或群組原則未封鎖工作排程器。");
   }
   return lines.join("\n");
+}
+
+export function serviceUpdateRegistrationWarning(error, { windows = isWindows } = {}) {
+  const detail = (error instanceof Error ? error.message : String(error || "")).trim();
+  const base = "服務定義有更新，但無法重新註冊";
+  const kept = "已沿用舊定義並重啟，路由器功能不受影響。";
+  const hint = windows
+    ? "要套用新的服務定義，請以系統管理員身分執行一次 update（保留現有設定）。"
+    : "要套用新的服務定義，請再執行一次 update（保留現有設定）。";
+  if (detail.includes("\n")) {
+    const tail = detail.includes("要套用新的服務定義") ? "" : `\n${hint}`;
+    return `${base}；${kept}\n${detail}${tail}`;
+  }
+  const reason = detail ? `（${detail}）` : "";
+  return `${base}${reason}；${kept}${hint}`;
 }
 
 // --- 平台分派 --------------------------------------------------------------
@@ -3898,17 +3926,48 @@ function utf16leWithBom(text) {
   ]);
 }
 
+function decodeUtf16leWithBom(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 2) return null;
+  if (buffer[0] !== 0xff || buffer[1] !== 0xfe) return null;
+  return buffer.subarray(2).toString("utf16le");
+}
+
+// 排程工作的 <Description> 只是顯示文字，不影響觸發器、身分或啟動命令；
+// <UserId> 與 <Command> 在 Windows 上不分大小寫（whoami 與 USERDOMAIN、C:\WINDOWS 與 C:\Windows）。
+// 只改文案或大小寫時不應觸發 schtasks /Create，否則先前以系統管理員建立的工作在一般權限升級會反覆報權限不足。
+function normalizeTaskXmlForComparison(xml) {
+  return String(xml)
+    .replaceAll("\r\n", "\n")
+    .replace(
+      /(<RegistrationInfo>\s*)<Description>[\s\S]*?<\/Description>(\s*<\/RegistrationInfo>)/,
+      "$1<Description></Description>$2",
+    )
+    .replace(
+      /<(UserId|Command)>([^<]*)<\/\1>/g,
+      (_, tag, value) => `<${tag}>${value.toLowerCase()}</${tag}>`,
+    );
+}
+
+export function windowsTaskXmlEquivalent(existingBytes, expectedXml) {
+  const existing = decodeUtf16leWithBom(existingBytes);
+  if (existing == null) return false;
+  return normalizeTaskXmlForComparison(existing) === normalizeTaskXmlForComparison(expectedXml);
+}
+
+function writeWindowsLauncher() {
+  writeFileSync(launcherPath, utf16leWithBom(launcherScript()), {
+    mode: 0o600,
+  });
+  restrictAcl(launcherPath);
+}
+
 function writeServiceDefinition() {
   if (isWindows) {
-    writeFileSync(launcherPath, utf16leWithBom(launcherScript()), {
-      mode: 0o600,
-    });
+    writeWindowsLauncher();
     writeFileSync(taskXmlPath, utf16leWithBom(taskXmlDocument()), {
       mode: 0o600,
     });
-    for (const path of [launcherPath, taskXmlPath]) {
-      restrictAcl(path);
-    }
+    restrictAcl(taskXmlPath);
     return;
   }
   ensureDirectory(launchAgentsDir);
@@ -3917,8 +3976,8 @@ function writeServiceDefinition() {
   shell("/usr/bin/plutil", ["-lint", plistPath]);
 }
 
-function startService() {
-  if (isWindows) startScheduledTask();
+function startService(options) {
+  if (isWindows) startScheduledTask(options);
   else startLaunchAgent();
 }
 
@@ -3951,18 +4010,32 @@ function manualStartHint() {
     : `launchctl kickstart -k ${launchDomain()}/${launchLabel}`;
 }
 
-// 服務定義逐位元組比對：一樣就完全不要碰註冊。
+function windowsLauncherUnchanged() {
+  try {
+    return existsSync(launcherPath) &&
+      Buffer.compare(readFileSync(launcherPath), utf16leWithBom(launcherScript())) === 0;
+  } catch {
+    return false;
+  }
+}
+
+function windowsTaskRegistrationUnchanged() {
+  try {
+    return existsSync(taskXmlPath) &&
+      windowsTaskXmlEquivalent(readFileSync(taskXmlPath), taskXmlDocument());
+  } catch {
+    return false;
+  }
+}
+
+// 服務定義比對：實質一致就完全不要碰註冊。
 function serviceDefinitionUnchanged() {
   try {
     if (!isWindows) {
       return existsSync(plistPath) &&
         readFileSync(plistPath, "utf8") === launchAgentPlist();
     }
-    if (!existsSync(taskXmlPath) || !existsSync(launcherPath)) return false;
-    return (
-      Buffer.compare(readFileSync(launcherPath), utf16leWithBom(launcherScript())) === 0 &&
-      Buffer.compare(readFileSync(taskXmlPath), utf16leWithBom(taskXmlDocument())) === 0
-    );
+    return windowsLauncherUnchanged() && windowsTaskRegistrationUnchanged();
   } catch {
     return false;
   }
@@ -5988,6 +6061,11 @@ async function update() {
     if (serviceDefinitionUnchanged()) {
       // 常見情況：埠與路徑都沒變，重新註冊沒有意義，原地重啟即可（不需提權）。
       restartServiceInPlace();
+    } else if (isWindows && windowsTaskRegistrationUnchanged()) {
+      // 只有 router-launcher.js 變動（例如 Node 路徑更新），排程工作定義本身未變：
+      // 直接更新本機目錄內的啟動腳本並原地重啟，不需要 schtasks /Create 提權。
+      writeWindowsLauncher();
+      restartServiceInPlace();
     } else {
       // 守護迴圈或啟動方式真的變了才重新註冊。這一步在 Windows 上可能因權限失敗，
       // 失敗就把舊定義放回去並原地重啟——升級不該因為註冊不了而讓服務停擺。
@@ -5995,17 +6073,14 @@ async function update() {
         if (isWindows && !testMode) assertScriptHostAvailable();
         writeServiceDefinition();
         stopService();
-        startService();
+        startService({ action: "update" });
         removeLegacyLauncher();
       } catch (registrationError) {
         for (const path of serviceArchivePaths()) {
           copyIfExists(join(backupDir, basename(path)), path);
         }
         restartServiceInPlace();
-        serviceWarning =
-          `服務定義有更新，但無法重新註冊（${registrationError.message}）。` +
-          "已沿用舊定義並重啟，路由器功能不受影響；" +
-          "要套用新的服務定義，請以系統管理員身分執行一次安裝或重新配置。";
+        serviceWarning = serviceUpdateRegistrationWarning(registrationError);
       }
     }
     health = await waitForHealth(plan.port);
