@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.47.0";
+const INSTALLER_VERSION = "1.48.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1115,6 +1115,46 @@ function rememberPrimaryModels(providerId, models) {
     if (models) pool.primaryModels[providerId] = models; else delete pool.primaryModels[providerId];
     writeKeyPoolFile(pool);
   } catch { /* 清單只用來挑 Key，存不下時路由器把主 Key 視為支援全部模型。 */ }
+}
+
+// 變更供應商 Base URL 時探測可用的 API 根地址並驗證金鑰；任一候選回 2xx 即確認可用，
+// 上游明確拒絕（401／403）或全部連不上則直接失敗，不覆蓋原本能用的設定。
+async function probeProviderBaseUrl(baseUrl, apiKey) {
+  const candidates = candidateApiRoots(baseUrl);
+  const failures = [];
+  let authStatus = null;
+  for (const apiRoot of candidates) {
+    const result = await fetchKeyModels(apiRoot, apiKey);
+    if (result.status != null && result.status >= 200 && result.status < 300) {
+      return { apiRoot, models: result.models, status: result.status };
+    }
+    if (result.status === 401 || result.status === 403) authStatus = result.status;
+    failures.push(`${apiRoot}/models: ${result.status != null ? `HTTP ${result.status}` : result.problem}`);
+  }
+  if (authStatus) {
+    fail(`新的 Base URL 拒絕這把 API Key（HTTP ${authStatus}），設定未修改。若換了供應商站點，請一併填寫對應的 API Key。`);
+  }
+  fail(`無法連線到新的 Base URL（${failures.join("；")}），設定未修改。`);
+}
+
+// Base URL 變更後，重整該供應商在 key-pool.json 裡記錄的主 Key 與備用 Key 模型清單；
+// 查不到的備用 Key 清掉舊清單，免得路由器沿用舊站點的清單而跳過它。
+async function refreshKeyPoolModels(providerId, apiRoot, primaryModels) {
+  try {
+    const pool = readKeyPoolFile();
+    const backups = backupKeysOf(pool, providerId);
+    if (!backups.length) return;
+    pool.primaryModels = { ...(pool.primaryModels || {}) };
+    if (primaryModels) pool.primaryModels[providerId] = primaryModels; else delete pool.primaryModels[providerId];
+    await Promise.all(backups.map(async (item) => {
+      let key;
+      try { key = readApiKey(item.keychainService); } catch { delete item.models; return; }
+      const checked = await fetchKeyModels(apiRoot, key);
+      if (checked.models) item.models = checked.models;
+      else delete item.models;
+    }));
+    writeKeyPoolFile(pool);
+  } catch { /* 清單只用來挑 Key，更新失敗不影響剛儲存好的供應商設定。 */ }
 }
 
 // 合併主 Key 與備用 Key 的模型清單，順便把各自的清單記進 key-pool.json 給路由器用。
@@ -2182,11 +2222,11 @@ function providerRoutes(routes, providerId) {
     : route.transport !== "claude-cli" && routeProviderId(route) === providerId);
 }
 
-// 修改供應商的顯示名稱與模型前綴。只改名稱欄位、自動產生的模型顯示名稱與模型目錄裡對應的
-// display_name；id、選擇器 ID、上游 ID、憑證與路由能力一律不變，路由器轉發用不到這些欄位，
-// 所以不必重啟路由器。name／modelPrefix 為 undefined 表示不修改，空字串代表恢復預設。
-// Claude 訂閱只能改前綴，名稱固定。
-export function planEditProvider(manifest, settings, catalog, providerId, { name, modelPrefix } = {}) {
+// 修改供應商的顯示名稱、模型前綴與 Base URL。只改名稱與前綴時不必重啟路由器；
+// 變更 Base URL 時一併更新 apiRoot、keychainService、credentialPath、路由的 providerHost
+// 與模型目錄裡的來源描述，並由呼叫端重啟路由器。name／modelPrefix 為 undefined 表示不修改，
+// 空字串代表恢復預設；Claude 訂閱只能改前綴，名稱固定且沒有 Base URL。
+export function planEditProvider(manifest, settings, catalog, providerId, { name, modelPrefix, baseUrl, apiRoot } = {}) {
   if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
     fail("安裝設定或模型目錄不完整，無法修改供應商。");
   }
@@ -2216,6 +2256,30 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
   const previousPrefix = cli ? validModelPrefix(settings.claudeCli?.modelPrefix) : provider.modelPrefix || null;
   const nextPrefix = modelPrefix === undefined ? previousPrefix : normalizeModelPrefix(modelPrefix);
 
+  let nextBaseUrl = cli ? null : provider.baseUrl;
+  if (baseUrl !== undefined) {
+    if (cli) {
+      if (baseUrl !== null && String(baseUrl).trim() !== "") fail("Claude 訂閱沒有 Base URL，不支援修改。");
+    } else {
+      const rawUrl = baseUrl === null ? "" : String(baseUrl).trim();
+      if (!rawUrl) fail("請填寫 Base URL。");
+      nextBaseUrl = normalizeUrl(rawUrl);
+      const clash = providers.find((item) => item.id !== provider.id && item.baseUrl === nextBaseUrl);
+      if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」。`);
+    }
+  }
+  const baseUrlChanged = !cli && nextBaseUrl !== provider.baseUrl;
+  const resolvedApiRoot = !cli && apiRoot !== undefined && apiRoot !== null && String(apiRoot).trim() !== ""
+    ? normalizeUrl(String(apiRoot).trim()) : null;
+  const nextApiRoot = cli ? null : (resolvedApiRoot || (baseUrlChanged ? candidateApiRoots(nextBaseUrl)[0] : provider.apiRoot));
+  const nextKeychainService = cli ? null : (baseUrlChanged ? keychainServiceFor(nextBaseUrl) : provider.keychainService);
+  const nextCredentialPath = cli ? null : (baseUrlChanged
+    ? (isWindows ? credentialFileFor(nextKeychainService) : null)
+    : (provider.credentialPath ?? null));
+  const previousHost = cli ? null : new URL(provider.apiRoot || provider.baseUrl).host;
+  const nextHost = cli ? null : new URL(nextApiRoot).host;
+  const routeSlugs = new Set(routes.map((route) => route.pickerSlug));
+
   const entries = new Map(catalog.models.map((model) => [model.slug, model]));
   const targets = autoModelDisplayNames(routes, nextPrefix);
   const renames = [];
@@ -2232,10 +2296,33 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
     }
   }
   const renamed = new Map(renames.map((item) => [item.slug, item.to]));
-  const rename = (route) => (renamed.has(route.pickerSlug) ? { ...route, displayName: renamed.get(route.pickerSlug) } : route);
-  const nextCatalog = renames.length === 0 ? catalog : {
+  const updateRoute = (route) => {
+    let next = route;
+    if (renamed.has(route.pickerSlug)) next = { ...next, displayName: renamed.get(route.pickerSlug) };
+    if (baseUrlChanged && routeSlugs.has(route.pickerSlug) && next.providerHost !== nextHost) {
+      next = { ...next, providerHost: nextHost };
+    }
+    return next;
+  };
+  const routeBySlug = new Map(routes.map((route) => [route.pickerSlug, route]));
+  const hostChanged = baseUrlChanged && nextHost !== previousHost;
+  let catalogChanged = renames.length > 0;
+  const updatedModels = catalog.models.map((model) => {
+    let next = model;
+    if (renamed.has(model.slug)) next = { ...next, display_name: renamed.get(model.slug) };
+    if (hostChanged && routeBySlug.has(model.slug) && typeof next.description === "string") {
+      const route = routeBySlug.get(model.slug);
+      const oldDesc = `${route.upstreamModel}，由 ${route.providerHost || previousHost} 提供`;
+      if (next.description === oldDesc) {
+        next = { ...next, description: `${route.upstreamModel}，由 ${nextHost} 提供` };
+        catalogChanged = true;
+      }
+    }
+    return next;
+  });
+  const nextCatalog = !catalogChanged ? catalog : {
     ...catalog,
-    models: catalog.models.map((model) => (renamed.has(model.slug) ? { ...model, display_name: renamed.get(model.slug) } : model)),
+    models: updatedModels,
   };
   // 同名不擋：使用者可能就是想這樣命名；交給畫面提醒。
   const counts = new Map();
@@ -2252,9 +2339,15 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
     delete next.modelPrefix;
     if (nextName) next.name = nextName;
     if (nextPrefix) next.modelPrefix = nextPrefix;
+    if (baseUrlChanged) {
+      next.baseUrl = nextBaseUrl;
+      next.apiRoot = nextApiRoot;
+      next.keychainService = nextKeychainService;
+      next.credentialPath = nextCredentialPath;
+    }
     return next;
   };
-  const routesOf = (record) => (Array.isArray(record.routes) ? record.routes.map(rename) : record.routes);
+  const routesOf = (record) => (Array.isArray(record.routes) ? record.routes.map(updateRoute) : record.routes);
   let nextSettings;
   let nextManifest;
   if (cli) {
@@ -2274,12 +2367,20 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
   }
   const providerChanged = nextName !== (cli ? null : provider.name || null) || nextPrefix !== previousPrefix;
   return {
-    changed: providerChanged || renames.length > 0,
+    changed: providerChanged || baseUrlChanged || renames.length > 0,
     providerId,
     name: nextName,
     previousName: cli ? null : provider.name || null,
     modelPrefix: nextPrefix,
     previousModelPrefix: previousPrefix,
+    baseUrl: nextBaseUrl,
+    previousBaseUrl: cli ? null : provider.baseUrl,
+    apiRoot: nextApiRoot,
+    previousApiRoot: cli ? null : provider.apiRoot,
+    baseUrlChanged,
+    keychainService: nextKeychainService,
+    previousKeychainService: cli ? null : provider.keychainService,
+    restartRouter: baseUrlChanged,
     renames,
     kept,
     conflicts,
@@ -4812,6 +4913,9 @@ export function planRemoveModels(manifest, settings, catalog, selectedSlugs) {
 // 選擇器的推理強度控制雙手；大腦固定使用這裡設定的推理強度。其他組合不能當成員（會形成巢狀）。
 // Antigravity CLI 與 Claude CLI 都可以：路由器讓兩個角色各自續接自己的對話。
 export const COMBO_REVIEW_LEVELS = ["off", "standard", "strict"];
+// 委派方式：subagent＝大腦在主執行緒用 Codex 的子 Agent 派工給雙手（預設；Codex 沒有子 Agent 工具時
+// 路由器自動改用內建流程）；router＝路由器在一輪裡依序呼叫大腦規劃、雙手執行。
+export const COMBO_DELEGATIONS = ["subagent", "router"];
 
 export function comboDependents(routes, slugs) {
   const removed = slugs instanceof Set ? slugs : new Set(slugs);
@@ -4851,6 +4955,8 @@ export function planSaveCombo(manifest, settings, catalog, input = {}) {
   if (plannerEffort && !plannerEfforts.includes(plannerEffort)) fail(`大腦模型不支援推理強度 ${plannerEffort}。`);
   const review = input.review ?? "off";
   if (!COMBO_REVIEW_LEVELS.includes(review)) fail("驗收選項無效。");
+  const delegation = input.delegation ?? existing?.combo?.delegation ?? "subagent";
+  if (!COMBO_DELEGATIONS.includes(delegation)) fail("委派方式無效。");
   // 給大腦的指令：完成條件、拆解與派工的注意事項。舊版欄位叫 criteria。
   const instructions = String(input.instructions ?? input.criteria ?? "").trim();
   if (instructions.length > 4000) fail("給大腦的指令最多 4000 個字元。");
@@ -4874,6 +4980,7 @@ export function planSaveCombo(manifest, settings, catalog, input = {}) {
       planner: { slug: planner.pickerSlug, ...(plannerEffort ? { effort: plannerEffort } : {}) },
       executor: { slug: executor.pickerSlug },
       review,
+      delegation,
       ...(instructions ? { instructions } : {}),
       executorTranslate: executor.translate || null,
       ...(Array.isArray(executorEntry?.input_modalities) ? { inputModalities: executorEntry.input_modalities } : {}),
@@ -5560,6 +5667,10 @@ function printProviderEdit(plan) {
   if (plan.name !== plan.previousName) console.log(`名稱：${label(plan.previousName)} → ${label(plan.name)}`);
   if (plan.modelPrefix !== plan.previousModelPrefix) {
     console.log(`模型前綴：${prefix(plan.previousModelPrefix)} → ${prefix(plan.modelPrefix)}`);
+  }
+  if (plan.baseUrlChanged) {
+    console.log(`Base URL：${plan.previousBaseUrl} → ${plan.baseUrl}`);
+    if (plan.apiRoot !== plan.previousApiRoot) console.log(`API 根地址：${plan.previousApiRoot} → ${plan.apiRoot}`);
   }
   if (plan.renames.length) {
     console.log(`選擇器裡會改名的模型（${plan.renames.length} 個）：`);
@@ -7624,6 +7735,7 @@ async function managerState() {
         planner: { slug: route.combo?.planner?.slug || null, effort: route.combo?.planner?.effort || null },
         executor: { slug: route.combo?.executor?.slug || null },
         review: COMBO_REVIEW_LEVELS.includes(route.combo?.review) ? route.combo.review : "off",
+        delegation: route.combo?.delegation === "router" ? "router" : "subagent",
         instructions: typeof route.combo?.instructions === "string" ? route.combo.instructions
           : typeof route.combo?.criteria === "string" ? route.combo.criteria : "",
       } } : {}),
@@ -8182,6 +8294,9 @@ async function managerSaveCombo(params = {}) {
   const reviewLabel = { off: "關閉", standard: "一般驗收", strict: "嚴格驗收" }[route.combo.review];
   console.log(`大腦：${name(route.combo.planner.slug)}${route.combo.planner.effort ? `（${route.combo.planner.effort}）` : ""}`);
   console.log(`雙手：${name(route.combo.executor.slug)}（推理強度跟隨 Codex 選擇器）`);
+  console.log(route.combo.delegation === "router"
+    ? "委派方式：路由器內建（大腦規劃、雙手執行，合成一個回應）"
+    : "委派方式：Codex 子 Agent（大腦在任務中派工給雙手；Codex 沒有子 Agent 工具時改用路由器內建流程）");
   console.log(`驗收：${reviewLabel}`);
   if (route.combo.instructions) console.log("已設定給大腦的指令。");
   console.log(`已儲存。備份：${backupDir}`);
@@ -8241,12 +8356,12 @@ async function managerDetectFast({ slug } = {}) {
   return { changed: true, fastProbe, fast: plan.fast, backupDir, restartDesktop: plan.restartDesktop };
 }
 
-// 網頁送來的名稱與前綴：undefined 不修改，null 或空字串恢復預設，其他型別一律拒絕。
-function providerEditFields({ name, modelPrefix } = {}) {
-  for (const value of [name, modelPrefix]) {
-    if (value !== undefined && value !== null && typeof value !== "string") fail("供應商名稱與前綴必須是文字。");
+// 網頁送來的供應商修改欄位：undefined 不修改，null 或空字串恢復預設（或留空不更換），其他型別一律拒絕。
+function providerEditFields({ name, modelPrefix, baseUrl, apiKey } = {}) {
+  for (const value of [name, modelPrefix, baseUrl, apiKey]) {
+    if (value !== undefined && value !== null && typeof value !== "string") fail("供應商名稱、前綴、Base URL 與 API Key 必須是文字。");
   }
-  return { name, modelPrefix };
+  return { name, modelPrefix, baseUrl, apiKey };
 }
 
 // 修改前的預覽：列出會改名、保留與同名的模型，不寫任何檔案。輸入無效時回傳原因，
@@ -8254,9 +8369,13 @@ function providerEditFields({ name, modelPrefix } = {}) {
 function managerProviderPreview({ providerId, ...fields } = {}) {
   const { manifest, settings, catalog } = requireInstallation();
   try {
-    const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
+    const { name, modelPrefix, baseUrl } = providerEditFields(fields);
+    const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), {
+      name, modelPrefix, ...(baseUrl !== undefined ? { baseUrl } : {}),
+    });
     return {
       ok: true, changed: plan.changed, name: plan.name, modelPrefix: plan.modelPrefix,
+      baseUrl: plan.baseUrl, baseUrlChanged: plan.baseUrlChanged, apiRoot: plan.apiRoot,
       renames: plan.renames, kept: plan.kept, conflicts: plan.conflicts,
     };
   } catch (error) {
@@ -8266,19 +8385,121 @@ function managerProviderPreview({ providerId, ...fields } = {}) {
 
 async function managerEditProvider({ providerId, ...fields } = {}) {
   assertManagerWritable();
-  const { manifest, settings, catalog } = requireInstallation();
-  const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
-  if (!plan.changed) {
+  const id = String(providerId || "");
+  const parsed = providerEditFields(fields);
+  const cli = id === CLAUDE_CLI_PROVIDER_ID;
+  const nextApiKey = parsed.apiKey == null ? "" : parsed.apiKey.trim();
+  if (cli && nextApiKey) fail("Claude 訂閱不使用 API Key，不支援修改。");
+  const { manifest, settings, catalog, providers } = requireInstallation();
+  const provider = cli ? null : providers.find((item) => item.id === id);
+  const previewPlan = planEditProvider(manifest, settings, catalog, id, {
+    name: parsed.name,
+    modelPrefix: parsed.modelPrefix,
+    ...(parsed.baseUrl !== undefined ? { baseUrl: parsed.baseUrl } : {}),
+  });
+  const baseUrlChanged = previewPlan.baseUrlChanged;
+  const keyChanged = Boolean(nextApiKey);
+  if (!previewPlan.changed && !keyChanged) {
     console.log("沒有任何變更。");
     return { changed: false };
   }
-  printProviderEdit(plan);
-  console.log(plan.renames.length
-    ? "正在寫入供應商設定與模型目錄（不需要重新啟動路由器）…"
-    : "正在寫入供應商設定（不需要重新啟動路由器）…");
-  const backupDir = await commitCatalogChange("edit-provider", plan);
-  console.log(`已儲存。備份：${backupDir}`);
-  return { changed: true, renamed: plan.renames.length, backupDir, restartDesktop: plan.restartDesktop };
+
+  let plan = previewPlan;
+  let keyVerified = null;
+  let keyStatus = null;
+  let keyProblem = null;
+  let probedModels = null;
+  let effectiveKey = nextApiKey;
+
+  if (baseUrlChanged) {
+    if (!effectiveKey) {
+      try { effectiveKey = readApiKey(provider.keychainService); }
+      catch { fail("找不到這家供應商原本的 API Key；修改 Base URL 時請一併填寫 API Key。"); }
+    }
+    console.log(`正在連線到新的 Base URL（${previewPlan.baseUrl}）並驗證 API Key…`);
+    const probed = await probeProviderBaseUrl(previewPlan.baseUrl, effectiveKey);
+    probedModels = probed.models;
+    keyVerified = true;
+    keyStatus = probed.status;
+    plan = planEditProvider(manifest, settings, catalog, id, {
+      name: parsed.name,
+      modelPrefix: parsed.modelPrefix,
+      baseUrl: previewPlan.baseUrl,
+      apiRoot: probed.apiRoot,
+    });
+    console.log(`已確認 API 根地址：${plan.apiRoot}${probed.models?.length ? `（查到 ${probed.models.length} 個模型）` : ""}。`);
+  } else if (keyChanged) {
+    console.log(`正在用新 Key 查詢「${providerName(provider)}」的模型清單…`);
+    const checked = await fetchKeyModels(provider.apiRoot, nextApiKey);
+    if (checked.status === 401 || checked.status === 403) fail(`上游拒絕這把 Key（HTTP ${checked.status}），沒有更換。`);
+    probedModels = checked.models;
+    keyStatus = checked.status;
+    keyProblem = checked.problem || null;
+    keyVerified = checked.status != null && checked.status >= 200 && checked.status < 300;
+  }
+
+  const targetService = baseUrlChanged ? plan.keychainService : provider?.keychainService;
+  const targetBaseUrl = baseUrlChanged ? plan.baseUrl : provider?.baseUrl;
+  const needWriteKey = baseUrlChanged || keyChanged;
+  let previousTargetKey = null;
+  if (needWriteKey) {
+    if (keychainHas(targetService)) {
+      try { previousTargetKey = readApiKey(targetService); } catch {}
+    }
+    storeApiKeyValue(targetService, targetBaseUrl, effectiveKey);
+  }
+
+  try {
+    let backupDir = null;
+    if (plan.changed) {
+      printProviderEdit(plan);
+      if (baseUrlChanged) {
+        console.log("正在寫入供應商設定並重新啟動路由器…");
+        backupDir = await commitRouterChange("edit-provider", plan);
+      } else {
+        console.log(plan.renames.length
+          ? "正在寫入供應商設定與模型目錄（不需要重新啟動路由器）…"
+          : "正在寫入供應商設定（不需要重新啟動路由器）…");
+        backupDir = await commitCatalogChange("edit-provider", plan);
+      }
+    }
+    if (baseUrlChanged) {
+      const oldService = provider.keychainService;
+      const stillUsed = providers.some((item) => item.id !== provider.id && item.keychainService === oldService);
+      if (oldService && oldService !== targetService && !stillUsed && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+        try { deleteApiKey(oldService, provider.keychainAccount || "codex"); } catch {}
+      }
+      await refreshKeyPoolModels(provider.id, plan.apiRoot, probedModels);
+    } else if (keyChanged) {
+      rememberPrimaryModels(provider.id, probedModels);
+    }
+    if (keyChanged && !baseUrlChanged) {
+      console.log(keyVerified
+        ? "已更換，新 Key 可以正常查詢模型清單。"
+        : `已更換，但無法確認新 Key 是否可用（${keyStatus != null ? `HTTP ${keyStatus}` : keyProblem || "連線失敗"}）。`);
+      console.log(isWindows
+        ? "路由器下一個請求就會改用新 Key，不必重啟。"
+        : "路由器最晚 5 分鐘內改用新 Key；上游拒絕舊 Key 時會立即改用。");
+    }
+    if (backupDir) console.log(`已儲存。備份：${backupDir}`);
+    return {
+      changed: true,
+      renamed: plan.renames.length,
+      baseUrlChanged,
+      keyChanged,
+      ...(keyVerified != null ? { keyVerified, keyStatus } : {}),
+      ...(backupDir ? { backupDir } : {}),
+      restartDesktop: plan.restartDesktop,
+    };
+  } catch (error) {
+    if (needWriteKey && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+      try {
+        if (previousTargetKey) storeApiKeyValue(targetService, targetBaseUrl, previousTargetKey);
+        else deleteApiKey(targetService);
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens, backupKeys } = {}) {
@@ -10691,7 +10912,7 @@ import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renam
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { zstdDecompressSync } from "node:zlib";
 import {
   toAnthropicRequest,
@@ -11786,6 +12007,9 @@ const stats = {
   comboPlannerFailures: 0,
   comboAsksDropped: 0,
   comboFailures: 0,
+  comboNative: 0,
+  comboNativeSubagents: 0,
+  comboSpawnRewrites: 0,
   customInstructionSyncs: 0,
   usageRecords: 0,
   usageLogFailures: 0,
@@ -12448,6 +12672,211 @@ async function comboFailure(response) {
   return { code: details.code || String(response.status), message: details.message || "組合模型的內部請求失敗。" };
 }
 
+// --- 組合模型：Codex 原生子 Agent 委派 --------------------------------------------
+//
+// Codex 提供多代理工具（spawn_agent，可覆寫模型）時，主執行緒直接交給大腦，大腦用 Codex 的
+// 子 Agent 派工給雙手；子 Agent 的進度與結果都由 Codex 原生顯示，可以平行派工。路由器只做：
+//   1. 改送大腦，套用大腦的推理強度與身分句，在提示詞加上派工指引；
+//   2. 大腦的 spawn_agent 漏了模型時補上雙手與 fork_turns:"none"（Codex 覆寫模型的必要條件）；
+//   3. 子 Agent 仍以組合模型的 ID 進來時（帶 x-openai-subagent）直接交給雙手，不會遞迴。
+// 沒有子 Agent 工具（舊版 Codex、關閉多代理、非 Codex 客戶端）或選了「路由器內建」時，
+// 改用上面的內建流程。
+export const COMBO_DELEGATIONS = ["subagent", "router"];
+export function comboDelegation(combo) {
+  return combo?.delegation === "router" ? "router" : "subagent";
+}
+
+const COMBO_SPAWN_TOOL = "spawn_agent";
+const COMBO_MAX_NATIVE = 200;
+const comboNativeConversations = new Map();
+
+// 找出請求裡的 spawn_agent（頂層 tools 或 additional_tools，含 namespace 巢狀），
+// 一併回傳同組的工具名稱，指引裡才能寫出實際可用的等待與追加任務工具。
+export function comboSpawnTool(body) {
+  const visit = (tools, namespace) => {
+    if (!Array.isArray(tools)) return null;
+    for (const tool of tools) {
+      if (tool?.type === "namespace") {
+        const found = visit(tool.tools, tool.name || namespace);
+        if (found) return found;
+      } else if (tool?.name === COMBO_SPAWN_TOOL && (!tool.type || tool.type === "function")) {
+        const names = tools.filter((item) => item?.type !== "namespace" && typeof item?.name === "string").map((item) => item.name);
+        const properties = tool.parameters?.properties && typeof tool.parameters.properties === "object" ? tool.parameters.properties : {};
+        return { namespace: namespace && namespace !== "functions" ? namespace : null, names, properties };
+      }
+    }
+    return null;
+  };
+  const top = visit(body?.tools, null);
+  if (top) return top;
+  for (const item of Array.isArray(body?.input) ? body.input : []) {
+    if (item?.type !== "additional_tools") continue;
+    const found = visit(item.tools, null);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Codex 子 Agent 的請求帶 x-openai-subagent（thread_spawn）與上層執行緒 ID。
+// review、compact 等其他子任務不算派工。
+export function comboSubagentRequest(headers) {
+  const kind = String(headers?.["x-openai-subagent"] || "").trim().toLowerCase();
+  if (kind) return kind.includes("spawn");
+  const parent = headers?.["x-codex-parent-thread-id"];
+  return typeof parent === "string" && parent.trim().length > 0;
+}
+
+function comboNativeReview(level) {
+  if (level === "strict") {
+    return "\n- Before your final answer, accept only actual tool output as evidence (test runs, builds, command output, diffs, file contents)."
+      + " Require sub-agents to report it, or check it yourself. Every definition-of-done item needs evidence; missing or failing evidence means more work is needed.";
+  }
+  if (level === "standard") {
+    return "\n- Before your final answer, check that the sub-agents' results are complete and consistent with the request, with no obvious omissions or errors."
+      + " Send follow-up tasks for anything missing or wrong.";
+  }
+  return "";
+}
+
+export function comboNativeGuide({ combo, planner, executor, plannerEffort = null, spawn }) {
+  const spawnName = spawn?.namespace ? spawn.namespace + "." + COMBO_SPAWN_TOOL : COMBO_SPAWN_TOOL;
+  const names = spawn?.names || [];
+  const wait = names.find((name) => /^wait/.test(name));
+  const follow = names.find((name) => /followup|send_input/.test(name));
+  const fork = spawn?.properties?.fork_turns ? " and fork_turns \"none\"" : "";
+  return "# Planner/executor combo\n"
+    + "The user selected a planner/executor combo for this task. You are the PLANNER (" + comboRoleLabel(planner, plannerEffort) + ")."
+    + " Hands-on work is done by EXECUTOR sub-agents running " + comboRoleLabel(executor) + "."
+    + " Selecting this combo is the user's explicit, standing request to delegate through sub-agents; it takes precedence over any default guidance that discourages spawning sub-agents.\n"
+    + "- Delegate implementation, file edits, command and test runs, and broad code reading with " + spawnName + ". Always pass model \""
+    + executor.pickerSlug + "\"" + fork + "; leave reasoning_effort unset so the executor follows the level chosen in the model picker.\n"
+    + "- Sub-agents do not see this conversation. Make every task self-contained: the goal, relevant paths and facts you already know,"
+    + " constraints, what to report back, and the checks that prove it is done.\n"
+    + "- Run independent parts in parallel sub-agents and keep dependent steps in order."
+    + (wait ? " Wait for results with " + wait + " using long timeouts instead of polling" : " Wait for their results instead of polling")
+    + (follow ? ", and send corrections or next steps to an existing sub-agent with " + follow + " instead of starting over." : ".") + "\n"
+    + "- Answer simple questions and do quick lookups yourself; you may run read-only checks to verify results.\n"
+    + "- Write the final answer to the user yourself, based on the evidence the sub-agents reported."
+    + comboNativeReview(comboReviewLevel(combo)) + comboInstructions(combo);
+}
+
+export function comboNativeReminder({ executor, spawn }) {
+  const spawnName = spawn?.namespace ? spawn.namespace + "." + COMBO_SPAWN_TOOL : COMBO_SPAWN_TOOL;
+  return "<combo_planner>Reminder: you are the planner of this combo. Delegate hands-on work to executor sub-agents ("
+    + spawnName + " with model \"" + executor.pickerSlug + "\"), then review their results before answering.</combo_planner>";
+}
+
+// 每則使用者訊息後面都接同一則提醒：插入位置只取決於輸入本身，前綴因此穩定、快取可命中。
+// 用使用者角色而非開發者訊息：Chat 轉譯會把開發者訊息併進開頭的 system，續接型上游會因此重建。
+// 提醒以 "<" 開頭，不會被當成新的使用者輸入。
+export function comboNativeInput(input, reminder) {
+  if (!Array.isArray(input) || !reminder) return input;
+  const output = [];
+  for (const item of input) {
+    output.push(item);
+    if (isComboUserMessage(item)) output.push(comboPlannerMessage(reminder));
+  }
+  return output;
+}
+
+// 大腦的 spawn_agent 沒指定模型（或指定成組合本身）時改派給雙手；覆寫模型時 Codex 要求
+// fork_turns 為 "none"。只動工具 schema 裡真的有的欄位，沒有改動時回傳 null。
+export function comboSpawnArguments(text, { comboSlug, executor, properties = {} }) {
+  let args;
+  try { args = JSON.parse(text || "{}"); } catch { return null; }
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  const next = { ...args };
+  if ("model" in properties && (typeof next.model !== "string" || !next.model.trim() || next.model === comboSlug)) {
+    next.model = executor.pickerSlug;
+  }
+  if ("fork_turns" in properties && typeof next.model === "string" && next.model && next.fork_turns !== "none") next.fork_turns = "none";
+  if (next.model === executor.pickerSlug && "reasoning_effort" in properties && next.reasoning_effort != null
+    && !(executor.efforts || []).includes(next.reasoning_effort)) delete next.reasoning_effort;
+  return isDeepStrictEqual(next, args) ? null : JSON.stringify(next);
+}
+
+function rememberComboNative(key, value) {
+  comboNativeConversations.delete(key);
+  comboNativeConversations.set(key, value);
+  while (comboNativeConversations.size > COMBO_MAX_NATIVE) comboNativeConversations.delete(comboNativeConversations.keys().next().value);
+}
+
+function comboNativeBody(body, { planner, plannerEffort, guide, reminder }) {
+  const plannerName = String(planner.upstreamModel || "").split("/").at(-1);
+  const instructions = typeof body.instructions === "string" && body.instructions
+    ? identityInstructions(body.instructions, plannerName) + "\n\n" + guide : guide;
+  const next = { ...body, model: planner.pickerSlug, instructions, input: comboNativeInput(body.input, reminder) };
+  if (plannerEffort) next.reasoning = { ...(body.reasoning || {}), effort: plannerEffort };
+  return next;
+}
+
+// 把大腦的串流原樣轉給 Codex，只改寫 spawn_agent 呼叫的參數：該呼叫的參數片段先暫存，
+// 結束時一次送出改寫後的完整參數，完成事件裡的 output 也一併改寫，歷史才前後一致。
+export function comboNativeStream(response, { isSpawn, rewrite, signal }) {
+  const encoder = new TextEncoder();
+  const held = new Map();
+  let keepAlive = null;
+  const fixItem = (item) => {
+    if (!isSpawn(item)) return item;
+    const args = rewrite(item.arguments);
+    return args == null ? item : { ...item, arguments: args };
+  };
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event) => controller.enqueue(encoder.encode("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n"));
+      keepAlive = setInterval(() => { try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch {} }, 15000);
+      try {
+        for await (const event of comboEvents(response)) {
+          const type = event?.type;
+          const index = event?.output_index;
+          if (type === "response.output_item.added" && isSpawn(event.item)) {
+            held.set(index, { args: null });
+            send(event);
+            continue;
+          }
+          const hold = Number.isFinite(index) ? held.get(index) : null;
+          if (hold && type === "response.function_call_arguments.delta") continue;
+          if (hold && type === "response.function_call_arguments.done") {
+            hold.args = rewrite(event.arguments) ?? event.arguments;
+            send({ type: "response.function_call_arguments.delta", item_id: event.item_id, output_index: index, delta: hold.args });
+            send({ ...event, arguments: hold.args });
+            continue;
+          }
+          if (hold && type === "response.output_item.done") {
+            held.delete(index);
+            const original = event.item?.arguments;
+            const args = hold.args ?? rewrite(original) ?? original;
+            if (args !== original) stats.comboSpawnRewrites += 1;
+            send({ ...event, item: { ...event.item, arguments: args } });
+            continue;
+          }
+          if (["response.completed", "response.incomplete", "response.failed"].includes(type) && Array.isArray(event.response?.output)) {
+            send({ ...event, response: { ...event.response, output: event.response.output.map(fixItem) } });
+            continue;
+          }
+          send(event);
+        }
+      } catch (error) {
+        if (!signal?.aborted) {
+          stats.comboFailures += 1;
+          try {
+            controller.enqueue(encoder.encode("event: response.failed\ndata: "
+              + JSON.stringify(responseFailedEvent("combo_error", "組合模型處理失敗：" + (error?.message || error))) + "\n\n"));
+          } catch {}
+        }
+      } finally {
+        clearInterval(keepAlive);
+        try { controller.close(); } catch {}
+      }
+    },
+    cancel() {
+      clearInterval(keepAlive);
+      try { response.body?.cancel?.().catch?.(() => {}); } catch {}
+    },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
+}
+
 export async function fetchCombo(requestHeaders, incomingUrl, body, route, signal, meta = {}) {
   const combo = route.combo || {};
   const planner = routeMap.get(combo.planner?.slug);
@@ -12460,11 +12889,44 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
   stats.comboRequests += 1;
   if (meta.history) meta.history.usage = null;
   const executorBody = { ...body, model: executor.pickerSlug };
+  const plannerEffort = typeof combo.planner?.effort === "string" && combo.planner.effort ? combo.planner.effort : null;
+  if (comboDelegation(combo) === "subagent") {
+    // 子 Agent 若仍帶著組合模型的 ID（例如大腦沒有覆寫模型），直接交給雙手，不再層層派工。
+    if (comboSubagentRequest(requestHeaders)) {
+      stats.comboNativeSubagents += 1;
+      return comboLoopback(requestHeaders, incomingUrl, executorBody, "direct", route.pickerSlug, signal);
+    }
+    if (!meta.backgroundKind) {
+      const key = comboConversationKey(body, requestHeaders, route.pickerSlug);
+      const spawn = comboSpawnTool(body);
+      let native = null;
+      if (spawn && "model" in spawn.properties) {
+        native = { guide: comboNativeGuide({ combo, planner, executor, plannerEffort, spawn }), reminder: comboNativeReminder({ executor, spawn }), spawn };
+        rememberComboNative(key, native);
+      } else if (comboDirectRequest(body, null) && comboNativeConversations.has(key)) {
+        // 同一個原生對話的精簡上下文等請求也交給大腦，提示詞保持一致，大腦的對話才接得上。
+        native = comboNativeConversations.get(key);
+      }
+      if (native) {
+        stats.comboNative += 1;
+        const plannerBody = comboNativeBody(body, { planner, plannerEffort, guide: native.guide, reminder: native.reminder });
+        const response = await comboLoopback(requestHeaders, incomingUrl, plannerBody, "planner", route.pickerSlug, signal);
+        if (!response.ok || !response.body) return response;
+        const spawnNamespace = native.spawn?.namespace || null;
+        const properties = native.spawn?.properties || {};
+        return comboNativeStream(response, {
+          signal,
+          isSpawn: (item) => item?.type === "function_call" && item.name === COMBO_SPAWN_TOOL
+            && (!item.namespace || item.namespace === spawnNamespace),
+          rewrite: (text) => comboSpawnArguments(text, { comboSlug: route.pickerSlug, executor, properties }),
+        });
+      }
+    }
+  }
   if (comboDirectRequest(body, meta.backgroundKind)) {
     stats.comboDirect += 1;
     return comboLoopback(requestHeaders, incomingUrl, executorBody, "direct", route.pickerSlug, signal);
   }
-  const plannerEffort = typeof combo.planner?.effort === "string" && combo.planner.effort ? combo.planner.effort : null;
   const reviewLevel = comboReviewLevel(combo);
   const conversation = comboConversation(comboConversationKey(body, requestHeaders, route.pickerSlug));
   const encoder = new TextEncoder();
@@ -19939,7 +20401,9 @@ const instructions = [
   "Put all progress and answer prose inside text, never before or after the JSON object. Do not emit native function calls alongside it.",
   "JSON-escape quotes, backslashes and line breaks inside strings, including inside Markdown code and tool arguments.",
   "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
-  "When requesting host tools during multi-step work, put a brief user-facing progress update in text before calls: what you found or what the next action will check. Use the user's language.",
+  "Progress updates during multi-step work: when you start a new request, put one short sentence in text before the first calls saying what you will do.",
+  "After that, leave text empty while you keep working, and write a brief update only when you finish a meaningful stage (for example: done investigating, a set of edits finished, test or build results), change direction, or hit a blocker.",
+  "Do not narrate every lookup or tool call; one update every few tool rounds is enough. Never hold all updates until the final answer. This replaces any general guidance to comment before each tool call. Use the user's language.",
   "Request independent actions together when parallel_tool_calls permits. The host executes all calls.",
   "Use the supplied tool results to continue. For a final answer set calls to [].",
 ].join("\n");
@@ -21533,13 +21997,13 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .setting-control .kv.compact { grid-template-columns: 84px minmax(0, 1fr); gap: 6px 12px; font-size: 13px; }
 .setting-control .kv.compact dt { color: var(--faint); }
 .setting-list > .table-wrap { border-radius: var(--radius); }
-.setting-control .check-line { align-items: center; color: var(--text); font-size: 13.5px; }
-.setting-control .check-line > input[type=checkbox] { appearance: none; -webkit-appearance: none; position: relative; flex: none; width: 34px; height: 20px; margin: 0; border-radius: 999px; background: var(--border-strong); transition: background .15s; }
-.setting-control .check-line > input[type=checkbox]::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .35); transition: left .15s; }
-.setting-control .check-line > input[type=checkbox]:checked { background: var(--accent); }
-.setting-control .check-line > input[type=checkbox]:checked::after { left: 16px; }
-.setting-control .check-line > input[type=checkbox]:disabled { opacity: .45; cursor: not-allowed; }
-.setting-control .check-line > input[type=checkbox]:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
+.setting-control .check-line, .check-line.switch { align-items: center; color: var(--text); font-size: 13.5px; }
+.setting-control .check-line > input[type=checkbox], .check-line.switch > input[type=checkbox] { appearance: none; -webkit-appearance: none; position: relative; flex: none; width: 34px; height: 20px; margin: 0; border-radius: 999px; background: var(--border-strong); transition: background .15s; }
+.setting-control .check-line > input[type=checkbox]::after, .check-line.switch > input[type=checkbox]::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .35); transition: left .15s; }
+.setting-control .check-line > input[type=checkbox]:checked, .check-line.switch > input[type=checkbox]:checked { background: var(--accent); }
+.setting-control .check-line > input[type=checkbox]:checked::after, .check-line.switch > input[type=checkbox]:checked::after { left: 16px; }
+.setting-control .check-line > input[type=checkbox]:disabled, .check-line.switch > input[type=checkbox]:disabled { opacity: .45; cursor: not-allowed; }
+.setting-control .check-line > input[type=checkbox]:focus-visible, .check-line.switch > input[type=checkbox]:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
 .type-choices { display: grid; gap: 10px; }
 .type-option { display: flex; align-items: center; gap: 14px; width: 100%; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border-strong); background: var(--input); text-align: left; cursor: pointer; }
 .type-option:hover { background: var(--hover); border-color: var(--accent-ring); }
@@ -21696,13 +22160,23 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "新增組合模型": "Add combo model",
 "修改組合模型": "Edit combo model",
 "大腦 {planner} · 雙手 {executor}": "Planner {planner} · Executor {executor}",
+"Codex 子 Agent": "Codex sub-agents",
+"路由器內建流程": "Router's built-in flow",
 "已刪除": "deleted",
 "修改組合的大腦、雙手與驗收": "Edit the combo's planner, executor and review",
 "例如 Opus 規劃 + Neon 執行": "e.g. Opus plans + Neon executes",
-"大腦（規劃、回答詢問、驗收）": "Planner (plans, answers questions, reviews)",
+"大腦（規劃、派工、驗收）": "Planner (plans, delegates, reviews)",
 "大腦推理強度": "Planner reasoning level",
 "模型預設": "Model default",
 "雙手（呼叫工具、完成工作）": "Executor (calls tools, does the work)",
+"委派方式": "Delegation",
+"用 Codex 子 Agent 派工": "Delegate with Codex sub-agents",
+"大腦直接在任務裡工作，需要動手時用 Codex 的子 Agent 派工給雙手，可以同時派好幾個；子 Agent 的進度直接顯示在 Codex。子 Agent 看不到主對話，大腦會把需要的背景寫進派工內容。Codex 沒有提供子 Agent 工具時，自動改用路由器內建流程。": "The planner works in the task directly and hands hands-on work to the executor through Codex sub-agents, several at a time if needed; their progress shows right in Codex. Sub-agents don't see the main conversation, so the planner writes the needed context into each task. When Codex doesn't offer sub-agent tools, the router's built-in flow is used instead.",
+"關閉後由路由器在一輪裡依序呼叫大腦規劃、雙手執行，雙手卡住時可以詢問大腦，Codex 只看到一個連續的回應。": "When off, the router calls the planner to plan and then the executor to do the work within each turn; the executor can ask the planner when stuck, and Codex sees one continuous reply.",
+"大腦自行判斷子 Agent 的結果，不額外要求證據。": "The planner judges the sub-agents' results on its own, without asking for extra evidence.",
+"回覆你之前，大腦檢查子 Agent 的結果是否完整、有沒有遺漏或矛盾，不足就派後續任務補上。": "Before replying, the planner checks the sub-agents' results for completeness, omissions and contradictions, and assigns follow-up tasks when something is missing.",
+"大腦只認實際的工具輸出（測試、build、diff、檔案內容），要求子 Agent 附上證據或自己檢查；證據不足就繼續派工。": "The planner accepts only actual tool output (tests, builds, diffs, file contents); it asks sub-agents for evidence or checks it itself, and keeps assigning work until the evidence is there.",
+"Codex 選擇器的推理強度用在雙手的子 Agent，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。": "The reasoning level in Codex's picker applies to the executor sub-agents; the planner always uses the level chosen here. The context limit is the smaller of the two. Background tasks such as titles go straight to the executor.",
 "驗收": "Review",
 "一般驗收": "Standard review",
 "嚴格驗收": "Strict review",
@@ -21712,7 +22186,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "每輪最多打回 {count} 次，之後照常結束。": "At most {count} send-backs per turn; after that the turn ends normally.",
 "給大腦的指令（選填）": "Instructions for the planner (optional)",
 "例如：完成前必須跑 npm test 並全數通過；先讀 README 再動手；不要改 public API；步驟拆小，每步都要驗證。": "e.g. npm test must pass before finishing; read the README first; don't change the public API; keep steps small and verify each one.",
-"可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、回答詢問和驗收時都會遵守；雙手看到的是大腦據此寫出的計畫。": "Set a definition of done or anything to keep in mind when planning and handing off work. The planner follows these when planning, answering questions and reviewing; the executor sees the plan written from them.",
+"可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、派工和驗收時都會遵守；雙手只看到大腦據此寫出的計畫或派工內容。": "Set a definition of done or anything to keep in mind when planning and handing off work. The planner follows these when planning, delegating and reviewing; the executor only sees the plan or tasks the planner writes from them.",
 "你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。": "When you send a message, the planner reads the whole conversation and writes a plan, shown in Codex's thinking area. The executor then calls tools to do the work, and can ask the planner when stuck.",
 "Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。": "The reasoning level in Codex's picker controls the executor; the planner always uses the level chosen here. The context limit is the smaller of the two. Background tasks such as titles go straight to the executor.",
 "每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。": "Each new message adds one planner call, so the first words appear a little later.",
@@ -21954,7 +22428,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "新增供應商": "Add provider",
 "主要": "Primary",
 "{count} 個模型": "{count} models",
-"修改名稱與模型前綴": "Edit name and model prefix",
+"修改名稱、前綴、Base URL 與 API Key": "Edit name, prefix, Base URL, and API Key",
 "模型前綴": "Model prefix",
 "API 根地址": "API root",
 "已加密儲存": "Stored encrypted",
@@ -22026,6 +22500,14 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "選擇器裡這家的模型顯示成「前綴/模型名」，上游自帶的前綴（例如 ark/）會被取代，不會疊成兩層。留空使用自動規則：上游已有前綴時沿用原名，否則補「{prefix}/」。之後新增的模型也會套用。": "This provider's models appear in the picker as “prefix/model”. An upstream prefix (such as ark/) is replaced rather than doubled. Leave empty for the automatic rule: keep the upstream name if it already has a prefix, otherwise add “{prefix}/”. Models added later use it too.",
 "選擇器裡 Claude 訂閱的模型顯示成「前綴/模型名」；留空使用預設的「claude-cli/」。之後新增的模型也會套用。": "Claude subscription models appear in the picker as “prefix/model”. Leave empty for the default “claude-cli/”. Models added later use it too.",
 "只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。": "Only the settings and model catalog are written; nothing is re-probed and the router doesn't restart. If model names change, restart {app} to see them in the picker.",
+"只改名稱、前綴或 API Key 不會重新啟動路由器；修改 Base URL 會連線驗證並重新啟動路由器。模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。": "Changing only the name, prefix, or API Key does not restart the router. Changing Base URL verifies the connection and restarts the router. If model names change, restart {app} to see them in the picker.",
+"留空則保留目前的 API Key": "Leave empty to keep the current API Key",
+"目前找不到 API Key，請填入新的 API Key": "API Key missing; enter a new API Key",
+"更換網域或站點時修改；會連線確認 API 根地址並驗證 API Key，儲存後自動重新啟動路由器。既有模型的上游 ID 與介面設定維持不變。": "Change when switching domain or host. Connects to verify the API root and API Key, then restarts the router. Existing models' upstream IDs and protocol settings stay unchanged.",
+"選填：要更換主 Key（或改 Base URL 同時換 Key）時填寫。會先查詢模型清單驗證，上游明確拒絕（401／403）時不會覆蓋原本的 Key。": "Optional: fill in to replace the main key (or switch keys when changing Base URL). Checked against the model list first; rejected keys (401/403) will not overwrite the current key.",
+"請填寫 Base URL。": "Enter a Base URL.",
+"Base URL 必須使用 http:// 或 https://。": "Base URL must start with http:// or https://.",
+"Base URL 格式無效。": "Invalid Base URL.",
 "取消": "Cancel",
 "前綴只能用英文字母、數字、點、底線與連字號，1～32 個字元，開頭與結尾必須是英文字母或數字。": "The prefix may contain only letters, digits, dots, underscores, and hyphens (1–32 characters), and must start and end with a letter or digit.",
 "名稱最多 {max} 個字。": "Names can be at most {max} characters.",
@@ -22387,11 +22869,6 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "將新增供應商「{name}」，並探測以下 {count} 個模型：": "Provider “{name}” will be added and these {count} models probed:",
 "將新增供應商（所選模型已有前綴，ID 自動產生），並探測以下 {count} 個模型：": "A provider will be added (the selected models already have prefixes, so the ID is generated) and these {count} models probed:",
 "開始探測並新增": "Probe and add",
-"新的 API Key": "New API Key",
-"更換 API Key：{name}": "Replace API Key: {name}",
-"會先用新 Key 查詢模型清單：上游明確拒絕（401／403）時不會更換。路由器會自動改用新 Key，不需要重新啟動。": "The new key is checked by fetching the model list first; it isn't replaced if the upstream rejects it (401/403). The router picks up the new key automatically, with no restart.",
-"驗證並儲存": "Verify and save",
-"請填寫新的 API Key。": "Enter the new API Key.",
 "移除供應商「{name}」": "Remove provider “{name}”",
 "會一併移除它的 {count} 個模型：": "Its {count} models are removed too:",
 "移除後由「{name}」擔任主要供應商。": "“{name}” becomes the primary provider.",
@@ -22572,7 +23049,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 ["^「(.+)」是保留名稱，請換一個。$", "“$1” is reserved. Choose another."],
 ["^Claude 訂閱的名稱目前不支援修改。$", "The Claude subscription's name can't be changed yet."],
 ["^尚未連接 Claude 訂閱，沒有可以修改的模型前綴。$", "The Claude subscription isn't connected, so there's no model prefix to change."],
-["^供應商名稱與前綴必須是文字。$", "Provider names and prefixes must be text."],
+["^供應商名稱、前綴、Base URL 與 API Key 必須是文字。$", "Provider name, prefix, Base URL, and API Key must be text."],
+["^請填寫 Base URL。$", "Enter a Base URL."],
+["^Base URL 無效：(.+)$", "Invalid Base URL: $1"],
+["^Base URL 必須使用 http:// 或 https://。$", "Base URL must start with http:// or https://."],
+["^Claude 訂閱沒有 Base URL，不支援修改。$", "The Claude subscription has no Base URL to edit."],
+["^Claude 訂閱不使用 API Key，不支援修改。$", "The Claude subscription does not use an API Key."],
+["^找不到這家供應商原本的 API Key；修改 Base URL 時請一併填寫 API Key。$", "Could not find this provider's current API Key. Enter an API Key when changing the Base URL."],
+["^新的 Base URL 拒絕這把 API Key（HTTP (\\d+)），設定未修改。.*$", "The new Base URL rejected this API Key (HTTP $1); nothing changed. If switching providers or accounts, enter the matching API Key too."],
+["^無法連線到新的 Base URL（(.+)），設定未修改。$", "Could not reach the new Base URL ($1); nothing changed."],
 ["^安裝設定或模型目錄不完整.*$", "The installation settings or model catalog are incomplete."],
 ["^顯示名稱不能是空白。$", "The display name can't be empty."],
 ["^(?:上下文上限)必須是 ([\\d,]+) 到 ([\\d,]+) 之間的整數。$", "The context limit must be an integer between $1 and $2."],
@@ -23974,10 +24459,17 @@ function comboSummary(model) {
   return t("大腦 {planner} · 雙手 {executor}", {
     planner: planner ? planner.displayName + (combo.planner.effort ? "（" + combo.planner.effort + "）" : "") : t("已刪除"),
     executor: executor ? executor.displayName : t("已刪除"),
-  });
+  }) + " · " + (combo.delegation === "router" ? t("路由器內建流程") : t("Codex 子 Agent"));
 }
 
-function comboReviewHint(level) {
+function comboReviewHint(level, native) {
+  if (native) {
+    return {
+      off: t("大腦自行判斷子 Agent 的結果，不額外要求證據。"),
+      standard: t("回覆你之前，大腦檢查子 Agent 的結果是否完整、有沒有遺漏或矛盾，不足就派後續任務補上。"),
+      strict: t("大腦只認實際的工具輸出（測試、build、diff、檔案內容），要求子 Agent 附上證據或自己檢查；證據不足就繼續派工。"),
+    }[level];
+  }
   const hints = {
     off: t("雙手完成就結束，不額外呼叫大腦。"),
     standard: t("雙手交出最終回答後，大腦讀回答和對話，判斷是否完成、有沒有遺漏或矛盾；不通過就把意見交給雙手繼續。"),
@@ -24014,22 +24506,42 @@ function openComboEditor(model = null) {
   const reviewLabels = { off: t("關閉"), standard: t("一般驗收"), strict: t("嚴格驗收") };
   const review = h("select", {}, Object.entries(reviewLabels).map(([value, label]) =>
     h("option", { value, selected: value === (combo.review || "off"), text: label })));
-  const reviewHint = h("span", { class: "hint", text: comboReviewHint(review.value) });
-  review.addEventListener("change", () => { reviewHint.textContent = comboReviewHint(review.value); });
+  // 委派方式：預設用 Codex 的子 Agent；關閉後改用路由器內建的規劃、執行流程。
+  const delegation = h("input", { type: "checkbox", role: "switch", checked: combo.delegation !== "router", "aria-label": t("用 Codex 子 Agent 派工") });
+  const delegationState = h("span", {});
+  const delegationHint = h("span", { class: "hint" });
+  const reviewHint = h("span", { class: "hint" });
+  const flowNotes = h("div", { class: "stack" });
+  const refreshDelegation = () => {
+    const native = delegation.checked;
+    delegationState.textContent = native ? t("Codex 子 Agent") : t("路由器內建流程");
+    delegationHint.textContent = native
+      ? t("大腦直接在任務裡工作，需要動手時用 Codex 的子 Agent 派工給雙手，可以同時派好幾個；子 Agent 的進度直接顯示在 Codex。子 Agent 看不到主對話，大腦會把需要的背景寫進派工內容。Codex 沒有提供子 Agent 工具時，自動改用路由器內建流程。")
+      : t("關閉後由路由器在一輪裡依序呼叫大腦規劃、雙手執行，雙手卡住時可以詢問大腦，Codex 只看到一個連續的回應。");
+    reviewHint.textContent = comboReviewHint(review.value, native);
+    flowNotes.replaceChildren(...(native
+      ? [paragraph(t("Codex 選擇器的推理強度用在雙手的子 Agent，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。"), "note")]
+      : [paragraph(t("你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。"), "note"),
+        paragraph(t("Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。"), "note"),
+        paragraph(t("每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。"), "note")]));
+  };
+  delegation.addEventListener("change", refreshDelegation);
+  review.addEventListener("change", refreshDelegation);
+  refreshDelegation();
   const instructions = h("textarea", { rows: "4", maxlength: "4000", value: combo.instructions || "",
     placeholder: t("例如：完成前必須跑 npm test 並全數通過；先讀 README 再動手；不要改 public API；步驟拆小，每步都要驗證。") });
   const body = [
     h("label", { class: "field" }, h("span", { text: t("顯示名稱") }), name),
     h("div", { class: "field-row" },
-      h("label", { class: "field" }, h("span", { text: t("大腦（規劃、回答詢問、驗收）") }), planner),
+      h("label", { class: "field" }, h("span", { text: t("大腦（規劃、派工、驗收）") }), planner),
       h("label", { class: "field" }, h("span", { text: t("大腦推理強度") }), effort)),
     h("label", { class: "field" }, h("span", { text: t("雙手（呼叫工具、完成工作）") }), executor),
+    h("div", { class: "field" }, h("span", { text: t("委派方式") }),
+      h("label", { class: "check-line switch" }, delegation, delegationState), delegationHint),
     h("label", { class: "field" }, h("span", { text: t("驗收") }), review, reviewHint),
     h("label", { class: "field" }, h("span", { text: t("給大腦的指令（選填）") }), instructions,
-      h("span", { class: "hint", text: t("可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、回答詢問和驗收時都會遵守；雙手看到的是大腦據此寫出的計畫。") })),
-    paragraph(t("你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。"), "note"),
-    paragraph(t("Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。"), "note"),
-    paragraph(t("每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。"), "note"),
+      h("span", { class: "hint", text: t("可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、派工和驗收時都會遵守；雙手只看到大腦據此寫出的計畫或派工內容。") })),
+    flowNotes,
     paragraph(t("儲存後會重新啟動路由器，重新啟動 {app} 後就能在模型選單選擇。", { app: desktopName() }), "note"),
   ];
   const modal = openModal({ title: model ? t("修改組合模型") : t("新增組合模型"), body, wide: true });
@@ -24044,6 +24556,7 @@ function openComboEditor(model = null) {
         planner: { slug: planner.value, ...(effort.value ? { effort: effort.value } : {}) },
         executor: { slug: executor.value },
         review: review.value,
+        delegation: delegation.checked ? "subagent" : "router",
         instructions: instructions.value.trim(),
       };
       modal.close();
@@ -24116,7 +24629,7 @@ function renderProviders() {
       provider.primary ? h("span", { class: "chip cyan", text: t("主要") }) : null,
       h("span", { class: "chip", text: t("{count} 個模型", { count: provider.modelCount }) }),
       h("span", { class: "head-actions" },
-        h("button", { type: "button", class: "button small", disabled: blocked, title: t("修改名稱與模型前綴"),
+        h("button", { type: "button", class: "button small", disabled: blocked, title: t("修改名稱、前綴、Base URL 與 API Key"),
           onclick: () => openEditProvider(provider.id) }, icon("edit"), t("修改")))),
     h("div", { class: "body" },
       provider.name ? cardRow("ID", h("span", { class: "mono", text: provider.id })) : null,
@@ -24131,7 +24644,6 @@ function renderProviders() {
       backupKeysRow(provider, blocked)),
     h("div", { class: "foot" },
       h("button", { type: "button", class: "button small", disabled: blocked, onclick: () => openAddModels(provider.id) }, icon("plus"), t("添加模型")),
-      h("button", { type: "button", class: "button small", onclick: () => openReplaceKey(provider) }, icon("key"), t("更換 API Key")),
       h("button", {
         type: "button", class: "button small", disabled: blocked || (provider.backupKeys || []).length >= MAX_BACKUP_KEYS,
         title: (provider.backupKeys || []).length >= MAX_BACKUP_KEYS ? t("每家供應商最多 {count} 把備用 Key", { count: MAX_BACKUP_KEYS }) : null,
@@ -24282,18 +24794,33 @@ function prefixSummary(providerId, prefix) {
   return h("span", { class: "muted", text: t("自動：上游已有前綴時沿用，否則 {prefix}/", { prefix: autoPrefix(providerId) }) });
 }
 
-// 修改供應商的名稱與模型前綴。名稱只用於顯示，內部 id 不變；前綴決定選擇器裡這家模型的
-// 顯示名稱，只改自動產生的名稱。一邊輸入一邊向安裝器要預覽，與實際寫入用同一套規則。
+function normalizeBaseUrlInput(value) {
+  const parsed = new URL(value);
+  if (!/^https?:$/.test(parsed.protocol)) throw new Error("protocol");
+  parsed.hash = "";
+  parsed.search = "";
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+  return parsed.toString().replace(/\/$/, "");
+}
+
+// 修改供應商的名稱、模型前綴、Base URL 與主 API Key。名稱只用於顯示，內部 id 不變；
+// 前綴決定選擇器裡這家模型的顯示名稱，只改自動產生的名稱。一邊輸入一邊向安裝器要預覽，
+// 與實際寫入用同一套規則；API Key 不送去預覽，只在儲存時送給安裝器驗證與寫入。
 function openEditProvider(providerId) {
   const cli = providerId === CLAUDE_CLI_ID;
   const provider = cli ? null : (state.providers || []).find((item) => item.id === providerId);
   if (!cli && !provider) return;
   const currentPrefix = cli ? (state.claudeCli && state.claudeCli.modelPrefix) || "" : provider.modelPrefix || "";
   const currentName = cli ? t("Claude 訂閱") : provider.name || provider.id;
+  const currentBaseUrl = cli ? "" : provider.baseUrl || "";
   const name = h("input", { type: "text", value: currentName, maxlength: String(PROVIDER_NAME_MAX_LENGTH), disabled: cli, spellcheck: "false" });
   const prefix = h("input", { type: "text", value: currentPrefix, maxlength: "40", spellcheck: "false", autocomplete: "off",
     placeholder: cli ? t("留空＝自動（{prefix}/）", { prefix: autoPrefix(providerId) })
       : t("留空＝自動（{prefix}/ 或上游原名）", { prefix: autoPrefix(providerId) }) });
+  const baseUrl = cli ? null : h("input", { type: "url", value: currentBaseUrl, spellcheck: "false", autocomplete: "off",
+    placeholder: "https://api.example.com/v1" });
+  const apiKey = cli ? null : h("input", { type: "password", autocomplete: "new-password", spellcheck: "false",
+    placeholder: provider.keyStored ? t("留空則保留目前的 API Key") : t("目前找不到 API Key，請填入新的 API Key") });
   const preview = h("div", { class: "stack" });
   const saveButton = h("button", { type: "button", class: "button primary", text: t("儲存") });
   const models = (state.models || []).filter((model) => (cli ? model.transport === "claude-cli" : model.transport !== "claude-cli" && model.providerId === providerId));
@@ -24306,21 +24833,37 @@ function openEditProvider(providerId) {
       h("span", { class: "hint", text: cli
         ? t("選擇器裡 Claude 訂閱的模型顯示成「前綴/模型名」；留空使用預設的「claude-cli/」。之後新增的模型也會套用。")
         : t("選擇器裡這家的模型顯示成「前綴/模型名」，上游自帶的前綴（例如 ark/）會被取代，不會疊成兩層。留空使用自動規則：上游已有前綴時沿用原名，否則補「{prefix}/」。之後新增的模型也會套用。", { prefix: autoPrefix(providerId) }) })),
+    !cli ? h("label", { class: "field" }, h("span", { text: "Base URL" }), baseUrl,
+      h("span", { class: "hint", text: t("更換網域或站點時修改；會連線確認 API 根地址並驗證 API Key，儲存後自動重新啟動路由器。既有模型的上游 ID 與介面設定維持不變。") })) : null,
+    !cli ? h("label", { class: "field" }, h("span", { text: t("更換 API Key") }), apiKey,
+      h("span", { class: "hint", text: t("選填：要更換主 Key（或改 Base URL 同時換 Key）時填寫。會先查詢模型清單驗證，上游明確拒絕（401／403）時不會覆蓋原本的 Key。") })) : null,
     preview,
-    paragraph(t("只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。", { app: desktopName() }), "note"),
+    paragraph(cli
+      ? t("只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。", { app: desktopName() })
+      : t("只改名稱、前綴或 API Key 不會重新啟動路由器；修改 Base URL 會連線驗證並重新啟動路由器。模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。", { app: desktopName() }), "note"),
   ] });
   modal.setFoot(h("span", { class: "grow" }),
     h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }), saveButton);
 
   let timer = null;
   let request = 0;
-  const fields = () => ({ name: name.value, modelPrefix: prefix.value });
+  const fields = () => ({ name: name.value, modelPrefix: prefix.value, baseUrl: baseUrl.value });
   // 先在本機檢查格式，訊息才會跟著介面語言；重名之類需要完整設定的檢查交給安裝器。
   const localProblem = () => {
     const value = prefix.value.trim().replace(/\/+$/, "");
     if (value && !MODEL_PREFIX_PATTERN.test(value)) return t("前綴只能用英文字母、數字、點、底線與連字號，1～32 個字元，開頭與結尾必須是英文字母或數字。");
     if (!cli && name.value.replace(/\s+/g, " ").trim().length > PROVIDER_NAME_MAX_LENGTH) {
       return t("名稱最多 {max} 個字。", { max: PROVIDER_NAME_MAX_LENGTH });
+    }
+    if (!cli) {
+      const rawUrl = baseUrl.value.trim();
+      if (!rawUrl) return t("請填寫 Base URL。");
+      try {
+        const parsed = new URL(rawUrl);
+        if (!/^https?:$/.test(parsed.protocol)) return t("Base URL 必須使用 http:// 或 https://。");
+      } catch {
+        return t("Base URL 格式無效。");
+      }
     }
     return null;
   };
@@ -24372,17 +24915,31 @@ function openEditProvider(providerId) {
   };
   name.addEventListener("input", update);
   prefix.addEventListener("input", update);
+  if (!cli) baseUrl.addEventListener("input", update);
   saveButton.onclick = () => {
     if (localProblem()) return;
     const nextName = name.value.replace(/\s+/g, " ").trim();
     const nextPrefix = prefix.value.trim().replace(/\/+$/, "");
-    if ((cli || nextName === currentName || (!nextName && !provider.name)) && nextPrefix === currentPrefix) {
+    const nextBaseUrl = cli ? "" : normalizeBaseUrlInput(baseUrl.value.trim());
+    const nextApiKey = cli ? "" : apiKey.value.trim();
+    const nameSame = cli || nextName === currentName || (!nextName && !provider.name);
+    const prefixSame = nextPrefix === currentPrefix;
+    const urlSame = cli || nextBaseUrl === currentBaseUrl;
+    if (nameSame && prefixSame && urlSame && !nextApiKey) {
       modal.close();
       toast(t("沒有任何變更。"));
       return;
     }
+    if (!cli) apiKey.value = "";
     modal.close();
-    runJob("edit-provider", cli ? { providerId, modelPrefix: nextPrefix } : { providerId, name: nextName, modelPrefix: nextPrefix },
+    const params = cli
+      ? { providerId, modelPrefix: nextPrefix }
+      : {
+        providerId, name: nextName, modelPrefix: nextPrefix,
+        ...(!urlSame ? { baseUrl: nextBaseUrl } : {}),
+        ...(nextApiKey ? { apiKey: nextApiKey } : {}),
+      };
+    runJob("edit-provider", params,
       { title: t("修改供應商：{name}", { name: cli ? t("Claude 訂閱") : nextName || providerId }) });
   };
   showPreview({ renames: [], kept: [], conflicts: [] });
@@ -26094,27 +26651,6 @@ function openAddProvider({ firstInstall = false } = {}) {
         backups.clear();
       } }));
   }
-}
-
-function openReplaceKey(provider) {
-  const apiKey = h("input", { type: "password", placeholder: t("新的 API Key"), autocomplete: "new-password", spellcheck: "false" });
-  const modal = openModal({
-    title: t("更換 API Key：{name}", { name: providerLabel(provider.id) }),
-    body: [
-      h("dl", { class: "kv" }, h("dt", { text: "Base URL" }), h("dd", { class: "mono", text: provider.baseUrl || "—" })),
-      h("label", { class: "field" }, h("span", { text: t("新的 API Key") }), apiKey),
-      paragraph(t("會先用新 Key 查詢模型清單：上游明確拒絕（401／403）時不會更換。路由器會自動改用新 Key，不需要重新啟動。"), "note"),
-    ],
-  });
-  modal.setFoot(h("span", { class: "grow" }),
-    h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }),
-    h("button", { type: "button", class: "button primary", text: t("驗證並儲存"), onclick: () => {
-      const value = apiKey.value.trim();
-      if (!value) { toast(t("請填寫新的 API Key。"), "error"); return; }
-      apiKey.value = "";
-      modal.close();
-      runJob("replace-key", { providerId: provider.id, apiKey: value }, { title: t("更換 API Key：{name}", { name: providerLabel(provider.id) }) });
-    } }));
 }
 
 function confirmRemoveProvider(provider) {

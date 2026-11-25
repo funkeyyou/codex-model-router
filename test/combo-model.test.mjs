@@ -107,7 +107,13 @@ test("建立與修改組合：成員檢查、上下文取較小值、推理強�
   assert.equal(route.contextWindow, 400000);
   assert.deepEqual(route.efforts, executorRoute.efforts);
   assert.deepEqual(route.combo, { planner: { slug: "custom/planner", effort: "high" }, executor: { slug: "custom/executor" },
-    review: "strict", instructions: "npm test", executorTranslate: "chat", inputModalities: ["text", "image"] });
+    review: "strict", delegation: "subagent", instructions: "npm test", executorTranslate: "chat", inputModalities: ["text", "image"] });
+  // 委派方式：預設 Codex 子 Agent，可改成路由器內建；修改時沒帶這個欄位就沿用原本的設定。
+  const routerMode = installer.planSaveCombo(manifest, settings, catalog, { ...input, delegation: "router" });
+  assert.equal(routerMode.route.combo.delegation, "router");
+  assert.equal(installer.planSaveCombo(manifest, routerMode.settings, routerMode.catalog,
+    { ...input, slug: routerMode.route.pickerSlug, delegation: undefined }).route.combo.delegation, "router");
+  assert.throws(() => installer.planSaveCombo(manifest, settings, catalog, { ...input, delegation: "auto" }), /委派方式無效/);
   assert.equal(installer.planSaveCombo(manifest, settings, catalog, { ...input, instructions: undefined, criteria: "舊欄位" }).route.combo.instructions, "舊欄位");
   assert.throws(() => installer.planSaveCombo(manifest, settings, catalog, { ...input, instructions: "x".repeat(4001) }), /4000/);
   const entry = plan.catalog.models.find((model) => model.slug === route.pickerSlug);
@@ -320,4 +326,177 @@ test("背景任務直接交給雙手，不呼叫大腦", async (t) => {
   const events = await readEvents(response);
   assert.equal(events.at(-1).type, "response.completed");
   assert.deepEqual(models, ["exec-model"]);
+});
+
+// ---- Codex 原生子 Agent 委派 ------------------------------------------------------
+const spawnParameters = { type: "object", properties: {
+  task_name: { type: "string" }, message: { type: "string" }, fork_turns: { type: "string" },
+  model: { type: "string" }, reasoning_effort: { type: "string" } }, required: ["task_name", "message"] };
+const collaborationTools = { type: "additional_tools", role: "developer", tools: [
+  { type: "namespace", name: "functions", tools: [{ type: "function", name: "shell", parameters: { type: "object", properties: {} } }] },
+  { type: "namespace", name: "collaboration", tools: [
+    { type: "function", name: "spawn_agent", parameters: spawnParameters },
+    { type: "function", name: "wait_agent", parameters: { type: "object", properties: {} } },
+    { type: "function", name: "followup_task", parameters: { type: "object", properties: {} } },
+  ] },
+] };
+
+test("原生子 Agent：偵測 spawn_agent、子 Agent 標頭、改寫派工參數，提醒只依輸入決定位置", () => {
+  const spawn = router.comboSpawnTool({ input: [collaborationTools, user("hi")], tools: [] });
+  assert.equal(spawn.namespace, "collaboration");
+  assert.deepEqual(spawn.names, ["spawn_agent", "wait_agent", "followup_task"]);
+  assert.ok("model" in spawn.properties);
+  assert.equal(router.comboSpawnTool({ input: [user("hi")], tools: [{ type: "function", name: "shell" }] }), null);
+  assert.equal(router.comboSpawnTool({ tools: [{ type: "function", name: "spawn_agent", parameters: spawnParameters }] }).namespace, null);
+
+  assert.equal(router.comboSubagentRequest({ "x-openai-subagent": "thread_spawn" }), true);
+  assert.equal(router.comboSubagentRequest({ "x-openai-subagent": "review", "x-codex-parent-thread-id": "p" }), false);
+  assert.equal(router.comboSubagentRequest({ "x-codex-parent-thread-id": "parent" }), true);
+  assert.equal(router.comboSubagentRequest({}), false);
+
+  const executor = { pickerSlug: "custom/executor-e2e", efforts: ["low", "medium", "high"] };
+  const rewrite = (args, properties = spawn.properties) =>
+    JSON.parse(router.comboSpawnArguments(JSON.stringify(args), { comboSlug: "custom/combo-x", executor, properties }) || "null");
+  assert.deepEqual(rewrite({ task_name: "a", message: "m" }), { task_name: "a", message: "m", model: "custom/executor-e2e", fork_turns: "none" });
+  assert.deepEqual(rewrite({ message: "m", model: "custom/combo-x", fork_turns: "all", reasoning_effort: "max" }),
+    { message: "m", model: "custom/executor-e2e", fork_turns: "none" }, "不能派給組合本身；雙手不支援的推理強度改為沿用");
+  assert.equal(rewrite({ message: "m", model: "custom/executor-e2e", fork_turns: "none" }), null, "已正確指定時不改");
+  assert.deepEqual(rewrite({ message: "m", model: "custom/other" }), { message: "m", model: "custom/other", fork_turns: "none" }, "大腦明確選的其他模型保留");
+  assert.equal(rewrite({ message: "m" }, { message: {} }), null, "schema 沒有 model 時不動");
+  assert.equal(router.comboSpawnArguments("{oops", { comboSlug: "x", executor, properties: spawn.properties }), null);
+
+  const reminder = router.comboNativeReminder({ executor, spawn });
+  assert.match(reminder, /^<combo_planner>.*collaboration\.spawn_agent.*custom\/executor-e2e/);
+  const input = [collaborationTools, user("<environment_context>x</environment_context>"), user("第一題"),
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }, user("第二題")];
+  const injected = router.comboNativeInput(input, reminder);
+  assert.deepEqual(injected.map((item) => item.type === "message" ? item.role + ":" + item.content[0].text.slice(0, 14) : item.type),
+    ["additional_tools", "user:<environment_c", "user:第一題", "user:<combo_planner", "assistant:ok", "user:第二題", "user:<combo_planner"]);
+  assert.deepEqual(router.comboNativeInput(input.slice(0, 4), reminder), injected.slice(0, 5), "前一輪的插入位置不會因為新訊息而改變");
+  assert.equal(router.isComboUserMessage(injected[3]), false, "提醒不算新的使用者輸入");
+
+  const guide = router.comboNativeGuide({ combo: { review: "strict", instructions: "npm test 要過" },
+    planner: { displayName: "api/planner-model" }, executor: { ...executor, displayName: "api/exec-model" }, plannerEffort: "high", spawn });
+  assert.match(guide, /PLANNER \(api\/planner-model（high）\)[\s\S]*api\/exec-model/);
+  assert.match(guide, /model "custom\/executor-e2e" and fork_turns "none"/);
+  assert.match(guide, /wait_agent[\s\S]*followup_task/);
+  assert.match(guide, /takes precedence over any default guidance that discourages spawning sub-agents/);
+  assert.match(guide, /actual tool output[\s\S]*<planner_instructions>\nnpm test 要過/);
+});
+
+function spawnReply(id, args) {
+  const item = { id: "fc_" + id, type: "function_call", namespace: "collaboration", name: "spawn_agent",
+    arguments: JSON.stringify(args), call_id: "spawn-" + id, status: "completed" };
+  const half = Math.ceil(item.arguments.length / 2);
+  return sse([{ type: "response.created", response: { id, status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
+    { type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: item.arguments.slice(0, half) },
+    { type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: item.arguments.slice(half) },
+    { type: "response.function_call_arguments.done", output_index: 0, item_id: item.id, arguments: item.arguments },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id, status: "completed", output: [item], usage } }]);
+}
+
+async function comboRouter(t, routes) {
+  const previousKey = process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
+  process.env.CODEX_MODEL_ROUTER_TEST_API_KEY = "fixture-key";
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
+    else process.env.CODEX_MODEL_ROUTER_TEST_API_KEY = previousKey;
+  });
+  const instance = await loadRouterWith({ upstreamWebSocket: false, usageLog: false, routes });
+  instance.routerServer.listen(0, "127.0.0.1");
+  await once(instance.routerServer, "listening");
+  t.after(() => new Promise((resolve) => instance.routerServer.close(resolve)));
+  return "http://127.0.0.1:" + instance.routerServer.address().port;
+}
+
+test("原生子 Agent 端到端：主執行緒交給大腦、派工改派雙手；子 Agent 帶組合 ID 時直接交給雙手", async (t) => {
+  const nativeCombo = { ...comboRoute, combo: { ...comboRoute.combo, delegation: "subagent", review: "strict", instructions: "npm test 要過" } };
+  const origin = await comboRouter(t, [plannerE2E, executorE2E, nativeCombo]);
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  const replies = [() => spawnReply("s1", { task_name: "fix_login", message: "修好 src/login.js，回報 diff 與 npm test 結果" }),
+    () => textReply("x1", "子 Agent 完成"), () => textReply("p2", "整理後的最終回答")];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    const href = String(url);
+    if (href.startsWith("http://127.0.0.1")) return realFetch(url, options);
+    if (href.endsWith("/models")) return Response.json({ models: [] });
+    calls.push(JSON.parse(String(options.body)));
+    return replies.shift()();
+  });
+  const headers = { "content-type": "application/json", authorization: "Bearer fixture", "chatgpt-account-id": "acct", "session-id": "native-e2e" };
+  const instructions = "You are Codex, an agent based on exec-model. You and the user share one workspace.";
+  const first = [collaborationTools, user("<environment_context>cwd</environment_context>"), user("修好登入")];
+  const post = (input, extra = {}) => realFetch(origin + "/v1/responses", { method: "POST", headers: { ...headers, ...extra },
+    body: JSON.stringify({ model: nativeCombo.pickerSlug, instructions, input, reasoning: { effort: "medium" }, stream: true, prompt_cache_key: "native-1" }) });
+
+  const events = await readEvents(await post(first));
+  assert.equal(calls.length, 1, "一次請求只呼叫大腦，沒有路由器內部的規劃或執行");
+  const [plannerCall] = calls;
+  assert.equal(plannerCall.model, "planner-model");
+  assert.equal(plannerCall.reasoning.effort, "high");
+  assert.match(plannerCall.instructions, /^You are Codex, an agent based on planner-model\. You and the user share one workspace\.\n\n# Planner\/executor combo/);
+  assert.match(plannerCall.instructions, /model "custom\/executor-e2e"[\s\S]*actual tool output[\s\S]*npm test 要過/);
+  assert.deepEqual(userTexts(plannerCall.input).slice(-2).map((text) => text.slice(0, 15)), ["修好登入", "<combo_planner>"]);
+  assert.equal(plannerCall.input[0].type, "additional_tools", "大腦拿到 Codex 的完整工具，包括子 Agent 工具");
+
+  // Codex 看到的派工參數已補上雙手模型與 fork_turns，串流片段、完成項目與完成事件三處一致。
+  const expected = { task_name: "fix_login", message: "修好 src/login.js，回報 diff 與 npm test 結果", model: "custom/executor-e2e", fork_turns: "none" };
+  const done = events.find((event) => event.type === "response.output_item.done");
+  assert.equal(done.item.namespace, "collaboration");
+  assert.deepEqual(JSON.parse(done.item.arguments), expected);
+  const deltas = events.filter((event) => event.type === "response.function_call_arguments.delta");
+  assert.equal(deltas.length, 1);
+  assert.deepEqual(JSON.parse(deltas[0].delta), expected);
+  assert.deepEqual(JSON.parse(events.find((event) => event.type === "response.function_call_arguments.done").arguments), expected);
+  const completed = events.at(-1);
+  assert.equal(completed.type, "response.completed");
+  assert.deepEqual(JSON.parse(completed.response.output[0].arguments), expected);
+
+  // 子 Agent 若仍以組合模型的 ID 進來，交給雙手，而不是再派工一次。
+  await readEvents(await post([user("修好 src/login.js")], { "x-openai-subagent": "thread_spawn", "x-codex-parent-thread-id": "parent" }));
+  assert.equal(calls[1].model, "exec-model");
+  assert.ok(!String(calls[1].instructions || "").includes("Planner/executor combo"));
+
+  // 下一次請求帶回派工結果：仍由大腦處理，前一輪送出的內容原樣延續（快取可命中）。
+  const second = [...first, ...completed.response.output, { type: "function_call_output", call_id: "spawn-s1", output: "agent started" }];
+  await readEvents(await post(second));
+  const again = calls[2];
+  assert.equal(again.model, "planner-model");
+  assert.equal(again.instructions, plannerCall.instructions);
+  assert.deepEqual(again.input.slice(0, plannerCall.input.length).map((item) => JSON.stringify(item)),
+    plannerCall.input.map((item) => JSON.stringify(item)));
+  const health = await realFetch(origin + "/healthz").then((response) => response.json());
+  assert.equal(health.stats.comboNative, 2);
+  assert.equal(health.stats.comboNativeSubagents, 1);
+  assert.equal(health.stats.comboSpawnRewrites, 1);
+  assert.equal(health.stats.comboPlans, 0);
+});
+
+test("委派方式選路由器內建，或 Codex 沒有子 Agent 工具時，改用路由器內建流程", async (t) => {
+  const routerCombo = { ...comboRoute, pickerSlug: "custom/combo-router", combo: { ...comboRoute.combo, delegation: "router", review: "off" } };
+  const fallbackCombo = { ...comboRoute, pickerSlug: "custom/combo-fallback", combo: { ...comboRoute.combo, review: "off" } };
+  const origin = await comboRouter(t, [plannerE2E, executorE2E, routerCombo, fallbackCombo]);
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    const href = String(url);
+    if (href.startsWith("http://127.0.0.1")) return realFetch(url, options);
+    if (href.endsWith("/models")) return Response.json({ models: [] });
+    const body = JSON.parse(String(options.body));
+    calls.push(body);
+    return textReply("r" + calls.length, body.model === "planner-model" ? "PLAN" : "DONE");
+  });
+  const post = (model, input) => realFetch(origin + "/v1/responses", { method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer fixture", "chatgpt-account-id": "acct", "session-id": model },
+    body: JSON.stringify({ model, input, reasoning: { effort: "medium" }, stream: true, prompt_cache_key: model }) });
+  const shellOnly = { ...collaborationTools, tools: [collaborationTools.tools[0]] };
+  for (const [model, tools] of [[routerCombo.pickerSlug, collaborationTools], [fallbackCombo.pickerSlug, shellOnly]]) {
+    const start = calls.length;
+    const events = await readEvents(await post(model, [tools, user("修好登入")]));
+    assert.equal(events.at(-1).type, "response.completed");
+    assert.deepEqual(calls.slice(start).map((call) => call.model), ["planner-model", "exec-model"], model);
+    assert.match(userTexts(calls[start].input).at(-1), /Write the plan/);
+  }
 });

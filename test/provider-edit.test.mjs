@@ -208,3 +208,55 @@ test("更新、新增與移除供應商都保留其他家的名稱與前綴", ()
   const removed = installer.planRemoveProvider(base.manifest, base.settings, base.catalog, "default");
   assert.deepEqual([removed.settings.providers[0].id, removed.settings.providers[0].name], ["owo", "PingPing"]);
 });
+
+test("修改 Base URL：更新 apiRoot、keychainService、providerHost 與目錄描述，擋下無效或重複網址", () => {
+  const before = fixture();
+  before.settings.routes[0].providerHost = "gw.example";
+  before.settings.routes[3].providerHost = "owo.example";
+  before.manifest.routes[0].providerHost = "gw.example";
+  before.manifest.routes[3].providerHost = "owo.example";
+  before.catalog.models.find((m) => m.slug === "custom/a").description = "ark/gpt-a，由 gw.example 提供";
+  before.catalog.models.find((m) => m.slug === "custom/owo-d").description = "claude-d，由 owo.example 提供";
+  const original = structuredClone(before);
+
+  // 只有結尾斜線差異視為未變更。
+  const same = installer.planEditProvider(before.manifest, before.settings, before.catalog, "default", { baseUrl: "https://gw.example/" });
+  assert.equal(same.changed, false);
+  assert.equal(same.baseUrlChanged, false);
+  assert.equal(same.restartRouter, false);
+
+  // 變更主要供應商 Base URL：帶入探測到的 apiRoot，同步舊頂層欄位、路由 host 與模型描述。
+  const moved = installer.planEditProvider(before.manifest, before.settings, before.catalog, "default",
+    { baseUrl: "https://new-gw.example:9880/", apiRoot: "https://new-gw.example:9880/v1" });
+  assert.equal(moved.changed, true);
+  assert.equal(moved.baseUrlChanged, true);
+  assert.equal(moved.restartRouter, true);
+  assert.equal(moved.restartDesktop, false, "未改模型顯示名稱不必強制重啟桌面版");
+  assert.equal(moved.baseUrl, "https://new-gw.example:9880");
+  assert.equal(moved.apiRoot, "https://new-gw.example:9880/v1");
+  assert.notEqual(moved.keychainService, "svc.gw");
+  assert.equal(moved.settings.providers[0].baseUrl, "https://new-gw.example:9880");
+  assert.equal(moved.settings.providers[0].apiRoot, "https://new-gw.example:9880/v1");
+  assert.equal(moved.settings.providers[0].keychainService, moved.keychainService);
+  assert.equal(moved.manifest.baseUrl, "https://new-gw.example:9880", "install.json 同步主要供應商舊欄位");
+  assert.equal(moved.manifest.apiRoot, "https://new-gw.example:9880/v1");
+  assert.equal(moved.manifest.keychainService, moved.keychainService);
+  assert.equal(moved.settings.routes[0].providerHost, "new-gw.example:9880");
+  assert.equal(moved.manifest.routes[0].providerHost, "new-gw.example:9880");
+  assert.equal(moved.settings.routes[3].providerHost, "owo.example", "其他供應商的路由不受影響");
+  assert.equal(moved.catalog.models.find((m) => m.slug === "custom/a").description, "ark/gpt-a，由 new-gw.example:9880 提供");
+  assert.equal(moved.catalog.models.find((m) => m.slug === "custom/owo-d").description, "claude-d，由 owo.example 提供");
+  assert.deepEqual(before, original, "不能改動傳入物件");
+
+  // 未指定 apiRoot（預覽情境）時使用第一個候選位址。
+  const preview = installer.planEditProvider(before.manifest, before.settings, before.catalog, "owo", { baseUrl: "https://direct.example:9880" });
+  assert.equal(preview.baseUrlChanged, true);
+  assert.equal(preview.apiRoot, "https://direct.example:9880/v1");
+
+  // 無效、空白、重複與 Claude 訂閱一律拒絕。
+  assert.throws(() => installer.planEditProvider(before.manifest, before.settings, before.catalog, "default", { baseUrl: "" }), /請填寫 Base URL/);
+  assert.throws(() => installer.planEditProvider(before.manifest, before.settings, before.catalog, "default", { baseUrl: "not-a-url" }), /Base URL 無效/);
+  assert.throws(() => installer.planEditProvider(before.manifest, before.settings, before.catalog, "default", { baseUrl: "ftp://gw.example" }), /http:\/\/ 或 https:\/\//);
+  assert.throws(() => installer.planEditProvider(before.manifest, before.settings, before.catalog, "default", { baseUrl: "https://owo.example/v1" }), /這個 Base URL 已經是供應商「owo」/);
+  assert.throws(() => installer.planEditProvider(before.manifest, before.settings, before.catalog, "claude-cli", { baseUrl: "https://a.example" }), /沒有 Base URL/);
+});

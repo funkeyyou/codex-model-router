@@ -96,6 +96,10 @@ async function upstream(t) {
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
     requests.push({ path: req.url, model: body.model, key: req.headers.authorization });
     res.setHeader("content-type", "application/json");
+    if (req.url.split("?")[0] === "/moved/v1/models") {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ error: { message: "not found" } }));
+    }
     if (req.url.split("?")[0].endsWith("/models")) return res.end(JSON.stringify({ data: ["claude-opus-fixture", "claude-sonnet-fixture"].map(id => ({ id })) }));
     if (body.max_tokens === 9999999) {
       res.statusCode = 400;
@@ -158,6 +162,16 @@ test("沒有 Codex：首次安裝、Claude Gateway 對話、模型管理、更�
   await ops.jobs["reorder-models"].run({ slugs: models.map(m => m.slug).reverse() });
   await ops.jobs["edit-model"].run({ slug: models[0].slug, displayName: "Fixture Opus", contextWindow: 500000, maxOutputTokens: 64000 });
   await ops.jobs["edit-provider"].run({ providerId: "default", name: "Fixture", modelPrefix: "fixture" });
+  // 變更 Base URL 與 API Key：/moved/v1/models 回 404、/moved/models 回 200，應自動改用 /moved 並重啟路由器。
+  const moved = await ops.jobs["edit-provider"].run({ providerId: "default", baseUrl: ${JSON.stringify(api.baseUrl + "/moved")}, apiKey: "moved-key" });
+  assert.equal(moved.baseUrlChanged, true);
+  assert.equal(moved.keyChanged, true);
+  assert.equal(moved.keyVerified, true);
+  assert.equal(readSettingsIfExists().providers[0].baseUrl, ${JSON.stringify(api.baseUrl + "/moved")});
+  assert.equal(readSettingsIfExists().providers[0].apiRoot, ${JSON.stringify(api.baseUrl + "/moved")});
+  const afterMove = await fetch(root + "/claude/v1/messages", { method: "POST", headers, body: JSON.stringify({
+    model: first.models[0].slug, max_tokens: 16, messages: [{ role: "user", content: "after move" }] }) });
+  assert.equal(afterMove.status, 200);
   const second = await ops.providerDraft({ baseUrl: ${JSON.stringify(api.baseUrl + "/second")}, apiKey: "fixture-key" });
   await ops.jobs["add-provider"].run({ draftId: second.draftId, providerId: "second", models: ["claude-sonnet-fixture"] });
   await ops.jobs["remove-provider"].run({ providerId: "second", deleteKey: false });
@@ -187,6 +201,7 @@ test("沒有 Codex：首次安裝、Claude Gateway 對話、模型管理、更�
   for (const [file, content] of Object.entries(untouched)) assert.equal(readFileSync(join(codexHome, file), "utf8"), content);
   `);
   assert.ok(api.requests.some(req => req.model === "claude-opus-fixture" && req.key === "Bearer fixture-key"));
+  assert.ok(api.requests.some(req => req.path === "/moved/messages" && req.model === "claude-opus-fixture"), "修改 Base URL 後應改送往新路徑");
 });
 
 test("獨立安裝後偵測到 Codex 不自動改設定；明確連接可用真實 Codex model/list 驗證並可回退", {

@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.47.0";
+const INSTALLER_VERSION = "1.48.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1037,6 +1037,46 @@ function rememberPrimaryModels(providerId, models) {
     if (models) pool.primaryModels[providerId] = models; else delete pool.primaryModels[providerId];
     writeKeyPoolFile(pool);
   } catch { /* 清單只用來挑 Key，存不下時路由器把主 Key 視為支援全部模型。 */ }
+}
+
+// 變更供應商 Base URL 時探測可用的 API 根地址並驗證金鑰；任一候選回 2xx 即確認可用，
+// 上游明確拒絕（401／403）或全部連不上則直接失敗，不覆蓋原本能用的設定。
+async function probeProviderBaseUrl(baseUrl, apiKey) {
+  const candidates = candidateApiRoots(baseUrl);
+  const failures = [];
+  let authStatus = null;
+  for (const apiRoot of candidates) {
+    const result = await fetchKeyModels(apiRoot, apiKey);
+    if (result.status != null && result.status >= 200 && result.status < 300) {
+      return { apiRoot, models: result.models, status: result.status };
+    }
+    if (result.status === 401 || result.status === 403) authStatus = result.status;
+    failures.push(`${apiRoot}/models: ${result.status != null ? `HTTP ${result.status}` : result.problem}`);
+  }
+  if (authStatus) {
+    fail(`新的 Base URL 拒絕這把 API Key（HTTP ${authStatus}），設定未修改。若換了供應商站點，請一併填寫對應的 API Key。`);
+  }
+  fail(`無法連線到新的 Base URL（${failures.join("；")}），設定未修改。`);
+}
+
+// Base URL 變更後，重整該供應商在 key-pool.json 裡記錄的主 Key 與備用 Key 模型清單；
+// 查不到的備用 Key 清掉舊清單，免得路由器沿用舊站點的清單而跳過它。
+async function refreshKeyPoolModels(providerId, apiRoot, primaryModels) {
+  try {
+    const pool = readKeyPoolFile();
+    const backups = backupKeysOf(pool, providerId);
+    if (!backups.length) return;
+    pool.primaryModels = { ...(pool.primaryModels || {}) };
+    if (primaryModels) pool.primaryModels[providerId] = primaryModels; else delete pool.primaryModels[providerId];
+    await Promise.all(backups.map(async (item) => {
+      let key;
+      try { key = readApiKey(item.keychainService); } catch { delete item.models; return; }
+      const checked = await fetchKeyModels(apiRoot, key);
+      if (checked.models) item.models = checked.models;
+      else delete item.models;
+    }));
+    writeKeyPoolFile(pool);
+  } catch { /* 清單只用來挑 Key，更新失敗不影響剛儲存好的供應商設定。 */ }
 }
 
 // 合併主 Key 與備用 Key 的模型清單，順便把各自的清單記進 key-pool.json 給路由器用。
@@ -2104,11 +2144,11 @@ function providerRoutes(routes, providerId) {
     : route.transport !== "claude-cli" && routeProviderId(route) === providerId);
 }
 
-// 修改供應商的顯示名稱與模型前綴。只改名稱欄位、自動產生的模型顯示名稱與模型目錄裡對應的
-// display_name；id、選擇器 ID、上游 ID、憑證與路由能力一律不變，路由器轉發用不到這些欄位，
-// 所以不必重啟路由器。name／modelPrefix 為 undefined 表示不修改，空字串代表恢復預設。
-// Claude 訂閱只能改前綴，名稱固定。
-export function planEditProvider(manifest, settings, catalog, providerId, { name, modelPrefix } = {}) {
+// 修改供應商的顯示名稱、模型前綴與 Base URL。只改名稱與前綴時不必重啟路由器；
+// 變更 Base URL 時一併更新 apiRoot、keychainService、credentialPath、路由的 providerHost
+// 與模型目錄裡的來源描述，並由呼叫端重啟路由器。name／modelPrefix 為 undefined 表示不修改，
+// 空字串代表恢復預設；Claude 訂閱只能改前綴，名稱固定且沒有 Base URL。
+export function planEditProvider(manifest, settings, catalog, providerId, { name, modelPrefix, baseUrl, apiRoot } = {}) {
   if (!manifest || !Array.isArray(settings?.routes) || !Array.isArray(catalog?.models)) {
     fail("安裝設定或模型目錄不完整，無法修改供應商。");
   }
@@ -2138,6 +2178,30 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
   const previousPrefix = cli ? validModelPrefix(settings.claudeCli?.modelPrefix) : provider.modelPrefix || null;
   const nextPrefix = modelPrefix === undefined ? previousPrefix : normalizeModelPrefix(modelPrefix);
 
+  let nextBaseUrl = cli ? null : provider.baseUrl;
+  if (baseUrl !== undefined) {
+    if (cli) {
+      if (baseUrl !== null && String(baseUrl).trim() !== "") fail("Claude 訂閱沒有 Base URL，不支援修改。");
+    } else {
+      const rawUrl = baseUrl === null ? "" : String(baseUrl).trim();
+      if (!rawUrl) fail("請填寫 Base URL。");
+      nextBaseUrl = normalizeUrl(rawUrl);
+      const clash = providers.find((item) => item.id !== provider.id && item.baseUrl === nextBaseUrl);
+      if (clash) fail(`這個 Base URL 已經是供應商「${providerName(clash)}」。`);
+    }
+  }
+  const baseUrlChanged = !cli && nextBaseUrl !== provider.baseUrl;
+  const resolvedApiRoot = !cli && apiRoot !== undefined && apiRoot !== null && String(apiRoot).trim() !== ""
+    ? normalizeUrl(String(apiRoot).trim()) : null;
+  const nextApiRoot = cli ? null : (resolvedApiRoot || (baseUrlChanged ? candidateApiRoots(nextBaseUrl)[0] : provider.apiRoot));
+  const nextKeychainService = cli ? null : (baseUrlChanged ? keychainServiceFor(nextBaseUrl) : provider.keychainService);
+  const nextCredentialPath = cli ? null : (baseUrlChanged
+    ? (isWindows ? credentialFileFor(nextKeychainService) : null)
+    : (provider.credentialPath ?? null));
+  const previousHost = cli ? null : new URL(provider.apiRoot || provider.baseUrl).host;
+  const nextHost = cli ? null : new URL(nextApiRoot).host;
+  const routeSlugs = new Set(routes.map((route) => route.pickerSlug));
+
   const entries = new Map(catalog.models.map((model) => [model.slug, model]));
   const targets = autoModelDisplayNames(routes, nextPrefix);
   const renames = [];
@@ -2154,10 +2218,33 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
     }
   }
   const renamed = new Map(renames.map((item) => [item.slug, item.to]));
-  const rename = (route) => (renamed.has(route.pickerSlug) ? { ...route, displayName: renamed.get(route.pickerSlug) } : route);
-  const nextCatalog = renames.length === 0 ? catalog : {
+  const updateRoute = (route) => {
+    let next = route;
+    if (renamed.has(route.pickerSlug)) next = { ...next, displayName: renamed.get(route.pickerSlug) };
+    if (baseUrlChanged && routeSlugs.has(route.pickerSlug) && next.providerHost !== nextHost) {
+      next = { ...next, providerHost: nextHost };
+    }
+    return next;
+  };
+  const routeBySlug = new Map(routes.map((route) => [route.pickerSlug, route]));
+  const hostChanged = baseUrlChanged && nextHost !== previousHost;
+  let catalogChanged = renames.length > 0;
+  const updatedModels = catalog.models.map((model) => {
+    let next = model;
+    if (renamed.has(model.slug)) next = { ...next, display_name: renamed.get(model.slug) };
+    if (hostChanged && routeBySlug.has(model.slug) && typeof next.description === "string") {
+      const route = routeBySlug.get(model.slug);
+      const oldDesc = `${route.upstreamModel}，由 ${route.providerHost || previousHost} 提供`;
+      if (next.description === oldDesc) {
+        next = { ...next, description: `${route.upstreamModel}，由 ${nextHost} 提供` };
+        catalogChanged = true;
+      }
+    }
+    return next;
+  });
+  const nextCatalog = !catalogChanged ? catalog : {
     ...catalog,
-    models: catalog.models.map((model) => (renamed.has(model.slug) ? { ...model, display_name: renamed.get(model.slug) } : model)),
+    models: updatedModels,
   };
   // 同名不擋：使用者可能就是想這樣命名；交給畫面提醒。
   const counts = new Map();
@@ -2174,9 +2261,15 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
     delete next.modelPrefix;
     if (nextName) next.name = nextName;
     if (nextPrefix) next.modelPrefix = nextPrefix;
+    if (baseUrlChanged) {
+      next.baseUrl = nextBaseUrl;
+      next.apiRoot = nextApiRoot;
+      next.keychainService = nextKeychainService;
+      next.credentialPath = nextCredentialPath;
+    }
     return next;
   };
-  const routesOf = (record) => (Array.isArray(record.routes) ? record.routes.map(rename) : record.routes);
+  const routesOf = (record) => (Array.isArray(record.routes) ? record.routes.map(updateRoute) : record.routes);
   let nextSettings;
   let nextManifest;
   if (cli) {
@@ -2196,12 +2289,20 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
   }
   const providerChanged = nextName !== (cli ? null : provider.name || null) || nextPrefix !== previousPrefix;
   return {
-    changed: providerChanged || renames.length > 0,
+    changed: providerChanged || baseUrlChanged || renames.length > 0,
     providerId,
     name: nextName,
     previousName: cli ? null : provider.name || null,
     modelPrefix: nextPrefix,
     previousModelPrefix: previousPrefix,
+    baseUrl: nextBaseUrl,
+    previousBaseUrl: cli ? null : provider.baseUrl,
+    apiRoot: nextApiRoot,
+    previousApiRoot: cli ? null : provider.apiRoot,
+    baseUrlChanged,
+    keychainService: nextKeychainService,
+    previousKeychainService: cli ? null : provider.keychainService,
+    restartRouter: baseUrlChanged,
     renames,
     kept,
     conflicts,
@@ -4734,6 +4835,9 @@ export function planRemoveModels(manifest, settings, catalog, selectedSlugs) {
 // 選擇器的推理強度控制雙手；大腦固定使用這裡設定的推理強度。其他組合不能當成員（會形成巢狀）。
 // Antigravity CLI 與 Claude CLI 都可以：路由器讓兩個角色各自續接自己的對話。
 export const COMBO_REVIEW_LEVELS = ["off", "standard", "strict"];
+// 委派方式：subagent＝大腦在主執行緒用 Codex 的子 Agent 派工給雙手（預設；Codex 沒有子 Agent 工具時
+// 路由器自動改用內建流程）；router＝路由器在一輪裡依序呼叫大腦規劃、雙手執行。
+export const COMBO_DELEGATIONS = ["subagent", "router"];
 
 export function comboDependents(routes, slugs) {
   const removed = slugs instanceof Set ? slugs : new Set(slugs);
@@ -4773,6 +4877,8 @@ export function planSaveCombo(manifest, settings, catalog, input = {}) {
   if (plannerEffort && !plannerEfforts.includes(plannerEffort)) fail(`大腦模型不支援推理強度 ${plannerEffort}。`);
   const review = input.review ?? "off";
   if (!COMBO_REVIEW_LEVELS.includes(review)) fail("驗收選項無效。");
+  const delegation = input.delegation ?? existing?.combo?.delegation ?? "subagent";
+  if (!COMBO_DELEGATIONS.includes(delegation)) fail("委派方式無效。");
   // 給大腦的指令：完成條件、拆解與派工的注意事項。舊版欄位叫 criteria。
   const instructions = String(input.instructions ?? input.criteria ?? "").trim();
   if (instructions.length > 4000) fail("給大腦的指令最多 4000 個字元。");
@@ -4796,6 +4902,7 @@ export function planSaveCombo(manifest, settings, catalog, input = {}) {
       planner: { slug: planner.pickerSlug, ...(plannerEffort ? { effort: plannerEffort } : {}) },
       executor: { slug: executor.pickerSlug },
       review,
+      delegation,
       ...(instructions ? { instructions } : {}),
       executorTranslate: executor.translate || null,
       ...(Array.isArray(executorEntry?.input_modalities) ? { inputModalities: executorEntry.input_modalities } : {}),
@@ -5482,6 +5589,10 @@ function printProviderEdit(plan) {
   if (plan.name !== plan.previousName) console.log(`名稱：${label(plan.previousName)} → ${label(plan.name)}`);
   if (plan.modelPrefix !== plan.previousModelPrefix) {
     console.log(`模型前綴：${prefix(plan.previousModelPrefix)} → ${prefix(plan.modelPrefix)}`);
+  }
+  if (plan.baseUrlChanged) {
+    console.log(`Base URL：${plan.previousBaseUrl} → ${plan.baseUrl}`);
+    if (plan.apiRoot !== plan.previousApiRoot) console.log(`API 根地址：${plan.previousApiRoot} → ${plan.apiRoot}`);
   }
   if (plan.renames.length) {
     console.log(`選擇器裡會改名的模型（${plan.renames.length} 個）：`);
@@ -7546,6 +7657,7 @@ async function managerState() {
         planner: { slug: route.combo?.planner?.slug || null, effort: route.combo?.planner?.effort || null },
         executor: { slug: route.combo?.executor?.slug || null },
         review: COMBO_REVIEW_LEVELS.includes(route.combo?.review) ? route.combo.review : "off",
+        delegation: route.combo?.delegation === "router" ? "router" : "subagent",
         instructions: typeof route.combo?.instructions === "string" ? route.combo.instructions
           : typeof route.combo?.criteria === "string" ? route.combo.criteria : "",
       } } : {}),
@@ -8104,6 +8216,9 @@ async function managerSaveCombo(params = {}) {
   const reviewLabel = { off: "關閉", standard: "一般驗收", strict: "嚴格驗收" }[route.combo.review];
   console.log(`大腦：${name(route.combo.planner.slug)}${route.combo.planner.effort ? `（${route.combo.planner.effort}）` : ""}`);
   console.log(`雙手：${name(route.combo.executor.slug)}（推理強度跟隨 Codex 選擇器）`);
+  console.log(route.combo.delegation === "router"
+    ? "委派方式：路由器內建（大腦規劃、雙手執行，合成一個回應）"
+    : "委派方式：Codex 子 Agent（大腦在任務中派工給雙手；Codex 沒有子 Agent 工具時改用路由器內建流程）");
   console.log(`驗收：${reviewLabel}`);
   if (route.combo.instructions) console.log("已設定給大腦的指令。");
   console.log(`已儲存。備份：${backupDir}`);
@@ -8163,12 +8278,12 @@ async function managerDetectFast({ slug } = {}) {
   return { changed: true, fastProbe, fast: plan.fast, backupDir, restartDesktop: plan.restartDesktop };
 }
 
-// 網頁送來的名稱與前綴：undefined 不修改，null 或空字串恢復預設，其他型別一律拒絕。
-function providerEditFields({ name, modelPrefix } = {}) {
-  for (const value of [name, modelPrefix]) {
-    if (value !== undefined && value !== null && typeof value !== "string") fail("供應商名稱與前綴必須是文字。");
+// 網頁送來的供應商修改欄位：undefined 不修改，null 或空字串恢復預設（或留空不更換），其他型別一律拒絕。
+function providerEditFields({ name, modelPrefix, baseUrl, apiKey } = {}) {
+  for (const value of [name, modelPrefix, baseUrl, apiKey]) {
+    if (value !== undefined && value !== null && typeof value !== "string") fail("供應商名稱、前綴、Base URL 與 API Key 必須是文字。");
   }
-  return { name, modelPrefix };
+  return { name, modelPrefix, baseUrl, apiKey };
 }
 
 // 修改前的預覽：列出會改名、保留與同名的模型，不寫任何檔案。輸入無效時回傳原因，
@@ -8176,9 +8291,13 @@ function providerEditFields({ name, modelPrefix } = {}) {
 function managerProviderPreview({ providerId, ...fields } = {}) {
   const { manifest, settings, catalog } = requireInstallation();
   try {
-    const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
+    const { name, modelPrefix, baseUrl } = providerEditFields(fields);
+    const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), {
+      name, modelPrefix, ...(baseUrl !== undefined ? { baseUrl } : {}),
+    });
     return {
       ok: true, changed: plan.changed, name: plan.name, modelPrefix: plan.modelPrefix,
+      baseUrl: plan.baseUrl, baseUrlChanged: plan.baseUrlChanged, apiRoot: plan.apiRoot,
       renames: plan.renames, kept: plan.kept, conflicts: plan.conflicts,
     };
   } catch (error) {
@@ -8188,19 +8307,121 @@ function managerProviderPreview({ providerId, ...fields } = {}) {
 
 async function managerEditProvider({ providerId, ...fields } = {}) {
   assertManagerWritable();
-  const { manifest, settings, catalog } = requireInstallation();
-  const plan = planEditProvider(manifest, settings, catalog, String(providerId || ""), providerEditFields(fields));
-  if (!plan.changed) {
+  const id = String(providerId || "");
+  const parsed = providerEditFields(fields);
+  const cli = id === CLAUDE_CLI_PROVIDER_ID;
+  const nextApiKey = parsed.apiKey == null ? "" : parsed.apiKey.trim();
+  if (cli && nextApiKey) fail("Claude 訂閱不使用 API Key，不支援修改。");
+  const { manifest, settings, catalog, providers } = requireInstallation();
+  const provider = cli ? null : providers.find((item) => item.id === id);
+  const previewPlan = planEditProvider(manifest, settings, catalog, id, {
+    name: parsed.name,
+    modelPrefix: parsed.modelPrefix,
+    ...(parsed.baseUrl !== undefined ? { baseUrl: parsed.baseUrl } : {}),
+  });
+  const baseUrlChanged = previewPlan.baseUrlChanged;
+  const keyChanged = Boolean(nextApiKey);
+  if (!previewPlan.changed && !keyChanged) {
     console.log("沒有任何變更。");
     return { changed: false };
   }
-  printProviderEdit(plan);
-  console.log(plan.renames.length
-    ? "正在寫入供應商設定與模型目錄（不需要重新啟動路由器）…"
-    : "正在寫入供應商設定（不需要重新啟動路由器）…");
-  const backupDir = await commitCatalogChange("edit-provider", plan);
-  console.log(`已儲存。備份：${backupDir}`);
-  return { changed: true, renamed: plan.renames.length, backupDir, restartDesktop: plan.restartDesktop };
+
+  let plan = previewPlan;
+  let keyVerified = null;
+  let keyStatus = null;
+  let keyProblem = null;
+  let probedModels = null;
+  let effectiveKey = nextApiKey;
+
+  if (baseUrlChanged) {
+    if (!effectiveKey) {
+      try { effectiveKey = readApiKey(provider.keychainService); }
+      catch { fail("找不到這家供應商原本的 API Key；修改 Base URL 時請一併填寫 API Key。"); }
+    }
+    console.log(`正在連線到新的 Base URL（${previewPlan.baseUrl}）並驗證 API Key…`);
+    const probed = await probeProviderBaseUrl(previewPlan.baseUrl, effectiveKey);
+    probedModels = probed.models;
+    keyVerified = true;
+    keyStatus = probed.status;
+    plan = planEditProvider(manifest, settings, catalog, id, {
+      name: parsed.name,
+      modelPrefix: parsed.modelPrefix,
+      baseUrl: previewPlan.baseUrl,
+      apiRoot: probed.apiRoot,
+    });
+    console.log(`已確認 API 根地址：${plan.apiRoot}${probed.models?.length ? `（查到 ${probed.models.length} 個模型）` : ""}。`);
+  } else if (keyChanged) {
+    console.log(`正在用新 Key 查詢「${providerName(provider)}」的模型清單…`);
+    const checked = await fetchKeyModels(provider.apiRoot, nextApiKey);
+    if (checked.status === 401 || checked.status === 403) fail(`上游拒絕這把 Key（HTTP ${checked.status}），沒有更換。`);
+    probedModels = checked.models;
+    keyStatus = checked.status;
+    keyProblem = checked.problem || null;
+    keyVerified = checked.status != null && checked.status >= 200 && checked.status < 300;
+  }
+
+  const targetService = baseUrlChanged ? plan.keychainService : provider?.keychainService;
+  const targetBaseUrl = baseUrlChanged ? plan.baseUrl : provider?.baseUrl;
+  const needWriteKey = baseUrlChanged || keyChanged;
+  let previousTargetKey = null;
+  if (needWriteKey) {
+    if (keychainHas(targetService)) {
+      try { previousTargetKey = readApiKey(targetService); } catch {}
+    }
+    storeApiKeyValue(targetService, targetBaseUrl, effectiveKey);
+  }
+
+  try {
+    let backupDir = null;
+    if (plan.changed) {
+      printProviderEdit(plan);
+      if (baseUrlChanged) {
+        console.log("正在寫入供應商設定並重新啟動路由器…");
+        backupDir = await commitRouterChange("edit-provider", plan);
+      } else {
+        console.log(plan.renames.length
+          ? "正在寫入供應商設定與模型目錄（不需要重新啟動路由器）…"
+          : "正在寫入供應商設定（不需要重新啟動路由器）…");
+        backupDir = await commitCatalogChange("edit-provider", plan);
+      }
+    }
+    if (baseUrlChanged) {
+      const oldService = provider.keychainService;
+      const stillUsed = providers.some((item) => item.id !== provider.id && item.keychainService === oldService);
+      if (oldService && oldService !== targetService && !stillUsed && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+        try { deleteApiKey(oldService, provider.keychainAccount || "codex"); } catch {}
+      }
+      await refreshKeyPoolModels(provider.id, plan.apiRoot, probedModels);
+    } else if (keyChanged) {
+      rememberPrimaryModels(provider.id, probedModels);
+    }
+    if (keyChanged && !baseUrlChanged) {
+      console.log(keyVerified
+        ? "已更換，新 Key 可以正常查詢模型清單。"
+        : `已更換，但無法確認新 Key 是否可用（${keyStatus != null ? `HTTP ${keyStatus}` : keyProblem || "連線失敗"}）。`);
+      console.log(isWindows
+        ? "路由器下一個請求就會改用新 Key，不必重啟。"
+        : "路由器最晚 5 分鐘內改用新 Key；上游拒絕舊 Key 時會立即改用。");
+    }
+    if (backupDir) console.log(`已儲存。備份：${backupDir}`);
+    return {
+      changed: true,
+      renamed: plan.renames.length,
+      baseUrlChanged,
+      keyChanged,
+      ...(keyVerified != null ? { keyVerified, keyStatus } : {}),
+      ...(backupDir ? { backupDir } : {}),
+      restartDesktop: plan.restartDesktop,
+    };
+  } catch (error) {
+    if (needWriteKey && !env.CODEX_MODEL_ROUTER_TEST_API_KEY) {
+      try {
+        if (previousTargetKey) storeApiKeyValue(targetService, targetBaseUrl, previousTargetKey);
+        else deleteApiKey(targetService);
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 async function managerAddProvider({ draftId, models, providerId, contextWindow, maxOutputTokens, backupKeys } = {}) {

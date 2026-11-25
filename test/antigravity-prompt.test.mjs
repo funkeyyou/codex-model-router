@@ -21,6 +21,11 @@ test("Antigravity changes instruction prose while preserving user input and host
   assert.match(prompt, /^Answer the coding agent request[\s\S]*in the system context\.\nNew chat messages/);
   assert.match(prompt, /Do not invoke native tools/);
   assert.match(prompt, /all progress and answer prose inside text/);
+  // 進度摘要：開始時一句交代方向，之後只在完成階段、改變方向或卡住時更新，但不能拖到最後才講。
+  assert.match(prompt, /one short sentence in text before the first calls/);
+  assert.match(prompt, /leave text empty while you keep working[\s\S]*only when you finish a meaningful stage/);
+  assert.match(prompt, /Do not narrate every lookup or tool call[\s\S]*Never hold all updates until the final answer/);
+  assert.doesNotMatch(prompt, /progress update in text before calls/);
   const messages = JSON.parse(prompt.split("New chat messages (respond to these):\n")[1]);
   assert.doesNotMatch(JSON.stringify(standing), /codex/i);
   assert.match(standing[0].content, /^You are a coding agent\./);

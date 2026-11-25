@@ -15,7 +15,9 @@ const instructions = [
   "Put all progress and answer prose inside text, never before or after the JSON object. Do not emit native function calls alongside it.",
   "JSON-escape quotes, backslashes and line breaks inside strings, including inside Markdown code and tool arguments.",
   "Each call has name (exact host function name) and arguments (a JSON object matching its schema).",
-  "When requesting host tools during multi-step work, put a brief user-facing progress update in text before calls: what you found or what the next action will check. Use the user's language.",
+  "Progress updates during multi-step work: when you start a new request, put one short sentence in text before the first calls saying what you will do.",
+  "After that, leave text empty while you keep working, and write a brief update only when you finish a meaningful stage (for example: done investigating, a set of edits finished, test or build results), change direction, or hit a blocker.",
+  "Do not narrate every lookup or tool call; one update every few tool rounds is enough. Never hold all updates until the final answer. This replaces any general guidance to comment before each tool call. Use the user's language.",
   "Request independent actions together when parallel_tool_calls permits. The host executes all calls.",
   "Use the supplied tool results to continue. For a final answer set calls to [].",
 ].join("\n");

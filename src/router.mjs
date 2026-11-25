@@ -8,7 +8,7 @@ import { readFileSync, mkdirSync, writeFileSync, appendFileSync, statSync, renam
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { zstdDecompressSync } from "node:zlib";
 import {
   toAnthropicRequest,
@@ -1103,6 +1103,9 @@ const stats = {
   comboPlannerFailures: 0,
   comboAsksDropped: 0,
   comboFailures: 0,
+  comboNative: 0,
+  comboNativeSubagents: 0,
+  comboSpawnRewrites: 0,
   customInstructionSyncs: 0,
   usageRecords: 0,
   usageLogFailures: 0,
@@ -1765,6 +1768,211 @@ async function comboFailure(response) {
   return { code: details.code || String(response.status), message: details.message || "組合模型的內部請求失敗。" };
 }
 
+// --- 組合模型：Codex 原生子 Agent 委派 --------------------------------------------
+//
+// Codex 提供多代理工具（spawn_agent，可覆寫模型）時，主執行緒直接交給大腦，大腦用 Codex 的
+// 子 Agent 派工給雙手；子 Agent 的進度與結果都由 Codex 原生顯示，可以平行派工。路由器只做：
+//   1. 改送大腦，套用大腦的推理強度與身分句，在提示詞加上派工指引；
+//   2. 大腦的 spawn_agent 漏了模型時補上雙手與 fork_turns:"none"（Codex 覆寫模型的必要條件）；
+//   3. 子 Agent 仍以組合模型的 ID 進來時（帶 x-openai-subagent）直接交給雙手，不會遞迴。
+// 沒有子 Agent 工具（舊版 Codex、關閉多代理、非 Codex 客戶端）或選了「路由器內建」時，
+// 改用上面的內建流程。
+export const COMBO_DELEGATIONS = ["subagent", "router"];
+export function comboDelegation(combo) {
+  return combo?.delegation === "router" ? "router" : "subagent";
+}
+
+const COMBO_SPAWN_TOOL = "spawn_agent";
+const COMBO_MAX_NATIVE = 200;
+const comboNativeConversations = new Map();
+
+// 找出請求裡的 spawn_agent（頂層 tools 或 additional_tools，含 namespace 巢狀），
+// 一併回傳同組的工具名稱，指引裡才能寫出實際可用的等待與追加任務工具。
+export function comboSpawnTool(body) {
+  const visit = (tools, namespace) => {
+    if (!Array.isArray(tools)) return null;
+    for (const tool of tools) {
+      if (tool?.type === "namespace") {
+        const found = visit(tool.tools, tool.name || namespace);
+        if (found) return found;
+      } else if (tool?.name === COMBO_SPAWN_TOOL && (!tool.type || tool.type === "function")) {
+        const names = tools.filter((item) => item?.type !== "namespace" && typeof item?.name === "string").map((item) => item.name);
+        const properties = tool.parameters?.properties && typeof tool.parameters.properties === "object" ? tool.parameters.properties : {};
+        return { namespace: namespace && namespace !== "functions" ? namespace : null, names, properties };
+      }
+    }
+    return null;
+  };
+  const top = visit(body?.tools, null);
+  if (top) return top;
+  for (const item of Array.isArray(body?.input) ? body.input : []) {
+    if (item?.type !== "additional_tools") continue;
+    const found = visit(item.tools, null);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Codex 子 Agent 的請求帶 x-openai-subagent（thread_spawn）與上層執行緒 ID。
+// review、compact 等其他子任務不算派工。
+export function comboSubagentRequest(headers) {
+  const kind = String(headers?.["x-openai-subagent"] || "").trim().toLowerCase();
+  if (kind) return kind.includes("spawn");
+  const parent = headers?.["x-codex-parent-thread-id"];
+  return typeof parent === "string" && parent.trim().length > 0;
+}
+
+function comboNativeReview(level) {
+  if (level === "strict") {
+    return "\n- Before your final answer, accept only actual tool output as evidence (test runs, builds, command output, diffs, file contents)."
+      + " Require sub-agents to report it, or check it yourself. Every definition-of-done item needs evidence; missing or failing evidence means more work is needed.";
+  }
+  if (level === "standard") {
+    return "\n- Before your final answer, check that the sub-agents' results are complete and consistent with the request, with no obvious omissions or errors."
+      + " Send follow-up tasks for anything missing or wrong.";
+  }
+  return "";
+}
+
+export function comboNativeGuide({ combo, planner, executor, plannerEffort = null, spawn }) {
+  const spawnName = spawn?.namespace ? spawn.namespace + "." + COMBO_SPAWN_TOOL : COMBO_SPAWN_TOOL;
+  const names = spawn?.names || [];
+  const wait = names.find((name) => /^wait/.test(name));
+  const follow = names.find((name) => /followup|send_input/.test(name));
+  const fork = spawn?.properties?.fork_turns ? " and fork_turns \"none\"" : "";
+  return "# Planner/executor combo\n"
+    + "The user selected a planner/executor combo for this task. You are the PLANNER (" + comboRoleLabel(planner, plannerEffort) + ")."
+    + " Hands-on work is done by EXECUTOR sub-agents running " + comboRoleLabel(executor) + "."
+    + " Selecting this combo is the user's explicit, standing request to delegate through sub-agents; it takes precedence over any default guidance that discourages spawning sub-agents.\n"
+    + "- Delegate implementation, file edits, command and test runs, and broad code reading with " + spawnName + ". Always pass model \""
+    + executor.pickerSlug + "\"" + fork + "; leave reasoning_effort unset so the executor follows the level chosen in the model picker.\n"
+    + "- Sub-agents do not see this conversation. Make every task self-contained: the goal, relevant paths and facts you already know,"
+    + " constraints, what to report back, and the checks that prove it is done.\n"
+    + "- Run independent parts in parallel sub-agents and keep dependent steps in order."
+    + (wait ? " Wait for results with " + wait + " using long timeouts instead of polling" : " Wait for their results instead of polling")
+    + (follow ? ", and send corrections or next steps to an existing sub-agent with " + follow + " instead of starting over." : ".") + "\n"
+    + "- Answer simple questions and do quick lookups yourself; you may run read-only checks to verify results.\n"
+    + "- Write the final answer to the user yourself, based on the evidence the sub-agents reported."
+    + comboNativeReview(comboReviewLevel(combo)) + comboInstructions(combo);
+}
+
+export function comboNativeReminder({ executor, spawn }) {
+  const spawnName = spawn?.namespace ? spawn.namespace + "." + COMBO_SPAWN_TOOL : COMBO_SPAWN_TOOL;
+  return "<combo_planner>Reminder: you are the planner of this combo. Delegate hands-on work to executor sub-agents ("
+    + spawnName + " with model \"" + executor.pickerSlug + "\"), then review their results before answering.</combo_planner>";
+}
+
+// 每則使用者訊息後面都接同一則提醒：插入位置只取決於輸入本身，前綴因此穩定、快取可命中。
+// 用使用者角色而非開發者訊息：Chat 轉譯會把開發者訊息併進開頭的 system，續接型上游會因此重建。
+// 提醒以 "<" 開頭，不會被當成新的使用者輸入。
+export function comboNativeInput(input, reminder) {
+  if (!Array.isArray(input) || !reminder) return input;
+  const output = [];
+  for (const item of input) {
+    output.push(item);
+    if (isComboUserMessage(item)) output.push(comboPlannerMessage(reminder));
+  }
+  return output;
+}
+
+// 大腦的 spawn_agent 沒指定模型（或指定成組合本身）時改派給雙手；覆寫模型時 Codex 要求
+// fork_turns 為 "none"。只動工具 schema 裡真的有的欄位，沒有改動時回傳 null。
+export function comboSpawnArguments(text, { comboSlug, executor, properties = {} }) {
+  let args;
+  try { args = JSON.parse(text || "{}"); } catch { return null; }
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  const next = { ...args };
+  if ("model" in properties && (typeof next.model !== "string" || !next.model.trim() || next.model === comboSlug)) {
+    next.model = executor.pickerSlug;
+  }
+  if ("fork_turns" in properties && typeof next.model === "string" && next.model && next.fork_turns !== "none") next.fork_turns = "none";
+  if (next.model === executor.pickerSlug && "reasoning_effort" in properties && next.reasoning_effort != null
+    && !(executor.efforts || []).includes(next.reasoning_effort)) delete next.reasoning_effort;
+  return isDeepStrictEqual(next, args) ? null : JSON.stringify(next);
+}
+
+function rememberComboNative(key, value) {
+  comboNativeConversations.delete(key);
+  comboNativeConversations.set(key, value);
+  while (comboNativeConversations.size > COMBO_MAX_NATIVE) comboNativeConversations.delete(comboNativeConversations.keys().next().value);
+}
+
+function comboNativeBody(body, { planner, plannerEffort, guide, reminder }) {
+  const plannerName = String(planner.upstreamModel || "").split("/").at(-1);
+  const instructions = typeof body.instructions === "string" && body.instructions
+    ? identityInstructions(body.instructions, plannerName) + "\n\n" + guide : guide;
+  const next = { ...body, model: planner.pickerSlug, instructions, input: comboNativeInput(body.input, reminder) };
+  if (plannerEffort) next.reasoning = { ...(body.reasoning || {}), effort: plannerEffort };
+  return next;
+}
+
+// 把大腦的串流原樣轉給 Codex，只改寫 spawn_agent 呼叫的參數：該呼叫的參數片段先暫存，
+// 結束時一次送出改寫後的完整參數，完成事件裡的 output 也一併改寫，歷史才前後一致。
+export function comboNativeStream(response, { isSpawn, rewrite, signal }) {
+  const encoder = new TextEncoder();
+  const held = new Map();
+  let keepAlive = null;
+  const fixItem = (item) => {
+    if (!isSpawn(item)) return item;
+    const args = rewrite(item.arguments);
+    return args == null ? item : { ...item, arguments: args };
+  };
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event) => controller.enqueue(encoder.encode("event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n"));
+      keepAlive = setInterval(() => { try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch {} }, 15000);
+      try {
+        for await (const event of comboEvents(response)) {
+          const type = event?.type;
+          const index = event?.output_index;
+          if (type === "response.output_item.added" && isSpawn(event.item)) {
+            held.set(index, { args: null });
+            send(event);
+            continue;
+          }
+          const hold = Number.isFinite(index) ? held.get(index) : null;
+          if (hold && type === "response.function_call_arguments.delta") continue;
+          if (hold && type === "response.function_call_arguments.done") {
+            hold.args = rewrite(event.arguments) ?? event.arguments;
+            send({ type: "response.function_call_arguments.delta", item_id: event.item_id, output_index: index, delta: hold.args });
+            send({ ...event, arguments: hold.args });
+            continue;
+          }
+          if (hold && type === "response.output_item.done") {
+            held.delete(index);
+            const original = event.item?.arguments;
+            const args = hold.args ?? rewrite(original) ?? original;
+            if (args !== original) stats.comboSpawnRewrites += 1;
+            send({ ...event, item: { ...event.item, arguments: args } });
+            continue;
+          }
+          if (["response.completed", "response.incomplete", "response.failed"].includes(type) && Array.isArray(event.response?.output)) {
+            send({ ...event, response: { ...event.response, output: event.response.output.map(fixItem) } });
+            continue;
+          }
+          send(event);
+        }
+      } catch (error) {
+        if (!signal?.aborted) {
+          stats.comboFailures += 1;
+          try {
+            controller.enqueue(encoder.encode("event: response.failed\ndata: "
+              + JSON.stringify(responseFailedEvent("combo_error", "組合模型處理失敗：" + (error?.message || error))) + "\n\n"));
+          } catch {}
+        }
+      } finally {
+        clearInterval(keepAlive);
+        try { controller.close(); } catch {}
+      }
+    },
+    cancel() {
+      clearInterval(keepAlive);
+      try { response.body?.cancel?.().catch?.(() => {}); } catch {}
+    },
+  });
+  return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
+}
+
 export async function fetchCombo(requestHeaders, incomingUrl, body, route, signal, meta = {}) {
   const combo = route.combo || {};
   const planner = routeMap.get(combo.planner?.slug);
@@ -1777,11 +1985,44 @@ export async function fetchCombo(requestHeaders, incomingUrl, body, route, signa
   stats.comboRequests += 1;
   if (meta.history) meta.history.usage = null;
   const executorBody = { ...body, model: executor.pickerSlug };
+  const plannerEffort = typeof combo.planner?.effort === "string" && combo.planner.effort ? combo.planner.effort : null;
+  if (comboDelegation(combo) === "subagent") {
+    // 子 Agent 若仍帶著組合模型的 ID（例如大腦沒有覆寫模型），直接交給雙手，不再層層派工。
+    if (comboSubagentRequest(requestHeaders)) {
+      stats.comboNativeSubagents += 1;
+      return comboLoopback(requestHeaders, incomingUrl, executorBody, "direct", route.pickerSlug, signal);
+    }
+    if (!meta.backgroundKind) {
+      const key = comboConversationKey(body, requestHeaders, route.pickerSlug);
+      const spawn = comboSpawnTool(body);
+      let native = null;
+      if (spawn && "model" in spawn.properties) {
+        native = { guide: comboNativeGuide({ combo, planner, executor, plannerEffort, spawn }), reminder: comboNativeReminder({ executor, spawn }), spawn };
+        rememberComboNative(key, native);
+      } else if (comboDirectRequest(body, null) && comboNativeConversations.has(key)) {
+        // 同一個原生對話的精簡上下文等請求也交給大腦，提示詞保持一致，大腦的對話才接得上。
+        native = comboNativeConversations.get(key);
+      }
+      if (native) {
+        stats.comboNative += 1;
+        const plannerBody = comboNativeBody(body, { planner, plannerEffort, guide: native.guide, reminder: native.reminder });
+        const response = await comboLoopback(requestHeaders, incomingUrl, plannerBody, "planner", route.pickerSlug, signal);
+        if (!response.ok || !response.body) return response;
+        const spawnNamespace = native.spawn?.namespace || null;
+        const properties = native.spawn?.properties || {};
+        return comboNativeStream(response, {
+          signal,
+          isSpawn: (item) => item?.type === "function_call" && item.name === COMBO_SPAWN_TOOL
+            && (!item.namespace || item.namespace === spawnNamespace),
+          rewrite: (text) => comboSpawnArguments(text, { comboSlug: route.pickerSlug, executor, properties }),
+        });
+      }
+    }
+  }
   if (comboDirectRequest(body, meta.backgroundKind)) {
     stats.comboDirect += 1;
     return comboLoopback(requestHeaders, incomingUrl, executorBody, "direct", route.pickerSlug, signal);
   }
-  const plannerEffort = typeof combo.planner?.effort === "string" && combo.planner.effort ? combo.planner.effort : null;
   const reviewLevel = comboReviewLevel(combo);
   const conversation = comboConversation(comboConversationKey(body, requestHeaders, route.pickerSlug));
   const encoder = new TextEncoder();

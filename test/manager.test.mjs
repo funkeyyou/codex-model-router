@@ -401,7 +401,7 @@ test("管理頁腳本可編譯，且符合 CSP：無行內事件、無 style 屬
   jobTypes.add("apply-update");
   assert.deepEqual([...jobTypes].sort(), ["add-backup-key", "add-models", "add-provider", "antigravity-add", "antigravity-cli-install", "antigravity-cli-update", "apply-update", "chatgpt-login", "claude-cli-add", "claude-cli-install",
     "claude-cli-login", "claude-cli-update", "connect-claude-desktop", "connect-codex", "detect-fast", "edit-model", "edit-provider", "imagegen-disable", "imagegen-setup", "install", "install-antigravity", "install-claude", "remove-backup-key", "remove-models",
-    "remove-provider", "reorder-models", "repair-models", "replace-key", "restart-desktop", "restart-router", "restore-claude-desktop", "save-combo",
+    "remove-provider", "reorder-models", "repair-models", "restart-desktop", "restart-router", "restore-claude-desktop", "save-combo",
     "set-background-model", "set-claude-desktop", "set-global-context", "set-hidden-models", "set-keysmith", "set-official-model-visibility", "set-quota-mode",
     "set-tool-output-budget", "set-upstream-image-guard",
     "uninstall", "update"]);

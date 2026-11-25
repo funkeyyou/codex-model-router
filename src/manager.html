@@ -341,13 +341,13 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .setting-control .kv.compact { grid-template-columns: 84px minmax(0, 1fr); gap: 6px 12px; font-size: 13px; }
 .setting-control .kv.compact dt { color: var(--faint); }
 .setting-list > .table-wrap { border-radius: var(--radius); }
-.setting-control .check-line { align-items: center; color: var(--text); font-size: 13.5px; }
-.setting-control .check-line > input[type=checkbox] { appearance: none; -webkit-appearance: none; position: relative; flex: none; width: 34px; height: 20px; margin: 0; border-radius: 999px; background: var(--border-strong); transition: background .15s; }
-.setting-control .check-line > input[type=checkbox]::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .35); transition: left .15s; }
-.setting-control .check-line > input[type=checkbox]:checked { background: var(--accent); }
-.setting-control .check-line > input[type=checkbox]:checked::after { left: 16px; }
-.setting-control .check-line > input[type=checkbox]:disabled { opacity: .45; cursor: not-allowed; }
-.setting-control .check-line > input[type=checkbox]:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
+.setting-control .check-line, .check-line.switch { align-items: center; color: var(--text); font-size: 13.5px; }
+.setting-control .check-line > input[type=checkbox], .check-line.switch > input[type=checkbox] { appearance: none; -webkit-appearance: none; position: relative; flex: none; width: 34px; height: 20px; margin: 0; border-radius: 999px; background: var(--border-strong); transition: background .15s; }
+.setting-control .check-line > input[type=checkbox]::after, .check-line.switch > input[type=checkbox]::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .35); transition: left .15s; }
+.setting-control .check-line > input[type=checkbox]:checked, .check-line.switch > input[type=checkbox]:checked { background: var(--accent); }
+.setting-control .check-line > input[type=checkbox]:checked::after, .check-line.switch > input[type=checkbox]:checked::after { left: 16px; }
+.setting-control .check-line > input[type=checkbox]:disabled, .check-line.switch > input[type=checkbox]:disabled { opacity: .45; cursor: not-allowed; }
+.setting-control .check-line > input[type=checkbox]:focus-visible, .check-line.switch > input[type=checkbox]:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
 .type-choices { display: grid; gap: 10px; }
 .type-option { display: flex; align-items: center; gap: 14px; width: 100%; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border-strong); background: var(--input); text-align: left; cursor: pointer; }
 .type-option:hover { background: var(--hover); border-color: var(--accent-ring); }
@@ -504,13 +504,23 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "新增組合模型": "Add combo model",
 "修改組合模型": "Edit combo model",
 "大腦 {planner} · 雙手 {executor}": "Planner {planner} · Executor {executor}",
+"Codex 子 Agent": "Codex sub-agents",
+"路由器內建流程": "Router's built-in flow",
 "已刪除": "deleted",
 "修改組合的大腦、雙手與驗收": "Edit the combo's planner, executor and review",
 "例如 Opus 規劃 + Neon 執行": "e.g. Opus plans + Neon executes",
-"大腦（規劃、回答詢問、驗收）": "Planner (plans, answers questions, reviews)",
+"大腦（規劃、派工、驗收）": "Planner (plans, delegates, reviews)",
 "大腦推理強度": "Planner reasoning level",
 "模型預設": "Model default",
 "雙手（呼叫工具、完成工作）": "Executor (calls tools, does the work)",
+"委派方式": "Delegation",
+"用 Codex 子 Agent 派工": "Delegate with Codex sub-agents",
+"大腦直接在任務裡工作，需要動手時用 Codex 的子 Agent 派工給雙手，可以同時派好幾個；子 Agent 的進度直接顯示在 Codex。子 Agent 看不到主對話，大腦會把需要的背景寫進派工內容。Codex 沒有提供子 Agent 工具時，自動改用路由器內建流程。": "The planner works in the task directly and hands hands-on work to the executor through Codex sub-agents, several at a time if needed; their progress shows right in Codex. Sub-agents don't see the main conversation, so the planner writes the needed context into each task. When Codex doesn't offer sub-agent tools, the router's built-in flow is used instead.",
+"關閉後由路由器在一輪裡依序呼叫大腦規劃、雙手執行，雙手卡住時可以詢問大腦，Codex 只看到一個連續的回應。": "When off, the router calls the planner to plan and then the executor to do the work within each turn; the executor can ask the planner when stuck, and Codex sees one continuous reply.",
+"大腦自行判斷子 Agent 的結果，不額外要求證據。": "The planner judges the sub-agents' results on its own, without asking for extra evidence.",
+"回覆你之前，大腦檢查子 Agent 的結果是否完整、有沒有遺漏或矛盾，不足就派後續任務補上。": "Before replying, the planner checks the sub-agents' results for completeness, omissions and contradictions, and assigns follow-up tasks when something is missing.",
+"大腦只認實際的工具輸出（測試、build、diff、檔案內容），要求子 Agent 附上證據或自己檢查；證據不足就繼續派工。": "The planner accepts only actual tool output (tests, builds, diffs, file contents); it asks sub-agents for evidence or checks it itself, and keeps assigning work until the evidence is there.",
+"Codex 選擇器的推理強度用在雙手的子 Agent，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。": "The reasoning level in Codex's picker applies to the executor sub-agents; the planner always uses the level chosen here. The context limit is the smaller of the two. Background tasks such as titles go straight to the executor.",
 "驗收": "Review",
 "一般驗收": "Standard review",
 "嚴格驗收": "Strict review",
@@ -520,7 +530,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "每輪最多打回 {count} 次，之後照常結束。": "At most {count} send-backs per turn; after that the turn ends normally.",
 "給大腦的指令（選填）": "Instructions for the planner (optional)",
 "例如：完成前必須跑 npm test 並全數通過；先讀 README 再動手；不要改 public API；步驟拆小，每步都要驗證。": "e.g. npm test must pass before finishing; read the README first; don't change the public API; keep steps small and verify each one.",
-"可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、回答詢問和驗收時都會遵守；雙手看到的是大腦據此寫出的計畫。": "Set a definition of done or anything to keep in mind when planning and handing off work. The planner follows these when planning, answering questions and reviewing; the executor sees the plan written from them.",
+"可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、派工和驗收時都會遵守；雙手只看到大腦據此寫出的計畫或派工內容。": "Set a definition of done or anything to keep in mind when planning and handing off work. The planner follows these when planning, delegating and reviewing; the executor only sees the plan or tasks the planner writes from them.",
 "你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。": "When you send a message, the planner reads the whole conversation and writes a plan, shown in Codex's thinking area. The executor then calls tools to do the work, and can ask the planner when stuck.",
 "Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。": "The reasoning level in Codex's picker controls the executor; the planner always uses the level chosen here. The context limit is the smaller of the two. Background tasks such as titles go straight to the executor.",
 "每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。": "Each new message adds one planner call, so the first words appear a little later.",
@@ -762,7 +772,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "新增供應商": "Add provider",
 "主要": "Primary",
 "{count} 個模型": "{count} models",
-"修改名稱與模型前綴": "Edit name and model prefix",
+"修改名稱、前綴、Base URL 與 API Key": "Edit name, prefix, Base URL, and API Key",
 "模型前綴": "Model prefix",
 "API 根地址": "API root",
 "已加密儲存": "Stored encrypted",
@@ -834,6 +844,14 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "選擇器裡這家的模型顯示成「前綴/模型名」，上游自帶的前綴（例如 ark/）會被取代，不會疊成兩層。留空使用自動規則：上游已有前綴時沿用原名，否則補「{prefix}/」。之後新增的模型也會套用。": "This provider's models appear in the picker as “prefix/model”. An upstream prefix (such as ark/) is replaced rather than doubled. Leave empty for the automatic rule: keep the upstream name if it already has a prefix, otherwise add “{prefix}/”. Models added later use it too.",
 "選擇器裡 Claude 訂閱的模型顯示成「前綴/模型名」；留空使用預設的「claude-cli/」。之後新增的模型也會套用。": "Claude subscription models appear in the picker as “prefix/model”. Leave empty for the default “claude-cli/”. Models added later use it too.",
 "只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。": "Only the settings and model catalog are written; nothing is re-probed and the router doesn't restart. If model names change, restart {app} to see them in the picker.",
+"只改名稱、前綴或 API Key 不會重新啟動路由器；修改 Base URL 會連線驗證並重新啟動路由器。模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。": "Changing only the name, prefix, or API Key does not restart the router. Changing Base URL verifies the connection and restarts the router. If model names change, restart {app} to see them in the picker.",
+"留空則保留目前的 API Key": "Leave empty to keep the current API Key",
+"目前找不到 API Key，請填入新的 API Key": "API Key missing; enter a new API Key",
+"更換網域或站點時修改；會連線確認 API 根地址並驗證 API Key，儲存後自動重新啟動路由器。既有模型的上游 ID 與介面設定維持不變。": "Change when switching domain or host. Connects to verify the API root and API Key, then restarts the router. Existing models' upstream IDs and protocol settings stay unchanged.",
+"選填：要更換主 Key（或改 Base URL 同時換 Key）時填寫。會先查詢模型清單驗證，上游明確拒絕（401／403）時不會覆蓋原本的 Key。": "Optional: fill in to replace the main key (or switch keys when changing Base URL). Checked against the model list first; rejected keys (401/403) will not overwrite the current key.",
+"請填寫 Base URL。": "Enter a Base URL.",
+"Base URL 必須使用 http:// 或 https://。": "Base URL must start with http:// or https://.",
+"Base URL 格式無效。": "Invalid Base URL.",
 "取消": "Cancel",
 "前綴只能用英文字母、數字、點、底線與連字號，1～32 個字元，開頭與結尾必須是英文字母或數字。": "The prefix may contain only letters, digits, dots, underscores, and hyphens (1–32 characters), and must start and end with a letter or digit.",
 "名稱最多 {max} 個字。": "Names can be at most {max} characters.",
@@ -1195,11 +1213,6 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "將新增供應商「{name}」，並探測以下 {count} 個模型：": "Provider “{name}” will be added and these {count} models probed:",
 "將新增供應商（所選模型已有前綴，ID 自動產生），並探測以下 {count} 個模型：": "A provider will be added (the selected models already have prefixes, so the ID is generated) and these {count} models probed:",
 "開始探測並新增": "Probe and add",
-"新的 API Key": "New API Key",
-"更換 API Key：{name}": "Replace API Key: {name}",
-"會先用新 Key 查詢模型清單：上游明確拒絕（401／403）時不會更換。路由器會自動改用新 Key，不需要重新啟動。": "The new key is checked by fetching the model list first; it isn't replaced if the upstream rejects it (401/403). The router picks up the new key automatically, with no restart.",
-"驗證並儲存": "Verify and save",
-"請填寫新的 API Key。": "Enter the new API Key.",
 "移除供應商「{name}」": "Remove provider “{name}”",
 "會一併移除它的 {count} 個模型：": "Its {count} models are removed too:",
 "移除後由「{name}」擔任主要供應商。": "“{name}” becomes the primary provider.",
@@ -1380,7 +1393,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 ["^「(.+)」是保留名稱，請換一個。$", "“$1” is reserved. Choose another."],
 ["^Claude 訂閱的名稱目前不支援修改。$", "The Claude subscription's name can't be changed yet."],
 ["^尚未連接 Claude 訂閱，沒有可以修改的模型前綴。$", "The Claude subscription isn't connected, so there's no model prefix to change."],
-["^供應商名稱與前綴必須是文字。$", "Provider names and prefixes must be text."],
+["^供應商名稱、前綴、Base URL 與 API Key 必須是文字。$", "Provider name, prefix, Base URL, and API Key must be text."],
+["^請填寫 Base URL。$", "Enter a Base URL."],
+["^Base URL 無效：(.+)$", "Invalid Base URL: $1"],
+["^Base URL 必須使用 http:// 或 https://。$", "Base URL must start with http:// or https://."],
+["^Claude 訂閱沒有 Base URL，不支援修改。$", "The Claude subscription has no Base URL to edit."],
+["^Claude 訂閱不使用 API Key，不支援修改。$", "The Claude subscription does not use an API Key."],
+["^找不到這家供應商原本的 API Key；修改 Base URL 時請一併填寫 API Key。$", "Could not find this provider's current API Key. Enter an API Key when changing the Base URL."],
+["^新的 Base URL 拒絕這把 API Key（HTTP (\\d+)），設定未修改。.*$", "The new Base URL rejected this API Key (HTTP $1); nothing changed. If switching providers or accounts, enter the matching API Key too."],
+["^無法連線到新的 Base URL（(.+)），設定未修改。$", "Could not reach the new Base URL ($1); nothing changed."],
 ["^安裝設定或模型目錄不完整.*$", "The installation settings or model catalog are incomplete."],
 ["^顯示名稱不能是空白。$", "The display name can't be empty."],
 ["^(?:上下文上限)必須是 ([\\d,]+) 到 ([\\d,]+) 之間的整數。$", "The context limit must be an integer between $1 and $2."],
@@ -2782,10 +2803,17 @@ function comboSummary(model) {
   return t("大腦 {planner} · 雙手 {executor}", {
     planner: planner ? planner.displayName + (combo.planner.effort ? "（" + combo.planner.effort + "）" : "") : t("已刪除"),
     executor: executor ? executor.displayName : t("已刪除"),
-  });
+  }) + " · " + (combo.delegation === "router" ? t("路由器內建流程") : t("Codex 子 Agent"));
 }
 
-function comboReviewHint(level) {
+function comboReviewHint(level, native) {
+  if (native) {
+    return {
+      off: t("大腦自行判斷子 Agent 的結果，不額外要求證據。"),
+      standard: t("回覆你之前，大腦檢查子 Agent 的結果是否完整、有沒有遺漏或矛盾，不足就派後續任務補上。"),
+      strict: t("大腦只認實際的工具輸出（測試、build、diff、檔案內容），要求子 Agent 附上證據或自己檢查；證據不足就繼續派工。"),
+    }[level];
+  }
   const hints = {
     off: t("雙手完成就結束，不額外呼叫大腦。"),
     standard: t("雙手交出最終回答後，大腦讀回答和對話，判斷是否完成、有沒有遺漏或矛盾；不通過就把意見交給雙手繼續。"),
@@ -2822,22 +2850,42 @@ function openComboEditor(model = null) {
   const reviewLabels = { off: t("關閉"), standard: t("一般驗收"), strict: t("嚴格驗收") };
   const review = h("select", {}, Object.entries(reviewLabels).map(([value, label]) =>
     h("option", { value, selected: value === (combo.review || "off"), text: label })));
-  const reviewHint = h("span", { class: "hint", text: comboReviewHint(review.value) });
-  review.addEventListener("change", () => { reviewHint.textContent = comboReviewHint(review.value); });
+  // 委派方式：預設用 Codex 的子 Agent；關閉後改用路由器內建的規劃、執行流程。
+  const delegation = h("input", { type: "checkbox", role: "switch", checked: combo.delegation !== "router", "aria-label": t("用 Codex 子 Agent 派工") });
+  const delegationState = h("span", {});
+  const delegationHint = h("span", { class: "hint" });
+  const reviewHint = h("span", { class: "hint" });
+  const flowNotes = h("div", { class: "stack" });
+  const refreshDelegation = () => {
+    const native = delegation.checked;
+    delegationState.textContent = native ? t("Codex 子 Agent") : t("路由器內建流程");
+    delegationHint.textContent = native
+      ? t("大腦直接在任務裡工作，需要動手時用 Codex 的子 Agent 派工給雙手，可以同時派好幾個；子 Agent 的進度直接顯示在 Codex。子 Agent 看不到主對話，大腦會把需要的背景寫進派工內容。Codex 沒有提供子 Agent 工具時，自動改用路由器內建流程。")
+      : t("關閉後由路由器在一輪裡依序呼叫大腦規劃、雙手執行，雙手卡住時可以詢問大腦，Codex 只看到一個連續的回應。");
+    reviewHint.textContent = comboReviewHint(review.value, native);
+    flowNotes.replaceChildren(...(native
+      ? [paragraph(t("Codex 選擇器的推理強度用在雙手的子 Agent，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。"), "note")]
+      : [paragraph(t("你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。"), "note"),
+        paragraph(t("Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。"), "note"),
+        paragraph(t("每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。"), "note")]));
+  };
+  delegation.addEventListener("change", refreshDelegation);
+  review.addEventListener("change", refreshDelegation);
+  refreshDelegation();
   const instructions = h("textarea", { rows: "4", maxlength: "4000", value: combo.instructions || "",
     placeholder: t("例如：完成前必須跑 npm test 並全數通過；先讀 README 再動手；不要改 public API；步驟拆小，每步都要驗證。") });
   const body = [
     h("label", { class: "field" }, h("span", { text: t("顯示名稱") }), name),
     h("div", { class: "field-row" },
-      h("label", { class: "field" }, h("span", { text: t("大腦（規劃、回答詢問、驗收）") }), planner),
+      h("label", { class: "field" }, h("span", { text: t("大腦（規劃、派工、驗收）") }), planner),
       h("label", { class: "field" }, h("span", { text: t("大腦推理強度") }), effort)),
     h("label", { class: "field" }, h("span", { text: t("雙手（呼叫工具、完成工作）") }), executor),
+    h("div", { class: "field" }, h("span", { text: t("委派方式") }),
+      h("label", { class: "check-line switch" }, delegation, delegationState), delegationHint),
     h("label", { class: "field" }, h("span", { text: t("驗收") }), review, reviewHint),
     h("label", { class: "field" }, h("span", { text: t("給大腦的指令（選填）") }), instructions,
-      h("span", { class: "hint", text: t("可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、回答詢問和驗收時都會遵守；雙手看到的是大腦據此寫出的計畫。") })),
-    paragraph(t("你送出新訊息時，大腦先讀完整對話並寫出計畫，計畫會顯示在 Codex 的思考區；接著由雙手呼叫工具完成工作。雙手卡住時可以詢問大腦。"), "note"),
-    paragraph(t("Codex 選擇器的推理強度控制雙手，大腦固定用這裡選的推理強度。上下文取兩者中較小的上限。標題等背景任務直接交給雙手。"), "note"),
-    paragraph(t("每次送出新訊息會多一次大腦呼叫，第一個字會晚一點出現。"), "note"),
+      h("span", { class: "hint", text: t("可以寫完成條件，或規劃、派工時要注意的事。大腦規劃、派工和驗收時都會遵守；雙手只看到大腦據此寫出的計畫或派工內容。") })),
+    flowNotes,
     paragraph(t("儲存後會重新啟動路由器，重新啟動 {app} 後就能在模型選單選擇。", { app: desktopName() }), "note"),
   ];
   const modal = openModal({ title: model ? t("修改組合模型") : t("新增組合模型"), body, wide: true });
@@ -2852,6 +2900,7 @@ function openComboEditor(model = null) {
         planner: { slug: planner.value, ...(effort.value ? { effort: effort.value } : {}) },
         executor: { slug: executor.value },
         review: review.value,
+        delegation: delegation.checked ? "subagent" : "router",
         instructions: instructions.value.trim(),
       };
       modal.close();
@@ -2924,7 +2973,7 @@ function renderProviders() {
       provider.primary ? h("span", { class: "chip cyan", text: t("主要") }) : null,
       h("span", { class: "chip", text: t("{count} 個模型", { count: provider.modelCount }) }),
       h("span", { class: "head-actions" },
-        h("button", { type: "button", class: "button small", disabled: blocked, title: t("修改名稱與模型前綴"),
+        h("button", { type: "button", class: "button small", disabled: blocked, title: t("修改名稱、前綴、Base URL 與 API Key"),
           onclick: () => openEditProvider(provider.id) }, icon("edit"), t("修改")))),
     h("div", { class: "body" },
       provider.name ? cardRow("ID", h("span", { class: "mono", text: provider.id })) : null,
@@ -2939,7 +2988,6 @@ function renderProviders() {
       backupKeysRow(provider, blocked)),
     h("div", { class: "foot" },
       h("button", { type: "button", class: "button small", disabled: blocked, onclick: () => openAddModels(provider.id) }, icon("plus"), t("添加模型")),
-      h("button", { type: "button", class: "button small", onclick: () => openReplaceKey(provider) }, icon("key"), t("更換 API Key")),
       h("button", {
         type: "button", class: "button small", disabled: blocked || (provider.backupKeys || []).length >= MAX_BACKUP_KEYS,
         title: (provider.backupKeys || []).length >= MAX_BACKUP_KEYS ? t("每家供應商最多 {count} 把備用 Key", { count: MAX_BACKUP_KEYS }) : null,
@@ -3090,18 +3138,33 @@ function prefixSummary(providerId, prefix) {
   return h("span", { class: "muted", text: t("自動：上游已有前綴時沿用，否則 {prefix}/", { prefix: autoPrefix(providerId) }) });
 }
 
-// 修改供應商的名稱與模型前綴。名稱只用於顯示，內部 id 不變；前綴決定選擇器裡這家模型的
-// 顯示名稱，只改自動產生的名稱。一邊輸入一邊向安裝器要預覽，與實際寫入用同一套規則。
+function normalizeBaseUrlInput(value) {
+  const parsed = new URL(value);
+  if (!/^https?:$/.test(parsed.protocol)) throw new Error("protocol");
+  parsed.hash = "";
+  parsed.search = "";
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+  return parsed.toString().replace(/\/$/, "");
+}
+
+// 修改供應商的名稱、模型前綴、Base URL 與主 API Key。名稱只用於顯示，內部 id 不變；
+// 前綴決定選擇器裡這家模型的顯示名稱，只改自動產生的名稱。一邊輸入一邊向安裝器要預覽，
+// 與實際寫入用同一套規則；API Key 不送去預覽，只在儲存時送給安裝器驗證與寫入。
 function openEditProvider(providerId) {
   const cli = providerId === CLAUDE_CLI_ID;
   const provider = cli ? null : (state.providers || []).find((item) => item.id === providerId);
   if (!cli && !provider) return;
   const currentPrefix = cli ? (state.claudeCli && state.claudeCli.modelPrefix) || "" : provider.modelPrefix || "";
   const currentName = cli ? t("Claude 訂閱") : provider.name || provider.id;
+  const currentBaseUrl = cli ? "" : provider.baseUrl || "";
   const name = h("input", { type: "text", value: currentName, maxlength: String(PROVIDER_NAME_MAX_LENGTH), disabled: cli, spellcheck: "false" });
   const prefix = h("input", { type: "text", value: currentPrefix, maxlength: "40", spellcheck: "false", autocomplete: "off",
     placeholder: cli ? t("留空＝自動（{prefix}/）", { prefix: autoPrefix(providerId) })
       : t("留空＝自動（{prefix}/ 或上游原名）", { prefix: autoPrefix(providerId) }) });
+  const baseUrl = cli ? null : h("input", { type: "url", value: currentBaseUrl, spellcheck: "false", autocomplete: "off",
+    placeholder: "https://api.example.com/v1" });
+  const apiKey = cli ? null : h("input", { type: "password", autocomplete: "new-password", spellcheck: "false",
+    placeholder: provider.keyStored ? t("留空則保留目前的 API Key") : t("目前找不到 API Key，請填入新的 API Key") });
   const preview = h("div", { class: "stack" });
   const saveButton = h("button", { type: "button", class: "button primary", text: t("儲存") });
   const models = (state.models || []).filter((model) => (cli ? model.transport === "claude-cli" : model.transport !== "claude-cli" && model.providerId === providerId));
@@ -3114,21 +3177,37 @@ function openEditProvider(providerId) {
       h("span", { class: "hint", text: cli
         ? t("選擇器裡 Claude 訂閱的模型顯示成「前綴/模型名」；留空使用預設的「claude-cli/」。之後新增的模型也會套用。")
         : t("選擇器裡這家的模型顯示成「前綴/模型名」，上游自帶的前綴（例如 ark/）會被取代，不會疊成兩層。留空使用自動規則：上游已有前綴時沿用原名，否則補「{prefix}/」。之後新增的模型也會套用。", { prefix: autoPrefix(providerId) }) })),
+    !cli ? h("label", { class: "field" }, h("span", { text: "Base URL" }), baseUrl,
+      h("span", { class: "hint", text: t("更換網域或站點時修改；會連線確認 API 根地址並驗證 API Key，儲存後自動重新啟動路由器。既有模型的上游 ID 與介面設定維持不變。") })) : null,
+    !cli ? h("label", { class: "field" }, h("span", { text: t("更換 API Key") }), apiKey,
+      h("span", { class: "hint", text: t("選填：要更換主 Key（或改 Base URL 同時換 Key）時填寫。會先查詢模型清單驗證，上游明確拒絕（401／403）時不會覆蓋原本的 Key。") })) : null,
     preview,
-    paragraph(t("只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。", { app: desktopName() }), "note"),
+    paragraph(cli
+      ? t("只寫入設定與模型目錄，不重新探測、不重新啟動路由器；模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。", { app: desktopName() })
+      : t("只改名稱、前綴或 API Key 不會重新啟動路由器；修改 Base URL 會連線驗證並重新啟動路由器。模型名稱有變動時，重新啟動 {app} 後選擇器才會顯示。", { app: desktopName() }), "note"),
   ] });
   modal.setFoot(h("span", { class: "grow" }),
     h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }), saveButton);
 
   let timer = null;
   let request = 0;
-  const fields = () => ({ name: name.value, modelPrefix: prefix.value });
+  const fields = () => ({ name: name.value, modelPrefix: prefix.value, baseUrl: baseUrl.value });
   // 先在本機檢查格式，訊息才會跟著介面語言；重名之類需要完整設定的檢查交給安裝器。
   const localProblem = () => {
     const value = prefix.value.trim().replace(/\/+$/, "");
     if (value && !MODEL_PREFIX_PATTERN.test(value)) return t("前綴只能用英文字母、數字、點、底線與連字號，1～32 個字元，開頭與結尾必須是英文字母或數字。");
     if (!cli && name.value.replace(/\s+/g, " ").trim().length > PROVIDER_NAME_MAX_LENGTH) {
       return t("名稱最多 {max} 個字。", { max: PROVIDER_NAME_MAX_LENGTH });
+    }
+    if (!cli) {
+      const rawUrl = baseUrl.value.trim();
+      if (!rawUrl) return t("請填寫 Base URL。");
+      try {
+        const parsed = new URL(rawUrl);
+        if (!/^https?:$/.test(parsed.protocol)) return t("Base URL 必須使用 http:// 或 https://。");
+      } catch {
+        return t("Base URL 格式無效。");
+      }
     }
     return null;
   };
@@ -3180,17 +3259,31 @@ function openEditProvider(providerId) {
   };
   name.addEventListener("input", update);
   prefix.addEventListener("input", update);
+  if (!cli) baseUrl.addEventListener("input", update);
   saveButton.onclick = () => {
     if (localProblem()) return;
     const nextName = name.value.replace(/\s+/g, " ").trim();
     const nextPrefix = prefix.value.trim().replace(/\/+$/, "");
-    if ((cli || nextName === currentName || (!nextName && !provider.name)) && nextPrefix === currentPrefix) {
+    const nextBaseUrl = cli ? "" : normalizeBaseUrlInput(baseUrl.value.trim());
+    const nextApiKey = cli ? "" : apiKey.value.trim();
+    const nameSame = cli || nextName === currentName || (!nextName && !provider.name);
+    const prefixSame = nextPrefix === currentPrefix;
+    const urlSame = cli || nextBaseUrl === currentBaseUrl;
+    if (nameSame && prefixSame && urlSame && !nextApiKey) {
       modal.close();
       toast(t("沒有任何變更。"));
       return;
     }
+    if (!cli) apiKey.value = "";
     modal.close();
-    runJob("edit-provider", cli ? { providerId, modelPrefix: nextPrefix } : { providerId, name: nextName, modelPrefix: nextPrefix },
+    const params = cli
+      ? { providerId, modelPrefix: nextPrefix }
+      : {
+        providerId, name: nextName, modelPrefix: nextPrefix,
+        ...(!urlSame ? { baseUrl: nextBaseUrl } : {}),
+        ...(nextApiKey ? { apiKey: nextApiKey } : {}),
+      };
+    runJob("edit-provider", params,
       { title: t("修改供應商：{name}", { name: cli ? t("Claude 訂閱") : nextName || providerId }) });
   };
   showPreview({ renames: [], kept: [], conflicts: [] });
@@ -4902,27 +4995,6 @@ function openAddProvider({ firstInstall = false } = {}) {
         backups.clear();
       } }));
   }
-}
-
-function openReplaceKey(provider) {
-  const apiKey = h("input", { type: "password", placeholder: t("新的 API Key"), autocomplete: "new-password", spellcheck: "false" });
-  const modal = openModal({
-    title: t("更換 API Key：{name}", { name: providerLabel(provider.id) }),
-    body: [
-      h("dl", { class: "kv" }, h("dt", { text: "Base URL" }), h("dd", { class: "mono", text: provider.baseUrl || "—" })),
-      h("label", { class: "field" }, h("span", { text: t("新的 API Key") }), apiKey),
-      paragraph(t("會先用新 Key 查詢模型清單：上游明確拒絕（401／403）時不會更換。路由器會自動改用新 Key，不需要重新啟動。"), "note"),
-    ],
-  });
-  modal.setFoot(h("span", { class: "grow" }),
-    h("button", { type: "button", class: "button", text: t("取消"), onclick: () => modal.close() }),
-    h("button", { type: "button", class: "button primary", text: t("驗證並儲存"), onclick: () => {
-      const value = apiKey.value.trim();
-      if (!value) { toast(t("請填寫新的 API Key。"), "error"); return; }
-      apiKey.value = "";
-      modal.close();
-      runJob("replace-key", { providerId: provider.id, apiKey: value }, { title: t("更換 API Key：{name}", { name: providerLabel(provider.id) }) });
-    } }));
 }
 
 function confirmRemoveProvider(provider) {
