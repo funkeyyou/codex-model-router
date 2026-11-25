@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.46.1";
+const INSTALLER_VERSION = "1.47.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -6955,7 +6955,7 @@ const MANAGER_MCP_KEY = "mcp_servers.model_router_manager";
 const managerMcpPath = join(installRoot, "manager-entry.mjs");
 const managerLauncherPath = join(installRoot, isWindows ? "manager-open.js" : "manager-open.sh");
 const managerIconPath = join(installRoot, "manager-icon.svg");
-const MANAGER_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#111d35"/><path d="M14 22h14l10 20h12M14 42h14l10-20h12m-6-6 6 6-6 6m0 8 6 6-6 6" fill="none" stroke="#63b5fa" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>\n';
+const MANAGER_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0d0b14"/><g fill="none" stroke="#a78bfa" stroke-width="4.6" stroke-linecap="round"><path d="M12 32h13"/><path d="M25 32c8 0 8-13.5 16.5-13.5"/><path d="M25 32h16.5"/><path d="M25 32c8 0 8 13.5 16.5 13.5"/></g><circle cx="46.5" cy="18.5" r="4.4" fill="#a78bfa"/><circle cx="46.5" cy="32" r="4.4" fill="#34d399"/><circle cx="46.5" cy="45.5" r="4.4" fill="#a78bfa"/></svg>\n';
 // 記錄檔裡跟故障有關的前綴；ready、log-truncated 之類的例行訊息不顯示。
 const MANAGER_LOG_KINDS = new Set([
   "error", "websocket-error", "catalog-refresh-failed", "request-too-large", "upstream-ws-cooldown", "auth-probe-grace",
@@ -9139,21 +9139,60 @@ function usageAverage(sum, count) {
   return count > 0 ? sum / count : null;
 }
 
+function usageMedian(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+// 路由器以第一段到最後一段串流輸出的視窗計算 TPS，並記下 generationMs。更早的紀錄只有首次輸出與
+// 總耗時，在這裡依同一套規則重算：沒有串流出來的推理 tokens 不計入、視窗不到 0.5 秒不算。
+// 原本就沒有 TPS 的紀錄（失敗、整段一次送達的 CLI 回覆）維持 null。
+const usageMinGenerationMs = 500;
+
 function recordedOutputTps(record) {
   // 舊版有首次輸出時間、明確沒有首次文字時間的紀錄，是由工具呼叫觸發的。
   const hasText = record.hasText ?? !(record.firstTextMs === null && Number.isFinite(record.firstOutputMs));
-  return hasText ? record.outputTps : null;
+  if (!hasText || !Number.isFinite(record.outputTps)) return null;
+  if (Object.hasOwn(record, "generationMs")) return record.outputTps;
+  const windowMs = record.durationMs - record.firstOutputMs;
+  const output = Number(record.output) || 0;
+  const reasoningStreamed = Number.isFinite(record.firstTextMs) && record.firstOutputMs < record.firstTextMs;
+  const tokens = reasoningStreamed ? output : output - (Number(record.reasoning) || 0);
+  return windowMs >= usageMinGenerationMs && tokens >= 2 ? (tokens - 1) * 1000 / windowMs : null;
+}
+
+// 使用記錄頁的趨勢小圖：把時間範圍切成固定數量的區段，各自累計請求、失敗、快取與耗時。
+export function usageSeries(records, since, until, count = 24) {
+  const span = Math.max(1, until - since) / count;
+  const buckets = Array.from({ length: count }, () => ({ requests: 0, failed: 0, input: 0, cached: 0, output: 0, durationMs: 0, durationSamples: 0 }));
+  for (const record of records) {
+    const at = Date.parse(record?.at);
+    if (!Number.isFinite(at) || at < since || at > until) continue;
+    const bucket = buckets[Math.min(count - 1, Math.floor((at - since) / span))];
+    bucket.requests += 1;
+    if (record.status === "failed") bucket.failed += 1;
+    for (const field of ["input", "cached", "output"]) bucket[field] += Number(record[field]) || 0;
+    if (Number.isFinite(record.durationMs) && record.durationMs >= 0) {
+      bucket.durationMs += record.durationMs;
+      bucket.durationSamples += 1;
+    }
+  }
+  return buckets;
 }
 
 export function summarizeUsage(records) {
   const byModel = new Map();
   const total = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0 };
   let totalDurationSamples = 0;
+  let totalFirstOutputMs = 0;
+  let totalFirstOutputSamples = 0;
   for (const record of records) {
     const key = record.model || "-";
     const entry = byModel.get(key) || { model: key, provider: record.provider || null, route: record.route || null,
       requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0, background: 0,
-      durationSamples: 0, firstOutputMs: 0, firstOutputSamples: 0, outputTps: 0, outputTpsSamples: 0 };
+      durationSamples: 0, firstOutputMs: 0, firstOutputSamples: 0, outputTps: [] };
     for (const target of [entry, total]) {
       target.requests += 1;
       for (const field of ["input", "cached", "cacheWrite", "output", "reasoning"]) target[field] += Number(record[field]) || 0;
@@ -9169,29 +9208,31 @@ export function summarizeUsage(records) {
     if (Number.isFinite(firstOutputMs) && firstOutputMs >= 0) {
       entry.firstOutputMs += firstOutputMs;
       entry.firstOutputSamples += 1;
+      totalFirstOutputMs += firstOutputMs;
+      totalFirstOutputSamples += 1;
     }
     const outputTps = recordedOutputTps(record);
-    if (Number.isFinite(outputTps) && outputTps >= 0) {
-      entry.outputTps += outputTps;
-      entry.outputTpsSamples += 1;
-    }
+    if (Number.isFinite(outputTps) && outputTps >= 0) entry.outputTps.push(outputTps);
     if (record.background) entry.background += 1;
     byModel.set(key, entry);
   }
   const rate = (item) => (item.input > 0 ? item.cached / item.input : null);
   return {
-    total: { ...total, cacheHitRate: rate(total), avgDurationMs: usageAverage(total.durationMs, totalDurationSamples) },
-    models: [...byModel.values()].map(({ durationSamples, firstOutputMs, firstOutputSamples, outputTps, outputTpsSamples, ...item }) => ({
+    total: { ...total, cacheHitRate: rate(total), avgDurationMs: usageAverage(total.durationMs, totalDurationSamples),
+      avgFirstOutputMs: usageAverage(totalFirstOutputMs, totalFirstOutputSamples) },
+    models: [...byModel.values()].map(({ durationSamples, firstOutputMs, firstOutputSamples, outputTps, ...item }) => ({
       ...item, cacheHitRate: rate(item),
       avgDurationMs: usageAverage(item.durationMs, durationSamples),
       avgFirstOutputMs: usageAverage(firstOutputMs, firstOutputSamples),
-      avgOutputTps: usageAverage(outputTps, outputTpsSamples),
+      // 單次 TPS 的分布有長尾（短回覆、半段緩衝），平均值會被少數極端值拉高；取中位數（tokps 的 p50）。
+      medianOutputTps: usageMedian(outputTps),
+      outputTpsSamples: outputTps.length,
     }))
       .sort((left, right) => right.input + right.output - (left.input + left.output)),
   };
 }
 
-function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
+function managerUsage({ page = 1, sinceHours = 24, asOf, entries: includeEntries = true } = {}) {
   const now = Date.now();
   const snapshot = Number.isSafeInteger(asOf) && asOf <= now && asOf >= now - hourMs ? asOf : now;
   const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), usageHistoryHours);
@@ -9225,7 +9266,8 @@ function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
   const offset = (current - 1) * usagePageSize;
   return {
     sinceHours: hours, summary: summarizeUsage(summaryRecords), asOf: snapshot,
-    entries: recent.slice(offset, offset + usagePageSize).map((record) => ({ ...record, outputTps: recordedOutputTps(record) })),
+    series: usageSeries(summaryRecords, summarySince, snapshot),
+    entries: includeEntries === false ? [] : recent.slice(offset, offset + usagePageSize).map((record) => ({ ...record, outputTps: recordedOutputTps(record) })),
     pagination: { page: current, pages, total: recent.length },
     logPath: usageLogPath,
   };
@@ -11916,6 +11958,14 @@ function usageContext({ requestHeaders, model, route, provider, transport, backg
 
 const usageNumber = (value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.round(Number(value)) : 0);
 
+// 輸出 TPS 沿用 vLLM、NVIDIA genai-perf、llmperf 與 tokps 的單次請求定義：
+//   (視窗內的輸出 tokens − 1) ÷ (最後一段串流輸出 − 第一段串流輸出)
+// 第一個 token 在首次輸出前就已生成，所以視窗只涵蓋 N − 1 個 token 間隔。
+// 沒有串流出來的推理（上游只回報數量）是在首次輸出之前生成的，不算進視窗（tokps 的做法）。
+// 只有一段串流、或第一段到最後一段不到 0.5 秒，多半是上游或中轉站把整段一次送出，
+// 這時量不到生成速度，記成 null，不拿送達時間硬算。
+const usageMinGenerationMs = 500;
+
 export function usageRecord(context, event, now = Date.now()) {
   const status = event?.type === "response.completed" ? "completed"
     : event?.type === "response.incomplete" ? "incomplete"
@@ -11931,10 +11981,16 @@ export function usageRecord(context, event, now = Date.now()) {
     ? Math.min(durationMs, Math.max(0, firstOutputAt - context.startedAt))
     : null;
   const output = usageNumber(usage?.output_tokens);
-  const generationMs = firstOutputMs === null ? 0 : durationMs - firstOutputMs;
+  const reasoning = usageNumber(usage?.output_tokens_details?.reasoning_tokens);
+  const generationMs = firstOutputMs !== null && Number.isFinite(context.lastOutputAt)
+    ? Math.min(durationMs - firstOutputMs, Math.max(0, context.lastOutputAt - firstOutputAt))
+    : null;
+  const windowTokens = context.reasoningStreamed ? output : Math.max(0, output - reasoning);
   // 結束事件可補足只在完整回應中提供文字的上游。
   const finalOutput = event.response?.output;
   const hasText = firstTextMs !== null || (Array.isArray(finalOutput) && finalOutput.some(hasOutputText));
+  const measurable = !context.bufferedOutput && hasText && status !== "failed" && windowTokens >= 2 &&
+    (context.outputChunks || 0) >= 2 && generationMs >= usageMinGenerationMs;
   return {
     at: new Date(now).toISOString(),
     model: context.model,
@@ -11942,13 +11998,13 @@ export function usageRecord(context, event, now = Date.now()) {
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
     ...(context.combo ? { combo: context.combo, comboRole: context.comboRole } : {}),
-    durationMs, firstTextMs, firstOutputMs, hasText,
-    outputTps: !context.bufferedOutput && hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
+    durationMs, firstTextMs, firstOutputMs, generationMs, hasText,
+    outputTps: measurable ? (windowTokens - 1) * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
     cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
     output,
-    reasoning: usageNumber(usage?.output_tokens_details?.reasoning_tokens),
+    reasoning,
     hasUsage: Boolean(usage),
     ...(status === "failed" && event.response?.error?.code ? { error: String(event.response.error.code).slice(0, 80) } : {}),
   };
@@ -11979,6 +12035,9 @@ function rotateUsageLog(at) {
 const usageToolItems = new Set(["function_call", "custom_tool_call", "tool_search_call", "mcp_call",
   "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "local_shell_call",
   "shell_call", "apply_patch_call", "computer_call"]);
+const usageReasoningDeltas = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
+const usageOutputDeltas = new Set(["response.output_text.delta", "response.function_call_arguments.delta",
+  "response.custom_tool_call_input.delta", ...usageReasoningDeltas]);
 
 function hasOutputText(item) {
   return item?.type === "message" && Array.isArray(item.content) && item.content.some(
@@ -11988,20 +12047,25 @@ function hasOutputText(item) {
 
 export function recordUsageEvent(context, event) {
   if (context.recorded || settings.usageLog === false) return;
+  const now = Date.now();
   if ((event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) ||
       (event?.type === "response.output_text.done" && typeof event.text === "string" && event.text.length) ||
       (event?.type === "response.output_item.done" && hasOutputText(event.item))) {
-    context.firstTextAt ??= Date.now();
+    context.firstTextAt ??= now;
     context.firstOutputAt ??= context.firstTextAt;
   }
   // 串流出來的思考也是輸出：模型先想 20 秒、正文 1 秒就送完時，只從正文起算會把思考的
   // tokens 擠進那 1 秒，TPS 變成數千。首次輸出因此從第一段可見的思考或正文起算。
-  if (context.firstOutputAt == null && (
-    ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)) ||
-    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta" ||
-      event?.type === "response.reasoning_summary_text.delta" || event?.type === "response.reasoning_text.delta") && event.delta?.length)
-  )) {
-    context.firstOutputAt = Date.now();
+  const streamedDelta = usageOutputDeltas.has(event?.type) && typeof event.delta === "string" && event.delta.length > 0;
+  if (context.firstOutputAt == null && (streamedDelta ||
+    ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)))) {
+    context.firstOutputAt = now;
+  }
+  // TPS 的視窗到最後一段串流輸出為止；段數用來辨認整段一次送達的回覆。
+  if (streamedDelta) {
+    context.lastOutputAt = now;
+    context.outputChunks = (context.outputChunks || 0) + 1;
+    if (usageReasoningDeltas.has(event.type)) context.reasoningStreamed = true;
   }
   const record = usageRecord(context, event);
   if (!record) return;
@@ -19700,7 +19764,8 @@ export function desktopRoute(settings, model) {
 // but not retained by the observer. Lifecycle and usage frames are small.
 export function desktopUsageObserver() {
   let buffer = "", skip = false, started = false, stopped = false, failed = false, stopReason = null, usage = null;
-  let firstTextAt = null, firstOutputAt = null;
+  let firstTextAt = null, firstOutputAt = null, lastOutputAt = null, outputChunks = 0, reasoningStreamed = false;
+  const streamedDeltas = { text_delta: "text", thinking_delta: "thinking", input_json_delta: "partial_json" };
   const decoder = new TextDecoder();
   const frame = (text) => {
     const data = text.split("\n").filter((line) => line.startsWith("data:"))
@@ -19717,6 +19782,14 @@ export function desktopUsageObserver() {
       }
       if (event.type === "content_block_start" && ["tool_use", "server_tool_use"].includes(event.content_block?.type)) {
         firstOutputAt ??= Date.now();
+      }
+      // Same generation window as router.mjs usageRecord: first to last streamed delta.
+      const field = event.type === "content_block_delta" ? streamedDeltas[event.delta?.type] : null;
+      if (field && typeof event.delta[field] === "string" && event.delta[field].length) {
+        lastOutputAt = Date.now();
+        firstOutputAt ??= lastOutputAt;
+        outputChunks += 1;
+        if (event.delta.type === "thinking_delta") reasoningStreamed = true;
       }
       if (event.type === "message_delta") {
         if (event.usage) usage = { ...usage, ...event.usage };
@@ -19739,7 +19812,8 @@ export function desktopUsageObserver() {
       if (buffer.length > 64 * 1024) { buffer = buffer.slice(-3); skip = true; }
     },
     result() {
-      return { usage, firstTextAt, firstOutputAt, status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
+      return { usage, firstTextAt, firstOutputAt, lastOutputAt, outputChunks, reasoningStreamed,
+        status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
     },
   };
 }
@@ -19778,6 +19852,9 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
       recorded = true;
       context.firstTextAt = result.firstTextAt;
       context.firstOutputAt = result.firstOutputAt;
+      context.lastOutputAt = result.lastOutputAt;
+      context.outputChunks = result.outputChunks;
+      context.reasoningStreamed = result.reasoningStreamed;
       recordUsage(context, desktopUsageEvent(result, context.upstreamModel, code));
     };
     try {
@@ -21120,25 +21197,34 @@ __CODEX_MODEL_ROUTER_MANAGER_HTML__
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>模型路由器</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%230f172a'/%3E%3Cpath d='M11 16h8c4 0 6 2 8 5l2 3c1.5 2.3 3 3.5 6 3.5h2' stroke='%2338bdf8' stroke-width='4.5' fill='none' stroke-linecap='round'/%3E%3Cpath d='M11 32h8c3 0 5-1.5 6.5-3.5' stroke='%233b82f6' stroke-width='4.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%230d0b14'/%3E%3Cg fill='none' stroke='%23a78bfa' stroke-width='3.6' stroke-linecap='round'%3E%3Cpath d='M9 24h10'/%3E%3Cpath d='M19 24c6 0 6-10 12.5-10'/%3E%3Cpath d='M19 24h12.5'/%3E%3Cpath d='M19 24c6 0 6 10 12.5 10'/%3E%3C/g%3E%3Ccircle cx='35.5' cy='14' r='3.4' fill='%23a78bfa'/%3E%3Ccircle cx='35.5' cy='24' r='3.4' fill='%2334d399'/%3E%3Ccircle cx='35.5' cy='34' r='3.4' fill='%23a78bfa'/%3E%3C/svg%3E">
 <style>
 :root {
   color-scheme: dark;
-  --bg: #0b1120;
-  --panel: #111a2e;
-  --panel-2: #0f172a;
-  --panel-3: #16203a;
-  --border: #1e293b;
-  --border-strong: #2a3a55;
-  --text: #e2e8f0;
-  --muted: #94a3b8;
-  --faint: #64748b;
-  --accent: #38bdf8;
-  --accent-2: #3b82f6;
-  --ok: #22c55e;
-  --warn: #f59e0b;
-  --danger: #f43f5e;
+  --bg: #09090b;
+  --sidebar: #0b0b0e;
+  --panel: #111115;
+  --panel-2: #15151a;
+  --panel-3: #19191f;
+  --hover: #1a1a21;
+  --input: #0d0d11;
+  --border: #1f1f27;
+  --border-strong: #2d2d38;
+  --text: #f4f4f5;
+  --muted: #a1a1aa;
+  --faint: #6b6b78;
+  --placeholder: #52525b;
+  --accent: #8b5cf6;
+  --accent-strong: #7c3aed;
+  --accent-text: #c4b5fd;
+  --accent-soft: rgba(139, 92, 246, .14);
+  --accent-ring: rgba(139, 92, 246, .45);
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --danger: #fb7185;
+  --info: #60a5fa;
   --radius: 12px;
+  --radius-sm: 8px;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei UI", "Microsoft JhengHei", "Noto Sans TC", system-ui, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
@@ -21147,94 +21233,111 @@ __CODEX_MODEL_ROUTER_MANAGER_HTML__
 /* 簡體介面改用簡體字形的字型；英文介面仍保留中文字型，伺服器回傳的記錄可能是中文。 */
 :root:lang(zh-Hans) { --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif; }
 html, body { margin: 0; }
+/* 預留捲軸空間：切換篩選讓頁面變短時，表格寬度不會跟著跳動。 */
+html { scrollbar-gutter: stable; }
 body { background: var(--bg); color: var(--text); font: 14px/1.55 var(--sans); -webkit-font-smoothing: antialiased; }
-a { color: var(--accent); }
+a { color: var(--accent-text); }
 button { font: inherit; color: inherit; }
 .app { display: flex; min-height: 100vh; }
 
-.sidebar { width: 252px; flex: none; background: var(--panel-2); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; }
-.brand { display: flex; gap: 12px; align-items: center; padding: 20px 18px 18px; border-bottom: 1px solid var(--border); }
-.logo { width: 46px; height: 46px; flex: none; border-radius: 13px; display: grid; place-items: center; background: linear-gradient(150deg, #1c2a45, #0b1120); box-shadow: inset 0 0 0 1px #26365a, 0 6px 18px rgba(14, 165, 233, .12); }
-.brand-name { font-weight: 700; font-size: 16px; letter-spacing: .2px; white-space: nowrap; }
-.version-badge { margin-top: 5px; display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 8px; background: #1e293b; color: var(--muted); border: 1px solid transparent; font: 12.5px/1.7 var(--mono); cursor: pointer; }
+.sidebar { width: 240px; flex: none; background: var(--sidebar); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; }
+.brand { display: flex; gap: 11px; align-items: center; padding: 18px 16px 14px; }
+.logo { width: 38px; height: 38px; flex: none; border-radius: 10px; display: grid; place-items: center; background: radial-gradient(circle at 50% 45%, #241a3f 0%, #0d0b14 72%); box-shadow: inset 0 0 0 1px #2a2340, 0 6px 22px rgba(139, 92, 246, .26); }
+.brand-name { font-weight: 650; font-size: 14.5px; letter-spacing: .2px; white-space: nowrap; }
+.version-badge { margin-top: 3px; display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 6px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); font: 11.5px/1.7 var(--mono); cursor: pointer; }
 .version-badge:hover { color: var(--text); border-color: var(--border-strong); }
-.version-badge.has-update { background: rgba(245, 158, 11, .14); color: #fde68a; }
-.version-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px rgba(245, 158, 11, .18); }
-.nav { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; min-height: 0; overflow-y: auto; }
-.nav-group-label { margin: 8px 12px 2px; color: var(--faint); font-size: 11px; font-weight: 700; letter-spacing: .6px; }
-.nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; color: var(--muted); background: none; border: 0; cursor: pointer; text-align: left; font-size: 14.5px; }
-.nav-item:hover { background: #142036; color: var(--text); }
-.nav-item.active { background: #172544; color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
-.nav-item svg { width: 19px; height: 19px; flex: none; }
-.nav-count { margin-left: auto; font-size: 12px; color: var(--faint); }
-.sidebar-footer { margin-top: auto; padding: 14px 16px 16px; border-top: 1px solid var(--border); display: grid; gap: 10px; font-size: 12.5px; color: var(--muted); }
-.router-status { display: flex; align-items: center; gap: 8px; }
-.status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--faint); }
-.status-dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(34, 197, 94, .16); }
-.status-dot.bad { background: var(--danger); box-shadow: 0 0 0 3px rgba(244, 63, 94, .16); }
-.link-button { background: none; border: 0; padding: 0; color: var(--faint); cursor: pointer; text-align: left; font-size: 12.5px; }
+.version-badge.has-update { background: rgba(251, 191, 36, .12); border-color: rgba(251, 191, 36, .3); color: #fde68a; }
+.version-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px rgba(251, 191, 36, .18); }
+.nav { padding: 4px 10px 10px; display: flex; flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; }
+.nav-group-label { margin: 14px 10px 4px; color: var(--faint); font-size: 11px; font-weight: 600; letter-spacing: .6px; text-transform: uppercase; }
+.nav-item { position: relative; display: flex; align-items: center; gap: 11px; height: 36px; padding: 0 10px; border-radius: var(--radius-sm); color: var(--muted); background: none; border: 0; cursor: pointer; text-align: left; font-size: 14px; }
+.nav-item:hover { background: var(--hover); color: var(--text); }
+.nav-item.active { background: var(--accent-soft); color: #ede9fe; font-weight: 550; box-shadow: inset 2px 0 0 var(--accent); }
+.nav-item.active svg { color: var(--accent-text); }
+.nav-item svg { width: 18px; height: 18px; flex: none; }
+.nav-count { margin-left: auto; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.sidebar-footer { margin-top: auto; padding: 12px; display: grid; gap: 8px; font-size: 12.5px; color: var(--muted); }
+.router-status { display: grid; gap: 1px; padding: 10px 12px; border-radius: 10px; background: var(--panel); border: 1px solid var(--border); }
+.router-status .status-title { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; }
+.router-status .status-sub { color: var(--faint); font-size: 12px; padding-left: 16px; font-variant-numeric: tabular-nums; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--faint); }
+.status-dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, .16); }
+.status-dot.bad { background: var(--danger); box-shadow: 0 0 0 3px rgba(251, 113, 133, .16); }
+.status-dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(251, 191, 36, .16); }
+.link-button { background: none; border: 0; padding: 0 4px; color: var(--faint); cursor: pointer; text-align: left; font-size: 12.5px; }
 .link-button:hover { color: var(--text); }
 .language-picker { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .language-picker svg { width: 15px; height: 15px; flex: none; }
-.language-picker select { width: auto; flex: 1; min-width: 0; padding: 4px 8px; border-radius: 8px; font-size: 12.5px; background: #0d1528; }
+.language-picker select { width: auto; flex: 1; min-width: 0; padding: 5px 8px; border-radius: var(--radius-sm); font-size: 12.5px; background: var(--input); }
 
-.main { flex: 1; min-width: 0; padding: 28px 34px 56px; max-width: 1280px; }
-.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
-.page-head h1 { margin: 0; font-size: 22px; letter-spacing: .3px; }
-.page-head p { margin: 4px 0 0; color: var(--muted); }
+.main { flex: 1; min-width: 0; padding: 26px 32px 56px; max-width: 1320px; }
+.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
+.page-head > div:first-child { flex: 1 1 420px; min-width: 0; }
+.page-head h1 { margin: 0; font-size: 21px; font-weight: 650; letter-spacing: .2px; }
+.page-head p { margin: 4px 0 0; color: var(--muted); font-size: 13.5px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.actions > select { width: auto; min-width: 150px; height: 34px; padding-top: 0; padding-bottom: 0; }
 
-.button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border-strong); background: #152038; font-weight: 500; cursor: pointer; white-space: nowrap; }
+.button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: 34px; padding: 0 13px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong); background: #17171d; color: var(--text); font-weight: 500; cursor: pointer; white-space: nowrap; }
 .button svg { width: 16px; height: 16px; }
-.button:hover:not(:disabled) { background: #1a2847; }
+.button:hover:not(:disabled) { background: #1f1f27; border-color: #3a3a47; }
 .button:disabled { opacity: .45; cursor: not-allowed; }
-.button.primary { background: linear-gradient(135deg, #06b6d4, #3b82f6); border-color: transparent; color: #fff; }
-.button.primary:hover:not(:disabled) { filter: brightness(1.08); background: linear-gradient(135deg, #06b6d4, #3b82f6); }
-.button.danger { background: rgba(244, 63, 94, .12); border-color: rgba(244, 63, 94, .42); color: #fecdd3; }
-.button.danger:hover:not(:disabled) { background: rgba(244, 63, 94, .2); }
-.button.small { padding: 5px 10px; font-size: 12.5px; border-radius: 8px; }
-.icon-button { width: 30px; height: 30px; display: inline-grid; place-items: center; border-radius: 8px; border: 1px solid transparent; background: transparent; color: var(--muted); cursor: pointer; padding: 0; }
+.button.primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; box-shadow: 0 1px 0 rgba(255, 255, 255, .08) inset, 0 4px 14px rgba(124, 58, 237, .25); }
+.button.primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
+.button.danger { background: rgba(251, 113, 133, .1); border-color: rgba(251, 113, 133, .38); color: #fecdd3; }
+.button.danger:hover:not(:disabled) { background: rgba(251, 113, 133, .18); border-color: rgba(251, 113, 133, .5); }
+.button.small { height: 28px; padding: 0 10px; font-size: 12.5px; border-radius: 7px; }
+.button.small svg { width: 14px; height: 14px; }
+.icon-button { width: 30px; height: 30px; display: inline-grid; place-items: center; border-radius: 7px; border: 1px solid transparent; background: transparent; color: var(--muted); cursor: pointer; padding: 0; }
 .icon-button svg { width: 17px; height: 17px; }
-.icon-button:hover:not(:disabled) { background: #1a2847; color: var(--text); }
+.icon-button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 .icon-button:disabled { opacity: .28; cursor: default; }
 .icon-button.spin svg { animation: spin .8s linear infinite; }
 
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 18px; }
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; min-width: 0; }
-.card-label { color: var(--muted); font-size: 12.5px; }
-.card-value { font-size: 24px; font-weight: 700; margin-top: 4px; display: flex; align-items: center; gap: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card-sub { color: var(--faint); font-size: 12.5px; margin-top: 3px; overflow-wrap: anywhere; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card { position: relative; overflow: hidden; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px 13px; min-width: 0; min-height: 104px; }
+.card-label { color: var(--muted); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+.card-label svg { width: 15px; height: 15px; flex: none; color: var(--faint); }
+.card-value { font-size: 24px; font-weight: 650; margin-top: 4px; display: flex; align-items: center; gap: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+.card-sub { color: var(--faint); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; position: relative; z-index: 1; }
+.card.has-spark .card-value { padding-right: 100px; }
+.spark { position: absolute; right: 14px; top: 36px; width: 88px; height: 32px; pointer-events: none; }
 
-.panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 18px; overflow: hidden; }
-.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 18px; border-bottom: 1px solid var(--border); }
-.panel-head h2 { margin: 0; font-size: 15px; }
-.panel-body { padding: 16px 18px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 16px; overflow: hidden; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.panel-head h2 { margin: 0; font-size: 14.5px; font-weight: 600; }
+.panel-title { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.tile { width: 32px; height: 32px; flex: none; border-radius: 9px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-text); }
+.tile svg { width: 17px; height: 17px; }
+.panel-body { padding: 16px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-th { color: var(--muted); font-weight: 500; font-size: 12.5px; background: #0f1830; white-space: nowrap; }
+th, td { text-align: left; padding: 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th { color: var(--faint); font-weight: 500; font-size: 12px; background: var(--panel-2); white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }
-tbody tr:hover td { background: #121d35; }
+tbody tr:hover td { background: #141419; }
 td.tight, th.tight { width: 1%; white-space: nowrap; }
 .mono { font-family: var(--mono); font-size: 12.5px; }
 .muted { color: var(--muted); }
 .faint { color: var(--faint); }
 .nowrap { white-space: nowrap; }
-.chip { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border-radius: 999px; font-size: 12px; line-height: 1.7; background: #1b2742; color: #cbd5e1; border: 1px solid #24324d; white-space: nowrap; }
-.chip.cyan { background: rgba(56, 189, 248, .12); border-color: rgba(56, 189, 248, .32); color: #bae6fd; }
-.chip.violet { background: rgba(167, 139, 250, .12); border-color: rgba(167, 139, 250, .32); color: #ddd6fe; }
-.chip.amber { background: rgba(245, 158, 11, .12); border-color: rgba(245, 158, 11, .32); color: #fde68a; }
-.chip.green { background: rgba(34, 197, 94, .12); border-color: rgba(34, 197, 94, .32); color: #bbf7d0; }
-.chip.rose { background: rgba(244, 63, 94, .12); border-color: rgba(244, 63, 94, .32); color: #fecdd3; }
+.chip { display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; height: 21px; border-radius: 6px; font-size: 11.5px; font-weight: 500; line-height: 1; background: #1b1b22; color: #d4d4d8; border: 1px solid #26262f; white-space: nowrap; }
+.chip.cyan { background: rgba(96, 165, 250, .12); border-color: rgba(96, 165, 250, .26); color: #bfdbfe; }
+.chip.violet { background: rgba(139, 92, 246, .14); border-color: rgba(139, 92, 246, .3); color: #ddd6fe; }
+.chip.orange { background: rgba(224, 122, 82, .14); border-color: rgba(224, 122, 82, .3); color: #fed7c3; }
+.chip.amber { background: rgba(251, 191, 36, .12); border-color: rgba(251, 191, 36, .28); color: #fde68a; }
+.chip.green { background: rgba(52, 211, 153, .12); border-color: rgba(52, 211, 153, .28); color: #bbf7d0; }
+.chip.rose { background: rgba(251, 113, 133, .12); border-color: rgba(251, 113, 133, .3); color: #fecdd3; }
+.chip.accent { background: var(--accent-soft); border-color: rgba(139, 92, 246, .32); color: var(--accent-text); }
 td.num { font-variant-numeric: tabular-nums; }
 
-.banner { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 10px; margin-bottom: 16px; border: 1px solid; font-size: 13.5px; }
+.banner { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; border: 1px solid; font-size: 13.5px; }
 .banner svg { width: 18px; height: 18px; flex: none; }
 .banner .grow { flex: 1; min-width: 0; }
-.banner.info { background: rgba(56, 189, 248, .08); border-color: rgba(56, 189, 248, .3); color: #bae6fd; }
-.banner.warn { background: rgba(245, 158, 11, .08); border-color: rgba(245, 158, 11, .35); color: #fde68a; }
-.banner.error { background: rgba(244, 63, 94, .08); border-color: rgba(244, 63, 94, .35); color: #fecdd3; }
-.banner.success { background: rgba(34, 197, 94, .08); border-color: rgba(34, 197, 94, .32); color: #bbf7d0; }
+.banner.info { background: rgba(139, 92, 246, .08); border-color: rgba(139, 92, 246, .3); color: #ddd6fe; }
+.banner.warn { background: rgba(251, 191, 36, .07); border-color: rgba(251, 191, 36, .3); color: #fde68a; }
+.banner.error { background: rgba(251, 113, 133, .07); border-color: rgba(251, 113, 133, .32); color: #fecdd3; }
+.banner.success { background: rgba(52, 211, 153, .07); border-color: rgba(52, 211, 153, .3); color: #bbf7d0; }
 .kv { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 9px 16px; margin: 0; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; word-break: break-all; }
@@ -21243,14 +21346,21 @@ td.num { font-variant-numeric: tabular-nums; }
 .welcome ol { margin: 0; padding-left: 22px; line-height: 2; }
 .welcome .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .notes { display: grid; gap: 6px; margin: -4px 0 14px; }
-.note { color: var(--muted); font-size: 12.5px; }
+.note { color: var(--faint); font-size: 12.5px; }
 .note.warn { color: #fde68a; }
 
 .model-name { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.model-name > span:first-child { white-space: nowrap; }
+.model-cell .model-name { white-space: nowrap; }
+.cell-sub { margin-top: 4px; color: var(--faint); font-size: 12px; white-space: nowrap; }
 .model-sub { color: var(--faint); font: 12px/1.5 var(--mono); margin-top: 2px; word-break: break-all; }
-.drag-handle { cursor: grab; color: var(--faint); display: inline-grid; place-items: center; width: 26px; height: 30px; border-radius: 6px; touch-action: none; user-select: none; -webkit-user-select: none; }
-.drag-handle:hover { color: var(--text); background: #1a2847; }
-.drag-handle.disabled { cursor: default; opacity: .35; }
+.model-cell { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.model-family { width: 26px; height: 26px; flex: none; border-radius: 7px; display: grid; place-items: center; background: #1b1b22; border: 1px solid #26262f; }
+.model-family .brand-icon { width: 15px; height: 15px; }
+.model-family svg { width: 14px; height: 14px; color: var(--faint); }
+.drag-handle { cursor: grab; color: var(--faint); display: inline-grid; place-items: center; width: 24px; height: 30px; border-radius: 6px; touch-action: none; user-select: none; -webkit-user-select: none; opacity: .7; }
+.drag-handle:hover { color: var(--text); background: var(--hover); opacity: 1; }
+.drag-handle.disabled { cursor: default; opacity: .3; }
 .drag-handle.disabled:hover { background: none; color: var(--faint); }
 .drag-handle svg { width: 16px; height: 16px; }
 body.dragging-row, body.dragging-row * { cursor: grabbing !important; user-select: none !important; -webkit-user-select: none !important; }
@@ -21258,22 +21368,62 @@ tr.dragging td { opacity: .35; }
 tr.drop-before td { box-shadow: inset 0 2px 0 var(--accent); }
 tr.drop-after td { box-shadow: inset 0 -2px 0 var(--accent); }
 .row-actions { display: flex; gap: 2px; justify-content: flex-end; }
-input[type=checkbox] { width: 16px; height: 16px; accent-color: #22d3ee; cursor: pointer; vertical-align: middle; }
+input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; vertical-align: middle; }
+.meter { display: inline-flex; align-items: center; gap: 9px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.meter-bar { width: 44px; height: 5px; border-radius: 99px; background: #23232c; overflow: hidden; flex: none; }
+
+/* 固定欄寬的表格：名稱欄吃剩下的寬度，過長用省略號，篩選或名稱長短都不會改變其他欄的寬度。 */
+.fixed-table { table-layout: fixed; }
+.fixed-table th { white-space: normal; line-height: 1.35; }
+.fixed-table td { overflow: hidden; text-overflow: ellipsis; }
+.fixed-table input[type=checkbox] { margin: 0; }
+.fixed-table .model-cell > div { flex: 1; min-width: 0; }
+.fixed-table .model-name { flex-wrap: nowrap; }
+.fixed-table .model-name > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.fixed-table .model-name > .chip { flex: none; }
+.fixed-table .model-sub, .fixed-table .cell-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; word-break: normal; }
+.fixed-table .chip { max-width: 100%; overflow: hidden; }
+.chip-row { display: flex; gap: 6px; }
+.w-check { width: 44px; }
+.w-grip { width: 28px; }
+.w-transport { width: 196px; }
+.w-limits { width: 104px; }
+.w-num { width: 84px; }
+.w-req { width: 104px; }
+.w-cache { width: 116px; }
+.w-actions { width: 112px; }
+.w-time { width: 128px; }
+.w-state { width: 112px; }
+.w-duration { width: 92px; }
+.w-tps { width: 104px; }
+.meter-bar i { display: block; height: 100%; border-radius: inherit; background: var(--ok); }
+.meter-bar i.mid { background: var(--warn); }
+.meter-bar i.low { background: var(--danger); }
+
+.toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.toolbar h2 { margin: 0; font-size: 14.5px; font-weight: 600; }
+.toolbar .grow { flex: 1; }
+.segmented { display: inline-flex; gap: 2px; padding: 2px; border-radius: var(--radius-sm); background: var(--input); border: 1px solid var(--border); flex-wrap: wrap; }
+.segmented button { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 6px; border: 0; background: none; color: var(--muted); font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+.segmented button:hover { color: var(--text); }
+.segmented button.active { background: #1f1f27; color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, .35); }
+.segmented button .count { color: var(--faint); font-variant-numeric: tabular-nums; }
+.search-box { position: relative; width: 220px; max-width: 100%; }
+.search-box svg { position: absolute; left: 10px; top: 50%; width: 15px; height: 15px; transform: translateY(-50%); color: var(--faint); pointer-events: none; }
+.search-box input[type=search] { padding-left: 32px; height: 32px; }
 
 .provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
 .provider-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); display: flex; flex-direction: column; }
-.provider-card .head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
-.provider-card .head .title { font-weight: 700; font-size: 15px; }
+.provider-card .head { display: flex; align-items: center; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; row-gap: 8px; }
+.provider-card .head .title { font-weight: 650; font-size: 14.5px; white-space: nowrap; }
+.provider-card .head .spacer { flex: 1; }
+.provider-card .head-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .provider-card .body { padding: 14px 16px; display: grid; gap: 8px; flex: 1; }
 .provider-card .row { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 10px; font-size: 13px; }
-.provider-card .row > span:first-child { color: var(--muted); }
+.provider-card .row > span:first-child { color: var(--faint); }
 .provider-card .row > span:last-child { word-break: break-all; }
-.provider-card .head .spacer { flex: 1; }
-.provider-card .head .title { white-space: nowrap; }
-.provider-card .foot { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 .provider-card .row .chip { margin-left: 6px; }
-.provider-card .head { flex-wrap: wrap; row-gap: 8px; }
-.provider-card .head-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.provider-card .foot { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 .brand-icon { width: 18px; height: 18px; flex: none; object-fit: contain; }
 .provider-card .head .brand-icon { width: 20px; height: 20px; }
 .preset-group { display: grid; gap: 6px; }
@@ -21282,8 +21432,8 @@ input[type=checkbox] { width: 16px; height: 16px; accent-color: #22d3ee; cursor:
 .preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 6px; }
 .preset-option { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--panel-2); color: var(--text); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; min-width: 0; }
 .preset-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.preset-option:hover { background: #1a2847; }
-.preset-option.selected { border-color: var(--accent); background: #10233f; }
+.preset-option:hover { background: var(--hover); }
+.preset-option.selected { border-color: var(--accent); background: var(--accent-soft); }
 .preset-picker { max-height: 236px; overflow: auto; padding-right: 2px; }
 .key-list { display: flex; flex-direction: column; gap: 4px; }
 .key-item { display: flex; align-items: center; gap: 4px; }
@@ -21291,68 +21441,66 @@ input[type=checkbox] { width: 16px; height: 16px; accent-color: #22d3ee; cursor:
 .key-item .icon-button svg { width: 14px; height: 14px; }
 .backup-inputs { display: grid; gap: 6px; }
 .backup-inputs[hidden] { display: none; }
-.check-line { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.check-line { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.check-line input { margin-top: 2px; }
 
-.popover { position: fixed; z-index: 30; width: 344px; background: var(--panel-3); border: 1px solid var(--border-strong); border-radius: 16px; box-shadow: 0 22px 60px rgba(0, 0, 0, .5); }
+.popover { position: fixed; z-index: 30; width: 344px; background: var(--panel-3); border: 1px solid var(--border-strong); border-radius: 14px; box-shadow: 0 22px 60px rgba(0, 0, 0, .6); }
 .popover-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 12px 12px 18px; border-bottom: 1px solid var(--border-strong); font-weight: 600; font-size: 15px; }
 .popover-body { padding: 20px 16px 12px; }
-.big-version { display: flex; align-items: center; justify-content: center; gap: 12px; font-size: 32px; font-weight: 800; letter-spacing: .4px; }
+.big-version { display: flex; align-items: center; justify-content: center; gap: 12px; font-size: 30px; font-weight: 750; letter-spacing: .4px; }
 .status-icon { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; }
 .status-icon svg { width: 16px; height: 16px; }
-.status-icon.ok { background: rgba(34, 197, 94, .15); color: var(--ok); }
-.status-icon.update { background: rgba(245, 158, 11, .16); color: var(--warn); }
-.status-icon.unknown { background: rgba(148, 163, 184, .14); color: var(--muted); }
+.status-icon.ok { background: rgba(52, 211, 153, .14); color: var(--ok); }
+.status-icon.update { background: rgba(251, 191, 36, .14); color: var(--warn); }
+.status-icon.unknown { background: rgba(161, 161, 170, .12); color: var(--muted); }
 .status-line { text-align: center; color: var(--muted); margin-top: 6px; }
 .popover-section { margin-top: 14px; display: grid; gap: 10px; }
 .changes { max-height: 230px; overflow: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 12.5px; }
 .changes h4 { margin: 0 0 4px; font-size: 12.5px; }
 .changes ul { margin: 0 0 8px; padding-left: 18px; color: var(--muted); }
 .changes ul:last-child { margin-bottom: 0; }
-.check-line { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; color: var(--muted); cursor: pointer; }
-.check-line input { margin-top: 2px; }
 .popover-link { display: flex; justify-content: center; align-items: center; gap: 9px; color: var(--muted); text-decoration: none; padding: 10px; border-radius: 10px; margin-top: 12px; border-top: 1px solid var(--border-strong); }
 .popover-link svg { width: 18px; height: 18px; }
-.popover-link:hover { color: var(--text); background: #1a2847; }
+.popover-link:hover { color: var(--text); background: var(--hover); }
 
-.modal-backdrop { position: fixed; inset: 0; background: rgba(2, 6, 23, .68); display: grid; place-items: center; z-index: 40; padding: 20px; }
-.modal { width: min(560px, 100%); max-height: calc(100vh - 40px); display: flex; flex-direction: column; background: #121b30; border: 1px solid var(--border-strong); border-radius: 16px; box-shadow: 0 30px 80px rgba(0, 0, 0, .55); }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(3, 3, 6, .72); backdrop-filter: blur(2px); display: grid; place-items: center; z-index: 40; padding: 20px; }
+.modal { width: min(560px, 100%); max-height: calc(100vh - 40px); display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--border-strong); border-radius: 14px; box-shadow: 0 30px 80px rgba(0, 0, 0, .6); }
 .modal.wide { width: min(780px, 100%); }
-.modal-head { padding: 14px 14px 14px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.modal-head h3 { margin: 0; font-size: 16px; }
+.modal-head { padding: 13px 14px 13px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.modal-head h3 { margin: 0; font-size: 15.5px; font-weight: 600; }
 .modal-body { padding: 18px 20px; overflow: auto; display: grid; gap: 14px; }
 .modal-body p { margin: 0; }
 .modal-body .banner { margin-bottom: 0; }
-.modal-foot { padding: 13px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
+.modal-foot { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
 .modal-foot .grow { flex: 1; color: var(--muted); font-size: 12.5px; display: flex; align-items: center; gap: 8px; min-width: 0; }
 .field { display: grid; gap: 6px; align-content: start; }
 .field > span { color: var(--muted); font-size: 12.5px; }
 .field .hint { color: var(--faint); font-size: 12px; }
 .field .hint.warn { color: #fde68a; }
-.panel.compact .compact-bar { display: flex; align-items: center; gap: 12px; padding: 10px 18px; }
-.panel.compact .compact-title { font-weight: 600; font-size: 13.5px; white-space: nowrap; }
-.panel.compact .compact-summary { color: var(--muted); font-size: 12.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel.compact .compact-bar { display: flex; align-items: center; gap: 12px; padding: 9px 16px; }
+.panel.compact .compact-title { font-weight: 600; font-size: 13px; white-space: nowrap; }
+.panel.compact .compact-summary { color: var(--faint); font-size: 12.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .panel.compact .panel-body { border-top: 1px solid var(--border); }
 .field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
-input[type=text], input[type=password], input[type=number], input[type=search], input[type=url], select, textarea { width: 100%; padding: 9px 11px; border-radius: 10px; border: 1px solid var(--border-strong); background: #0d1528; color: var(--text); font: inherit; }
+input[type=text], input[type=password], input[type=number], input[type=search], input[type=url], select, textarea { width: 100%; padding: 8px 11px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong); background: var(--input); color: var(--text); font: inherit; }
 textarea { resize: vertical; min-height: 64px; }
-input::placeholder { color: #4b5b75; }
-textarea::placeholder { color: #4b5b75; }
-input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56, 189, 248, .7); box-shadow: 0 0 0 3px rgba(56, 189, 248, .15); }
-.button:focus-visible, .nav-item:focus-visible, .icon-button:focus-visible, .version-badge:focus-visible, .link-button:focus-visible, .type-option:focus-visible { outline: 2px solid rgba(56, 189, 248, .65); outline-offset: 2px; }
-.check-list { border: 1px solid var(--border); border-radius: 10px; max-height: 330px; overflow: auto; background: #0e1629; }
+input::placeholder, textarea::placeholder { color: var(--placeholder); }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent-ring); box-shadow: 0 0 0 3px rgba(139, 92, 246, .16); }
+.button:focus-visible, .nav-item:focus-visible, .icon-button:focus-visible, .version-badge:focus-visible, .link-button:focus-visible, .type-option:focus-visible, .segmented button:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
+.check-list { border: 1px solid var(--border); border-radius: 10px; max-height: 330px; overflow: auto; background: var(--input); }
 .session-row { width: 100%; border: 0; border-bottom: 1px solid var(--border); background: transparent; color: inherit; padding: 12px 14px; text-align: left; cursor: pointer; }
 .session-row:last-child { border-bottom: 0; }
-.session-row:hover { background: rgba(255,255,255,.035); }
+.session-row:hover { background: rgba(255, 255, 255, .035); }
 .session-row-title { font-weight: 650; margin-bottom: 4px; }
 .session-row-meta { color: var(--muted); font-size: 12px; }
 .diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.diff-pane { min-width: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: #0b1220; }
+.diff-pane { min-width: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--input); }
 .diff-label { padding: 7px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; font-weight: 650; }
 .diff-text { margin: 0; padding: 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word; font: inherit; font-size: 13px; }
 @media (max-width: 720px) { .diff-grid { grid-template-columns: 1fr; } }
-.check-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.check-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .check-row:last-child { border-bottom: 0; }
-.check-row:hover { background: #121d35; }
+.check-row:hover { background: #141419; }
 .check-row.disabled { opacity: .5; cursor: default; }
 .check-row .mono { flex: 1; min-width: 0; word-break: break-all; font-size: 13px; }
 .pick-text { flex: 1; min-width: 0; display: grid; gap: 1px; }
@@ -21361,40 +21509,69 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 .option-row input { margin-top: 3px; }
 .stack { display: grid; gap: 14px; }
 .actions.end { justify-content: flex-end; }
-.setting-value { font-size: 22px; font-weight: 700; }
-.setting-body { display: grid; gap: 10px; }
+.setting-value { font-size: 21px; font-weight: 650; letter-spacing: .2px; }
+.setting-body { display: grid; gap: 10px; align-content: start; }
+.setting-group { max-width: 1120px; margin-bottom: 28px; }
+.setting-group > h2 { margin: 0 0 8px 2px; font-size: 12.5px; font-weight: 600; color: var(--muted); letter-spacing: .3px; }
+.setting-list { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
+.setting-row { display: grid; grid-template-columns: minmax(220px, 340px) minmax(0, 1fr); gap: 32px; padding: 20px 22px; border-bottom: 1px solid var(--border); }
+.setting-row:last-child { border-bottom: 0; }
+.setting-label h3 { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; }
+.setting-label h3 .icon-button { width: 24px; height: 24px; }
+.setting-label h3 .icon-button svg { width: 14px; height: 14px; }
+.setting-label p { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.setting-control { display: grid; gap: 10px; align-content: start; min-width: 0; }
+.setting-control p { margin: 0; }
+.setting-control .note { line-height: 1.6; }
+.setting-control .check-list { max-height: none; }
+.inline-field { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.inline-field input[type=number] { width: 160px; height: 34px; }
+.inline-select { width: auto; max-width: 100%; min-width: 260px; }
+.subhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+.subhead-title { font-weight: 600; font-size: 13px; }
+.subhead .button { margin-left: auto; }
+.setting-control .kv.compact { grid-template-columns: 84px minmax(0, 1fr); gap: 6px 12px; font-size: 13px; }
+.setting-control .kv.compact dt { color: var(--faint); }
+.setting-list > .table-wrap { border-radius: var(--radius); }
+.setting-control .check-line { align-items: center; color: var(--text); font-size: 13.5px; }
+.setting-control .check-line > input[type=checkbox] { appearance: none; -webkit-appearance: none; position: relative; flex: none; width: 34px; height: 20px; margin: 0; border-radius: 999px; background: var(--border-strong); transition: background .15s; }
+.setting-control .check-line > input[type=checkbox]::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .35); transition: left .15s; }
+.setting-control .check-line > input[type=checkbox]:checked { background: var(--accent); }
+.setting-control .check-line > input[type=checkbox]:checked::after { left: 16px; }
+.setting-control .check-line > input[type=checkbox]:disabled { opacity: .45; cursor: not-allowed; }
+.setting-control .check-line > input[type=checkbox]:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 2px; }
 .type-choices { display: grid; gap: 10px; }
-.type-option { display: flex; align-items: center; gap: 14px; width: 100%; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border-strong); background: #0e1629; text-align: left; cursor: pointer; }
-.type-option:hover { background: #142036; border-color: rgba(56, 189, 248, .55); }
-.type-option > svg { width: 22px; height: 22px; flex: none; color: var(--accent); }
+.type-option { display: flex; align-items: center; gap: 14px; width: 100%; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border-strong); background: var(--input); text-align: left; cursor: pointer; }
+.type-option:hover { background: var(--hover); border-color: var(--accent-ring); }
+.type-option > svg { width: 22px; height: 22px; flex: none; color: var(--accent-text); }
 .type-option > svg:last-child { width: 18px; height: 18px; color: var(--faint); }
 .type-option .grow { flex: 1; min-width: 0; display: grid; gap: 4px; }
 .type-option .title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14.5px; }
-.checklist { border: 1px solid var(--border); border-radius: 10px; background: #0e1629; }
+.checklist { border: 1px solid var(--border); border-radius: 10px; background: var(--input); }
 .check-item { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border-bottom: 1px solid var(--border); }
 .check-item:last-child { border-bottom: 0; }
 .check-item .mark { width: 22px; height: 22px; border-radius: 50%; flex: none; display: grid; place-items: center; font-size: 12px; font-weight: 600; }
 .check-item .mark svg { width: 13px; height: 13px; }
-.check-item .mark.ok { background: rgba(34, 197, 94, .15); color: var(--ok); }
-.check-item .mark.bad { background: rgba(244, 63, 94, .15); color: var(--danger); }
-.check-item .mark.pending { background: rgba(148, 163, 184, .12); color: var(--faint); }
+.check-item .mark.ok { background: rgba(52, 211, 153, .14); color: var(--ok); }
+.check-item .mark.bad { background: rgba(251, 113, 133, .14); color: var(--danger); }
+.check-item .mark.pending { background: rgba(161, 161, 170, .12); color: var(--faint); }
 .check-item .grow { flex: 1; min-width: 0; display: grid; gap: 2px; }
 .check-item.pending .grow { color: var(--faint); }
 .list-toolbar { display: flex; gap: 8px; align-items: center; }
 .list-toolbar input { flex: 1; }
 .plain-list { margin: 0; padding-left: 20px; display: grid; gap: 3px; }
-.log { background: #0a1020; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font: 12.5px/1.6 var(--mono); white-space: pre-wrap; word-break: break-word; height: 50vh; min-height: 220px; overflow: auto; color: #cbd5e1; margin: 0; }
+.log { background: #08080b; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font: 12.5px/1.6 var(--mono); white-space: pre-wrap; word-break: break-word; height: 50vh; min-height: 220px; overflow: auto; color: #d4d4d8; margin: 0; }
 .presets { display: flex; gap: 6px; flex-wrap: wrap; }
-.spinner { width: 15px; height: 15px; border-radius: 50%; border: 2px solid rgba(148, 163, 184, .28); border-top-color: var(--accent); animation: spin .8s linear infinite; display: inline-block; flex: none; }
+.spinner { width: 15px; height: 15px; border-radius: 50%; border: 2px solid rgba(161, 161, 170, .28); border-top-color: var(--accent); animation: spin .8s linear infinite; display: inline-block; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .result-ok { color: #86efac; display: inline-flex; align-items: center; gap: 6px; }
 .result-bad { color: #fda4af; display: inline-flex; align-items: center; gap: 6px; }
 .result-ok svg, .result-bad svg { width: 16px; height: 16px; flex: none; }
 .toast-root { position: fixed; right: 20px; bottom: 20px; display: grid; gap: 8px; z-index: 60; }
-.toast { padding: 10px 14px; border-radius: 10px; background: #1b2742; border: 1px solid var(--border-strong); max-width: 440px; box-shadow: 0 12px 34px rgba(0, 0, 0, .45); }
-.toast.error { border-color: rgba(244, 63, 94, .55); color: #fecdd3; }
-.toast.success { border-color: rgba(34, 197, 94, .45); color: #bbf7d0; }
-.overlay { position: fixed; inset: 0; background: rgba(2, 6, 23, .82); display: grid; place-items: center; z-index: 70; }
+.toast { padding: 10px 14px; border-radius: 10px; background: var(--panel-3); border: 1px solid var(--border-strong); max-width: 440px; box-shadow: 0 12px 34px rgba(0, 0, 0, .5); }
+.toast.error { border-color: rgba(251, 113, 133, .5); color: #fecdd3; }
+.toast.success { border-color: rgba(52, 211, 153, .45); color: #bbf7d0; }
+.overlay { position: fixed; inset: 0; background: rgba(3, 3, 6, .84); display: grid; place-items: center; z-index: 70; }
 .overlay-box { display: grid; gap: 14px; justify-items: center; text-align: center; padding: 30px; max-width: 420px; }
 .overlay-box .spinner { width: 28px; height: 28px; border-width: 3px; }
 .fatal { max-width: 520px; margin: 18vh auto; text-align: center; display: grid; gap: 10px; padding: 0 20px; }
@@ -21403,23 +21580,34 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 .limit-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
 .model-meta { display: none; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
 
+@media (max-width: 1280px) {
+  .col-stat-wide { display: none; }
+}
+@media (max-width: 1060px) {
+  .col-stat { display: none; }
+}
 @media (max-width: 880px) {
   .app { flex-direction: column; }
   .sidebar { width: auto; height: auto; position: static; border-right: 0; border-bottom: 1px solid var(--border); }
   .nav { flex-direction: row; overflow-x: auto; }
+  .nav-group-label { display: none; }
   .nav-count { display: none; }
   /* 窄版面只留語言選單：Codex 內建瀏覽器的側欄常常比這個寬度窄。 */
-  .sidebar-footer { border-top: 0; padding: 0 16px 12px; }
+  .sidebar-footer { padding: 0 16px 12px; }
   .sidebar-footer .router-status, .sidebar-footer .link-button { display: none; }
   .language-picker select { flex: none; }
   .main { padding: 20px 16px 40px; }
   .kv { grid-template-columns: 1fr; gap: 2px 0; }
   .kv dd { margin-bottom: 8px; }
+  .setting-row { grid-template-columns: 1fr; gap: 12px; }
+  .card.has-spark .card-value { padding-right: 0; }
+  .spark { opacity: .45; }
 }
 @media (max-width: 760px) {
   .col-provider, .col-transport, .col-effort { display: none; }
   .model-meta { display: flex; }
   th, td { padding: 9px 8px; }
+  .search-box { width: 100%; }
 }
 @media (max-width: 540px) {
   .row-actions .nudge { display: none; }
@@ -21434,14 +21622,20 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
       <div class="logo" aria-hidden="true">
         <svg viewBox="0 0 48 48" width="30" height="30" fill="none">
           <defs>
-            <linearGradient id="logo-a" x1="6" y1="8" x2="42" y2="40" gradientUnits="userSpaceOnUse">
-              <stop offset="0" stop-color="#22d3ee"/>
-              <stop offset="1" stop-color="#3b82f6"/>
+            <linearGradient id="logo-a" x1="8" y1="12" x2="38" y2="36" gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#c4b5fd"/>
+              <stop offset="1" stop-color="#6d5dfc"/>
             </linearGradient>
           </defs>
-          <path d="M8 15h9c4.2 0 6.4 2 8.6 5.6l1.9 3c1.6 2.6 3.4 3.9 6.6 3.9H40" stroke="url(#logo-a)" stroke-width="4.6" stroke-linecap="round"/>
-          <path d="M8 33h9c3.4 0 5.4-1.3 7.2-4" stroke="url(#logo-a)" stroke-width="4.6" stroke-linecap="round" opacity=".6"/>
-          <path d="m35 21.5 6 6-6 6" stroke="url(#logo-a)" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <g stroke="url(#logo-a)" stroke-width="3.4" stroke-linecap="round">
+            <path d="M8 24h11"/>
+            <path d="M19 24c6 0 6-10 12.5-10"/>
+            <path d="M19 24h12.5"/>
+            <path d="M19 24c6 0 6 10 12.5 10"/>
+          </g>
+          <circle cx="35.5" cy="14" r="3.3" fill="#a78bfa"/>
+          <circle cx="35.5" cy="24" r="3.3" fill="#34d399"/>
+          <circle cx="35.5" cy="34" r="3.3" fill="#7c6cfb"/>
         </svg>
       </div>
       <div>
@@ -21472,6 +21666,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "anthropic":"data:image/svg+xml;base64,PHN2ZyBmaWxsPSIjZGJlNGYzIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGhlaWdodD0iMWVtIiBzdHlsZT0iZmxleDpub25lO2xpbmUtaGVpZ2h0OjEiIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjFlbSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMTMuODI3IDMuNTJoMy42MDNMMjQgMjBoLTMuNjAzbC02LjU3LTE2LjQ4em0tNy4yNTggMGgzLjc2N0wxNi45MDYgMjBoLTMuNjc0bC0xLjM0My0zLjQ2MUg1LjAxN2wtMS4zNDQgMy40NkgwTDYuNTcgMy41MjJ6bTQuMTMyIDkuOTU5TDguNDUzIDcuNjg3IDYuMjA1IDEzLjQ4SDEwLjd6Ij48L3BhdGg+PC9zdmc+",
 "claude":"data:image/svg+xml;base64,PHN2ZyBoZWlnaHQ9IjFlbSIgc3R5bGU9ImZsZXg6bm9uZTtsaW5lLWhlaWdodDoxIiB2aWV3Qm94PSIwIDAgMjQgMjQiIHdpZHRoPSIxZW0iIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTQuNzA5IDE1Ljk1NWw0LjcyLTIuNjQ3LjA4LS4yMy0uMDgtLjEyOEg5LjJsLS43OS0uMDQ4LTIuNjk4LS4wNzMtMi4zMzktLjA5Ny0yLjI2Ni0uMTIyLS41NzEtLjEyMUwwIDExLjc4NGwuMDU1LS4zNTIuNDgtLjMyMS42ODYuMDYgMS41Mi4xMDMgMi4yNzguMTU4IDEuNjUyLjA5NyAyLjQ0OS4yNTVoLjM4OWwuMDU1LS4xNTctLjEzNC0uMDk4LS4xMDMtLjA5Ny0yLjM1OC0xLjU5Ni0yLjU1Mi0xLjY4OC0xLjMzNi0uOTcyLS43MjQtLjQ5MS0uMzY0LS40NjItLjE1OC0xLjAwOC42NTYtLjcyMi44ODEuMDYuMjI1LjA2MS44OTMuNjg2IDEuOTA4IDEuNDc2IDIuNDkxIDEuODMzLjM2NS4zMDQuMTQ1LS4xMDMuMDE5LS4wNzMtLjE2NC0uMjc0LTEuMzU1LTIuNDQ2LTEuNDQ2LTIuNDktLjY0NC0xLjAzMi0uMTctLjYxOWEyLjk3IDIuOTcgMCAwMS0uMTA0LS43MjlMNi4yODMuMTM0IDYuNjk2IDBsLjk5Ni4xMzQuNDIuMzY0LjYyIDEuNDE0IDEuMDAyIDIuMjI5IDEuNTU1IDMuMDMuNDU2Ljg5OC4yNDMuODMyLjA5MS4yNTVoLjE1OFY5LjAxbC4xMjgtMS43MDYuMjM3LTIuMDk1LjIzLTIuNjk1LjA4LS43Ni4zNzYtLjkxLjc0Ny0uNDkyLjU4NC4yOC40OC42ODUtLjA2Ny40NDQtLjI4NiAxLjg1MS0uNTU5IDIuOTAzLS4zNjQgMS45NDJoLjIxMmwuMjQzLS4yNDIuOTg1LTEuMzA2IDEuNjUyLTIuMDY0LjczLS44Mi44NS0uOTA0LjU0Ny0uNDMxaDEuMDMzbC43NiAxLjEyOS0uMzQgMS4xNjYtMS4wNjQgMS4zNDctLjg4MSAxLjE0Mi0xLjI2NCAxLjctLjc5IDEuMzYuMDczLjExLjE4OC0uMDIgMi44NTYtLjYwNiAxLjU0My0uMjggMS44NDEtLjMxNS44MzMuMzg4LjA5MS4zOTUtLjMyOC44MDctMS45NjkuNDg2LTIuMzA5LjQ2Mi0zLjQzOS44MTMtLjA0Mi4wMy4wNDkuMDYxIDEuNTQ5LjE0Ni42NjIuMDM2aDEuNjIybDMuMDIuMjI1Ljc5LjUyMi40NzQuNjM4LS4wNzkuNDg1LTEuMjE1LjYyLTEuNjQtLjM4OS0zLjgyOS0uOTEtMS4zMTItLjMyOWgtLjE4MnYuMTFsMS4wOTMgMS4wNjggMi4wMDYgMS44MSAyLjUwOSAyLjMzLjEyNy41NzgtLjMyMi40NTUtLjM0LS4wNDktMi4yMDUtMS42NTctLjg1MS0uNzQ3LTEuOTI2LTEuNjJoLS4xMjh2LjE3bC40NDQuNjQ5IDIuMzQ1IDMuNTIxLjEyMiAxLjA4LS4xNy4zNTMtLjYwOC4yMTMtLjY2OC0uMTIyLTEuMzc0LTEuOTI1LTEuNDE1LTIuMTY3LTEuMTQzLTEuOTQzLS4xNC4wOC0uNjc0IDcuMjU0LS4zMTYuMzctLjcyOS4yOC0uNjA3LS40NjEtLjMyMi0uNzQ3LjMyMi0xLjQ3Ni4zODktMS45MjQuMzE1LTEuNTMuMjg2LTEuOS4xNy0uNjMyLS4wMTItLjA0Mi0uMTQuMDE4LTEuNDM0IDEuOTY3LTIuMTggMi45NDUtMS43MjYgMS44NDUtLjQxNC4xNjQtLjcxNy0uMzcuMDY3LS42NjIuNDAxLS41ODkgMi4zODgtMy4wMzYgMS40NC0xLjg4Mi45My0xLjA4Ni0uMDA2LS4xNThoLS4wNTVMNC4xMzIgMTguNTZsLTEuMTMuMTQ2LS40ODctLjQ1Ni4wNjEtLjc0Ni4yMzEtLjI0MyAxLjkwOC0xLjMxMi0uMDA2LjAwNnoiIGZpbGw9IiNEOTc3NTciIGZpbGwtcnVsZT0ibm9uemVybyI+PC9wYXRoPjwvc3ZnPg==",
 "deepseek":"data:image/svg+xml;base64,PHN2ZyBoZWlnaHQ9IjFlbSIgc3R5bGU9ImZsZXg6bm9uZTtsaW5lLWhlaWdodDoxIiB2aWV3Qm94PSIwIDAgMjQgMjQiIHdpZHRoPSIxZW0iIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTIzLjc0OCA0LjQ4MmMtLjI1NC0uMTI0LS4zNjQuMTEzLS41MTIuMjM0LS4wNTEuMDM5LS4wOTQuMDktLjEzNy4xMzYtLjM3Mi4zOTctLjgwNi42NTctMS4zNzMuNjI2LS44MjktLjA0Ni0xLjUzNy4yMTQtMi4xNjMuODQ4LS4xMzMtLjc4Mi0uNTc1LTEuMjQ4LTEuMjQ3LTEuNTQ4LS4zNTItLjE1Ni0uNzA4LS4zMTEtLjk1NS0uNjUtLjE3Mi0uMjQxLS4yMTktLjUxLS4zMDUtLjc3NC0uMDU1LS4xNi0uMTEtLjMyMy0uMjkzLS4zNS0uMi0uMDMxLS4yNzguMTM2LS4zNTYuMjc2LS4zMTMuNTcyLS40MzQgMS4yMDItLjQyMiAxLjg0LjAyNyAxLjQzNi42MzMgMi41OCAxLjgzOCAzLjM5My4xMzcuMDkzLjE3Mi4xODcuMTI5LjMyMy0uMDgyLjI4LS4xOC41NTItLjI2Ni44MzMtLjA1NS4xNzktLjEzNy4yMTctLjMyOS4xNGE1LjUyNiA1LjUyNiAwIDAxLTEuNzM2LTEuMThjLS44NTctLjgyOC0xLjYzMS0xLjc0Mi0yLjU5Ny0yLjQ1OGExMS4zNjUgMTEuMzY1IDAgMDAtLjY4OS0uNDcxYy0uOTg1LS45NTcuMTMtMS43NDMuMzg4LTEuODM2LjI3LS4wOTguMDkzLS40MzItLjc3OS0uNDI4LS44NzIuMDA0LTEuNjcuMjk1LTIuNjg3LjY4NGEzLjA1NSAzLjA1NSAwIDAxLS40NjUuMTM3IDkuNTk3IDkuNTk3IDAgMDAtMi44ODMtLjEwMmMtMS44ODUuMjEtMy4zOSAxLjEwMi00LjQ5NyAyLjYyM0MuMDgyIDguNjA2LS4yMzEgMTAuNjg0LjE1MiAxMi44NWMuNDAzIDIuMjg0IDEuNTY5IDQuMTc1IDMuMzYgNS42NTMgMS44NTggMS41MzMgMy45OTcgMi4yODQgNi40MzggMi4xNCAxLjQ4Mi0uMDg1IDMuMTMzLS4yODQgNC45OTQtMS44Ni40Ny4yMzQuOTYyLjMyNyAxLjc4LjM5Ny42My4wNTkgMS4yMzYtLjAzIDEuNzA1LS4xMjguNzM1LS4xNTYuNjg0LS44MzcuNDE5LS45NjEtMi4xNTUtMS4wMDQtMS42ODItLjU5NS0yLjExMy0uOTI2IDEuMDk2LTEuMjk2IDIuNzQ2LTIuNjQyIDMuMzkyLTcuMDAzLjA1LS4zNDcuMDA3LS41NjUgMC0uODQ1LS4wMDQtLjE3LjAzNS0uMjM3LjIzLS4yNTZhNC4xNzMgNC4xNzMgMCAwMDEuNTQ1LS40NzVjMS4zOTYtLjc2MyAxLjk2LTIuMDE1IDIuMDkzLTMuNTE3LjAyLS4yMy0uMDA0LS40NjctLjI0Ny0uNTg4ek0xMS41ODEgMThjLTIuMDg5LTEuNjQyLTMuMTAyLTIuMTgzLTMuNTItMi4xNi0uMzkyLjAyNC0uMzIxLjQ3MS0uMjM1Ljc2My4wOS4yODguMjA3LjQ4Ni4zNzEuNzM5LjExNC4xNjcuMTkyLjQxNi0uMTEzLjYwMy0uNjczLjQxNi0xLjg0Mi0uMTQtMS44OTctLjE2Ny0xLjM2MS0uODAyLTIuNS0xLjg2LTMuMzAxLTMuMzA3LS43NzQtMS4zOTMtMS4yMjQtMi44ODctMS4yOTgtNC40ODItLjAyLS4zODYuMDkzLS41MjIuNDc3LS41OTJhNC42OTYgNC42OTYgMCAwMTEuNTI5LS4wMzljMi4xMzIuMzEyIDMuOTQ2IDEuMjY1IDUuNDY4IDIuNzc0Ljg2OC44NiAxLjUyNSAxLjg4NyAyLjIwMiAyLjg5MS43MiAxLjA2NiAxLjQ5NCAyLjA4MiAyLjQ4IDIuOTE0LjM0OC4yOTIuNjI1LjUxNC44OTEuNjc3LS44MDIuMDktMi4xNC4xMS0zLjA1NC0uNjE0em0xLTYuNDRhLjMwNi4zMDYgMCAwMS40MTUtLjI4Ny4zMDIuMzAyIDAgMDEuMi4yODguMzA2LjMwNiAwIDAxLS4zMS4zMDcuMzAzLjMwMyAwIDAxLS4zMDQtLjMwOHptMy4xMSAxLjU5NmMtLjIuMDgxLS4zOTkuMTUxLS41OS4xNmExLjI0NSAxLjI0NSAwIDAxLS43OTgtLjI1NGMtLjI3NC0uMjMtLjQ3LS4zNTgtLjU1Mi0uNzU4YTEuNzMgMS43MyAwIDAxLjAxNi0uNTg4Yy4wNy0uMzI3LS4wMDgtLjUzNy0uMjM5LS43MjctLjE4Ny0uMTU2LS40MjYtLjE5OS0uNjg4LS4xOTlhLjU1OS41NTkgMCAwMS0uMjU0LS4wNzhjLS4xMS0uMDU0LS4yLS4xOS0uMTE0LS4zNTguMDI4LS4wNTQuMTYtLjE4Ni4xOTItLjIxLjM1Ni0uMjAyLjc2Ny0uMTM2IDEuMTQ2LjAxNi4zNTIuMTQ0LjYxOC40MDggMS4wMDEuNzgyLjM5MS40NTEuNDYyLjU3Ni42ODUuOTE0LjE3Ni4yNjUuMzM2LjUzNy40NDUuODQ4LjA2Ny4xOTUtLjAxOS4zNTQtLjI1LjQ1MnoiIGZpbGw9IiM0RDZCRkUiPjwvcGF0aD48L3N2Zz4=",
+"gemini":"data:image/svg+xml;base64,PHN2ZyBoZWlnaHQ9IjFlbSIgc3R5bGU9ImZsZXg6bm9uZTtsaW5lLWhlaWdodDoxIiB2aWV3Qm94PSIwIDAgMjQgMjQiIHdpZHRoPSIxZW0iIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTIwLjYxNiAxMC44MzVhMTQuMTQ3IDE0LjE0NyAwIDAxLTQuNDUtMy4wMDEgMTQuMTExIDE0LjExMSAwIDAxLTMuNjc4LTYuNDUyLjUwMy41MDMgMCAwMC0uOTc1IDAgMTQuMTM0IDE0LjEzNCAwIDAxLTMuNjc5IDYuNDUyIDE0LjE1NSAxNC4xNTUgMCAwMS00LjQ1IDMuMDAxYy0uNjUuMjgtMS4zMTguNTA1LTIuMDAyLjY3OGEuNTAyLjUwMiAwIDAwMCAuOTc1Yy42ODQuMTcyIDEuMzUuMzk3IDIuMDAyLjY3N2ExNC4xNDcgMTQuMTQ3IDAgMDE0LjQ1IDMuMDAxIDE0LjExMiAxNC4xMTIgMCAwMTMuNjc5IDYuNDUzLjUwMi41MDIgMCAwMC45NzUgMGMuMTcyLS42ODUuMzk3LTEuMzUxLjY3Ny0yLjAwM2ExNC4xNDUgMTQuMTQ1IDAgMDEzLjAwMS00LjQ1IDE0LjExMyAxNC4xMTMgMCAwMTYuNDUzLTMuNjc4LjUwMy41MDMgMCAwMDAtLjk3NSAxMy4yNDUgMTMuMjQ1IDAgMDEtMi4wMDMtLjY3OHoiIGZpbGw9IiMzMTg2RkYiPjwvcGF0aD48cGF0aCBkPSJNMjAuNjE2IDEwLjgzNWExNC4xNDcgMTQuMTQ3IDAgMDEtNC40NS0zLjAwMSAxNC4xMTEgMTQuMTExIDAgMDEtMy42NzgtNi40NTIuNTAzLjUwMyAwIDAwLS45NzUgMCAxNC4xMzQgMTQuMTM0IDAgMDEtMy42NzkgNi40NTIgMTQuMTU1IDE0LjE1NSAwIDAxLTQuNDUgMy4wMDFjLS42NS4yOC0xLjMxOC41MDUtMi4wMDIuNjc4YS41MDIuNTAyIDAgMDAwIC45NzVjLjY4NC4xNzIgMS4zNS4zOTcgMi4wMDIuNjc3YTE0LjE0NyAxNC4xNDcgMCAwMTQuNDUgMy4wMDEgMTQuMTEyIDE0LjExMiAwIDAxMy42NzkgNi40NTMuNTAyLjUwMiAwIDAwLjk3NSAwYy4xNzItLjY4NS4zOTctMS4zNTEuNjc3LTIuMDAzYTE0LjE0NSAxNC4xNDUgMCAwMTMuMDAxLTQuNDUgMTQuMTEzIDE0LjExMyAwIDAxNi40NTMtMy42NzguNTAzLjUwMyAwIDAwMC0uOTc1IDEzLjI0NSAxMy4yNDUgMCAwMS0yLjAwMy0uNjc4eiIgZmlsbD0idXJsKCNsb2JlLWljb25zLWdlbWluaS1maWxsLTApIj48L3BhdGg+PHBhdGggZD0iTTIwLjYxNiAxMC44MzVhMTQuMTQ3IDE0LjE0NyAwIDAxLTQuNDUtMy4wMDEgMTQuMTExIDE0LjExMSAwIDAxLTMuNjc4LTYuNDUyLjUwMy41MDMgMCAwMC0uOTc1IDAgMTQuMTM0IDE0LjEzNCAwIDAxLTMuNjc5IDYuNDUyIDE0LjE1NSAxNC4xNTUgMCAwMS00LjQ1IDMuMDAxYy0uNjUuMjgtMS4zMTguNTA1LTIuMDAyLjY3OGEuNTAyLjUwMiAwIDAwMCAuOTc1Yy42ODQuMTcyIDEuMzUuMzk3IDIuMDAyLjY3N2ExNC4xNDcgMTQuMTQ3IDAgMDE0LjQ1IDMuMDAxIDE0LjExMiAxNC4xMTIgMCAwMTMuNjc5IDYuNDUzLjUwMi41MDIgMCAwMC45NzUgMGMuMTcyLS42ODUuMzk3LTEuMzUxLjY3Ny0yLjAwM2ExNC4xNDUgMTQuMTQ1IDAgMDEzLjAwMS00LjQ1IDE0LjExMyAxNC4xMTMgMCAwMTYuNDUzLTMuNjc4LjUwMy41MDMgMCAwMDAtLjk3NSAxMy4yNDUgMTMuMjQ1IDAgMDEtMi4wMDMtLjY3OHoiIGZpbGw9InVybCgjbG9iZS1pY29ucy1nZW1pbmktZmlsbC0xKSI+PC9wYXRoPjxwYXRoIGQ9Ik0yMC42MTYgMTAuODM1YTE0LjE0NyAxNC4xNDcgMCAwMS00LjQ1LTMuMDAxIDE0LjExMSAxNC4xMTEgMCAwMS0zLjY3OC02LjQ1Mi41MDMuNTAzIDAgMDAtLjk3NSAwIDE0LjEzNCAxNC4xMzQgMCAwMS0zLjY3OSA2LjQ1MiAxNC4xNTUgMTQuMTU1IDAgMDEtNC40NSAzLjAwMWMtLjY1LjI4LTEuMzE4LjUwNS0yLjAwMi42NzhhLjUwMi41MDIgMCAwMDAgLjk3NWMuNjg0LjE3MiAxLjM1LjM5NyAyLjAwMi42NzdhMTQuMTQ3IDE0LjE0NyAwIDAxNC40NSAzLjAwMSAxNC4xMTIgMTQuMTEyIDAgMDEzLjY3OSA2LjQ1My41MDIuNTAyIDAgMDAuOTc1IDBjLjE3Mi0uNjg1LjM5Ny0xLjM1MS42NzctMi4wMDNhMTQuMTQ1IDE0LjE0NSAwIDAxMy4wMDEtNC40NSAxNC4xMTMgMTQuMTEzIDAgMDE2LjQ1My0zLjY3OC41MDMuNTAzIDAgMDAwLS45NzUgMTMuMjQ1IDEzLjI0NSAwIDAxLTIuMDAzLS42Nzh6IiBmaWxsPSJ1cmwoI2xvYmUtaWNvbnMtZ2VtaW5pLWZpbGwtMikiPjwvcGF0aD48ZGVmcz48bGluZWFyR3JhZGllbnQgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiIGlkPSJsb2JlLWljb25zLWdlbWluaS1maWxsLTAiIHgxPSI3IiB4Mj0iMTEiIHkxPSIxNS41IiB5Mj0iMTIiPjxzdG9wIHN0b3AtY29sb3I9IiMwOEI5NjIiPjwvc3RvcD48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiMwOEI5NjIiIHN0b3Atb3BhY2l0eT0iMCI+PC9zdG9wPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIiBpZD0ibG9iZS1pY29ucy1nZW1pbmktZmlsbC0xIiB4MT0iOCIgeDI9IjExLjUiIHkxPSI1LjUiIHkyPSIxMSI+PHN0b3Agc3RvcC1jb2xvcj0iI0Y5NDU0MyI+PC9zdG9wPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI0Y5NDU0MyIgc3RvcC1vcGFjaXR5PSIwIj48L3N0b3A+PC9saW5lYXJHcmFkaWVudD48bGluZWFyR3JhZGllbnQgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiIGlkPSJsb2JlLWljb25zLWdlbWluaS1maWxsLTIiIHgxPSIzLjUiIHgyPSIxNy41IiB5MT0iMTMuNSIgeTI9IjEyIj48c3RvcCBzdG9wLWNvbG9yPSIjRkFCQzEyIj48L3N0b3A+PHN0b3Agb2Zmc2V0PSIuNDYiIHN0b3AtY29sb3I9IiNGQUJDMTIiIHN0b3Atb3BhY2l0eT0iMCI+PC9zdG9wPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjwvc3ZnPg==",
 "hunyuan":"data:image/svg+xml;base64,PHN2ZyBoZWlnaHQ9IjFlbSIgc3R5bGU9ImZsZXg6bm9uZTtsaW5lLWhlaWdodDoxIiB2aWV3Qm94PSIwIDAgMjQgMjQiIHdpZHRoPSIxZW0iIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgZmlsbD0iIzAwNTVFOSIgcj0iMTIiPjwvY2lyY2xlPjxwYXRoIGQ9Ik0xMiAwYy41MTggMCAxLjAyOC4wMzMgMS41MjguMDk2QTYuMTg4IDYuMTg4IDAgMDExMi4xMiAxMi4yOGwtLjEyLjAwMWMtMi45OSAwLTUuMjQyIDIuMTc5LTUuNTU0IDUuMTEtLjIyMyAyLjA4Ni4zNTMgNC40MTIgMi4yNDIgNi4xNDZDMy42NzIgMjIuMSAwIDE3LjQ3OSAwIDEyIDAgNS4zNzMgNS4zNzMgMCAxMiAweiIgZmlsbD0iI0E4REZGNSI+PC9wYXRoPjxwYXRoIGQ9Ik01LjI4NiA1YTIuNDM4IDIuNDM4IDAgMDEuNjgyIDMuMzhjLTMuOTYyIDUuOTY2LTMuMjE1IDEwLjc0MyAyLjY0OCAxNS4xMzZDMy42MzYgMjIuMDU2IDAgMTcuNDUyIDAgMTJjMC0xLjc4Ny4zOS0zLjQ4MiAxLjA5LTUuMDA2LjI1My0uNDM1LjUyNS0uODcyLjgxNy0xLjMxMUEyLjQzOCAyLjQzOCAwIDAxNS4yODYgNXoiIGZpbGw9IiMwMDU1RTkiPjwvcGF0aD48cGF0aCBkPSJNMTIuOTguMDRjLjI3Mi4wMjEuNTQzLjA1My44MS4wOTMuNTgzLjEwNiAxLjExNy4yNTQgMS41MzguNDQgNi42MzggMi45MjcgOC4wNyAxMC4wNTIgMS43NDggMTUuNjQyYTQuMTI1IDQuMTI1IDAgMDEtNS44MjItLjM1OGMtMS41MS0xLjcwNi0xLjMtNC4xODQuMzU3LTUuODIyLjg1OC0uODQ4IDMuMTA4LTEuMjIzIDQuMDQ1LTIuNDQxIDEuMjU3LTEuNjM0IDIuMTIyLTYuMDA5LTIuNTIzLTcuNTA2TDEyLjk4LjAzOXoiIGZpbGw9IiMwMEJDRkYiPjwvcGF0aD48cGF0aCBkPSJNMTMuNTI4LjA5NkE2LjE4NyA2LjE4NyAwIDAxMTIgMTIuMjgxYTUuNzUgNS43NSAwIDAwLTEuNzEuMjU1Yy4xNDctLjkwNS41OTUtMS43ODQgMS4zMjEtMi41MDEuODU4LS44NDggMy4xMDgtMS4yMjMgNC4wNDUtMi40NDEgMS4yNy0xLjY1MSAyLjE0LTYuMTA0LTIuNjc2LTcuNTU0LjE4NC4wMTQuMzY3LjAzMy41NDguMDU2eiIgZmlsbD0iI0VDRUNFRSI+PC9wYXRoPjwvc3ZnPg==",
 "kimi":"data:image/svg+xml;base64,PHN2ZyBmaWxsPSIjZGJlNGYzIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGhlaWdodD0iMWVtIiBzdHlsZT0iZmxleDpub25lO2xpbmUtaGVpZ2h0OjEiIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjFlbSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMTkuNzM4IDUuNzc2Yy4xNjMtLjIwOS4zMDYtLjQuNDU3LS41ODUuMDctLjA4Ny4wNjQtLjE1My0uMDA0LS4yNDQtLjY1NS0uODYxLS43MTctMS44MTctLjM0LTIuNzg3LjI4My0uNzMuOTA5LTEuMDcyIDEuNjc0LTEuMTQ1LjQ3Ny0uMDQ1Ljk0NS4wMDQgMS4zNzkuMjM2LjU3LjMwNS45MDIuNzcgMS4wMSAxLjQxMi4wODYuNTEyLjA3IDEuMDEyLS4wNzUgMS41MDgtLjI1Ny44NzgtLjg4OCAxLjMzMy0xLjc1MyAxLjQ0OC0uNzE4LjA5Ni0xLjQ0Ni4xMDgtMi4xNy4xNTctLjA1Ni4wMDQtLjExMyAwLS4xNzggMHoiIGZpbGw9IiMwMjdBRkYiPjwvcGF0aD48cGF0aCBkPSJNMTcuOTYyIDEuODQ0aC00LjMyNmwtMy40MjUgNy44MUg1LjM2OVYxLjg3OEgxLjVWMjJoMy44N3YtOC40NzdoNi44MjRhMy4wMjUgMy4wMjUgMCAwMDIuNzQzLTEuNzVWMjJoMy44N3YtOC40NzdhMy44NyAzLjg3IDAgMDAtMy41ODgtMy44NnYtLjAxaC0yLjEyNWEzLjk0IDMuOTQgMCAwMDIuMzIzLTIuMTJsMi41NDUtNS42ODl6Ij48L3BhdGg+PC9zdmc+",
 "longcat":"data:image/svg+xml;base64,PHN2ZyBmaWxsPSIjZGJlNGYzIiBoZWlnaHQ9IjFlbSIgc3R5bGU9ImZsZXg6bm9uZTtsaW5lLWhlaWdodDoxIiB2aWV3Qm94PSIwIDAgMjQgMjQiIHdpZHRoPSIxZW0iIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggY2xpcC1ydWxlPSJldmVub2RkIiBkPSJNLjUwNyAxOS44ODNhLjUwNy41MDcgMCAwMS0uNDg5LS42NDJMNC4yOSAzLjc0NWExLjAxMyAxLjAxMyAwIDAxMS41MzMtLjU3OGw1LjYyMiAzLjY4N2ExLjAxMyAxLjAxMyAwIDAwMS4xMSAwTDE4LjIgMy4xNjVhMS4wMTMgMS4wMTMgMCAwMTEuNTMyLjU4bDQuMjUgMTUuNDk3YS41MDYuNTA2IDAgMDEtLjQ5LjY0SDE4LjA3YTYuMjk3IDYuMjk3IDAgMDAxLjUzLTQuMTE1di0uMTc3YTYuMDkgNi4wOSAwIDAwLTEuNTEzLTQuMDE3bC0uNjk3LTMuNDk1YS40MzguNDM4IDAgMDAtLjY5NC0uMjY2TDE0LjA3IDkuNzgxYS43NDguNzQ4IDAgMDEtLjY1NC4xMjEgNS4xNTYgNS4xNTYgMCAwMC0yLjgzMyAwIC43NDYuNzQ2IDAgMDEtLjY1My0uMTIxTDcuMzAyIDcuODFhLjQzNS40MzUgMCAwMC0uNjg4LjI2OWwtLjY3NSAzLjY1MmE1LjM2IDUuMzYgMCAwMC0xLjUzOSAzLjc2di4zMzNjMCAxLjQ3NC41MjcgMi45IDEuNDg4IDQuMDJsLjAzMi4wMzhILjUwN3oiIGZpbGw9IiMyOUUxNTQiIGZpbGwtcnVsZT0iZXZlbm9kZCI+PC9wYXRoPjxwYXRoIGQ9Ik05LjIxMyAxNi44NDNoMS41MnYtMy41NDZoLTEuMjlsLS4yMyAzLjU0NnptNS41NzMgMGgtMS41MnYtMy41NDZoMS4yOWwuMjMgMy41NDZ6Ij48L3BhdGg+PC9zdmc+",
@@ -21582,7 +21777,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "版本資訊": "Version info",
 "尚未安裝": "Not installed",
 "檢查中…": "Checking…",
-"路由器運作中 · :{port}": "Router running · :{port}",
+"路由器運作中": "Router running",
+":{port} · 已運作 {uptime}": ":{port} · up {uptime}",
 "路由器無法連線": "Router unreachable",
 "與管理程式的連線中斷，正在重試。若管理程式已結束，請從 Codex 的「自訂模型管理」或安裝器的 ui 命令重新開啟。": "Lost connection to the manager; retrying. If the manager has exited, reopen it from “Custom Model Manager” in Codex or with the installer's ui command.",
 "設定已寫入。重新啟動 {app} 後，模型選擇器才會顯示這次的變更。": "Settings saved. Restart {app} to see the changes in the model picker.",
@@ -21711,20 +21907,35 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "還原": "Revert",
 "儲存順序": "Save order",
 "拖曳左側把手或用箭頭調整順序。排序、改名與上下文只寫入模型目錄，不會重新啟動路由器；修改輸出會重新啟動路由器。": "Drag the handle on the left or use the arrows to reorder. Order, names, and context are written to the model catalog only and don't restart the router; changing output restarts the router.",
-"輸出只對 Claude 模型有效（送往 Claude 的 max_tokens，「/」後面是模型上限）；GPT 與 Chat 模型的輸出由上游決定。": "Output applies to Claude models only (max_tokens sent to Claude; the value after “/” is the model's limit). GPT and Chat models' output is decided upstream.",
+"「上下文 / 輸出」的輸出只對 Claude 模型有效（送往 Claude 的 max_tokens）；GPT 與 Chat 模型的輸出由上游決定，只顯示上下文。": "In “Context / Output”, output applies to Claude models only (max_tokens sent to Claude). GPT and Chat models' output is decided upstream, so only their context is shown.",
 "已手動排序：之後新增的模型會排在最後。": "Manually ordered: models added later go to the end.",
 "全域 model_context_window = {value}，會覆蓋下表各模型的上下文設定。": "Global model_context_window = {value} overrides each model's context below.",
+"已添加的模型": "Added models",
+"依供應商篩選": "Filter by provider",
+"全部": "All",
+"搜尋模型": "Search models",
+"沒有符合的模型。": "No matching models.",
+"上下文 / 輸出": "Context / Output",
+"介面 / 推理強度": "Interface / Reasoning",
+"24 小時請求": "Requests (24h)",
+"篩選中無法調整順序；清除篩選後即可拖曳排序。": "Reordering is unavailable while filtering. Clear the filter to drag rows.",
+"帳號": "Account",
+"上下文與歷史": "Context and history",
+"模型選單": "Model picker",
+"其他": "Other",
+"生圖模型": "Image models",
+"快取寫入 {value}": "Cache writes {value}",
+"首次輸出 {value}": "First output {value}",
+"失敗率 {rate}": "Failure rate {rate}",
 "還沒有自訂模型。": "No custom models yet.",
 "全選": "Select all",
 "名稱": "Name",
 "介面": "Interface",
 "推理強度": "Reasoning effort",
-"上下文": "Context",
 "輸出": "Output",
 "{value} tokens（沿用官方模板，未實測）": "{value} tokens (from the official template, not measured)",
 "{value} tokens": "{value} tokens",
 "模板": "template",
-"上游預設": "Upstream default",
 "這個介面不送出輸出上限，由上游模型決定": "This interface doesn't send an output limit; the upstream model decides",
 "每次回覆最多 {value} tokens；模型上限 {cap}": "Up to {value} tokens per reply; model limit {cap}",
 "每次回覆最多 {value} tokens": "Up to {value} tokens per reply",
@@ -21904,7 +22115,6 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "狀態": "Status",
 "已啟用": "Enabled",
 "技能位置": "Skill location",
-"使用方式": "How to use",
 "在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。": "Type $router-imagegen in a new Codex task, or just ask for an image. With several models enabled, the AI picks one as needed.",
 "尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。": "Not enabled. Select models below and test them; models that pass are added to the $router-imagegen skill.",
 "用哪一家供應商生圖": "Provider for image generation",
@@ -21996,7 +22206,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "切換 API Key 模式": "Switch API key mode",
 "和 Codex 官方的 API Key 登入相同：Codex 改用本機產生的 API Key 登入，不需要 ChatGPT 帳號也能使用第三方模型。ChatGPT 帳號額度用完、{app} 鎖住發送按鈕時，開啟後第三方模型也能照常發送；選到官方模型時會直接提示目前不可用。": "Works like Codex's official API key sign-in: Codex signs in with a locally generated API key, so third-party models work without a ChatGPT account. When your ChatGPT usage runs out and {app} locks the Send button, turning this on lets third-party models send as usual; picking an official model shows a clear “unavailable” message instead.",
 "原本的任務都會保留：打開任務後在模型選單改選第三方模型即可接續。關閉後 ChatGPT 登入會原樣還原，不需要重新登入。": "All existing tasks stay: open a task and pick a third-party model to continue it. Turning this off restores your ChatGPT sign-in exactly as before, no need to sign in again.",
-"安裝時 Codex 沒有登入帳號，因此預設開啟。要改用 ChatGPT 帳號時按「關閉並登入 ChatGPT」，會帶你到瀏覽器登入。": "Turned on by default because Codex wasn't signed in during setup. To switch to a ChatGPT account, choose “Turn off and sign in to ChatGPT” and your browser will take you through sign-in.",
+"安裝時 Codex 沒有登入帳號，因此預設開啟。關閉後會帶你到瀏覽器登入 ChatGPT 帳號。": "Turned on by default because Codex wasn't signed in during setup. Turning it off takes you to the browser to sign in with a ChatGPT account.",
 "Codex 目前沒有登入帳號；開啟後不必登入也能使用第三方模型，或直接登入 ChatGPT 帳號。": "Codex isn't signed in. Turn this on to use third-party models without signing in, or sign in with a ChatGPT account.",
 "開啟於 {time}": "Turned on at {time}",
 "Codex 目前的登入方式與這個模式不一致（可能在 Codex 裡重新登入過）。請重新開啟或關閉一次。": "Codex's current sign-in doesn't match this mode (you may have signed in again inside Codex). Turn the mode on or off once more.",
@@ -22039,8 +22249,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "各模型": "By model",
 "平均首次輸出": "Average time to first output",
 "平均總耗時": "Average total duration",
-"平均輸出 TPS": "Average output TPS",
-"對有量測的請求逐筆取平均。": "Arithmetic mean across requests with a measurement.",
+"輸出 TPS 中位數": "Median output TPS",
+"有量到 TPS 的請求取中位數；少數極端值不會拉高結果。": "Median across requests with a measured TPS, so a few extreme values don't inflate it.",
 "輸入": "Input",
 "快取命中": "Cache hits",
 "快取寫入": "Cache writes",
@@ -22050,7 +22260,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "總耗時": "Total duration",
 "輸出 TPS": "Output TPS",
 "從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。": "From router request receipt to the first streamed thinking, text or tool call.",
-"上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。": "Upstream-reported output tokens divided by seconds from first output to completion.",
+"（輸出 tokens − 1）÷ 第一段到最後一段串流輸出的秒數，與 vLLM、genai-perf 相同；沒有串流出來的推理 tokens 不計入。整段一次送達或不到 0.5 秒的回覆不計算。": "(Output tokens − 1) ÷ seconds from the first to the last streamed output, as in vLLM and genai-perf. Reasoning tokens that weren't streamed are excluded. Replies delivered in one burst or spanning under 0.5 s aren't measured.",
 "近 30 天 · 每頁 100 筆": "Last 30 days · 100 per page",
 "上一頁": "Previous",
 "下一頁": "Next",
@@ -22386,8 +22596,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(56
 "Key 只會以 Windows 憑證保護（DPAPI）加密儲存，不會寫進設定檔，也不會再顯示在頁面上。": "Key 只会以 Windows 数据保护（DPAPI）加密保存，不会写进配置文件，也不会再显示在页面上。"
 },
 "t2s": {
-"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務匯區協卻參員問啟單嗎嘗嚴國圍圖執報場塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說誰調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴蹤軟較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
-"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务汇区协却参员问启单吗尝严国围图执报场块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说谁调请论谓证识谱译议护读变让负责贵费贴资赔质赖踪软较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
+"from": "丟並乾亂佈佔併來係倉個們側偵備傳僅價優儲兒內兩冊冪凍別刪則剛剝劃動務勢匯區協卻參員問啟單嗎嘗嚴國圍圖執報場塊壓壞夠夾實寧審寫寬將專尋對導屆層屬帳帶幀幾庫廠廣張強後徑從復恆惡態慣憑憶應戶拋捲掃掛採換損搶撐擁擇擊擋擔據擠擬擷擺攏攤敗數斂斷於時暫會東條棄極構標樣樹機檔檢檻欄權歡歷歸殘殺殼決沒況洩淨減測湊準溝滾滿潰濾瀏為無熱狀獨現環產畫異當疊發盡監確碼種稱積穩筆節範篩簡簽籤紀約納純級細紹終組結絕給統綁經維網綴緊緒線編緩縮總織繪繼續義聯聲聽脫腦腳臨與舊萬蓋藍處號衝補裝裡製複見規視覽觀觸訂計訊記設許診註詞詢試話該詳誌認語誤說誰調請論謂證識譜譯議護讀變讓負責貴費貼資賠質賴趨蹤軟軸較載輔輪輯輸轉迴這連週進運過達遞遠適遲遷選遺還邊邏郵鄰釋鈕銷錄錨錯鍵鎖鐘鑄鑰長門閉開閒間閘閱關陣陸隊階際隨險隱雖雙雜離難雲電靜韓響頁頂項順須預頭頻題額類顧顯風飄餘駐驗驟體麼點齊",
+"to": "丢并干乱布占并来系仓个们侧侦备传仅价优储儿内两册幂冻别删则刚剥划动务势汇区协却参员问启单吗尝严国围图执报场块压坏够夹实宁审写宽将专寻对导届层属帐带帧几库厂广张强后径从复恒恶态惯凭忆应户抛卷扫挂采换损抢撑拥择击挡担据挤拟撷摆拢摊败数敛断于时暂会东条弃极构标样树机档检槛栏权欢历归残杀壳决没况泄净减测凑准沟滚满溃滤浏为无热状独现环产画异当叠发尽监确码种称积稳笔节范筛简签签纪约纳纯级细绍终组结绝给统绑经维网缀紧绪线编缓缩总织绘继续义联声听脱脑脚临与旧万盖蓝处号冲补装里制复见规视览观触订计讯记设许诊注词询试话该详志认语误说谁调请论谓证识谱译议护读变让负责贵费贴资赔质赖趋踪软轴较载辅轮辑输转回这连周进运过达递远适迟迁选遗还边逻邮邻释钮销录锚错键锁钟铸钥长门闭开闲间闸阅关阵陆队阶际随险隐虽双杂离难云电静韩响页顶项顺须预头频题额类顾显风飘余驻验骤体么点齐",
 "phrases": {
 "程式碼": "代码",
 "原始碼": "源代码",
@@ -22690,6 +22900,16 @@ const ICONS = {
   chevronRight: '<path d="m9 6 6 6-6 6"/>',
   claude: '<path d="M12 3v5.5M12 15.5V21M3 12h5.5M15.5 12H21M5.6 5.6l3.9 3.9M14.5 14.5l3.9 3.9M18.4 5.6l-3.9 3.9M9.5 14.5l-3.9 3.9"/>',
   globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.3 2.4 3.5 5.2 3.5 8.5s-1.2 6.1-3.5 8.5c-2.3-2.4-3.5-5.2-3.5-8.5S9.7 5.9 12 3.5Z"/>',
+  bolt: '<path d="M13 3 4.5 13.5H12L11 21l8.5-10.5H12L13 3Z"/>',
+  database: '<ellipse cx="12" cy="6" rx="7.5" ry="2.8"/><path d="M4.5 6v12c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V6"/><path d="M4.5 12c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8"/>',
+  clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
+  gauge: '<path d="M4.2 17.5a8.5 8.5 0 1 1 15.6 0"/><path d="m12 13.5 3.5-3.5"/>',
+  expand: '<path d="M8 3.5H5.5a2 2 0 0 0-2 2V8M16 3.5h2.5a2 2 0 0 1 2 2V8M3.5 16v2.5a2 2 0 0 0 2 2H8M20.5 16v2.5a2 2 0 0 1-2 2H16"/>',
+  eyeOff: '<path d="M10 5.2A9.6 9.6 0 0 1 12 5c6 0 9.5 7 9.5 7a15 15 0 0 1-2.1 2.9M6.5 6.6C4 8.2 2.5 12 2.5 12s3.5 7 9.5 7a9 9 0 0 0 4.9-1.4"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="m3.5 3.5 17 17"/>',
+  list: '<path d="M9 6.5h11M9 12h11M9 17.5h11"/><path d="M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/>',
+  shield: '<path d="M12 3.5 5 6v5.5c0 4.3 3 7.6 7 9 4-1.4 7-4.7 7-9V6l-7-2.5Z"/>',
+  combo: '<circle cx="6" cy="6.5" r="2.4"/><circle cx="6" cy="17.5" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M8.4 6.5H10a4 4 0 0 1 4 4v.2M8.4 17.5H10a4 4 0 0 0 4-4v-.2M14.3 12h1.3"/>',
 };
 const GITHUB_PATH = "M12 .7C5.7.7.6 5.8.6 12.1c0 5 3.3 9.3 7.8 10.8.6.1.8-.2.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0c2.2-1.5 3.2-1.2 3.2-1.2.6 1.6.2 2.8.1 3.1.7.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6a11.4 11.4 0 0 0 7.8-10.8C23.4 5.8 18.3.7 12 .7Z";
 
@@ -22732,6 +22952,32 @@ function h(tag, props, ...children) {
     node.append(child instanceof Node ? child : document.createTextNode(String(child)));
   }
   return node;
+}
+
+function svgNode(tag, attributes, ...children) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+  node.append(...children);
+  return node;
+}
+
+// 指標卡片右下角的趨勢小圖：只看走勢、不標數值。數值全為 0 時貼底，全部相同時畫在中間。
+let sparkCount = 0;
+function sparkline(values, color) {
+  // 比例類的數列（快取命中、平均耗時）在沒有請求的區段是 null，沿用前一段的值，免得畫成掉到 0。
+  let last = values.find((value) => Number.isFinite(value)) ?? 0;
+  const numbers = values.map((value) => (Number.isFinite(value) ? (last = value) : last));
+  const max = Math.max(...numbers);
+  const min = Math.min(...numbers);
+  const y = (value) => (max > min ? 31 - (value - min) / (max - min) * 27 : max > 0 ? 17.5 : 31);
+  const line = numbers.map((value, index) => (index * 96 / Math.max(1, numbers.length - 1)).toFixed(1) + "," + y(value).toFixed(1)).join(" ");
+  const id = "spark-" + (sparkCount += 1);
+  return svgNode("svg", { class: "spark", viewBox: "0 0 96 34", preserveAspectRatio: "none", "aria-hidden": "true" },
+    svgNode("defs", {}, svgNode("linearGradient", { id, x1: 0, x2: 0, y1: 0, y2: 1 },
+      svgNode("stop", { offset: 0, "stop-color": color, "stop-opacity": .32 }),
+      svgNode("stop", { offset: 1, "stop-color": color, "stop-opacity": 0 }))),
+    svgNode("polygon", { points: "0,34 " + line + " 96,34", fill: "url(#" + id + ")" }),
+    svgNode("polyline", { points: line, fill: "none", stroke: color, "stroke-width": 1.6, "stroke-linejoin": "round", "vector-effect": "non-scaling-stroke" }));
 }
 
 function formatTokens(value) {
@@ -22795,9 +23041,9 @@ function transports() {
   return {
     responses: ["Responses", "cyan", t("直接轉發 OpenAI Responses API")],
     chat: [t("Chat 轉譯"), "amber", t("上游只有 Chat Completions，由路由器在本機轉譯")],
-    anthropic: [t("Claude 轉譯"), "violet", t("以 Anthropic Messages API 轉譯")],
-    "antigravity-cli": ["Antigravity CLI", "amber", t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，支援文字、圖片和 Codex 工具呼叫。")],
-    "claude-cli": ["Claude CLI", "violet", t("透過 Claude Code 登入的訂閱帳號")],
+    anthropic: [t("Claude 轉譯"), "orange", t("以 Anthropic Messages API 轉譯")],
+    "antigravity-cli": ["Antigravity CLI", "violet", t("使用本機已登入的 agy 帳號。依模型清單合併推理檔位，支援文字、圖片和 Codex 工具呼叫。")],
+    "claude-cli": ["Claude CLI", "orange", t("透過 Claude Code 登入的訂閱帳號")],
     combo: [t("組合"), "green", t("大腦規劃、雙手執行的組合模型")],
   };
 }
@@ -22969,13 +23215,14 @@ function renderSidebar() {
   badge.title = hasUpdate ? t("有新版本，點擊查看") : t("版本資訊");
 
   const status = document.getElementById("router-status");
+  const statusLine = (dot, text) => h("div", { class: "status-title" }, h("span", { class: "status-dot " + dot }), h("span", { text }));
   if (!state || !state.installed) {
-    status.replaceChildren(h("span", { class: "status-dot" }),
-      h("span", { text: !state ? t("檢查中…") : state.managerOnly ? t("尚未連接供應商") : t("尚未安裝") }));
+    status.replaceChildren(statusLine("", !state ? t("檢查中…") : state.managerOnly ? t("尚未連接供應商") : t("尚未安裝")));
   } else if (state.router && state.router.ok) {
-    status.replaceChildren(h("span", { class: "status-dot ok" }), h("span", { text: t("路由器運作中 · :{port}", { port: state.router.port }) }));
+    status.replaceChildren(statusLine("ok", t("路由器運作中")),
+      h("div", { class: "status-sub", text: t(":{port} · 已運作 {uptime}", { port: state.router.port, uptime: formatUptime(state.router.uptimeSeconds) }) }));
   } else {
-    status.replaceChildren(h("span", { class: "status-dot bad" }), h("span", { text: t("路由器無法連線") }));
+    status.replaceChildren(statusLine("bad", t("路由器無法連線")));
   }
 }
 
@@ -23025,6 +23272,18 @@ function desktopName() {
 
 function renderView() {
   const view = document.getElementById("view");
+  // 搜尋框會在每次重繪時重建；記下焦點與游標位置，重繪後放回去，輸入才不會被打斷。
+  const focused = document.activeElement && document.activeElement.id === "model-search"
+    ? { start: document.activeElement.selectionStart, end: document.activeElement.selectionEnd } : null;
+  renderViewContent(view);
+  const search = focused && document.getElementById("model-search");
+  if (search) {
+    search.focus();
+    search.setSelectionRange(focused.start, focused.end);
+  }
+}
+
+function renderViewContent(view) {
   if (!state) {
     view.replaceChildren(h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("讀取中…")));
     return;
@@ -23051,6 +23310,32 @@ function pageHead(title, subtitle, ...actions) {
     actions.length ? h("div", { class: "actions" }, ...actions) : null);
 }
 
+// 設定類區塊的標題：左邊圖示方塊加標題，右邊放重新整理等按鈕。
+function panelHead(title, iconName, ...extra) {
+  return h("div", { class: "panel-head" },
+    h("div", { class: "panel-title" }, h("span", { class: "tile" }, icon(iconName)), h("h2", { text: title })), ...extra);
+}
+
+// 設定頁的一列：左邊是名稱與說明，右邊放狀態、控制項與補充說明。action 是名稱旁的小按鈕（例如重新整理）。
+function settingRow({ title, description, action }, ...controls) {
+  return h("div", { class: "setting-row" },
+    h("div", { class: "setting-label" }, h("h3", {}, h("span", { text: title }), action),
+      description ? h("p", { text: description }) : null),
+    h("div", { class: "setting-control" }, ...controls));
+}
+
+function settingGroup(title, ...rows) {
+  return h("section", { class: "setting-group" }, title ? h("h2", { text: title }) : null, h("div", { class: "setting-list" }, ...rows));
+}
+
+// 設定頁的開關。切換後先維持原狀，等確認框或背景工作完成、重新讀取狀態後才會改變。
+function switchLine({ on, disabled, label, onLabel = t("已開啟"), offLabel = t("未開啟"), onToggle }, ...extra) {
+  return h("label", { class: "check-line" },
+    h("input", { type: "checkbox", role: "switch", checked: on, disabled, "aria-label": label,
+      onchange: (event) => { event.target.checked = on; onToggle(!on); } }),
+    h("span", { text: on ? onLabel : offLabel }), ...extra);
+}
+
 // 尚未連接供應商（只裝了管理頁）：連接供應商的流程與「新增供應商」相同，最後改成安裝路由器。
 function renderWelcome() {
   const blocked = state.setupBlocked;
@@ -23073,21 +23358,24 @@ function renderSetupSettings() {
   if (!codexAvailable()) return renderCodexConnection();
   return [
     pageHead(sectionTitle("Codex設定"), t("尚未連接供應商，可先開啟 API Key 模式或調整全域上下文。")),
-    renderQuotaModePanel(Boolean(state.writeBlocked || state.setupBlocked)),
-    renderGlobalContextPanel(!codexAvailable()),
-    renderToolOutputBudgetPanel(Boolean(state.writeBlocked || state.setupBlocked)),
+    settingGroup(t("帳號"), renderQuotaModePanel(Boolean(state.writeBlocked || state.setupBlocked))),
+    settingGroup(t("上下文與歷史"),
+      renderGlobalContextPanel(!codexAvailable()),
+      renderToolOutputBudgetPanel(Boolean(state.writeBlocked || state.setupBlocked))),
     // 強制顯示是由路由器提供的模型清單達成；可以先看清單，連接供應商後才能儲存。
-    renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。")),
+    settingGroup(t("模型選單"),
+      renderHiddenModelsPanel(true, t("強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。"))),
   ];
 }
 
 // ---- 總覽 --------------------------------------------------------------------
 
-function card(label, value, sub, dot) {
-  return h("div", { class: "card" },
-    h("div", { class: "card-label", text: label }),
+function card(label, value, sub, dot, { icon: iconName, spark } = {}) {
+  return h("div", { class: "card" + (spark ? " has-spark" : "") },
+    h("div", { class: "card-label" }, iconName ? icon(iconName) : null, label),
     h("div", { class: "card-value" }, dot ? h("span", { class: "status-dot " + dot }) : null, value),
-    sub ? h("div", { class: "card-sub", text: sub, title: sub }) : null);
+    sub ? h("div", { class: "card-sub", text: sub, title: sub }) : null,
+    spark ? sparkline(spark.values, spark.color) : null);
 }
 
 function renderOverview() {
@@ -23104,13 +23392,13 @@ function renderOverview() {
     card(t("路由器"), router.ok ? t("運作中") : t("無法連線"),
       router.ok ? t("v{version} · 連接埠 {port} · 已運作 {uptime}", { version: router.version || "?", port: router.port, uptime: formatUptime(router.uptimeSeconds) })
         : (serverText(router.error) || t("沒有回應")),
-      router.ok ? "ok" : "bad"),
+      router.ok ? "ok" : "bad", { icon: "power" }),
     card(t("請求"), formatNumber(stats.requests ?? 0),
       t("失敗 {failures} · 官方 {official} · 自訂 {custom}", {
         failures: formatNumber(stats.failures ?? 0), official: formatNumber(stats.official ?? 0), custom: formatNumber(stats.custom ?? 0),
-      })),
-    card(t("自訂模型"), String((state.models || []).length), t("官方模型 {count} 個", { count: formatNumber(state.officialModelCount) })),
-    card(sectionTitle("供應商"), String((state.providers || []).length), primary ? t("主要：{name}", { name: providerLabel(primary.id) }) : ""));
+      }), null, { icon: "bolt" }),
+    card(t("自訂模型"), String((state.models || []).length), t("官方模型 {count} 個", { count: formatNumber(state.officialModelCount) }), null, { icon: "models" }),
+    card(sectionTitle("供應商"), String((state.providers || []).length), primary ? t("主要：{name}", { name: providerLabel(primary.id) }) : "", null, { icon: "providers" }));
 
   const invalidDefault = state.config && state.config.model && state.config.model.startsWith("custom/") &&
     !(state.models || []).some(model => model.slug === state.config.model);
@@ -23268,16 +23556,61 @@ function nudgeModel(slug, delta) {
   renderView();
 }
 
+// 篩選只影響顯示。有篩選時不能拖曳或上下移動：只看到部分模型時，很難判斷會排到全部模型的哪個位置。
+const modelFilter = { provider: "", query: "" };
+let modelStats = null;
+let modelStatsLoading = false;
+let modelSearchComposing = false;
+const SPARK_COLORS = { violet: "#8b5cf6", green: "#34d399", blue: "#60a5fa", amber: "#fbbf24", rose: "#fb7185" };
+
+// 模型頁的 24 小時統計，與使用記錄頁選的時間範圍分開；一分鐘內重繪不重新讀取。
+async function loadModelStats() {
+  if (modelStatsLoading) return;
+  modelStatsLoading = true;
+  try {
+    const data = await api("/api/query", { method: "POST", body: { type: "usage", params: { sinceHours: 24, entries: false } } });
+    modelStats = { at: Date.now(), summary: data.summary, series: data.series || [] };
+  } catch (error) {
+    modelStats = { at: Date.now(), error: error.message };
+  } finally {
+    modelStatsLoading = false;
+    if (currentView === "models" && !modelSearchComposing) renderView();
+  }
+}
+
+function filteredModels(models) {
+  const query = modelFilter.query.trim().toLowerCase();
+  return models.filter((model) => (!modelFilter.provider || model.providerId === modelFilter.provider) &&
+    (!query || [model.displayName, model.upstreamModel, model.slug, providerLabel(model.providerId)]
+      .some((value) => String(value || "").toLowerCase().includes(query))));
+}
+
+function modelKpis() {
+  if (!modelStats || modelStats.error) return null;
+  const { total } = modelStats.summary;
+  const series = modelStats.series;
+  return h("div", { class: "cards" },
+    card(t("請求"), formatNumber(total.requests), t("最近 24 小時"), null,
+      { icon: "bolt", spark: { values: series.map((item) => item.requests), color: SPARK_COLORS.violet } }),
+    card(t("快取命中"), percent(total.cacheHitRate), t("快取寫入 {value}", { value: total.cacheWrite ? formatTokens(total.cacheWrite) : "0" }), null,
+      { icon: "database", spark: { values: series.map((item) => (item.input ? item.cached / item.input : null)), color: SPARK_COLORS.green } }),
+    card(t("平均耗時"), formatDuration(total.avgDurationMs), t("首次輸出 {value}", { value: formatDuration(total.avgFirstOutputMs) }), null,
+      { icon: "clock", spark: { values: series.map((item) => (item.durationSamples ? item.durationMs / item.durationSamples : null)), color: SPARK_COLORS.blue } }),
+    card(t("失敗"), formatNumber(total.failed), t("失敗率 {rate}", { rate: percent(total.requests ? total.failed / total.requests : null) }), null,
+      { icon: "alert", spark: { values: series.map((item) => item.failed), color: SPARK_COLORS.rose } }));
+}
+
 function renderModels() {
   const blocked = writeBlocked();
   const models = orderedModels();
   const dirty = orderDirty();
+  if (!modelStats || Date.now() - modelStats.at > 60000) loadModelStats();
   const head = pageHead(sectionTitle("模型"), t("管理已添加的模型、顯示順序、上下文與輸出設定。"),
     h("button", {
       type: "button", class: "button danger", disabled: blocked || selected.size === 0 || dirty,
       onclick: () => confirmRemoveModels([...selected]),
     }, icon("trash"), selected.size ? t("刪除所選（{count}）", { count: selected.size }) : t("刪除所選")),
-    h("button", { type: "button", class: "button", disabled: blocked, onclick: () => openComboEditor() }, icon("plus"), t("新增組合模型")),
+    h("button", { type: "button", class: "button", disabled: blocked, onclick: () => openComboEditor() }, icon("combo"), t("新增組合模型")),
     h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")));
 
   const parts = [head];
@@ -23286,37 +23619,118 @@ function renderModels() {
       h("button", { type: "button", class: "button small", onclick: () => { orderDraft = null; renderView(); } }, t("還原")),
       h("button", { type: "button", class: "button small primary", disabled: blocked, onclick: saveOrder }, t("儲存順序"))));
   }
-  const notes = [
-    h("div", { class: "note", text: t("拖曳左側把手或用箭頭調整順序。排序、改名與上下文只寫入模型目錄，不會重新啟動路由器；修改輸出會重新啟動路由器。") }),
-    h("div", { class: "note", text: t("輸出只對 Claude 模型有效（送往 Claude 的 max_tokens，「/」後面是模型上限）；GPT 與 Chat 模型的輸出由上游決定。") }),
-  ];
-  if (state.customModelOrder === "manual") notes.push(h("div", { class: "note", text: t("已手動排序：之後新增的模型會排在最後。") }));
-  if (state.config && state.config.modelContextWindow) {
-    notes.push(h("div", { class: "note warn", text: t("全域 model_context_window = {value}，會覆蓋下表各模型的上下文設定。", { value: formatNumber(state.config.modelContextWindow) }) }));
-  }
-  parts.push(h("div", { class: "notes" }, notes));
-
   if (models.length === 0) {
     parts.push(h("div", { class: "panel" }, h("div", { class: "empty" },
       h("p", { text: t("還沒有自訂模型。") }),
       h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openAddModels() }, icon("plus"), t("新增模型")))));
     return parts;
   }
+  const kpis = modelKpis();
+  if (kpis) parts.push(kpis);
   if (codexConnected()) parts.push(renderBackgroundModelPanel(models, blocked));
+  parts.push(renderModelTable(models, blocked));
 
-  const allChecked = models.every((model) => selected.has(model.slug));
-  const headerBox = h("input", {
-    type: "checkbox", "aria-label": t("全選"), checked: allChecked && models.length > 0, disabled: blocked,
-    onchange: (event) => { for (const model of models) event.target.checked ? selected.add(model.slug) : selected.delete(model.slug); renderView(); },
-  });
-  const rows = models.map((model, index) => modelRow(model, index, models.length, blocked));
-  parts.push(h("div", { class: "panel" }, h("div", { class: "table-wrap" }, h("table", {},
-    h("thead", {}, h("tr", {},
-      h("th", { class: "tight" }, headerBox), h("th", { class: "tight" }),
-      h("th", { text: t("名稱") }), h("th", { class: "col-provider", text: t("供應商") }), h("th", { class: "col-transport", text: t("介面") }),
-      h("th", { class: "col-effort", text: t("推理強度") }), h("th", { text: t("上下文") }), h("th", { text: t("輸出") }), h("th", { class: "tight" }))),
-    h("tbody", {}, rows)))));
+  const notes = [
+    h("div", { class: "note", text: t("拖曳左側把手或用箭頭調整順序。排序、改名與上下文只寫入模型目錄，不會重新啟動路由器；修改輸出會重新啟動路由器。") }),
+    h("div", { class: "note", text: t("「上下文 / 輸出」的輸出只對 Claude 模型有效（送往 Claude 的 max_tokens）；GPT 與 Chat 模型的輸出由上游決定，只顯示上下文。") }),
+  ];
+  if (state.customModelOrder === "manual") notes.push(h("div", { class: "note", text: t("已手動排序：之後新增的模型會排在最後。") }));
+  if (state.config && state.config.modelContextWindow) {
+    notes.push(h("div", { class: "note warn", text: t("全域 model_context_window = {value}，會覆蓋下表各模型的上下文設定。", { value: formatNumber(state.config.modelContextWindow) }) }));
+  }
+  parts.push(h("div", { class: "notes" }, notes));
   return parts;
+}
+
+function renderModelTable(models, blocked) {
+  const providers = [];
+  for (const model of models) {
+    const entry = providers.find((item) => item.id === model.providerId);
+    if (entry) entry.count += 1;
+    else providers.push({ id: model.providerId, count: 1 });
+  }
+  if (!providers.some((item) => item.id === modelFilter.provider)) modelFilter.provider = "";
+  const filtering = Boolean(modelFilter.provider || modelFilter.query.trim());
+  const visible = filteredModels(models);
+  const stats = new Map((modelStats && modelStats.summary ? modelStats.summary.models : []).map((item) => [item.model, item]));
+  const segment = (id, label, count) => h("button", {
+    type: "button", class: modelFilter.provider === id ? "active" : null, "aria-pressed": String(modelFilter.provider === id),
+    onclick: () => { modelFilter.provider = id; renderView(); },
+  }, label, h("span", { class: "count", text: String(count) }));
+  const search = h("input", {
+    type: "search", id: "model-search", placeholder: t("搜尋模型"), "aria-label": t("搜尋模型"), value: modelFilter.query, autocomplete: "off",
+    oninput: (event) => { modelFilter.query = event.target.value; if (!modelSearchComposing) renderView(); },
+    oncompositionstart: () => { modelSearchComposing = true; },
+    oncompositionend: (event) => { modelSearchComposing = false; modelFilter.query = event.target.value; renderView(); },
+  });
+  const toolbar = h("div", { class: "toolbar" },
+    h("h2", { text: t("已添加的模型") }), h("span", { class: "chip", text: String(models.length) }),
+    providers.length > 1 ? h("div", { class: "segmented", role: "group", "aria-label": t("依供應商篩選") },
+      segment("", t("全部"), models.length), providers.map((item) => segment(item.id, providerLabel(item.id), item.count))) : null,
+    h("div", { class: "grow" }),
+    h("label", { class: "search-box" }, icon("search"), search));
+
+  const allChecked = visible.length > 0 && visible.every((model) => selected.has(model.slug));
+  const headerBox = h("input", {
+    type: "checkbox", "aria-label": t("全選"), checked: allChecked, disabled: blocked || visible.length === 0,
+    onchange: (event) => { for (const model of visible) event.target.checked ? selected.add(model.slug) : selected.delete(model.slug); renderView(); },
+  });
+  const rows = visible.length ? visible.map((model) => modelRow(model, models.indexOf(model), models.length, blocked,
+    { reorder: !blocked && !filtering, stats: stats.get(model.slug) }))
+    : h("tr", {}, h("td", { colspan: "9", class: "empty", text: t("沒有符合的模型。") }));
+  const statHead = (label, title, widthClass) => h("th", { class: "col-stat " + widthClass, text: label, title });
+  return h("div", { class: "panel" }, toolbar,
+    h("div", { class: "table-wrap" }, h("table", { class: "fixed-table" },
+      h("thead", {}, h("tr", {},
+        h("th", { class: "w-check" }, headerBox), h("th", { class: "w-grip" }),
+        h("th", { text: t("名稱") }), h("th", { class: "col-transport w-transport", text: t("介面 / 推理強度") }),
+        h("th", { class: "w-limits", text: t("上下文 / 輸出") }),
+        statHead(t("24 小時請求"), null, "w-req"), statHead(t("快取命中"), null, "w-cache"),
+        statHead(t("平均耗時"), t("每一輪從送出到結束"), "w-num col-stat-wide"),
+        h("th", { class: "w-actions" }))),
+      h("tbody", {}, rows))),
+    filtering ? h("div", { class: "toolbar note", text: t("篩選中無法調整順序；清除篩選後即可拖曳排序。") }) : null);
+}
+
+// 依上游模型名稱推斷的模型家族圖示；組合模型與認不出來的模型用一般圖示。
+const MODEL_FAMILIES = [
+  [/claude|opus|sonnet|haiku|fable/i, "claude"],
+  [/gemini|gemma/i, "gemini"],
+  [/deepseek/i, "deepseek"],
+  [/kimi|moonshot/i, "kimi"],
+  [/qwen|qwq/i, "qwen"],
+  [/glm|zhipu/i, "zhipu"],
+  [/minimax|abab/i, "minimax"],
+  [/grok/i, "xai"],
+  [/mimo/i, "mimo"],
+  [/hunyuan/i, "hunyuan"],
+  [/longcat/i, "longcat"],
+  [/gpt|codex|(?:^|\/)o\d/i, "openai"],
+];
+
+function modelFamily(model) {
+  if (model.combo) return h("span", { class: "model-family" }, icon("combo"));
+  const name = String(model.upstreamModel || model.displayName || "");
+  const family = MODEL_FAMILIES.find(([pattern]) => pattern.test(name));
+  return h("span", { class: "model-family" }, (family && brandIcon(family[1])) || icon("models"));
+}
+
+function cacheMeter(rate) {
+  if (rate === null || rate === undefined) return h("span", { class: "faint", text: "—" });
+  const fill = h("i", { class: rate >= 0.85 ? null : rate >= 0.5 ? "mid" : "low" });
+  // CSP 不允許 style 屬性；以 CSSOM 設定寬度。
+  fill.style.width = Math.round(Math.min(1, Math.max(0, rate)) * 100) + "%";
+  return h("span", { class: "meter" }, h("span", { class: "meter-bar" }, fill), percent(rate));
+}
+
+function modelStatCells(stats) {
+  if (!modelStats || modelStats.error) return ["", "", " col-stat-wide"].map((extra) => h("td", { class: "col-stat faint" + extra, text: "—" }));
+  const requests = stats ? stats.requests : 0;
+  return [
+    h("td", { class: "col-stat num", text: formatNumber(requests) }),
+    h("td", { class: "col-stat" }, requests ? cacheMeter(stats.cacheHitRate) : h("span", { class: "faint", text: "—" })),
+    h("td", { class: "col-stat col-stat-wide num nowrap", text: requests ? formatDuration(stats.avgDurationMs) : "—" }),
+  ];
 }
 
 // ---- 使用記錄 -------------------------------------------------------------------
@@ -23349,6 +23763,12 @@ function modelLabel(slug) {
   return model ? model.displayName : slug || "—";
 }
 
+// 使用記錄裡的模型可能已刪除，或是官方模型；這時改用記錄的模型名稱推斷圖示。
+function usageFamily(item) {
+  const model = (state.models || []).find((entry) => entry.slug === item.model);
+  return modelFamily(model || { upstreamModel: item.model });
+}
+
 function percent(value) {
   return value === null || value === undefined ? "—" : (value * 100).toFixed(value >= 0.995 || value === 0 ? 0 : 1) + "%";
 }
@@ -23377,29 +23797,40 @@ function renderUsage() {
   if (!usageData) return [head, h("div", { class: "panel" }, h("div", { class: "empty" }, h("span", { class: "spinner" }), " " + t("讀取中…")))];
   if (usageData.error) return [head, h("div", { class: "panel" }, h("div", { class: "empty", text: serverText(usageData.error) }))];
   const total = usageData.summary.total;
+  const series = usageData.series || [];
+  const spark = (pick, color) => ({ values: series.map(pick), color });
   const cards = h("div", { class: "cards" },
-    card(t("請求"), formatNumber(total.requests), t("失敗 {count}", { count: formatNumber(total.failed) })),
-    card(t("輸入 tokens"), formatTokens(total.input), t("快取命中 {rate} · 快取寫入 {write}", { rate: percent(total.cacheHitRate), write: formatTokens(total.cacheWrite) })),
-    card(t("輸出 tokens"), formatTokens(total.output), t("其中推理 {value}", { value: formatTokens(total.reasoning) })),
-    card(t("平均耗時"), formatDuration(total.avgDurationMs), t("每一輪從送出到結束")));
+    card(t("請求"), formatNumber(total.requests), t("失敗 {count}", { count: formatNumber(total.failed) }), null,
+      { icon: "bolt", spark: spark((item) => item.requests, SPARK_COLORS.violet) }),
+    card(t("輸入 tokens"), formatTokens(total.input), t("快取命中 {rate} · 快取寫入 {write}", { rate: percent(total.cacheHitRate), write: formatTokens(total.cacheWrite) }), null,
+      { icon: "database", spark: spark((item) => (item.input ? item.cached / item.input : null), SPARK_COLORS.green) }),
+    card(t("輸出 tokens"), formatTokens(total.output), t("其中推理 {value}", { value: formatTokens(total.reasoning) }), null,
+      { icon: "usage", spark: spark((item) => item.output, SPARK_COLORS.blue) }),
+    card(t("平均耗時"), formatDuration(total.avgDurationMs), t("每一輪從送出到結束"), null,
+      { icon: "clock", spark: spark((item) => (item.durationSamples ? item.durationMs / item.durationSamples : null), SPARK_COLORS.amber) }));
   const parts = [head, cards];
   const num = (value) => h("td", { class: "nowrap num", text: value });
   if (total.requests === 0) {
     parts.push(h("div", { class: "panel" }, h("div", { class: "empty", text: t("這段時間沒有使用記錄。") })));
   } else parts.push(h("div", { class: "panel" },
     h("div", { class: "panel-head" }, h("h2", { text: t("各模型") })),
-    h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, ...[t("模型"), t("請求"), t("輸入"), t("快取命中"), t("快取寫入"), t("輸出")].map((label) => h("th", { text: label })),
-        h("th", { text: t("平均首次輸出") }),
-        h("th", { text: t("平均總耗時") }),
-        h("th", { text: t("平均輸出 TPS"), title: t("對有量測的請求逐筆取平均。") }))),
+    h("div", { class: "table-wrap" }, h("table", { class: "fixed-table" },
+      h("thead", {}, h("tr", {}, h("th", { text: t("模型") }), h("th", { class: "w-num", text: t("請求") }),
+        h("th", { class: "w-num", text: t("輸入") }), h("th", { class: "w-cache", text: t("快取命中") }),
+        h("th", { class: "w-num col-stat-wide", text: t("快取寫入") }), h("th", { class: "w-num", text: t("輸出") }),
+        h("th", { class: "w-duration", text: t("平均首次輸出") }),
+        h("th", { class: "w-duration", text: t("平均總耗時") }),
+        h("th", { class: "w-tps", text: t("輸出 TPS 中位數"), title: t("有量到 TPS 的請求取中位數；少數極端值不會拉高結果。") }))),
       h("tbody", {}, usageData.summary.models.map((item) => h("tr", {},
-        h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(item.model) }),
-          h("span", { class: "faint mono", text: item.route === "custom" ? (item.provider || "") : t("官方") }))),
-        num(formatNumber(item.requests) + (item.failed ? " / " + t("失敗 {count}", { count: item.failed }) : "")),
-        num(formatTokens(item.input)), num(percent(item.cacheHitRate)), num(formatTokens(item.cacheWrite)),
+        h("td", {}, h("div", { class: "model-cell" }, usageFamily(item), h("div", {},
+          h("div", { class: "model-name" }, h("span", { text: modelLabel(item.model), title: modelLabel(item.model) })),
+          h("div", { class: "model-sub", text: item.route === "custom" ? providerLabel(item.provider || "") : t("官方") })))),
+        h("td", { class: "num" }, formatNumber(item.requests),
+          item.failed ? h("div", { class: "cell-sub", text: t("失敗 {count}", { count: item.failed }) }) : null),
+        num(formatTokens(item.input)), h("td", {}, cacheMeter(item.cacheHitRate)),
+        h("td", { class: "col-stat-wide nowrap num", text: formatTokens(item.cacheWrite) }),
         num(formatTokens(item.output)), num(formatRequestDuration(item.avgFirstOutputMs)),
-        num(formatRequestDuration(item.avgDurationMs)), num(formatOutputTps(item.avgOutputTps)))))))));
+        num(formatRequestDuration(item.avgDurationMs)), num(formatOutputTps(item.medianOutputTps)))))))));
   const { entries, pagination, asOf } = usageData;
   const paging = pagination.pages > 1 ? h("div", { class: "actions", "aria-busy": String(usageLoading) },
     h("span", { class: "faint", "aria-live": "polite", text: t("第 {page} / {pages} 頁 · 共 {total} 筆", pagination) }),
@@ -23412,18 +23843,22 @@ function renderUsage() {
     h("div", { class: "panel-head" },
       h("div", {}, h("h2", { text: t("最近的請求") }), h("span", { class: "faint", text: t("近 30 天 · 每頁 100 筆") })),
       paging),
-    entries.length === 0 ? h("div", { class: "empty", text: t("近 30 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, ...[t("時間"), t("模型"), t("狀態"), t("輸入"), t("快取命中"), t("輸出")].map((label) => h("th", { text: label })),
-        h("th", { title: t("從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。"), text: t("首次輸出") }),
-        h("th", { text: t("總耗時") }),
-        h("th", { title: t("上游回報的輸出 token 數 ÷ 從首次輸出到結束的秒數。"), text: t("輸出 TPS") }))),
+    entries.length === 0 ? h("div", { class: "empty", text: t("近 30 天沒有請求記錄。") }) : h("div", { class: "table-wrap" }, h("table", { class: "fixed-table" },
+      h("thead", {}, h("tr", {}, h("th", { class: "w-time", text: t("時間") }), h("th", { text: t("模型") }),
+        h("th", { class: "w-state", text: t("狀態") }), h("th", { class: "w-num", text: t("輸入") }),
+        h("th", { class: "w-num", text: t("快取命中") }), h("th", { class: "w-num", text: t("輸出") }),
+        h("th", { class: "w-duration", title: t("從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。"), text: t("首次輸出") }),
+        h("th", { class: "w-duration", text: t("總耗時") }),
+        h("th", { class: "w-tps", title: t("（輸出 tokens − 1）÷ 第一段到最後一段串流輸出的秒數，與 vLLM、genai-perf 相同；沒有串流出來的推理 tokens 不計入。整段一次送達或不到 0.5 秒的回覆不計算。"), text: t("輸出 TPS") }))),
       h("tbody", {}, entries.map((entry) => h("tr", {},
         h("td", { class: "nowrap mono", text: formatTime(entry.at) }),
-        h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(entry.model) }),
+        h("td", {}, h("div", { class: "model-name" }, h("span", { text: modelLabel(entry.model), title: modelLabel(entry.model) })),
+          entry.combo || entry.background ? h("div", { class: "cell-sub chip-row" },
           entry.combo ? h("span", { class: "chip green", text: t("組合：{name} · {role}", { name: modelLabel(entry.combo),
             role: entry.comboRole === "planner" ? t("大腦") : t("雙手") }) }) : null,
-          entry.background ? h("span", { class: "chip", text: backgroundKindLabel(entry.background) }) : null)),
+          entry.background ? h("span", { class: "chip", text: backgroundKindLabel(entry.background) }) : null) : null),
         h("td", {}, h("span", { class: "chip " + (entry.status === "completed" ? "green" : entry.status === "failed" ? "rose" : ""),
+          title: entry.status === "failed" ? (entry.error || null) : null,
           text: entry.status === "completed" ? t("完成") : entry.status === "failed" ? (entry.error || t("失敗")) : t("未完成") })),
         num(entry.hasUsage ? formatTokens(entry.input) : "—"),
         num(entry.hasUsage && entry.input ? percent(entry.cached / entry.input) : "—"),
@@ -23474,60 +23909,54 @@ function renderBackgroundModelPanel(models, blocked) {
       paragraph(t("只辨認這幾種背景任務固定的提示詞；你在選擇器手動選的模型，一般對話不受影響。變更立即生效，不必重新啟動。"), "note")));
 }
 
-function contextCell(model) {
+function limitsCell(model) {
   const template = model.contextSource === "template";
-  const title = !model.contextWindow ? ""
+  const context = !model.contextWindow ? ""
     : template ? t("{value} tokens（沿用官方模板，未實測）", { value: formatNumber(model.contextWindow) })
     : t("{value} tokens", { value: formatNumber(model.contextWindow) });
-  return h("td", { class: "nowrap", title },
-    formatTokens(model.contextWindow),
-    template ? h("span", { class: "faint", text: " " + t("模板") }) : null);
-}
-
-function outputCell(model) {
-  if (!model.outputConfigurable) {
-    return h("td", { class: "nowrap faint", text: t("上游預設"), title: t("這個介面不送出輸出上限，由上游模型決定") });
-  }
-  const showCap = model.outputCap && model.outputCap > model.outputTokens;
-  const title = model.outputCap
-    ? t("每次回覆最多 {value} tokens；模型上限 {cap}", { value: formatNumber(model.outputTokens), cap: formatNumber(model.outputCap) })
+  const output = !model.outputConfigurable ? t("這個介面不送出輸出上限，由上游模型決定")
+    : model.outputCap ? t("每次回覆最多 {value} tokens；模型上限 {cap}", { value: formatNumber(model.outputTokens), cap: formatNumber(model.outputCap) })
     : t("每次回覆最多 {value} tokens", { value: formatNumber(model.outputTokens) });
-  return h("td", { class: "nowrap", title },
-    formatTokens(model.outputTokens),
-    showCap ? h("span", { class: "faint", text: " / " + formatTokens(model.outputCap) }) : null);
+  return h("td", { class: "nowrap num", title: [context, output].filter(Boolean).join("\n") },
+    formatTokens(model.contextWindow),
+    template ? h("span", { class: "faint", text: " " + t("模板") }) : null,
+    model.outputConfigurable ? h("span", { class: "faint", text: " / " + formatTokens(model.outputTokens) }) : null);
 }
 
-function modelRow(model, index, count, blocked) {
+function modelRow(model, index, count, blocked, { reorder, stats }) {
   const isDefault = state.config && state.config.model === model.slug;
   const reasoning = model.fixedEffort ? t("固定為 {effort}", { effort: model.fixedEffort }) : effortText(model.efforts);
   const handle = h("span", {
-    class: "drag-handle" + (blocked ? " disabled" : ""), title: blocked ? null : t("按住拖曳調整順序"), "aria-hidden": "true",
+    class: "drag-handle" + (reorder ? "" : " disabled"), title: reorder ? t("按住拖曳調整順序") : null, "aria-hidden": "true",
   }, icon("grip"));
+  // 名稱裡已經有上游 ID（例如 ark/claude-opus-5-5）時不再重複；改過名的模型才補上上游 ID。
+  const renamed = model.upstreamModel && !model.displayName.includes(model.upstreamModel);
+  const sub = [providerLabel(model.providerId),
+    model.combo ? comboSummary(model) : renamed ? model.upstreamModel : null].filter(Boolean).join(" · ");
   const row = h("tr", { "data-slug": model.slug },
     h("td", { class: "tight" }, h("input", {
       type: "checkbox", "aria-label": t("選取 {name}", { name: model.displayName }), checked: selected.has(model.slug), disabled: blocked,
       onchange: (event) => { event.target.checked ? selected.add(model.slug) : selected.delete(model.slug); renderView(); },
     })),
     h("td", { class: "tight" }, handle),
-    h("td", {},
-      h("div", { class: "model-name" }, h("span", { text: model.displayName }),
-        isDefault ? h("span", { class: "chip green", text: t("全域預設") }) : null,
+    h("td", {}, h("div", { class: "model-cell" }, modelFamily(model), h("div", {},
+      h("div", { class: "model-name" }, h("span", { text: model.displayName, title: model.displayName }),
+        isDefault ? h("span", { class: "chip accent", text: t("全域預設") }) : null,
         model.inCatalog ? null : h("span", { class: "chip rose", text: t("目錄缺少"), title: t("models.json 裡沒有這個模型，請執行 update 修復") })),
-      h("div", { class: "model-sub", text: model.combo ? comboSummary(model) : model.upstreamModel, title: t("選擇器 ID：{slug}", { slug: model.slug }) }),
-      h("div", { class: "model-meta" }, h("span", { class: "chip", text: providerLabel(model.providerId) }), transportChip(model.transport),
+      h("div", { class: "model-sub", text: sub, title: sub + "\n" + t("選擇器 ID：{slug}", { slug: model.slug }) }),
+      h("div", { class: "model-meta" }, transportChip(model.transport),
         model.fast ? h("span", { class: "chip violet", text: "Fast", title: t("選擇器會顯示 Fast（service_tier=priority）") }) : null,
-        h("span", { class: "faint", text: reasoning }))),
-    h("td", { class: "col-provider" }, h("span", { class: "chip", text: providerLabel(model.providerId) })),
-    h("td", { class: "col-transport" }, transportChip(model.transport)),
-    h("td", { class: "col-effort muted nowrap", text: reasoning, title: model.fixedEffort ? reasoning : (model.efforts || []).join(", ") }),
-    contextCell(model),
-    outputCell(model),
+        h("span", { class: "faint", text: reasoning }))))),
+    h("td", { class: "col-transport" }, transportChip(model.transport),
+      h("div", { class: "cell-sub", text: reasoning, title: model.fixedEffort ? reasoning : (model.efforts || []).join(", ") })),
+    limitsCell(model),
+    ...modelStatCells(stats),
     h("td", { class: "tight" }, h("div", { class: "row-actions" },
-      h("button", { type: "button", class: "icon-button nudge", title: t("上移"), "aria-label": t("上移"), disabled: blocked || index === 0, onclick: () => nudgeModel(model.slug, -1) }, icon("up")),
-      h("button", { type: "button", class: "icon-button nudge", title: t("下移"), "aria-label": t("下移"), disabled: blocked || index === count - 1, onclick: () => nudgeModel(model.slug, 1) }, icon("down")),
+      h("button", { type: "button", class: "icon-button nudge", title: t("上移"), "aria-label": t("上移"), disabled: !reorder || index === 0, onclick: () => nudgeModel(model.slug, -1) }, icon("up")),
+      h("button", { type: "button", class: "icon-button nudge", title: t("下移"), "aria-label": t("下移"), disabled: !reorder || index === count - 1, onclick: () => nudgeModel(model.slug, 1) }, icon("down")),
       h("button", { type: "button", class: "icon-button", title: model.combo ? t("修改組合的大腦、雙手與驗收") : t("修改名稱、上下文與輸出"),
         "aria-label": t("修改"), disabled: blocked, onclick: () => (model.combo ? openComboEditor(model) : openEditModel(model)) }, icon("edit")))));
-  if (!blocked) attachDrag(handle, row, model.slug);
+  if (reorder) attachDrag(handle, row, model.slug);
   return row;
 }
 
@@ -24317,31 +24746,59 @@ function renderImagegen() {
       providerId: fallbackProvider ? fallbackProvider.id : null,
     };
   }
-  const labels = new Map(info.choices.map((choice) => [choice.id, choice.label]));
   const parts = [head];
   if (info.error) parts.push(banner("error", "alert", serverText(info.error)));
   if (freePlanImagegenHint()) parts.push(freePlanImagegenBanner());
+  parts.push(settingGroup(t("目前狀態"), renderImagegenStatus(info, blocked), renderUpstreamImageGuardPanel(info, blocked)));
+  parts.push(settingGroup(info.enabled ? t("重新偵測") : t("偵測並啟用"), renderImagegenProvider(providers, blocked), renderImagegenModels(info, blocked)));
+  if (info.lastCheck && info.lastCheck.checks.length) {
+    parts.push(settingGroup(t("最近一次偵測") + " · " + formatTime(info.lastCheck.checkedAt),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", { text: t("介面") }), h("th", { text: t("模型") }), h("th", { text: t("結果") }))),
+        h("tbody", {}, info.lastCheck.checks.map((check) => h("tr", {},
+          h("td", { class: "nowrap", text: apiModeLabel(check.apiMode) }),
+          h("td", { class: "mono", text: check.model }),
+          h("td", {}, check.ok
+            ? h("span", { class: "result-ok" }, icon("check"), t("通過"))
+            : h("span", { class: "result-bad" }, icon("alert"), serverText(check.error) || t("未通過"))))))))));
+  }
+  return parts;
+}
 
-  const statusPanel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("目前狀態") }),
-    info.enabled ? h("button", { type: "button", class: "button small danger", disabled: blocked, onclick: confirmDisableImagegen }, t("停用")) : null));
-  if (info.enabled) {
-    statusPanel.append(h("div", { class: "panel-body" }, h("dl", { class: "kv" },
-      h("dt", { text: t("狀態") }), h("dd", {}, h("span", { class: "chip green", text: t("已啟用") })),
-      h("dt", { text: sectionTitle("模型") }), h("dd", {}, info.models.map((model) => {
-        const upstream = info.upstreamModels[model];
+function renderImagegenStatus(info, blocked) {
+  const row = { title: t("中轉 API 生圖"), description: t("在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。") };
+  const toggle = switchLine({ on: info.enabled, label: t("中轉 API 生圖"), onLabel: t("已啟用"), offLabel: t("未啟用"),
+    // 開啟就是用下方勾選的模型偵測並啟用；沒有勾選時先停用開關。
+    disabled: blocked || (!info.enabled && imagegenDraft.models.size === 0),
+    onToggle: (enabled) => (enabled ? confirmImagegenSetup(info) : confirmDisableImagegen()) });
+  if (!info.enabled) {
+    return settingRow(row, toggle,
+      paragraph(t("尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。"), "note"));
+  }
+  const labels = new Map(info.choices.map((choice) => [choice.id, choice.label]));
+  return settingRow(row, toggle,
+    h("dl", { class: "kv compact" },
+      h("dt", { text: t("模型") }), h("dd", {}, info.models.map((model) => {
         const mode = (info.apiModes && info.apiModes[model]) || info.apiMode;
-        return h("div", {}, h("span", { text: labels.get(model) || model }), h("span", { class: "faint mono", text: "  " + (upstream || model) }),
+        return h("div", {}, h("span", { text: labels.get(model) || model }),
+          h("span", { class: "faint mono", text: "  " + (info.upstreamModels[model] || model) }),
           mode ? h("span", { class: "faint", text: "  · " + apiModeLabel(mode) }) : null);
       })),
       h("dt", { text: t("供應商") }), h("dd", { text: info.providerId ? providerLabel(info.providerId) : "—" }),
-      h("dt", { text: t("技能位置") }), h("dd", { class: "mono", text: info.root }),
-      h("dt", { text: t("使用方式") }), h("dd", { text: t("在 Codex 新任務輸入 $router-imagegen，或直接請它生圖；啟用多個模型時由 AI 依需求選擇。") }))));
-  } else {
-    statusPanel.append(h("div", { class: "panel-body" }, paragraph(t("尚未啟用。勾選下方的模型並偵測，通過的模型會加入 $router-imagegen 技能。"), "muted")));
-  }
-  parts.push(statusPanel);
-  parts.push(renderUpstreamImageGuardPanel(info, blocked));
+      h("dt", { text: t("技能位置") }), h("dd", { class: "mono faint", text: info.root })));
+}
 
+function renderImagegenProvider(providers, blocked) {
+  const current = providers.find((provider) => provider.id === imagegenDraft.providerId);
+  return settingRow({ title: t("供應商"), description: t("用哪一家供應商生圖") },
+    providers.length > 1
+      ? h("select", { class: "inline-select", "aria-label": t("用哪一家供應商生圖"), disabled: blocked,
+        onchange: (event) => { imagegenDraft.providerId = event.target.value; renderView(); } },
+      providers.map((provider) => h("option", { value: provider.id, selected: provider.id === imagegenDraft.providerId, text: providerOption(provider) })))
+      : h("div", { text: current ? providerOption(current) : "—" }));
+}
+
+function renderImagegenModels(info, blocked) {
   const detection = imagegenDraft.providerId ? loadImagegenDetect(imagegenDraft.providerId) : null;
   const detected = detection && detection.data ? detection.data.detected : [];
   const option = (choice, upstream) => {
@@ -24358,49 +24815,25 @@ function renderImagegen() {
       h("div", { class: "note", text: serverText(choice.description) })));
   };
   const known = info.choices.filter((choice) => !detected.some((item) => item.id === choice.id));
-  let detectNote;
-  if (!detection) detectNote = null;
-  else if (detection.loading || (!detection.data && !detection.error)) detectNote = paragraph(t("正在讀取供應商模型清單（不生圖、不計費）…"), "muted");
-  else if (detection.error) detectNote = paragraph(t("無法讀取供應商模型清單，可從下方已知清單勾選測試。"), "muted");
-  else if (!detection.data.listed) detectNote = paragraph(t("無法讀取供應商模型清單，可從下方已知清單勾選測試。"), "muted");
-  else if (!detected.length) detectNote = paragraph(t("供應商模型清單沒有列出生圖模型；部分中轉不公開圖片模型，可從下方已知清單勾選測試。"), "muted");
-  const detectedSection = h("div", { class: "stack" },
-    h("div", { class: "panel-head" }, h("h3", { text: t("自動偵測") }), h("span", { class: "note", text: t("供應商模型清單中的生圖模型") }),
+  let detectNote = null;
+  if (detection && (detection.loading || (!detection.data && !detection.error))) detectNote = t("正在讀取供應商模型清單（不生圖、不計費）…");
+  else if (detection && (detection.error || !detection.data.listed)) detectNote = t("無法讀取供應商模型清單，可從下方已知清單勾選測試。");
+  else if (detection && !detected.length) detectNote = t("供應商模型清單沒有列出生圖模型；部分中轉不公開圖片模型，可從下方已知清單勾選測試。");
+  const subhead = (title, note, action) => h("div", { class: "subhead" },
+    h("span", { class: "subhead-title", text: title }), h("span", { class: "note", text: note }), action);
+  return settingRow({ title: t("生圖模型"),
+    description: t("多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst，2.6 優先於 2.5；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。") },
+    subhead(t("自動偵測"), t("供應商模型清單中的生圖模型"),
       imagegenDraft.providerId ? h("button", { type: "button", class: "button small", disabled: Boolean(detection && detection.loading),
         onclick: () => { delete imagegenDetect[imagegenDraft.providerId]; renderView(); } }, icon("refresh"), t("重新讀取")) : null),
-    detectNote,
-    detected.length ? h("div", { class: "check-list" }, detected.map((choice) => option(choice, choice.upstreamModel))) : null);
-  const knownSection = h("div", { class: "stack" },
-    h("div", { class: "panel-head" }, h("h3", { text: t("已知清單") }), h("span", { class: "note", text: t("供應商沒有列出也可以勾選，以實際生圖測試為準") })),
-    h("div", { class: "check-list" }, known.map((choice) => option(choice))));
-  const providerField = providers.length > 1 ? h("label", { class: "field" }, h("span", { text: t("用哪一家供應商生圖") }),
-    h("select", { disabled: blocked, onchange: (event) => { imagegenDraft.providerId = event.target.value; renderView(); } },
-      providers.map((provider) => h("option", { value: provider.id, selected: provider.id === imagegenDraft.providerId, text: providerOption(provider) })))) : null;
-  parts.push(h("div", { class: "panel" },
-    h("div", { class: "panel-head" }, h("h2", { text: info.enabled ? t("重新偵測") : t("偵測並啟用") })),
-    h("div", { class: "panel-body stack" },
-      providerField,
-      paragraph(t("多選時由 AI 依需求挑選：GPT Image 裡一般生圖偏好 Flare、精細改圖偏好 Sunburst，2.6 優先於 2.5；Nano Banana 裡一般生圖用 2.1、複雜構圖與圖中文字用 Pro、大量求快用 2 Lite。Image 2、Nano Banana 2 與初代給指定或相容需求使用。"), "muted"),
-      detectedSection,
-      knownSection,
-      banner("warn", "alert", t("偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。")),
-      h("div", { class: "actions end" },
-        h("button", { type: "button", class: "button primary", disabled: blocked || imagegenDraft.models.size === 0, onclick: () => confirmImagegenSetup(info) },
-          icon("image"), info.enabled ? t("重新偵測並套用") : t("偵測並啟用"))))));
-
-  if (info.lastCheck && info.lastCheck.checks.length) {
-    parts.push(h("div", { class: "panel" },
-      h("div", { class: "panel-head" }, h("h2", { text: t("最近一次偵測") }), h("span", { class: "note", text: formatTime(info.lastCheck.checkedAt) })),
-      h("div", { class: "table-wrap" }, h("table", {},
-        h("thead", {}, h("tr", {}, h("th", { text: t("介面") }), h("th", { text: t("模型") }), h("th", { text: t("結果") }))),
-        h("tbody", {}, info.lastCheck.checks.map((check) => h("tr", {},
-          h("td", { class: "nowrap", text: apiModeLabel(check.apiMode) }),
-          h("td", { class: "mono", text: check.model }),
-          h("td", {}, check.ok
-            ? h("span", { class: "result-ok" }, icon("check"), t("通過"))
-            : h("span", { class: "result-bad" }, icon("alert"), serverText(check.error) || t("未通過"))))))))));
-  }
-  return parts;
+    detectNote ? paragraph(detectNote, "note") : null,
+    detected.length ? h("div", { class: "check-list" }, detected.map((choice) => option(choice, choice.upstreamModel))) : null,
+    subhead(t("已知清單"), t("供應商沒有列出也可以勾選，以實際生圖測試為準"), null),
+    h("div", { class: "check-list" }, known.map((choice) => option(choice))),
+    h("div", { class: "actions" },
+      h("button", { type: "button", class: "button primary", disabled: blocked || imagegenDraft.models.size === 0, onclick: () => confirmImagegenSetup(info) },
+        icon("image"), info.enabled ? t("重新偵測並套用") : t("偵測並啟用"))),
+    paragraph(t("偵測會實際生圖並依供應商計費：GPT Image 先用通用介面各生成一張低品質圖，全部失敗時再用 Ark 任務介面各試一次；Nano Banana 依序試 Chat、Gemini 原生與通用介面，通過就停。只有通過的模型會啟用，沒有通過時既有設定保持不變。"), "note warn"));
 }
 
 // 部分中轉站看到 Codex 用戶端就在伺服器端代為生圖，並把思考深度當成圖片 complexity 送出，
@@ -24409,32 +24842,30 @@ function renderUpstreamImageGuardPanel(info, blocked) {
   const builtin = info.builtinImagegen || { available: false, disabled: false };
   const enabled = info.upstreamImageGuard !== false && (!builtin.available || builtin.disabled);
   const apply = (value) => runJob("set-upstream-image-guard", { enabled: value }, { title: t("設定第三方上游生圖") });
-  return h("div", { class: "panel" },
-    h("div", { class: "panel-head" }, h("h2", { text: t("第三方模型生圖保護") })),
-    h("div", { class: "panel-body setting-body" },
-      h("label", { class: "check-line" }, h("input", {
-        type: "checkbox", checked: enabled, disabled: blocked, "aria-label": t("第三方模型生圖保護"),
-        onchange: (event) => {
-          const value = event.target.checked;
-          event.target.checked = enabled;
-          if (value && builtin.available && !info.enabled) {
-            confirmDialog({
-              title: t("關閉內建 Image Gen"),
-              confirmLabel: t("仍要關閉"),
-              body: paragraph(t("尚未啟用中轉 API 生圖。關閉內建 Image Gen 後，Codex 暫時無法生圖，直到你在本頁偵測並啟用中轉生圖。")),
-            }).then((ok) => { if (ok) apply(true); });
-            return;
-          }
-          apply(value);
-        },
-      }), h("span", { text: enabled ? t("已開啟") : t("未開啟") }),
-        builtin.available ? h("span", { class: builtin.disabled ? "chip" : "chip green",
-          text: builtin.disabled ? t("內建 Image Gen：已關閉") : t("內建 Image Gen：使用中") }) : null),
-      paragraph(t("部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。"), "muted"),
-      builtin.available
-        ? paragraph(t("勾選後會關閉 Codex 內建的 Image Gen（官方模型也一併停用），生圖只走 $router-imagegen；路由器也對第三方 GPT 模型改用自己的用戶端識別，避免上游代為生圖。取消勾選會恢復內建 Image Gen。對話內容與快取不受影響。"), "note")
-        : paragraph(t("開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。"), "note"),
-      paragraph(builtin.available ? t("內建 Image Gen 的變更需要重新啟動 ChatGPT 才會套用到新任務。") : t("立即生效，不必重新啟動。"), "note")));
+  return settingRow({ title: t("第三方模型生圖保護"),
+    description: t("部分中轉站一認出 Codex，就會在自己的伺服器上代為生圖，並把思考深度當成圖片複雜度送出；圖片模型不支援時會出現「Complexity 'high' is not supported for this image model」，整輪失敗。") },
+    h("label", { class: "check-line" }, h("input", {
+      type: "checkbox", role: "switch", checked: enabled, disabled: blocked, "aria-label": t("第三方模型生圖保護"),
+      onchange: (event) => {
+        const value = event.target.checked;
+        event.target.checked = enabled;
+        if (value && builtin.available && !info.enabled) {
+          confirmDialog({
+            title: t("關閉內建 Image Gen"),
+            confirmLabel: t("仍要關閉"),
+            body: paragraph(t("尚未啟用中轉 API 生圖。關閉內建 Image Gen 後，Codex 暫時無法生圖，直到你在本頁偵測並啟用中轉生圖。")),
+          }).then((ok) => { if (ok) apply(true); });
+          return;
+        }
+        apply(value);
+      },
+    }), h("span", { text: enabled ? t("已開啟") : t("未開啟") }),
+      builtin.available ? h("span", { class: builtin.disabled ? "chip" : "chip green",
+        text: builtin.disabled ? t("內建 Image Gen：已關閉") : t("內建 Image Gen：使用中") }) : null),
+    builtin.available
+      ? paragraph(t("勾選後會關閉 Codex 內建的 Image Gen（官方模型也一併停用），生圖只走 $router-imagegen；路由器也對第三方 GPT 模型改用自己的用戶端識別，避免上游代為生圖。取消勾選會恢復內建 Image Gen。對話內容與快取不受影響。"), "note")
+      : paragraph(t("開啟後，路由器對第三方 GPT 模型改用自己的用戶端識別，生圖改由 Codex 內建工具或 $router-imagegen 完成；對話內容與快取不受影響，官方模型不受影響。只接受 Codex 用戶端的供應商會自動改回原識別。"), "note"),
+    paragraph(builtin.available ? t("內建 Image Gen 的變更需要重新啟動 ChatGPT 才會套用到新任務。") : t("立即生效，不必重新啟動。"), "note"));
 }
 
 function confirmImagegenSetup(info) {
@@ -24473,12 +24904,10 @@ function renderSettings() {
   const blocked = writeBlocked();
   return [
     pageHead(sectionTitle("Codex設定"), t("影響所有模型的 Codex 設定。")),
-    renderQuotaModePanel(blocked),
-    renderOfficialModelVisibilityPanel(blocked),
-    renderKeysmithPanel(blocked),
-    renderGlobalContextPanel(blocked),
-    renderToolOutputBudgetPanel(blocked),
-    renderHiddenModelsPanel(blocked),
+    settingGroup(t("帳號"), renderQuotaModePanel(blocked)),
+    settingGroup(t("上下文與歷史"), renderGlobalContextPanel(blocked), renderToolOutputBudgetPanel(blocked)),
+    settingGroup(t("其他"), renderKeysmithPanel(blocked)),
+    settingGroup(t("模型選單"), renderOfficialModelVisibilityPanel(blocked), renderHiddenModelsPanel(blocked)),
   ];
 }
 
@@ -24498,7 +24927,7 @@ function renderCodexConnection() {
 
 function renderGeneralSettings() {
   return [pageHead(sectionTitle("通用設定"), t("管理頁與路由器的通用功能。")),
-    renderDiagnosticsPanel(), renderUninstallPanel()];
+    settingGroup(null, renderDiagnosticsPanel(), renderUninstallPanel())];
 }
 
 function renderClaudeSettings() {
@@ -24511,8 +24940,7 @@ function renderClaudeSettings() {
 
 function renderClaudeDesktopPanel(blocked) {
   const entry = ensureQuery("claude-desktop");
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
-    h("h2", { text: t("Claude Desktop 接入") }), refreshButton("claude-desktop", t("重新整理"))));
+  const panel = h("div", { class: "panel" }, panelHead(t("Claude Desktop 接入"), "claude", refreshButton("claude-desktop", t("重新整理"))));
   if (!entry.data) { panel.append(queryPlaceholder(entry, "claude-desktop")); return panel; }
   const data = entry.data;
   panel.append(h("div", { class: "panel-body setting-body" },
@@ -24570,15 +24998,12 @@ async function openClaudeDesktopConnection() {
 // 解除安裝：與終端的「回退配置」相同；還原 Codex 配置、移除路由器與入口，檔案封存不刪除。
 function renderUninstallPanel() {
   const routerInstalled = Boolean(state.installed);
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("解除安裝") })));
-  panel.append(h("div", { class: "panel-body setting-body" },
-    paragraph(routerInstalled
-      ? t("還原安裝器改過的 Codex 設定，停止並移除路由器、中轉生圖技能、桌面捷徑與 Codex 裡的「自訂模型管理」入口。")
-      : t("目前只裝了管理頁：會移除管理頁、桌面捷徑與 Codex 裡的「自訂模型管理」入口。"), "muted"),
-    paragraph(t("安裝檔案會封存到 Codex 的 backups 目錄，不會直接刪除；之後重新執行安裝器即可再次安裝。"), "note"),
+  return settingRow({ title: t("解除安裝"), description: routerInstalled
+    ? t("還原安裝器改過的 Codex 設定，停止並移除路由器、中轉生圖技能、桌面捷徑與 Codex 裡的「自訂模型管理」入口。")
+    : t("目前只裝了管理頁：會移除管理頁、桌面捷徑與 Codex 裡的「自訂模型管理」入口。") },
     h("div", { class: "actions" },
-      h("button", { type: "button", class: "button danger", onclick: confirmUninstall }, icon("trash"), t("解除安裝")))));
-  return panel;
+      h("button", { type: "button", class: "button danger", onclick: confirmUninstall }, icon("trash"), t("解除安裝"))),
+    paragraph(t("安裝檔案會封存到 Codex 的 backups 目錄，不會直接刪除；之後重新執行安裝器即可再次安裝。"), "note"));
 }
 
 function confirmUninstall() {
@@ -24615,15 +25040,13 @@ function confirmUninstall() {
 let diagnosticsBusy = false;
 
 function renderDiagnosticsPanel() {
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("診斷包") })));
-  panel.append(h("div", { class: "panel-body setting-body" },
-    paragraph(t("回報問題時匯出這份檔案：包含版本、系統、路由器狀態與計數、供應商與模型設定摘要、最近的錯誤與記錄尾端。"), "muted"),
-    paragraph(t("API Key、權杖、電子郵件與個人路徑會自動遮蔽，供應商只保留主機名稱；分享前仍建議自己看過一遍。不會發送任何付費請求。"), "note"),
+  return settingRow({ title: t("診斷包"),
+    description: t("回報問題時匯出這份檔案：包含版本、系統、路由器狀態與計數、供應商與模型設定摘要、最近的錯誤與記錄尾端。") },
     h("div", { class: "actions" },
       h("button", { type: "button", class: "button primary", disabled: diagnosticsBusy, onclick: () => exportDiagnostics("download") },
         icon("download"), diagnosticsBusy ? t("正在收集…") : t("下載診斷包")),
-      h("button", { type: "button", class: "button", disabled: diagnosticsBusy, onclick: () => exportDiagnostics("copy") }, t("複製到剪貼簿")))));
-  return panel;
+      h("button", { type: "button", class: "button", disabled: diagnosticsBusy, onclick: () => exportDiagnostics("copy") }, t("複製到剪貼簿"))),
+    paragraph(t("API Key、權杖、電子郵件與個人路徑會自動遮蔽，供應商只保留主機名稱；分享前仍建議自己看過一遍。不會發送任何付費請求。"), "note"));
 }
 
 async function exportDiagnostics(mode) {
@@ -24665,53 +25088,42 @@ function renderKeysmithPanel(blocked) {
     t("啟用後，其他模型可能無法正常使用，尤其是 Claude 模型（含 CLI 訂閱）。需要使用這些模型時，請先關閉此功能。"),
     t("已移除固定稱呼，保留原始輸出格式；模型仍可能拒答。"),
   ];
-  return h("div", { class: "panel" },
-    h("div", { class: "panel-head" }, h("h2", { text: t("Keysmith") })),
-    h("div", { class: "panel-body setting-body" },
-      h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
-      ...details.map((text, index) => paragraph(text, index === 3 ? "note warn" : "muted")),
-      h("div", { class: "actions" },
-        h("a", { href: "https://github.com/Jia-Ethan/codex-keysmith", target: "_blank", rel: "noreferrer", text: t("codex-keysmith 專案") })),
-      h("label", { class: "check-line" },
-        h("input", { type: "checkbox", role: "switch", "aria-label": title, checked: on, disabled: blocked,
-          onchange: event => {
-            event.target.checked = on;
-            const enabled = !on;
-            if (!enabled) return runJob("set-keysmith", { enabled }, { title: t("Keysmith") });
-            confirmDialog({ title, confirmLabel: t("開啟"), body: details.map(text => paragraph(text)) })
-              .then(ok => { if (ok) runJob("set-keysmith", { enabled }, { title: t("Keysmith") }); });
-          } }), h("span", { text: title }))));
+  return settingRow({ title: t("Keysmith"), description: details[0] },
+    h("label", { class: "check-line" },
+      h("input", { type: "checkbox", role: "switch", "aria-label": title, checked: on, disabled: blocked,
+        onchange: event => {
+          event.target.checked = on;
+          const enabled = !on;
+          if (!enabled) return runJob("set-keysmith", { enabled }, { title: t("Keysmith") });
+          confirmDialog({ title, confirmLabel: t("開啟"), body: details.map(text => paragraph(text)) })
+            .then(ok => { if (ok) runJob("set-keysmith", { enabled }, { title: t("Keysmith") }); });
+        } }), h("span", { text: on ? t("已開啟") : t("未開啟") })),
+    ...details.slice(1).map((text, index) => paragraph(text, index === 2 ? "note warn" : "note")),
+    h("a", { href: "https://github.com/Jia-Ethan/codex-keysmith", target: "_blank", rel: "noreferrer", text: t("codex-keysmith 專案") }));
 }
 
 function renderQuotaModePanel(blocked) {
   const quota = state ? state.quotaMode : null;
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("API Key 模式") })));
-  if (!quota) {
-    panel.append(h("div", { class: "panel-body setting-body" }, paragraph(t("請先添加第三方模型。"), "muted")));
-    return panel;
-  }
+  const description = t("和 Codex 官方的 API Key 登入相同：Codex 改用本機產生的 API Key 登入，不需要 ChatGPT 帳號也能使用第三方模型。ChatGPT 帳號額度用完、{app} 鎖住發送按鈕時，開啟後第三方模型也能照常發送；選到官方模型時會直接提示目前不可用。", { app: desktopName() });
+  if (!quota) return settingRow({ title: t("API Key 模式"), description }, paragraph(t("請先添加第三方模型。"), "muted"));
   const on = quota.enabled;
   const noModels = !quota.customModelCount;
   const ownKey = !on && quota.login === "apikey";
-  panel.append(h("div", { class: "panel-body setting-body" },
-    h("div", { class: "setting-value", text: on ? t("已開啟") : t("未開啟") }),
-    paragraph(t("和 Codex 官方的 API Key 登入相同：Codex 改用本機產生的 API Key 登入，不需要 ChatGPT 帳號也能使用第三方模型。ChatGPT 帳號額度用完、{app} 鎖住發送按鈕時，開啟後第三方模型也能照常發送；選到官方模型時會直接提示目前不可用。", { app: desktopName() }), "muted"),
+  return settingRow({ title: t("API Key 模式"), description },
+    switchLine({ on, label: t("API Key 模式"), disabled: blocked || ownKey,
+      onToggle: (enabled) => (enabled ? confirmQuotaMode(true) : confirmQuotaMode(false, quota.previousLogin)) }),
+    !on && quota.login === "none"
+      ? h("div", { class: "actions" },
+        h("button", { type: "button", class: "button small", disabled: blocked, onclick: () => runJob("chatgpt-login", {}, { title: t("登入 ChatGPT 帳號") }) }, icon("key"), t("登入 ChatGPT 帳號")))
+      : null,
     on && quota.previousLogin === "none"
-      ? paragraph(t("安裝時 Codex 沒有登入帳號，因此預設開啟。要改用 ChatGPT 帳號時按「關閉並登入 ChatGPT」，會帶你到瀏覽器登入。"), "note")
+      ? paragraph(t("安裝時 Codex 沒有登入帳號，因此預設開啟。關閉後會帶你到瀏覽器登入 ChatGPT 帳號。"), "note")
       : paragraph(t("原本的任務都會保留：打開任務後在模型選單改選第三方模型即可接續。關閉後 ChatGPT 登入會原樣還原，不需要重新登入。"), "note"),
     on && quota.since ? paragraph(t("開啟於 {time}", { time: formatTime(quota.since) }), "note") : null,
     quota.consistent ? null : paragraph(t("Codex 目前的登入方式與這個模式不一致（可能在 Codex 裡重新登入過）。請重新開啟或關閉一次。"), "note warn"),
     !on && quota.login === "none" ? paragraph(t("Codex 目前沒有登入帳號；開啟後不必登入也能使用第三方模型，或直接登入 ChatGPT 帳號。"), "note warn") : null,
     ownKey ? paragraph(t("Codex 目前以您自己的 OpenAI API Key 登入，請先在 Codex 登出後再開啟。"), "note") : null,
-    noModels ? paragraph(t("尚未添加模型；可先開啟 API Key 模式，再到供應商頁添加模型。"), "note") : null,
-    h("div", { class: "actions" }, on
-      ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => confirmQuotaMode(false, quota.previousLogin) }, icon("power"),
-        quota.previousLogin === "none" ? t("關閉並登入 ChatGPT") : t("關閉 API Key 模式"))
-      : h("button", { type: "button", class: "button primary", disabled: blocked || ownKey, onclick: () => confirmQuotaMode(true) }, icon("power"), t("開啟 API Key 模式")),
-      !on && quota.login === "none"
-        ? h("button", { type: "button", class: "button", disabled: blocked, onclick: () => runJob("chatgpt-login", {}, { title: t("登入 ChatGPT 帳號") }) }, icon("key"), t("登入 ChatGPT 帳號"))
-        : null)));
-  return panel;
+    noModels ? paragraph(t("尚未添加模型；可先開啟 API Key 模式，再到供應商頁添加模型。"), "note") : null);
 }
 
 function renderOfficialModelVisibilityPanel(blocked) {
@@ -24719,11 +25131,10 @@ function renderOfficialModelVisibilityPanel(blocked) {
   const apiKeyMode = quota?.enabled === true;
   const hidden = apiKeyMode || state?.hideOfficialModels === true;
   const noModels = !quota?.customModelCount;
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
-    h("h2", { text: t("隱藏官方模型選項") })));
-  panel.append(h("div", { class: "panel-body setting-body" },
+  return settingRow({ title: t("隱藏官方模型選項"),
+    description: t("只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。") },
     h("label", { class: "check-line" }, h("input", {
-      type: "checkbox", checked: hidden, "aria-label": t("隱藏官方模型選項"),
+      type: "checkbox", role: "switch", checked: hidden, "aria-label": t("隱藏官方模型選項"),
       disabled: blocked || !quota || apiKeyMode || (!hidden && noModels),
       onchange: event => {
         const value = event.target.checked;
@@ -24731,13 +25142,11 @@ function renderOfficialModelVisibilityPanel(blocked) {
         runJob("set-official-model-visibility", { hidden: value }, { title: t("設定官方模型選項") });
       },
     }), h("span", { text: hidden ? t("已開啟") : t("未開啟") })),
-    paragraph(t("只在 ChatGPT 帳號模式隱藏模型選單中的官方模型；保留帳號登入、既有任務與官方清單自動更新。關閉即可恢復。"), "muted"),
     paragraph(t("此設定不會停用官方模型；既有任務與背景任務仍依原本的模型設定執行。"), "note"),
     noModels ? paragraph(t("請先添加第三方模型。"), "note warn") : null,
     paragraph(apiKeyMode
       ? t("API Key 模式自動隱藏無法使用的官方模型；切回 ChatGPT 帳號模式後恢復原本的選擇。")
-      : t("儲存後請重新啟動 {app}，讓模型選單重新載入。", { app: desktopName() }), "note")));
-  return panel;
+      : t("儲存後請重新啟動 {app}，讓模型選單重新載入。", { app: desktopName() }), "note"));
 }
 
 function confirmQuotaMode(enabled, previousLogin = null) {
@@ -24758,47 +25167,42 @@ function confirmQuotaMode(enabled, previousLogin = null) {
 
 function renderToolOutputBudgetPanel(blocked) {
   const entry = ensureQuery("tool-output-budget");
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" },
-    h("h2", { text: t("工具輸出預算") }), refreshButton("tool-output-budget", t("工具輸出預算"))));
-  if (!entry.data) { panel.append(queryPlaceholder(entry, "tool-output-budget")); return panel; }
+  const head = { title: t("工具輸出預算"), action: refreshButton("tool-output-budget", t("工具輸出預算")),
+    description: t("每筆工具結果存入歷史的原生 token 預算，適用官方與自訂模型。建議起始值 10,000；不會清理既有歷史。") };
+  if (!entry.data) return settingRow(head, queryPlaceholder(entry, "tool-output-budget"));
   const current = entry.data.value;
-  const input = h("input", { type: "number", min: "1", max: "1000000", step: "1",
+  const input = h("input", { type: "number", min: "1", max: "1000000", step: "1", "aria-label": "tool_output_token_limit (tokens)",
     value: String(current ?? entry.data.defaultValue ?? 10000), disabled: blocked });
-  panel.append(h("div", { class: "panel-body setting-body" },
-    h("div", { class: "setting-value", text: current == null ? t("未設定（Codex 預設）") : t("{value} tokens", { value: formatNumber(current) }) }),
-    paragraph(t("每筆工具結果存入歷史的原生 token 預算，適用官方與自訂模型。建議起始值 10,000；不會清理既有歷史。"), "muted"),
-    h("label", { class: "field" }, h("span", { text: "tool_output_token_limit (tokens)" }), input),
-    paragraph(t("儲存後請自行重新啟動 Codex；不會自動中斷任務。"), "note"),
-    h("div", { class: "actions" }, h("button", { type: "button", class: "button primary", disabled: blocked, text: t("儲存"), onclick: () => {
-      const value = Number(input.value.trim());
-      if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) {
-        toast(t("工具輸出預算必須是 1～1,000,000 之間的整數。"), "error"); return;
-      }
-      if (value === current) { toast(t("沒有任何變更。")); return; }
-      runJob("set-tool-output-budget", { value }, { title: t("設定工具輸出預算") });
-    } }))));
-  return panel;
+  return settingRow(head,
+    h("div", { class: "actions" },
+      h("span", { class: "chip" + (current == null ? "" : " accent"), text: current == null ? t("未設定（Codex 預設）") : t("{value} tokens", { value: formatNumber(current) }) })),
+    h("div", { class: "inline-field" }, input, h("span", { class: "faint", text: "tokens" }),
+      h("button", { type: "button", class: "button primary", disabled: blocked, text: t("儲存"), onclick: () => {
+        const value = Number(input.value.trim());
+        if (!Number.isSafeInteger(value) || value < 1 || value > 1000000) {
+          toast(t("工具輸出預算必須是 1～1,000,000 之間的整數。"), "error"); return;
+        }
+        if (value === current) { toast(t("沒有任何變更。")); return; }
+        runJob("set-tool-output-budget", { value }, { title: t("設定工具輸出預算") });
+      } })),
+    h("div", { class: "note mono", text: "tool_output_token_limit" }),
+    paragraph(t("儲存後請自行重新啟動 Codex；不會自動中斷任務。"), "note"));
 }
 
 function renderGlobalContextPanel(blocked) {
   const entry = ensureQuery("global-context");
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("全域上下文") }),
-    refreshButton("global-context", t("重新整理全域上下文"))));
-  if (!entry.data) {
-    panel.append(queryPlaceholder(entry, "global-context"));
-    return panel;
-  }
+  const action = refreshButton("global-context", t("重新整理全域上下文"));
+  if (!entry.data) return settingRow({ title: t("全域上下文"), action }, queryPlaceholder(entry, "global-context"));
   const value = entry.data.value;
-  panel.append(h("div", { class: "panel-body setting-body" },
-    h("div", { class: "setting-value", text: value ? t("{value} tokens", { value: formatNumber(value) }) : t("未設定") }),
-    paragraph(value
+  return settingRow({ title: t("全域上下文"), action,
+    description: value
       ? t("Codex 的 model_context_window 已設定，會覆蓋所有模型（官方與自訂）自己的上下文；Codex 用到約 95% 時會自動壓縮。")
-      : t("目前沒有全域設定，每個模型使用自己的上下文（模型頁可以個別修改）。"), "muted"),
-    h("div", { class: "note mono", text: entry.data.filePath || "" }),
+      : t("目前沒有全域設定，每個模型使用自己的上下文（模型頁可以個別修改）。") },
     h("div", { class: "actions" },
-      h("button", { type: "button", class: "button primary", disabled: blocked, onclick: () => openGlobalContext(value) }, icon("edit"), value ? t("修改") : t("設定")),
-      value ? h("button", { type: "button", class: "button danger", disabled: blocked, onclick: confirmClearGlobalContext }, t("移除全域設定")) : null)));
-  return panel;
+      h("span", { class: "chip" + (value ? " accent" : ""), text: value ? t("{value} tokens", { value: formatNumber(value) }) : t("未設定") }),
+      h("button", { type: "button", class: "button", disabled: blocked, onclick: () => openGlobalContext(value) }, icon("edit"), value ? t("修改") : t("設定")),
+      value ? h("button", { type: "button", class: "button danger", disabled: blocked, onclick: confirmClearGlobalContext }, t("移除全域設定")) : null),
+    h("div", { class: "note mono", text: entry.data.filePath || "" }));
 }
 
 function openGlobalContext(current) {
@@ -24836,25 +25240,19 @@ function confirmClearGlobalContext() {
 
 function renderHiddenModelsPanel(blocked, note = null) {
   const entry = ensureQuery("hidden-models");
-  const panel = h("div", { class: "panel" }, h("div", { class: "panel-head" }, h("h2", { text: t("隱藏的官方模型") }),
-    refreshButton("hidden-models", t("重新整理隱藏的官方模型"))));
-  if (!entry.data) {
-    panel.append(queryPlaceholder(entry, "hidden-models", t("正在讀取 Codex 內建模型目錄…")));
-    return panel;
-  }
+  const head = { title: t("隱藏的官方模型"), action: refreshButton("hidden-models", t("重新整理隱藏的官方模型")),
+    description: t("Codex 內建目錄把下列模型標成隱藏，預設不會出現在選擇器。能不能用由帳號權限決定：強制顯示後若帳號沒有權限，選用時會失敗，取消勾選即可恢復。") };
+  const warning = note ? paragraph(note, "note warn") : null;
+  if (!entry.data) return settingRow(head, warning, queryPlaceholder(entry, "hidden-models", t("正在讀取 Codex 內建模型目錄…")));
   const models = entry.data.models || [];
   const saved = new Set(models.filter((model) => model.forced).map((model) => model.slug));
   if (!hiddenDraft) hiddenDraft = new Set(saved);
   const dirty = models.some((model) => hiddenDraft.has(model.slug) !== saved.has(model.slug));
-  const body = h("div", { class: "panel-body stack" },
-    paragraph(t("Codex 內建目錄把下列模型標成隱藏，預設不會出現在選擇器。能不能用由帳號權限決定：強制顯示後若帳號沒有權限，選用時會失敗，取消勾選即可恢復。"), "muted"));
-  if (state.hideOfficialModels && !state.quotaMode?.enabled) {
-    body.append(paragraph(t("已開啟「隱藏官方模型選項」；下列勾選會保留，關閉該開關後才會顯示。"), "note"));
-  }
-  if (models.length === 0) {
-    body.append(h("div", { class: "empty", text: t("Codex 內建目錄目前沒有隱藏的官方模型。") }));
-  } else {
-    body.append(h("div", { class: "check-list" }, models.map((model) => {
+  const pending = state.hideOfficialModels && !state.quotaMode?.enabled
+    ? paragraph(t("已開啟「隱藏官方模型選項」；下列勾選會保留，關閉該開關後才會顯示。"), "note") : null;
+  if (models.length === 0) return settingRow(head, warning, pending, paragraph(t("Codex 內建目錄目前沒有隱藏的官方模型。"), "muted"));
+  return settingRow(head, warning, pending,
+    h("div", { class: "check-list" }, models.map((model) => {
       const box = h("input", { type: "checkbox", checked: hiddenDraft.has(model.slug), disabled: blocked });
       box.addEventListener("change", () => {
         if (box.checked) hiddenDraft.add(model.slug);
@@ -24865,18 +25263,14 @@ function renderHiddenModelsPanel(blocked, note = null) {
         h("div", { class: "model-name" }, h("span", { text: model.displayName }), h("span", { class: "faint mono", text: model.slug }),
           saved.has(model.slug) ? h("span", { class: "chip green", text: t("目前強制顯示") }) : null),
         model.description ? h("div", { class: "note", text: model.description }) : null));
-    })));
-    body.append(h("div", { class: "actions end" },
-      h("span", { class: "note", text: t("儲存會重新啟動路由器，並以 Codex 實際讀到的目錄驗證；失敗會自動還原。") }),
-      dirty ? h("button", { type: "button", class: "button", onclick: () => { hiddenDraft = null; renderView(); } }, t("還原")) : null,
+    })),
+    h("div", { class: "actions" },
       h("button", { type: "button", class: "button primary", disabled: blocked || !dirty, onclick: () => {
         runJob("set-hidden-models", { slugs: models.filter((model) => hiddenDraft.has(model.slug)).map((model) => model.slug) },
           { title: t("設定隱藏的官方模型") });
-      } }, t("儲存"))));
-  }
-  if (note) body.prepend(paragraph(note, "note warn"));
-  panel.append(body);
-  return panel;
+      } }, t("儲存")),
+      dirty ? h("button", { type: "button", class: "button", onclick: () => { hiddenDraft = null; renderView(); } }, t("還原")) : null),
+    paragraph(t("儲存會重新啟動路由器，並以 Codex 實際讀到的目錄驗證；失敗會自動還原。"), "note"));
 }
 
 // ---- 對話框 ------------------------------------------------------------------

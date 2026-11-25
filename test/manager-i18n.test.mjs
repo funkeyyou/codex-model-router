@@ -160,6 +160,9 @@ test("首次使用沒有模型也能開啟 API Key 模式，既有 Key 與寫入
       renderGlobalContextPanel: () => ({ text: "context-setting" }), renderHiddenModelsPanel: () => ({ text: "hidden-setting" }),
       renderToolOutputBudgetPanel: () => ({ text: "tool-budget-setting" }),
       pageHead: () => null, paragraph: text => ({ text }), icon: () => null,
+      settingRow: (head, ...children) => ({ tag: "row", head, children }),
+      settingGroup: (title, ...rows) => ({ title, rows }),
+      switchLine: (options) => ({ tag: "switch", attrs: options }),
       h(tag, attrs, ...children) { return { tag, attrs, children, append(...items) { this.children.push(...items); } }; },
     });
     vm.runInContext(renderer + settings + setup + dispatch, context);
@@ -167,14 +170,17 @@ test("首次使用沒有模型也能開啟 API Key 模式，既有 Key 與寫入
       context.state.quotaMode.login = login;
       context.state.writeBlocked = blocked;
       vm.runInContext("renderView()", context);
-      const panel = context.rendered[1];
-      assert.equal(context.rendered[2].text, "context-setting");
-      assert.equal(context.rendered[3].text, "tool-budget-setting");
-      assert.equal(context.rendered[4].text, "hidden-setting");
-      const buttons = [];
-      const visit = node => { if (node?.tag === "button") buttons.push(node); node?.children?.flat(Infinity).forEach(visit); };
+      // 尚未連接供應商時的設定頁：帳號、上下文與歷史、模型選單三組。
+      const [panel] = context.rendered[1].rows;
+      const [contextPanel, budgetPanel] = context.rendered[2].rows;
+      const [hiddenPanel] = context.rendered[3].rows;
+      assert.equal(contextPanel.text, "context-setting");
+      assert.equal(budgetPanel.text, "tool-budget-setting");
+      assert.equal(hiddenPanel.text, "hidden-setting");
+      const switches = [];
+      const visit = node => { if (node?.tag === "switch") switches.push(node); node?.children?.flat(Infinity).forEach(visit); };
       visit(panel);
-      assert.equal(buttons[0].attrs.disabled, disabled);
+      assert.equal(switches[0].attrs.disabled, disabled);
     }
   }
 });
@@ -184,6 +190,7 @@ test("API Key 模式強制勾選隱藏官方模型，切回帳號模式恢復偏
   const context = vm.createContext({ ...languageModule(),
     state: { installed: true, hideOfficialModels: false, quotaMode: { enabled: true, customModelCount: 1 } },
     paragraph: text => ({ text }), desktopName: () => "Codex",
+    settingRow: (head, ...children) => ({ tag: "row", head, children }),
     h(tag, attrs, ...children) { return { tag, attrs, children, append(...items) { this.children.push(...items); } }; },
   });
   for (const [enabled, preference, checked] of [[true, false, true], [false, false, false], [false, true, true]]) {

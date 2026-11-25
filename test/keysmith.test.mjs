@@ -159,6 +159,7 @@ test("manager warns about Claude on both page and enable confirmation", async ()
     const jobs = []; let dialog;
     const context = { state: { keysmith: { enabled: on } }, t: text => text,
       h: (tag, props, ...children) => ({ tag, props, children }), paragraph: (text, className) => ({ text, className }),
+      settingRow: (head, ...children) => ({ tag: "row", head, children }),
       confirmDialog: async options => { dialog = options; return true; }, runJob: (type, params) => jobs.push({ type, params }) };
     const panel = vm.runInNewContext(code + "\nrenderKeysmithPanel(false)", context);
     assert.match(JSON.stringify(panel), /Claude.*CLI/);

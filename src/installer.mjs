@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.46.1";
+const INSTALLER_VERSION = "1.47.0";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -6877,7 +6877,7 @@ const MANAGER_MCP_KEY = "mcp_servers.model_router_manager";
 const managerMcpPath = join(installRoot, "manager-entry.mjs");
 const managerLauncherPath = join(installRoot, isWindows ? "manager-open.js" : "manager-open.sh");
 const managerIconPath = join(installRoot, "manager-icon.svg");
-const MANAGER_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#111d35"/><path d="M14 22h14l10 20h12M14 42h14l10-20h12m-6-6 6 6-6 6m0 8 6 6-6 6" fill="none" stroke="#63b5fa" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>\n';
+const MANAGER_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0d0b14"/><g fill="none" stroke="#a78bfa" stroke-width="4.6" stroke-linecap="round"><path d="M12 32h13"/><path d="M25 32c8 0 8-13.5 16.5-13.5"/><path d="M25 32h16.5"/><path d="M25 32c8 0 8 13.5 16.5 13.5"/></g><circle cx="46.5" cy="18.5" r="4.4" fill="#a78bfa"/><circle cx="46.5" cy="32" r="4.4" fill="#34d399"/><circle cx="46.5" cy="45.5" r="4.4" fill="#a78bfa"/></svg>\n';
 // 記錄檔裡跟故障有關的前綴；ready、log-truncated 之類的例行訊息不顯示。
 const MANAGER_LOG_KINDS = new Set([
   "error", "websocket-error", "catalog-refresh-failed", "request-too-large", "upstream-ws-cooldown", "auth-probe-grace",
@@ -9061,21 +9061,60 @@ function usageAverage(sum, count) {
   return count > 0 ? sum / count : null;
 }
 
+function usageMedian(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+// 路由器以第一段到最後一段串流輸出的視窗計算 TPS，並記下 generationMs。更早的紀錄只有首次輸出與
+// 總耗時，在這裡依同一套規則重算：沒有串流出來的推理 tokens 不計入、視窗不到 0.5 秒不算。
+// 原本就沒有 TPS 的紀錄（失敗、整段一次送達的 CLI 回覆）維持 null。
+const usageMinGenerationMs = 500;
+
 function recordedOutputTps(record) {
   // 舊版有首次輸出時間、明確沒有首次文字時間的紀錄，是由工具呼叫觸發的。
   const hasText = record.hasText ?? !(record.firstTextMs === null && Number.isFinite(record.firstOutputMs));
-  return hasText ? record.outputTps : null;
+  if (!hasText || !Number.isFinite(record.outputTps)) return null;
+  if (Object.hasOwn(record, "generationMs")) return record.outputTps;
+  const windowMs = record.durationMs - record.firstOutputMs;
+  const output = Number(record.output) || 0;
+  const reasoningStreamed = Number.isFinite(record.firstTextMs) && record.firstOutputMs < record.firstTextMs;
+  const tokens = reasoningStreamed ? output : output - (Number(record.reasoning) || 0);
+  return windowMs >= usageMinGenerationMs && tokens >= 2 ? (tokens - 1) * 1000 / windowMs : null;
+}
+
+// 使用記錄頁的趨勢小圖：把時間範圍切成固定數量的區段，各自累計請求、失敗、快取與耗時。
+export function usageSeries(records, since, until, count = 24) {
+  const span = Math.max(1, until - since) / count;
+  const buckets = Array.from({ length: count }, () => ({ requests: 0, failed: 0, input: 0, cached: 0, output: 0, durationMs: 0, durationSamples: 0 }));
+  for (const record of records) {
+    const at = Date.parse(record?.at);
+    if (!Number.isFinite(at) || at < since || at > until) continue;
+    const bucket = buckets[Math.min(count - 1, Math.floor((at - since) / span))];
+    bucket.requests += 1;
+    if (record.status === "failed") bucket.failed += 1;
+    for (const field of ["input", "cached", "output"]) bucket[field] += Number(record[field]) || 0;
+    if (Number.isFinite(record.durationMs) && record.durationMs >= 0) {
+      bucket.durationMs += record.durationMs;
+      bucket.durationSamples += 1;
+    }
+  }
+  return buckets;
 }
 
 export function summarizeUsage(records) {
   const byModel = new Map();
   const total = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0 };
   let totalDurationSamples = 0;
+  let totalFirstOutputMs = 0;
+  let totalFirstOutputSamples = 0;
   for (const record of records) {
     const key = record.model || "-";
     const entry = byModel.get(key) || { model: key, provider: record.provider || null, route: record.route || null,
       requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, failed: 0, durationMs: 0, background: 0,
-      durationSamples: 0, firstOutputMs: 0, firstOutputSamples: 0, outputTps: 0, outputTpsSamples: 0 };
+      durationSamples: 0, firstOutputMs: 0, firstOutputSamples: 0, outputTps: [] };
     for (const target of [entry, total]) {
       target.requests += 1;
       for (const field of ["input", "cached", "cacheWrite", "output", "reasoning"]) target[field] += Number(record[field]) || 0;
@@ -9091,29 +9130,31 @@ export function summarizeUsage(records) {
     if (Number.isFinite(firstOutputMs) && firstOutputMs >= 0) {
       entry.firstOutputMs += firstOutputMs;
       entry.firstOutputSamples += 1;
+      totalFirstOutputMs += firstOutputMs;
+      totalFirstOutputSamples += 1;
     }
     const outputTps = recordedOutputTps(record);
-    if (Number.isFinite(outputTps) && outputTps >= 0) {
-      entry.outputTps += outputTps;
-      entry.outputTpsSamples += 1;
-    }
+    if (Number.isFinite(outputTps) && outputTps >= 0) entry.outputTps.push(outputTps);
     if (record.background) entry.background += 1;
     byModel.set(key, entry);
   }
   const rate = (item) => (item.input > 0 ? item.cached / item.input : null);
   return {
-    total: { ...total, cacheHitRate: rate(total), avgDurationMs: usageAverage(total.durationMs, totalDurationSamples) },
-    models: [...byModel.values()].map(({ durationSamples, firstOutputMs, firstOutputSamples, outputTps, outputTpsSamples, ...item }) => ({
+    total: { ...total, cacheHitRate: rate(total), avgDurationMs: usageAverage(total.durationMs, totalDurationSamples),
+      avgFirstOutputMs: usageAverage(totalFirstOutputMs, totalFirstOutputSamples) },
+    models: [...byModel.values()].map(({ durationSamples, firstOutputMs, firstOutputSamples, outputTps, ...item }) => ({
       ...item, cacheHitRate: rate(item),
       avgDurationMs: usageAverage(item.durationMs, durationSamples),
       avgFirstOutputMs: usageAverage(firstOutputMs, firstOutputSamples),
-      avgOutputTps: usageAverage(outputTps, outputTpsSamples),
+      // 單次 TPS 的分布有長尾（短回覆、半段緩衝），平均值會被少數極端值拉高；取中位數（tokps 的 p50）。
+      medianOutputTps: usageMedian(outputTps),
+      outputTpsSamples: outputTps.length,
     }))
       .sort((left, right) => right.input + right.output - (left.input + left.output)),
   };
 }
 
-function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
+function managerUsage({ page = 1, sinceHours = 24, asOf, entries: includeEntries = true } = {}) {
   const now = Date.now();
   const snapshot = Number.isSafeInteger(asOf) && asOf <= now && asOf >= now - hourMs ? asOf : now;
   const hours = Math.min(Math.max(Number(sinceHours) || 24, 1), usageHistoryHours);
@@ -9147,7 +9188,8 @@ function managerUsage({ page = 1, sinceHours = 24, asOf } = {}) {
   const offset = (current - 1) * usagePageSize;
   return {
     sinceHours: hours, summary: summarizeUsage(summaryRecords), asOf: snapshot,
-    entries: recent.slice(offset, offset + usagePageSize).map((record) => ({ ...record, outputTps: recordedOutputTps(record) })),
+    series: usageSeries(summaryRecords, summarySince, snapshot),
+    entries: includeEntries === false ? [] : recent.slice(offset, offset + usagePageSize).map((record) => ({ ...record, outputTps: recordedOutputTps(record) })),
     pagination: { page: current, pages, total: recent.length },
     logPath: usageLogPath,
   };

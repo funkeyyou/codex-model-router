@@ -17,6 +17,7 @@ test("manager defaults to 10000, displays existing budget, and saves only the bu
     const jobs = [];
     const context = { t: text => text, formatNumber: String,
       ensureQuery: () => ({ data: { value: current, defaultValue: 10000 } }), refreshButton: () => null,
+      settingRow: (head, ...children) => ({ tag: "row", head, children }),
       h: (tag, attrs, ...children) => ({ tag, attrs, value: attrs?.value, children, append(...items) { this.children.push(...items); } }),
       paragraph: text => ({ text }), toast: () => {}, runJob: (type, params) => jobs.push({ type, params }) };
     const panel = vm.runInNewContext(code + "\nrenderToolOutputBudgetPanel(false)", context);

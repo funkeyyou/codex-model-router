@@ -93,14 +93,16 @@ test("大小相同、修改時間也相同的改寫一樣會生效（Windows 同
 
 test("使用記錄：完成、失敗與沒有用量的終止事件都記成一筆，非終止事件不記", async (t) => {
   const { router } = await setup(t);
-  const context = { startedAt: 1000, firstTextAt: 1500, model: "custom/owo-gpt", route: "custom", provider: "owo", transport: "websocket",
-    backgroundKind: "title", thread: "th-1" };
+  const context = { startedAt: 1000, firstTextAt: 1500, lastOutputAt: 2950, outputChunks: 12, model: "custom/owo-gpt", route: "custom",
+    provider: "owo", transport: "websocket", backgroundKind: "title", thread: "th-1" };
   const done = router.usageRecord(context, { type: "response.completed", response: { model: "gpt-6.1-sol",
     usage: { input_tokens: 1200, input_tokens_details: { cached_tokens: 900, cache_write_tokens: 100 }, output_tokens: 50,
       output_tokens_details: { reasoning_tokens: 20 } } } }, 3500);
+  // 推理沒有串流出來：視窗內只有 30 個 tokens，(30 − 1) ÷ 1.45 秒 = 20 tok/s。
   assert.deepEqual({ ...done, at: undefined }, { at: undefined, model: "custom/owo-gpt", upstreamModel: "gpt-6.1-sol", route: "custom",
     provider: "owo", transport: "websocket", background: "title", thread: "th-1", status: "completed", durationMs: 2500,
-    firstTextMs: 500, firstOutputMs: 500, hasText: true, outputTps: 25, input: 1200, cached: 900, cacheWrite: 100, output: 50, reasoning: 20, hasUsage: true });
+    firstTextMs: 500, firstOutputMs: 500, generationMs: 1450, hasText: true, outputTps: 20, input: 1200, cached: 900, cacheWrite: 100,
+    output: 50, reasoning: 20, hasUsage: true });
   const failed = router.usageRecord(context, { type: "response.failed", response: { error: { code: "rate_limit_exceeded" } } }, 2000);
   assert.equal(failed.status, "failed");
   assert.equal(failed.error, "rate_limit_exceeded");
@@ -110,10 +112,16 @@ test("使用記錄：完成、失敗與沒有用量的終止事件都記成一�
     type: "response.completed", response: { usage: { output_tokens: 50 } },
   }, 3500).outputTps, null, "buffered CLI replies must not report a fabricated generation speed");
   assert.equal(router.usageRecord({ ...context, firstTextAt: 3500 }, { type: "response.completed", response: { usage: { output_tokens: 50 } } }, 3500).outputTps, null);
+  const completed = { type: "response.completed", response: { usage: { output_tokens: 400 } } };
+  assert.equal(router.usageRecord({ ...context, outputChunks: 1 }, completed, 3500).outputTps, null,
+    "a single streamed chunk carries no generation timing");
+  const burst = router.usageRecord({ ...context, firstTextAt: 3300, lastOutputAt: 3303 }, completed, 3500);
+  assert.equal(burst.generationMs, 3);
+  assert.equal(burst.outputTps, null, "a relay that flushes the whole reply at once must not report thousands of tokens per second");
   assert.equal(router.usageRecord(context, { type: "response.output_text.delta" }), null);
 });
 
-test("使用記錄：串流的思考算首次輸出，TPS 不把思考 tokens 擠進正文的時間", async (t) => {
+test("使用記錄：串流的思考算首次輸出，TPS 從第一段到最後一段串流輸出，隱藏的推理不計入", async (t) => {
   const { router } = await setup(t);
   const realNow = Date.now;
   t.after(() => { Date.now = realNow; });
@@ -124,10 +132,24 @@ test("使用記錄：串流的思考算首次輸出，TPS 不把思考 tokens �
   at(23000, { type: "response.completed", response: { usage: { output_tokens: 2550, output_tokens_details: { reasoning_tokens: 2500 } } } });
   assert.equal(context.firstOutputAt, 6000);
   assert.equal(context.firstTextAt, 22000);
+  assert.equal(context.lastOutputAt, 22000);
+  assert.equal(context.outputChunks, 2);
   const record = router.usageRecord(context, { type: "response.completed", response: { usage: { output_tokens: 2550 } } }, 23000);
   assert.equal(record.firstOutputMs, 6000);
   assert.equal(record.firstTextMs, 22000);
-  assert.equal(Math.round(record.outputTps), 150);
+  assert.equal(record.generationMs, 16000);
+  assert.equal(record.outputTps, 2549 / 16);
+
+  // 推理只回報數量、沒有串流：那些 tokens 在首次輸出前就生成了，不能擠進正文的 1 秒。
+  const hidden = { startedAt: 0, model: "custom/gpt", route: "custom", provider: "owo", transport: "websocket" };
+  const send = (ms, event) => { Date.now = () => ms; router.recordUsageEvent(hidden, event); };
+  send(20000, { type: "response.output_text.delta", delta: "a" });
+  send(20500, { type: "response.function_call_arguments.delta", delta: "{" });
+  send(21000, { type: "response.output_text.delta", delta: "b" });
+  const answer = router.usageRecord(hidden, { type: "response.completed",
+    response: { usage: { output_tokens: 2101, output_tokens_details: { reasoning_tokens: 2000 } } } }, 21200);
+  assert.equal(answer.generationMs, 1000);
+  assert.equal(answer.outputTps, 100);
 });
 
 test("背景任務經過路由器時改送第三方上游，API Key 模式下也不被擋", async (t) => {

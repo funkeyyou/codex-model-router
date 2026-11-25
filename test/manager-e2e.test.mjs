@@ -195,13 +195,19 @@ test("最近請求固定顯示 30 天，以 100 筆分頁，並可讀取新舊�
   const first = await query({ sinceHours: 1 });
   assert.deepEqual(first.pagination, { page: 1, pages: 2, total: 102 });
   assert.equal(first.summary.total.requests, 1);
-  assert.equal(first.summary.models[0].avgOutputTps, null);
+  assert.equal(first.summary.models[0].medianOutputTps, null);
+  assert.equal(first.series.length, 24);
+  assert.equal(first.series.reduce((sum, bucket) => sum + bucket.requests, 0), 1);
   assert.deepEqual(first.entries[0], { ...legacyToolOnly, outputTps: null });
   assert.deepEqual(first.entries.map((entry) => entry.model), Array.from({ length: 100 }, (_, index) => "model-" + index));
   write("usage.jsonl", [row(0, 1000), { ...row(200, 0), at: new Date(first.asOf + 1).toISOString() }]);
   const second = await query({ sinceHours: 720, page: 2, asOf: first.asOf });
   assert.deepEqual(second.pagination, { page: 2, pages: 2, total: 102 });
   assert.deepEqual(second.entries.map((entry) => entry.model), ["model-100", "model-101"]);
+  const statsOnly = await query({ sinceHours: 24, entries: false });
+  assert.deepEqual(statsOnly.entries, []);
+  // 上面改寫過 usage.jsonl：目前有兩筆在 24 小時內。
+  assert.equal(statsOnly.summary.total.requests, 2);
 });
 
 test("背景管理頁：啟動命令退出後仍可存取，重複開啟沿用同一程序，結束後清理短期檔案", { timeout: 60000 }, async (t) => {

@@ -328,7 +328,8 @@ export function desktopRoute(settings, model) {
 // but not retained by the observer. Lifecycle and usage frames are small.
 export function desktopUsageObserver() {
   let buffer = "", skip = false, started = false, stopped = false, failed = false, stopReason = null, usage = null;
-  let firstTextAt = null, firstOutputAt = null;
+  let firstTextAt = null, firstOutputAt = null, lastOutputAt = null, outputChunks = 0, reasoningStreamed = false;
+  const streamedDeltas = { text_delta: "text", thinking_delta: "thinking", input_json_delta: "partial_json" };
   const decoder = new TextDecoder();
   const frame = (text) => {
     const data = text.split("\n").filter((line) => line.startsWith("data:"))
@@ -345,6 +346,14 @@ export function desktopUsageObserver() {
       }
       if (event.type === "content_block_start" && ["tool_use", "server_tool_use"].includes(event.content_block?.type)) {
         firstOutputAt ??= Date.now();
+      }
+      // Same generation window as router.mjs usageRecord: first to last streamed delta.
+      const field = event.type === "content_block_delta" ? streamedDeltas[event.delta?.type] : null;
+      if (field && typeof event.delta[field] === "string" && event.delta[field].length) {
+        lastOutputAt = Date.now();
+        firstOutputAt ??= lastOutputAt;
+        outputChunks += 1;
+        if (event.delta.type === "thinking_delta") reasoningStreamed = true;
       }
       if (event.type === "message_delta") {
         if (event.usage) usage = { ...usage, ...event.usage };
@@ -367,7 +376,8 @@ export function desktopUsageObserver() {
       if (buffer.length > 64 * 1024) { buffer = buffer.slice(-3); skip = true; }
     },
     result() {
-      return { usage, firstTextAt, firstOutputAt, status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
+      return { usage, firstTextAt, firstOutputAt, lastOutputAt, outputChunks, reasoningStreamed,
+        status: failed || !started || !stopped ? "failed" : stopReason === "max_tokens" ? "incomplete" : "completed" };
     },
   };
 }
@@ -406,6 +416,9 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
       recorded = true;
       context.firstTextAt = result.firstTextAt;
       context.firstOutputAt = result.firstOutputAt;
+      context.lastOutputAt = result.lastOutputAt;
+      context.outputChunks = result.outputChunks;
+      context.reasoningStreamed = result.reasoningStreamed;
       recordUsage(context, desktopUsageEvent(result, context.upstreamModel, code));
     };
     try {

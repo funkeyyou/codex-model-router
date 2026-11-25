@@ -1275,6 +1275,14 @@ function usageContext({ requestHeaders, model, route, provider, transport, backg
 
 const usageNumber = (value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.round(Number(value)) : 0);
 
+// 輸出 TPS 沿用 vLLM、NVIDIA genai-perf、llmperf 與 tokps 的單次請求定義：
+//   (視窗內的輸出 tokens − 1) ÷ (最後一段串流輸出 − 第一段串流輸出)
+// 第一個 token 在首次輸出前就已生成，所以視窗只涵蓋 N − 1 個 token 間隔。
+// 沒有串流出來的推理（上游只回報數量）是在首次輸出之前生成的，不算進視窗（tokps 的做法）。
+// 只有一段串流、或第一段到最後一段不到 0.5 秒，多半是上游或中轉站把整段一次送出，
+// 這時量不到生成速度，記成 null，不拿送達時間硬算。
+const usageMinGenerationMs = 500;
+
 export function usageRecord(context, event, now = Date.now()) {
   const status = event?.type === "response.completed" ? "completed"
     : event?.type === "response.incomplete" ? "incomplete"
@@ -1290,10 +1298,16 @@ export function usageRecord(context, event, now = Date.now()) {
     ? Math.min(durationMs, Math.max(0, firstOutputAt - context.startedAt))
     : null;
   const output = usageNumber(usage?.output_tokens);
-  const generationMs = firstOutputMs === null ? 0 : durationMs - firstOutputMs;
+  const reasoning = usageNumber(usage?.output_tokens_details?.reasoning_tokens);
+  const generationMs = firstOutputMs !== null && Number.isFinite(context.lastOutputAt)
+    ? Math.min(durationMs - firstOutputMs, Math.max(0, context.lastOutputAt - firstOutputAt))
+    : null;
+  const windowTokens = context.reasoningStreamed ? output : Math.max(0, output - reasoning);
   // 結束事件可補足只在完整回應中提供文字的上游。
   const finalOutput = event.response?.output;
   const hasText = firstTextMs !== null || (Array.isArray(finalOutput) && finalOutput.some(hasOutputText));
+  const measurable = !context.bufferedOutput && hasText && status !== "failed" && windowTokens >= 2 &&
+    (context.outputChunks || 0) >= 2 && generationMs >= usageMinGenerationMs;
   return {
     at: new Date(now).toISOString(),
     model: context.model,
@@ -1301,13 +1315,13 @@ export function usageRecord(context, event, now = Date.now()) {
     route: context.route, provider: context.provider, transport: context.transport,
     background: context.backgroundKind, thread: context.thread, status,
     ...(context.combo ? { combo: context.combo, comboRole: context.comboRole } : {}),
-    durationMs, firstTextMs, firstOutputMs, hasText,
-    outputTps: !context.bufferedOutput && hasText && status !== "failed" && output > 0 && generationMs > 0 ? output * 1000 / generationMs : null,
+    durationMs, firstTextMs, firstOutputMs, generationMs, hasText,
+    outputTps: measurable ? (windowTokens - 1) * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
     cacheWrite: usageNumber(usage?.input_tokens_details?.cache_write_tokens),
     output,
-    reasoning: usageNumber(usage?.output_tokens_details?.reasoning_tokens),
+    reasoning,
     hasUsage: Boolean(usage),
     ...(status === "failed" && event.response?.error?.code ? { error: String(event.response.error.code).slice(0, 80) } : {}),
   };
@@ -1338,6 +1352,9 @@ function rotateUsageLog(at) {
 const usageToolItems = new Set(["function_call", "custom_tool_call", "tool_search_call", "mcp_call",
   "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "local_shell_call",
   "shell_call", "apply_patch_call", "computer_call"]);
+const usageReasoningDeltas = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
+const usageOutputDeltas = new Set(["response.output_text.delta", "response.function_call_arguments.delta",
+  "response.custom_tool_call_input.delta", ...usageReasoningDeltas]);
 
 function hasOutputText(item) {
   return item?.type === "message" && Array.isArray(item.content) && item.content.some(
@@ -1347,20 +1364,25 @@ function hasOutputText(item) {
 
 export function recordUsageEvent(context, event) {
   if (context.recorded || settings.usageLog === false) return;
+  const now = Date.now();
   if ((event?.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length) ||
       (event?.type === "response.output_text.done" && typeof event.text === "string" && event.text.length) ||
       (event?.type === "response.output_item.done" && hasOutputText(event.item))) {
-    context.firstTextAt ??= Date.now();
+    context.firstTextAt ??= now;
     context.firstOutputAt ??= context.firstTextAt;
   }
   // 串流出來的思考也是輸出：模型先想 20 秒、正文 1 秒就送完時，只從正文起算會把思考的
   // tokens 擠進那 1 秒，TPS 變成數千。首次輸出因此從第一段可見的思考或正文起算。
-  if (context.firstOutputAt == null && (
-    ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)) ||
-    ((event?.type === "response.function_call_arguments.delta" || event?.type === "response.custom_tool_call_input.delta" ||
-      event?.type === "response.reasoning_summary_text.delta" || event?.type === "response.reasoning_text.delta") && event.delta?.length)
-  )) {
-    context.firstOutputAt = Date.now();
+  const streamedDelta = usageOutputDeltas.has(event?.type) && typeof event.delta === "string" && event.delta.length > 0;
+  if (context.firstOutputAt == null && (streamedDelta ||
+    ((event?.type === "response.output_item.added" || event?.type === "response.output_item.done") && usageToolItems.has(event.item?.type)))) {
+    context.firstOutputAt = now;
+  }
+  // TPS 的視窗到最後一段串流輸出為止；段數用來辨認整段一次送達的回覆。
+  if (streamedDelta) {
+    context.lastOutputAt = now;
+    context.outputChunks = (context.outputChunks || 0) + 1;
+    if (usageReasoningDeltas.has(event.type)) context.reasoningStreamed = true;
   }
   const record = usageRecord(context, event);
   if (!record) return;
