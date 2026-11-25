@@ -17,17 +17,16 @@ The installer opens a web manager in my browser. I will enter providers and API 
 When finished, tell me whether the web manager opened.
 ```
 
-It is a small router that runs on your computer (a local LLM proxy) with a web manager. In Codex, official models still go straight to OpenAI; only the custom models you add are sent to the API you configure. Your Codex sign-in, existing chats, and official models are unaffected.
+This is a small local router (LLM proxy) with a web manager. In Codex, official models still go straight to OpenAI; only the custom models you add go to your configured API. Your Codex sign-in, existing chats, and official models are unaffected.
 
-- **Supported APIs**: OpenAI Responses API, Anthropic Claude Messages API, and Chat Completions-only endpoints (DeepSeek, Qwen, GLM, Kimi, Gemini, Ollama, vLLM, and more; capabilities are probed during setup).
-- **Multiple providers**: connect several at once; each API key is stored encrypted (macOS Keychain / Windows DPAPI).
-- **Standalone installation**: Codex is optional. You can use Claude Desktop alone; Node.js 22.15+ is required.
-- **Web manager**: add or remove models, manage providers and API keys, and update in one click from your browser.
-- **Official model visibility**: hide or restore official models under **Codex settings → Hide official models in the picker** when signed in with ChatGPT. This option is disabled in API key mode.
+- **Supported APIs**: OpenAI Responses API, Anthropic Claude Messages API, and Chat Completions-only endpoints (DeepSeek, Qwen, GLM, Kimi, Gemini, Ollama, vLLM, and more; capabilities are probed when adding models).
+- **Multiple providers**: connect several at once; each API key is stored encrypted (macOS Keychain / Windows DPAPI). Use **Edit** on a provider to update its name, prefix, Base URL, or API key (changing Base URL verifies and restarts the router; other edits don't), and add backup keys for automatic failover.
+- **Web manager and Usage**: add, remove, reorder, filter, and search models, view 24-hour stats, and update in one click from your browser. The Models page lets you pick a **Background task model** for titles, memory consolidation, and other background tasks. **Usage** records tokens, cache hits, time to first output, total duration, and output TPS for each request (numbers only, never conversation content).
+- **Codex settings**: hide or restore official models under **Codex settings → Hide official models in the picker** (disabled in API key mode), and set the global context or the per-tool output budget.
+- **Antigravity CLI**: install `agy` and sign in, then add it under **Add provider** or **Add models**. Reasoning levels for the same model are grouped and selectable in Codex. It handles text, images, and Codex tool calls, records cache usage, and picks up the same conversation after an idle pause.
+- **Combo models**: under **Models → Add combo model**, pair two added models (API, Claude subscription, or Antigravity CLI) as planner and executor. The planner plans, delegates, and reviews; the executor calls tools. By default the planner hands work to executor sub-agents through Codex, several at a time if needed, with progress shown in Codex. Turn **Delegation** off to use the router's built-in flow. Supports standard/strict review and **Instructions for the planner**.
+- **Claude Desktop integration**: works without Codex. Connect or revert third-party Claude APIs in one click under **Claude → Claude Desktop**; existing settings are backed up, and chats and preferences are preserved. GPT and CLI subscription routes are not supported in Claude Desktop yet. [Setup and limitations](docs/claude-desktop.md)
 - **Optional**: relay image generation and Claude Code subscription routing.
-- **Antigravity CLI**: install `agy` and sign in, then select Antigravity CLI under “Add provider” or “Add model” in the manager. Available reasoning levels are grouped by model and selectable in Codex. Supports text, images, Codex tool calls and per-turn cache usage. A follow-up after an idle pause resumes the same conversation and sends only the new messages.
-- **Combo models**: under “Models → Add combo model” in the manager, pair two added models: a planner that plans, delegates and reviews, and an executor that calls tools and does the work (for example, Opus plans and GPT executes). Either role can be an API model, a Claude subscription model or an Antigravity CLI model. Pick the combo straight from Codex's model menu. By default the planner handles the chat itself and hands hands-on work to the executor through Codex sub-agents, several at a time if needed, with their progress shown right in Codex. Turn the **Delegation** switch off to use the router's built-in flow instead, where the plan appears in the thinking area. You can turn on standard or strict review and add instructions for the planner, such as a definition of done or how to hand off work.
-- **Claude Desktop integration**: use “Claude → Claude Desktop” to connect your Claude API models or restore the previous configuration in one click. Settings are backed up; chats and unrelated preferences are preserved. GPT and CLI subscription routes are not supported in Claude Desktop yet. [Setup and limitations](docs/claude-desktop.md)
 
 ## Install
 
@@ -75,7 +74,9 @@ The recommended installation commands use the third-party service `gh-proxy.com`
 
 </details>
 
-It first installs the web manager and a shortcut, then opens your browser. A Codex entry is added only when Codex is detected; installing Codex is optional. Click **Connect an API provider**, pick a common provider or enter a Base URL and API key, and choose the models to add to finish installing. Selected models are tested with real API requests, which may incur small charges. For Claude-only use, add Claude API models and connect under **Claude → Claude Desktop**. Global context and other Codex settings require Codex. If you install Codex later, connect it explicitly under **Codex settings**. If it's already installed, the manager opens directly. To use the terminal menu instead, add `menu` to the command (terminal prompts are currently in Traditional Chinese).
+It first installs the web manager and a shortcut, then opens your browser. A Codex entry is added only if Codex is detected; installing Codex is optional. Click **Connect a provider**, pick a common provider or enter a Base URL and API key, and choose models to finish setup. Selected models are tested with real API requests, which may incur small charges.
+
+For Claude Desktop only, add your Claude API models and connect under **Claude → Claude Desktop**. Global context and other Codex settings require Codex; if you install Codex later, connect it under **Codex settings**. If already installed, running the command opens the manager directly. To use the terminal menu instead, append `menu` (terminal prompts are currently in Traditional Chinese).
 
 For a pinned version, download the installers and `SHA256SUMS` from [Releases](https://github.com/funkeyyou/codex-model-router/releases).
 
@@ -87,7 +88,7 @@ Restart Codex afterwards and the new models appear in the model picker:
 
 ## Usage
 
-Most tasks can be done in the web manager. Open it from any of:
+Day-to-day tasks live in the web manager. Open it from any of:
 
 - the "Custom Model Manager" entry in Codex (named in the Codex display language), which appears after restarting Codex once
 - the "模型路由器" shortcut (Start menu on Windows, `~/Applications` on macOS)
@@ -118,7 +119,7 @@ You can also run commands from the folder containing the installer: `bash codex-
 
 ## Update and uninstall
 
-**Update**: use the version menu at the top left of the web manager, or run the `update` command. Your Base URL, API keys, and models are kept; a failed update is rolled back automatically.
+**Update**: use the version menu at the top left of the web manager, or run `update`. Your Base URL, API keys, and models are kept; a failed update rolls back automatically.
 
 **Uninstall**: run `rollback`. Chats that used Claude models may stop working with official models afterwards, so start a new chat for them ([details in Chinese](docs/troubleshooting.zh-TW.md#回退之後用過-claude-模型的舊對話會壞掉)).
 

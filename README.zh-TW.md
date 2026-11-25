@@ -17,17 +17,16 @@
 完成後告訴我管理頁是否已經開啟。
 ```
 
-它是一個在你電腦上執行的小型路由器（本機 LLM proxy），附帶網頁管理頁：在 Codex 選官方模型時，請求照常送往 OpenAI；選你加入的自訂模型時，才送到你設定的 API。Codex 的登入、既有對話與官方模型都不受影響。
+這是一個在本機執行的小型路由器（本機 LLM proxy），附帶網頁管理頁。在 Codex 選官方模型時，請求照常送往 OpenAI；選自訂模型時，才送到你設定的 API。Codex 的登入、既有對話與官方模型不受影響。
 
-- **支援的 API**：OpenAI Responses API、Anthropic Claude Messages API，以及只有 Chat Completions 的相容端點（DeepSeek、Qwen、GLM、Kimi、Gemini、Ollama、vLLM 等，安裝時會實際探測能力）。
-- **多家供應商**：可同時接多家，API Key 各自加密保存（macOS 鑰匙圈／Windows DPAPI）。
-- **獨立安裝**：不必安裝 Codex；只裝 Claude Desktop 也能用。需要 Node.js 22.15 以上。
-- **網頁管理頁**：在瀏覽器加減模型、管理供應商與 API Key、一鍵更新。
-- **官方模型顯示**：在「Codex設定 → 隱藏官方模型選項」整理帳號模式的模型選單，隨時恢復；API Key 模式下此功能停用。
+- **支援的 API**：OpenAI Responses API、Anthropic Claude Messages API，以及只提供 Chat Completions 的相容端點（DeepSeek、Qwen、GLM、Kimi、Gemini、Ollama、vLLM 等，加入時會實測能力）。
+- **多家供應商**：可同時接多家，API Key 各自加密保存（macOS 鑰匙圈／Windows DPAPI）。在供應商頁點「修改」可直接改名稱、前綴、Base URL 或更換 API Key（改 Base URL 會先驗證再重啟，其餘不重啟），也支援加入備用 Key 自動切換。
+- **網頁管理頁與使用記錄**：在瀏覽器加減與排序模型、依供應商篩選或搜尋、檢視近 24 小時統計，也能一鍵更新。模型頁可以指定「背景任務模型」，讓標題、記憶整理這類背景任務改用其他模型。「使用記錄」記下每次請求的 token、快取命中、首次輸出、總耗時與輸出 TPS，只記數字，不記對話內容。
+- **Codex 設定**：帳號模式下可在「Codex設定 → 隱藏官方模型選項」整理選單（API Key 模式下停用），也能調整全域上下文與單筆工具輸出預算。
+- **Antigravity CLI**：安裝 `agy` 並登入後，在管理頁「新增供應商」或「新增模型」加入。同模型的推理檔位會自動合併並在 Codex 切換；支援文字、圖片、Codex 工具呼叫與快取記錄，閒置後再追問會接回原對話。
+- **組合模型**：在「模型 → 新增組合模型」把兩個已添加的模型組成大腦與雙手（API、Claude 訂閱、Antigravity CLI 皆可），大腦規劃、派工與驗收，雙手呼叫工具執行。預設用 Codex 的子 Agent 派工，可以同時派多個，進度直接顯示在 Codex；關閉「委派方式」可切回路由器內建流程。支援一般／嚴格驗收與「給大腦的指令」。
+- **Claude Desktop 接入**：不必安裝 Codex，在「Claude → Claude 客戶端」一鍵設定或回退第三方 Claude API。原設定自動備份，聊天與偏好保留；暫不支援 GPT 或 CLI 訂閱路由。[使用說明](docs/claude-desktop.md)
 - **可選功能**：中轉 API 生圖、Claude Code 訂閱路由。
-- **Antigravity CLI**：先安裝 `agy` 並登入，再從管理頁「新增供應商」或「新增模型」選擇 Antigravity CLI。同一模型的推理檔位自動合併，可在 Codex 中切換；支援文字、圖片、Codex 工具呼叫與快取用量記錄。同一聊天閒置後再追問會接回原對話，只送出新增訊息。
-- **組合模型**：在管理頁「模型 → 新增組合模型」把兩個已添加的模型組成一個：大腦負責規劃、派工與驗收，雙手負責呼叫工具完成工作，例如 Opus 規劃、GPT 執行。大腦與雙手都可以是 API 模型、Claude 訂閱或 Antigravity CLI 模型。設定好後可直接在 Codex 模型選單選用。預設由大腦直接處理對話，需要動手時用 Codex 的子 Agent 派工給雙手，可以同時派好幾個，進度直接顯示在 Codex；也可以關閉「委派方式」開關，改用路由器內建流程（計畫顯示在思考區）。可選一般或嚴格驗收，也能寫「給大腦的指令」（完成條件、派工注意事項等）。
-- **Claude Desktop 接入**：在「Claude → Claude 客戶端」一鍵設定第三方 Claude API 模型，也可一鍵回退。設定自動備份，聊天與其他偏好保留；暫不支援在 Claude 客戶端使用 GPT 或 CLI 訂閱路由。[使用說明](docs/claude-desktop.md)
 
 ## 安裝
 
@@ -75,7 +74,9 @@ curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/
 
 </details>
 
-執行後會先安裝網頁管理頁與捷徑，並在瀏覽器開啟；偵測到 Codex 時才另外建立 Codex 入口，不要求安裝 Codex。在管理頁點「連接 API 供應商」，選擇常用供應商或填入 Base URL、API Key，勾選要加入的模型即可完成安裝；選中的模型會先發送測試請求確認可用，可能產生少量費用。只用 Claude 的話，添加 Claude API 模型後，到「Claude → Claude 客戶端」一鍵接入。Codex 的全域上下文等功能需要安裝並連接 Codex；獨立安裝後可在「Codex設定」手動連接。已經安裝過的話會直接開啟管理頁。習慣終端操作可以在指令後加上 `menu` 使用終端選單。
+執行後會先安裝網頁管理頁與捷徑並在瀏覽器開啟；偵測到 Codex 時才建立 Codex 入口，不要求安裝 Codex。在管理頁點「連接供應商」，選擇常用供應商或填入 Base URL 與 API Key，勾選模型即可完成。選中的模型會先送測試請求確認可用，可能產生少量費用。
+
+只用 Claude Desktop 的話，添加 Claude API 模型後，到「Claude → Claude 客戶端」一鍵接入即可。Codex 的全域上下文等功能需安裝並連接 Codex，後續可在「Codex設定」手動連接。如果已經安裝過，執行指令會直接開啟管理頁；習慣終端操作可在指令後加 `menu`。
 
 想固定版本或先核對檔案雜湊，見[固定版本並驗證下載](docs/guide.zh-TW.md#固定版本並驗證下載可選)。
 
@@ -87,7 +88,7 @@ curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/
 
 ## 使用
 
-大部分操作都能在網頁管理頁完成，開啟方式任選一種：
+日常操作都在網頁管理頁完成，開啟方式任選一種：
 
 - Codex 裡的「自訂模型管理」入口（名稱跟隨 Codex 介面語言；安裝後重開 Codex 一次才會出現）
 - 「模型路由器」捷徑（Windows 在開始功能表，macOS 在 `~/Applications`）
@@ -120,7 +121,7 @@ curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/
 
 ## 升級與移除
 
-**升級**：在網頁管理頁左上角的版本選單一鍵更新；或執行 `update` 指令。Base URL、API Key 與已加入的模型都會保留，不必重新設定；更新失敗會自動還原。
+**升級**：在網頁管理頁左上角的版本選單一鍵更新，或執行 `update` 指令。Base URL、API Key 與已加入的模型都會保留，更新失敗會自動還原。
 
 **移除**：執行 `rollback`。用過 Claude 模型的舊對話，移除後切回官方模型可能無法繼續，請改開新對話（[原因](docs/troubleshooting.zh-TW.md#回退之後用過-claude-模型的舊對話會壞掉)）。
 

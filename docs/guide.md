@@ -125,7 +125,7 @@ bash codex-model-router.sh ui
 powershell -ExecutionPolicy Bypass -File .\codex-model-router.ps1 ui
 ```
 
-安装或更新完成后，安装器会在路由器目录放一份安装器副本，并建立「Codex 模型路由器」快捷方式（macOS 在 `~/Applications`，Windows 在开始菜单），之后双击即可打开，不必再找当初下载的安装器。
+安装或更新完成后，安装器会在路由器目录放一份安装器副本，并建立「模型路由器」快捷方式（macOS 在 `~/Applications`，Windows 在开始菜单），之后双击即可打开，不必再找当初下载的安装器。
 
 从 1.27.5 起，安装或更新会自动加入 Codex 的「自定义模型管理」全局入口；从 1.30.1 起入口名称跟随 Codex 界面语言（繁中、简中，其他语言显示英文），切换语言后重启 Codex 生效。重新打开 Codex 后，点击入口即可在浏览器打开本机管理页，不需要下载仓库或配置项目 Actions。入口使用官方支持的 [MCP Apps 全局扩展](https://developers.openai.com/plugins/build/extensions#sidebar-apps)，需要支持 MCP Apps 的桌面版本；不同版本会显示在顶部或侧边栏。打开入口不需要模型推理或消耗中转额度。若只想重新注册入口，可运行 `ui-setup`，不重启路由器。
 

@@ -49,7 +49,7 @@ Since v1.27.0, menu item 2 or the `ui` command opens a local management page in 
 bash codex-model-router.sh ui
 ```
 
-After installing or updating, the installer keeps a copy of itself in the router directory and creates a "Codex 模型路由器" shortcut (`~/Applications` on macOS, the Start menu on Windows), so you can reopen the page without finding the downloaded installer.
+After installing or updating, the installer keeps a copy of itself in the router directory and creates a "模型路由器" shortcut (`~/Applications` on macOS, the Start menu on Windows), so you can reopen the page without finding the downloaded installer.
 
 Since v1.27.5, installation and updates add "Custom Model Manager" as a global Codex entry. Since v1.30.1 its name follows the Codex display language (Traditional Chinese, Simplified Chinese, otherwise English) and updates after Codex restarts. Restart Codex once to load it, then click the entry to open the local manager in your browser. No repository checkout or project Actions setup is required. It uses the officially supported [MCP Apps global extensions](https://developers.openai.com/plugins/build/extensions#sidebar-apps) and requires a desktop version that supports MCP Apps; placement in the header or sidebar depends on the client version. Opening it makes no model inference request and uses no provider quota. Run `ui-setup` to repair the entry without restarting the router.
 
