@@ -29,6 +29,9 @@ const OUTPUT_HEADROOM = 4096;
 // Anthropic 的 output_config.effort 接受的檔位。Codex 的五檔剛好同名，
 // 因此支援這個參數的模型可以直接透傳，不必再換算成 token 預算。
 const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const ANTHROPIC_PROGRESS_EVENTS = new Set([
+  "message_start", "message_delta", "content_block_start", "content_block_delta", "content_block_stop",
+]);
 
 // ---------------------------------------------------------------- 請求方向
 
@@ -1229,12 +1232,20 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
 
   const decoder = new TextDecoder();
   let pending = "";
+  let idleTimer = null;
+  let idleTimedOut = false;
+  const idleTimeoutMs = ctx.claudeStreamIdleTimeoutMs;
+  const resetIdleTimer = () => {
+    if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0 || typeof ctx.abortClaudeUpstream !== "function") return;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimedOut = true;
+      ctx.abortClaudeUpstream();
+    }, idleTimeoutMs);
+    idleTimer.unref();
+  };
 
-  const failResponse = (error, kind = null) => {
-    // 先在原本的抑制狀態下補完已串流的文字，壓縮回合的文字仍不外送。
-    flushText("commentary");
-    failed = true;
-    suppress = false;
+  const recordTerminalDiagnostic = (kind) => {
     if (kind) ctx.claudeFailureKind = kind;
     if (compactionMode) ctx.claudeCompactionFailed = true;
     // Retain only bounded protocol metadata, never prompts, thinking or signatures.
@@ -1253,10 +1264,18 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       text_items: output.filter((item) => item.type === "message").length,
       tool_calls: output.filter((item) => item.type === "function_call" || item.type === "custom_tool_call").length,
     };
+  };
+
+  const failResponse = (error, kind = null) => {
+    // 先在原本的抑制狀態下補完已串流的文字，壓縮回合的文字仍不外送。
+    flushText("commentary");
+    failed = true;
+    suppress = false;
+    recordTerminalDiagnostic(kind);
     const response = base();
     response.status = "failed";
     response.error = error;
-    response.usage = mapUsage(usage);
+    response.usage = usage ? mapUsage(usage) : null;
     send({ type: "response.failed", response });
   };
 
@@ -1504,6 +1523,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
         break;
 
       case "message_stop": {
+        const exhausted = stopReason === "max_tokens";
         const toolCalled = output.some((item) => item.type === "function_call" || item.type === "custom_tool_call");
         flushText(!toolCalled && (stopReason === "end_turn" || stopReason === "stop_sequence")
           ? "final_answer" : "commentary");
@@ -1536,23 +1556,22 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           item.type === "function_call" || item.type === "custom_tool_call" ||
           (item.type === "message" && item.content?.some((part) =>
             part.type === "output_text" && part.text?.trim())))) {
-          const exhausted = stopReason === "max_tokens";
-          const limit = ctx.anthropicRequest?.max_tokens;
-          const limitText = Number.isSafeInteger(limit) && limit > 0 ? `（設定 ${limit} tokens）` : "";
-          failResponse({
-            code: "invalid_prompt",
-            message: exhausted
-              ? `Claude 已達輸出上限${limitText}，但尚未產生回答或工具呼叫。請提高輸出上限或降低思考強度。`
-              : "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
-          }, exhausted ? "output_limit" : "empty_response");
-          break;
+          if (!exhausted) {
+            failResponse({
+              code: "invalid_prompt",
+              message: "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
+            }, "empty_response");
+            break;
+          }
+          // Responses 將只有推理的輸出耗盡也標為 incomplete，讓 Codex 記下用量並結束該回合。
+          recordTerminalDiagnostic("output_limit");
         }
         const response = base();
         response.status = "completed";
         response.completed_at = Math.floor(Date.now() / 1000);
         response.output = output;
         response.usage = mapUsage(usage);
-        if (stopReason === "max_tokens") {
+        if (exhausted) {
           response.status = "incomplete";
           response.incomplete_details = { reason: "max_output_tokens" };
         }
@@ -1588,8 +1607,9 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       return;
     }
     // 相容只在 SSE event 欄位標示類型的閘道。
-    const eventName = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
-    handle({ ...event, type: event.type || eventName });
+    const type = event.type || lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+    if (idleTimer && ANTHROPIC_PROGRESS_EVENTS.has(type)) resetIdleTimer();
+    handle({ ...event, type });
   };
   let mode = null;
   const maxBufferedBytes = 16 * 1024 * 1024;
@@ -1604,16 +1624,33 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       consume(block);
     }
   };
-  for await (const chunk of upstreamBody) {
-    pending += decoder.decode(chunk, { stream: true });
-    drain();
-    if (failed || completed) break;
-    if (Buffer.byteLength(pending, "utf8") > maxBufferedBytes) {
-      failResponse({ code: "invalid_upstream_response", message: "Claude 上游回應超過轉譯緩衝上限。" });
-      break;
+  resetIdleTimer();
+  try {
+    for await (const chunk of upstreamBody) {
+      pending += decoder.decode(chunk, { stream: true });
+      drain();
+      if (failed || completed) break;
+      if (mode === "json" && chunk.length) resetIdleTimer();
+      if (Buffer.byteLength(pending, "utf8") > maxBufferedBytes) {
+        failResponse({ code: "invalid_upstream_response", message: "Claude 上游回應超過轉譯緩衝上限。" });
+        break;
+      }
     }
+  } catch (error) {
+    if (!idleTimedOut) throw error;
+  } finally {
+    clearTimeout(idleTimer);
+    idleTimer = null;
   }
   if (failed || completed) return;
+  if (idleTimedOut) {
+    failResponse({
+      // Codex 會對一般串流錯誤重送數次。這裡明確結束，避免同一輪反覆等待上游。
+      code: "invalid_prompt",
+      message: `Claude 上游已連續 ${idleTimeoutMs / 1000} 秒沒有回傳生成事件，已停止等待。請稍後重試或在原對話切換模型。`,
+    }, "stream_idle_timeout");
+    return;
+  }
   pending += decoder.decode();
   drain();
   if (failed || completed) return;

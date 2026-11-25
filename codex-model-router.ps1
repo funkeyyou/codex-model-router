@@ -176,7 +176,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.46.0";
+const INSTALLER_VERSION = "1.46.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2637,6 +2637,7 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // 路由器讀取的每一個可調設定都要列在這裡；test/settings-keys.test.mjs 會核對。
 export const preservedSettingKeys = [
   "claudeCli",
+  "claudeStreamIdleTimeoutMs",
   "antigravityCli",
   // false 時路由器不寫 usage.jsonl（使用記錄）。
   "usageLog",
@@ -7830,6 +7831,16 @@ export function parseRouterLog(text, limit = 50) {
       causeCode: clip(record.causeCode, 60),
       upstreamStatus: Number.isInteger(record.upstreamStatus) ? record.upstreamStatus : null,
       ...(record.code === "router_history_unavailable" ? { historyReason: clip(record.historyReason, 40) } : {}),
+      ...(record.code === "tool_output_call_id_missing" && record.toolOutput ? {
+        toolOutput: {
+          ...Object.fromEntries(["index", "pendingCount", "matchCount"].filter(
+            key => Number.isSafeInteger(record.toolOutput[key]) && record.toolOutput[key] >= 0,
+          ).map(key => [key, record.toolOutput[key]])),
+          type: clip(record.toolOutput.type, 32), name: clip(record.toolOutput.name, 80),
+          namespace: clip(record.toolOutput.namespace, 80), idState: clip(record.toolOutput.idState, 16),
+          callIdState: clip(record.toolOutput.callIdState, 16), historyRebuilt: record.toolOutput.historyRebuilt === true,
+        },
+      } : {}),
     });
     if (record.code === "router_history_unavailable" && typeof record.requestId === "string") {
       historyErrors.set(record.requestId, entries.at(-1));
@@ -11654,11 +11665,28 @@ function isHostContextSnapshot(item) {
     item.call_id == null && typeof item.output === "string" && item.output.trim().length > 0;
 }
 
-export function normalizeHttpToolOutputs(body) {
+// Names that come from plug-ins can contain arbitrary text. Preserve protocol
+// names we recognize and fingerprint the rest so retries can still be compared.
+function diagnosticToolLabel(value) {
+  if (typeof value !== "string" || !value.length) return null;
+  if (HOST_CONTEXT_SNAPSHOT_NAME.test(value) ||
+      ["agent", "functions", "codex_app", "codex_tui", "browser_tabs", "create_thread",
+        "send_message_to_thread", "exec_command", "apply_patch", "write_stdin"].includes(value)) return value;
+  return "hash:" + createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function diagnosticIdState(value) {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (typeof value !== "string") return "invalid_type";
+  return value.trim() ? "present" : "blank";
+}
+
+export function normalizeHttpToolOutputs(body, historyRebuilt = false) {
   if (!Array.isArray(body?.input)) return body;
   const pending = new Map();
   let changed = false;
-  const input = body.input.map((item) => {
+  const input = body.input.map((item, index) => {
     if (!item || typeof item !== "object") return item;
     if (["function_call", "custom_tool_call"].includes(item.type) && item.call_id) {
       pending.set(item.call_id, item);
@@ -11674,12 +11702,14 @@ export function normalizeHttpToolOutputs(body) {
     if (isHostContextSnapshot(item)) {
       return { type: "message", role: "user", content: [{ type: "input_text", text: `[${item.name}]\n${item.output}` }] };
     }
+    let matchCount = 0;
     if (pending.size) {
       const callType = item.type === "function_call_output" ? "function_call" : "custom_tool_call";
       const matches = [...pending.values()].filter((call) => call.type === callType &&
         typeof item.id === "string" && item.id.length > 0 &&
         (call.id === item.id || call.call_id === item.id));
-      if (matches.length === 1) {
+      matchCount = matches.length;
+      if (matchCount === 1) {
         pending.delete(matches[0].call_id);
         const { id: _id, ...output } = item;
         return { ...output, call_id: matches[0].call_id };
@@ -11689,9 +11719,15 @@ export function normalizeHttpToolOutputs(body) {
     // 已重建的歷史可以包含先前的委派信封，仍須保留以便重播與壓縮。
     if (pending.size || body.previous_response_id ||
         (item.call_id != null && typeof item.call_id !== "string") || !isDelegationBootstrap(item)) {
-      throw new RouterRequestError(422, "tool_output_call_id_missing",
+      const error = new RouterRequestError(422, "tool_output_call_id_missing",
         "工具結果缺少 call_id，且無法從歷史唯一確認對應的呼叫。請重新連線並重送完整對話；若仍失敗，請在新任務提供工作摘要。路由器未猜測配對或重新執行工具。",
         "request");
+      error.toolOutput = {
+        index, type: item.type, namespace: diagnosticToolLabel(item.namespace), name: diagnosticToolLabel(item.name),
+        idState: diagnosticIdState(item.id), callIdState: diagnosticIdState(item.call_id),
+        pendingCount: pending.size, matchCount, historyRebuilt,
+      };
+      throw error;
     }
     return { type: "message", role: "user", content: [{ type: "input_text", text: item.output }] };
   });
@@ -11725,6 +11761,10 @@ function stripRouterImageArtifacts(body) {
 }
 const heartbeatIntervalMs =
   Number(settings.heartbeatIntervalMs) > 0 ? Number(settings.heartbeatIntervalMs) : 15000;
+// 在 Codex 預設的五分鐘串流逾時之前回報，避免用戶端反覆重送同一輪。
+const claudeStreamIdleTimeoutMs = Number.isSafeInteger(settings.claudeStreamIdleTimeoutMs) &&
+  settings.claudeStreamIdleTimeoutMs > 0 && settings.claudeStreamIdleTimeoutMs <= 2_147_483_647
+  ? settings.claudeStreamIdleTimeoutMs : 240_000;
 
 const requestHopByHopHeaders = new Set([
   "connection",
@@ -12690,6 +12730,7 @@ export function describeRouterError(error) {
     const { status, code, message, phase, upstreamStatus } = error;
     return { status, code, message, phase, upstreamStatus, causeCode: null,
       ...(code === "router_history_unavailable" ? { historyReason: error.historyReason || "unknown" } : {}),
+      ...(code === "tool_output_call_id_missing" && error.toolOutput ? { toolOutput: error.toolOutput } : {}),
     };
   }
   const chain = [];
@@ -13626,7 +13667,9 @@ export async function fetchModelUpstream(
   }
   // 先重建完整歷史才配對；在剝除選填 item id 之前保留可驗證的識別。
   // Claude/Chat 轉譯各自已有工具結果處理，官方原生 WS 不走此 HTTP 路徑。
-  if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
+  if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) {
+    effectiveBody = normalizeHttpToolOutputs(effectiveBody, Boolean(body?.previous_response_id));
+  }
   meta.history = comboRole ? null : prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
   // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
   meta.history = meta.history || { disabled: true };
@@ -13712,14 +13755,18 @@ export async function fetchModelUpstream(
         stats.lastProvider = "claude-cli";
         return translated;
       }
+      const upstreamController = new AbortController();
+      const upstreamSignal = signal ? AbortSignal.any([signal, upstreamController.signal]) : upstreamController.signal;
       const translated = await fetchCustom(
         provider,
         new URL(`${provider.apiRoot}/messages`),
         requestHeaders,
         anthropicBody,
-        signal,
+        upstreamSignal,
         { model: route.upstreamModel },
       );
+      meta.abortClaudeUpstream = () => upstreamController.abort();
+      meta.claudeStreamIdleTimeoutMs = claudeStreamIdleTimeoutMs;
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
       return translated;
@@ -14857,7 +14904,8 @@ function recordClaudeBridgeFailure(event, meta) {
       "translation",
     ), { transport: meta.transport || null, route: "custom", model: meta.model });
   }
-  if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
+  const outputLimit = event.type === "response.incomplete" && meta.claudeFailureKind === "output_limit";
+  if (meta.translate !== "anthropic" || (event.type !== "response.failed" && !outputLimit)) return;
   if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
   if (["empty_response", "output_limit"].includes(meta.claudeFailureKind)) stats.claudeEmptyResponses += 1;
   if (meta.claudeCompactionFailed) stats.claudeCompactionFailures += 1;
@@ -15610,6 +15658,9 @@ const OUTPUT_HEADROOM = 4096;
 // Anthropic 的 output_config.effort 接受的檔位。Codex 的五檔剛好同名，
 // 因此支援這個參數的模型可以直接透傳，不必再換算成 token 預算。
 const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const ANTHROPIC_PROGRESS_EVENTS = new Set([
+  "message_start", "message_delta", "content_block_start", "content_block_delta", "content_block_stop",
+]);
 
 // ---------------------------------------------------------------- 請求方向
 
@@ -16810,12 +16861,20 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
 
   const decoder = new TextDecoder();
   let pending = "";
+  let idleTimer = null;
+  let idleTimedOut = false;
+  const idleTimeoutMs = ctx.claudeStreamIdleTimeoutMs;
+  const resetIdleTimer = () => {
+    if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0 || typeof ctx.abortClaudeUpstream !== "function") return;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimedOut = true;
+      ctx.abortClaudeUpstream();
+    }, idleTimeoutMs);
+    idleTimer.unref();
+  };
 
-  const failResponse = (error, kind = null) => {
-    // 先在原本的抑制狀態下補完已串流的文字，壓縮回合的文字仍不外送。
-    flushText("commentary");
-    failed = true;
-    suppress = false;
+  const recordTerminalDiagnostic = (kind) => {
     if (kind) ctx.claudeFailureKind = kind;
     if (compactionMode) ctx.claudeCompactionFailed = true;
     // Retain only bounded protocol metadata, never prompts, thinking or signatures.
@@ -16834,10 +16893,18 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       text_items: output.filter((item) => item.type === "message").length,
       tool_calls: output.filter((item) => item.type === "function_call" || item.type === "custom_tool_call").length,
     };
+  };
+
+  const failResponse = (error, kind = null) => {
+    // 先在原本的抑制狀態下補完已串流的文字，壓縮回合的文字仍不外送。
+    flushText("commentary");
+    failed = true;
+    suppress = false;
+    recordTerminalDiagnostic(kind);
     const response = base();
     response.status = "failed";
     response.error = error;
-    response.usage = mapUsage(usage);
+    response.usage = usage ? mapUsage(usage) : null;
     send({ type: "response.failed", response });
   };
 
@@ -17085,6 +17152,7 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
         break;
 
       case "message_stop": {
+        const exhausted = stopReason === "max_tokens";
         const toolCalled = output.some((item) => item.type === "function_call" || item.type === "custom_tool_call");
         flushText(!toolCalled && (stopReason === "end_turn" || stopReason === "stop_sequence")
           ? "final_answer" : "commentary");
@@ -17117,23 +17185,22 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
           item.type === "function_call" || item.type === "custom_tool_call" ||
           (item.type === "message" && item.content?.some((part) =>
             part.type === "output_text" && part.text?.trim())))) {
-          const exhausted = stopReason === "max_tokens";
-          const limit = ctx.anthropicRequest?.max_tokens;
-          const limitText = Number.isSafeInteger(limit) && limit > 0 ? `（設定 ${limit} tokens）` : "";
-          failResponse({
-            code: "invalid_prompt",
-            message: exhausted
-              ? `Claude 已達輸出上限${limitText}，但尚未產生回答或工具呼叫。請提高輸出上限或降低思考強度。`
-              : "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
-          }, exhausted ? "output_limit" : "empty_response");
-          break;
+          if (!exhausted) {
+            failResponse({
+              code: "invalid_prompt",
+              message: "Claude 上游回報已完成，但沒有產生可顯示的回答或工具呼叫。請檢查上游回應，或改用新對話重試。",
+            }, "empty_response");
+            break;
+          }
+          // Responses 將只有推理的輸出耗盡也標為 incomplete，讓 Codex 記下用量並結束該回合。
+          recordTerminalDiagnostic("output_limit");
         }
         const response = base();
         response.status = "completed";
         response.completed_at = Math.floor(Date.now() / 1000);
         response.output = output;
         response.usage = mapUsage(usage);
-        if (stopReason === "max_tokens") {
+        if (exhausted) {
           response.status = "incomplete";
           response.incomplete_details = { reason: "max_output_tokens" };
         }
@@ -17169,8 +17236,9 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       return;
     }
     // 相容只在 SSE event 欄位標示類型的閘道。
-    const eventName = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
-    handle({ ...event, type: event.type || eventName });
+    const type = event.type || lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+    if (idleTimer && ANTHROPIC_PROGRESS_EVENTS.has(type)) resetIdleTimer();
+    handle({ ...event, type });
   };
   let mode = null;
   const maxBufferedBytes = 16 * 1024 * 1024;
@@ -17185,16 +17253,33 @@ export async function bridgeAnthropicStream(upstreamBody, emit, ctx) {
       consume(block);
     }
   };
-  for await (const chunk of upstreamBody) {
-    pending += decoder.decode(chunk, { stream: true });
-    drain();
-    if (failed || completed) break;
-    if (Buffer.byteLength(pending, "utf8") > maxBufferedBytes) {
-      failResponse({ code: "invalid_upstream_response", message: "Claude 上游回應超過轉譯緩衝上限。" });
-      break;
+  resetIdleTimer();
+  try {
+    for await (const chunk of upstreamBody) {
+      pending += decoder.decode(chunk, { stream: true });
+      drain();
+      if (failed || completed) break;
+      if (mode === "json" && chunk.length) resetIdleTimer();
+      if (Buffer.byteLength(pending, "utf8") > maxBufferedBytes) {
+        failResponse({ code: "invalid_upstream_response", message: "Claude 上游回應超過轉譯緩衝上限。" });
+        break;
+      }
     }
+  } catch (error) {
+    if (!idleTimedOut) throw error;
+  } finally {
+    clearTimeout(idleTimer);
+    idleTimer = null;
   }
   if (failed || completed) return;
+  if (idleTimedOut) {
+    failResponse({
+      // Codex 會對一般串流錯誤重送數次。這裡明確結束，避免同一輪反覆等待上游。
+      code: "invalid_prompt",
+      message: `Claude 上游已連續 ${idleTimeoutMs / 1000} 秒沒有回傳生成事件，已停止等待。請稍後重試或在原對話切換模型。`,
+    }, "stream_idle_timeout");
+    return;
+  }
   pending += decoder.decode();
   drain();
   if (failed || completed) return;

@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.46.0";
+const INSTALLER_VERSION = "1.46.1";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2490,6 +2490,7 @@ export function validateManagedCatalog(catalog, forceListed = [], customSlugs = 
 // 路由器讀取的每一個可調設定都要列在這裡；test/settings-keys.test.mjs 會核對。
 export const preservedSettingKeys = [
   "claudeCli",
+  "claudeStreamIdleTimeoutMs",
   "antigravityCli",
   // false 時路由器不寫 usage.jsonl（使用記錄）。
   "usageLog",
@@ -7683,6 +7684,16 @@ export function parseRouterLog(text, limit = 50) {
       causeCode: clip(record.causeCode, 60),
       upstreamStatus: Number.isInteger(record.upstreamStatus) ? record.upstreamStatus : null,
       ...(record.code === "router_history_unavailable" ? { historyReason: clip(record.historyReason, 40) } : {}),
+      ...(record.code === "tool_output_call_id_missing" && record.toolOutput ? {
+        toolOutput: {
+          ...Object.fromEntries(["index", "pendingCount", "matchCount"].filter(
+            key => Number.isSafeInteger(record.toolOutput[key]) && record.toolOutput[key] >= 0,
+          ).map(key => [key, record.toolOutput[key]])),
+          type: clip(record.toolOutput.type, 32), name: clip(record.toolOutput.name, 80),
+          namespace: clip(record.toolOutput.namespace, 80), idState: clip(record.toolOutput.idState, 16),
+          callIdState: clip(record.toolOutput.callIdState, 16), historyRebuilt: record.toolOutput.historyRebuilt === true,
+        },
+      } : {}),
     });
     if (record.code === "router_history_unavailable" && typeof record.requestId === "string") {
       historyErrors.set(record.requestId, entries.at(-1));

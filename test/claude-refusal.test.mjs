@@ -99,7 +99,7 @@ test("上游未標拒答卻回空內容時，也不再靜默完成", async () =>
   assert.equal(context.claudeFailureDiagnostic.stop_reason, "end_turn");
 });
 
-test("只思考就耗盡輸出時明確報錯，保留停止原因與用量但不洩漏內容", async () => {
+test("只思考就耗盡輸出時送出 incomplete 並保留用量，診斷只記數字", async () => {
   const context = { ...meta(), anthropicRequest: { max_tokens: 32000, system: "private prompt" } };
   const output = [];
   await bridge.bridgeAnthropicStream(sse([
@@ -114,9 +114,14 @@ test("只思考就耗盡輸出時明確報錯，保留停止原因與用量但�
     } },
     { type: "message_stop" },
   ]), (event) => output.push(event), context);
-  assert.equal(output.at(-1).type, "response.failed");
-  assert.match(output.at(-1).response.error.message, /輸出上限.*32000/);
-  assert.equal(output.at(-1).response.usage.output_tokens, 32000);
+  const terminal = output.at(-1);
+  assert.equal(terminal.type, "response.incomplete");
+  assert.equal(terminal.response.status, "incomplete");
+  assert.deepEqual(terminal.response.incomplete_details, { reason: "max_output_tokens" });
+  assert.equal(terminal.response.error, null);
+  assert.equal(terminal.response.usage.output_tokens, 32000);
+  assert.equal(terminal.response.usage.output_tokens_details.reasoning_tokens, 32000);
+  assert.deepEqual(terminal.response.output.map((item) => item.type), ["reasoning"]);
   assert.equal(context.claudeFailureKind, "output_limit");
   assert.deepEqual(context.claudeFailureDiagnostic, {
     stop_reason: "max_tokens", max_tokens: 32000, input_tokens: 12, output_tokens: 32000,
@@ -124,7 +129,7 @@ test("只思考就耗盡輸出時明確報錯，保留停止原因與用量但�
     reasoning_items: 1, text_items: 0, tool_calls: 0,
   });
   assert.doesNotMatch(JSON.stringify(context.claudeFailureDiagnostic), /private/);
-  assert.equal(output.some((event) => ["response.completed", "response.incomplete"].includes(event.type)), false);
+  assert.equal(output.some((event) => ["response.completed", "response.failed"].includes(event.type)), false);
 });
 
 test("已有可見文字的 max_tokens 仍為 incomplete；未知停止原因不寫入原文", async () => {
@@ -180,9 +185,16 @@ test("HTTP 和 WebSocket 轉譯都送出失敗，健康檢查計入拒答、空�
   const exhausted = [opening, { type: "message_delta", delta: { stop_reason: "max_tokens" },
     usage: { output_tokens: 32000, output_tokens_details: { thinking_tokens: 32000 } } }, { type: "message_stop" }];
   for (const transport of ["http", "websocket"]) {
+    chunks.length = 0;
+    frames.length = 0;
     const context = { ...meta(), transport, anthropicRequest: { max_tokens: 32000, messages: ["private prompt"] } };
     if (transport === "http") await router.bridgeTranslatedToHttp({ status: 200, body: sse(exhausted) }, response, context);
     else await router.bridgeTranslatedToWebSocket({ status: 200, body: sse(exhausted) }, socket, context);
+    const wire = transport === "http" ? chunks.join("") : router.parseWebSocketFrames(Buffer.concat(frames)).frames
+      .map((frame) => frame.payload.toString("utf8")).join("\n");
+    assert.match(wire, /"type":"response\.incomplete"/);
+    assert.match(wire, /"reason":"max_output_tokens"/);
+    assert.doesNotMatch(wire, /"type":"response\.(failed|completed)"/);
     const stats = (await health()).stats;
     assert.equal(stats.lastClaudeFailure.transport, transport);
     assert.equal(stats.lastClaudeFailure.stop_reason, "max_tokens");

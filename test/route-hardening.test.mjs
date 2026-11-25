@@ -211,7 +211,7 @@ test("切換官方 GPT 模型會重播完整歷史，且不外送本機圖片工
 });
 
 test("Claude 工具完成及失敗經真實 HTTP 返回 Codex 格式，未知附件在付費請求前拒絕", async (t) => {
-  let bad = false;
+  let outcome = "tool";
   const requests = [];
   const upstream = http.createServer(async (req, res) => {
     const chunks = [];
@@ -220,8 +220,27 @@ test("Claude 工具完成及失敗經真實 HTTP 返回 Codex 格式，未知附
     requests.push(body);
     const alias = body.tools[0].name;
     res.writeHead(200, { "content-type": "text/event-stream" });
+    if (outcome === "output_limit") {
+      res.end(sse([
+        { type: "content_block_start", content_block: { type: "thinking" } },
+        { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "unfinished reasoning" } },
+        { type: "content_block_delta", delta: { type: "signature_delta", signature: "fixture signature" } },
+        { type: "content_block_stop" },
+        { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: body.max_tokens } },
+        { type: "message_stop" },
+      ]));
+      return;
+    }
+    if (outcome === "answer") {
+      res.end(sse([
+        { type: "content_block_start", content_block: { type: "text", text: "Report received." } },
+        { type: "content_block_stop" },
+        { type: "message_delta", delta: { stop_reason: "end_turn" } }, { type: "message_stop" },
+      ]));
+      return;
+    }
     res.end(sse([{ type: "content_block_start", content_block: { type: "tool_use", name: alias, id: "call_local", input: {} } },
-      { type: "content_block_delta", delta: { type: "input_json_delta", partial_json: bad ? '{"path":' : '{"path":"report.txt"}' } },
+      { type: "content_block_delta", delta: { type: "input_json_delta", partial_json: outcome === "bad_tool" ? '{"path":' : '{"path":"report.txt"}' } },
       { type: "content_block_stop" }, { type: "message_delta", delta: { stop_reason: "tool_use" } }, { type: "message_stop" }]));
   });
   upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
@@ -238,8 +257,8 @@ test("Claude 工具完成及失敗經真實 HTTP 返回 Codex 格式，未知附
     tools: [{ type: "namespace", name: "files", tools: [fn("read__text")] }] };
   const post = (body) => fetch(`http://127.0.0.1:${server.address().port}/v1/responses`, { method: "POST", headers,
     body: JSON.stringify(body), signal: AbortSignal.timeout(3000) });
-  const text = await (await post(body)).text();
-  const events = text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+  const parseEvents = (text) => text.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+  const events = parseEvents(await (await post(body)).text());
   const call = events.find((e) => e.type === "response.output_item.done").item;
   assert.equal(call.name, "read__text"); assert.equal(call.namespace, "files");
   assert.equal(call.arguments, '{"path":"report.txt"}');
@@ -247,11 +266,24 @@ test("Claude 工具完成及失敗經真實 HTTP 返回 Codex 格式，未知附
   assert.ok(requests[0].thinking.budget_tokens > 0);
   assert.doesNotMatch(JSON.stringify(requests[0].messages), /configuration_update/);
   const id = events.at(-1).response.id;
-  await (await post({ ...body, previous_response_id: id, input: [{ type: "function_call_output", call_id: "call_local", output: "content" }] })).text();
+  outcome = "output_limit";
+  const limited = parseEvents(await (await post({ ...body, reasoning: { effort: "max" }, previous_response_id: id,
+    input: [{ type: "function_call_output", call_id: "call_local", output: "content" }] })).text()).at(-1);
+  assert.equal(limited.type, "response.incomplete");
+  assert.equal(limited.response.incomplete_details.reason, "max_output_tokens");
   const history = requests[1].messages.flatMap((m) => m.content);
   assert.equal(history.find((block) => block.type === "tool_use").name, requests[1].tools[0].name);
   assert.equal(history.find((block) => block.type === "tool_result").tool_use_id, "call_local");
-  bad = true;
+  outcome = "answer";
+  const resumed = parseEvents(await (await post({ ...body, reasoning: { effort: "max" },
+    previous_response_id: limited.response.id, input: [user("continue from the tool result")] })).text()).at(-1);
+  assert.equal(resumed.type, "response.completed");
+  assert.deepEqual(requests[2].thinking, requests[1].thinking);
+  const resumedHistory = requests[2].messages.flatMap((message) => message.content);
+  assert.equal(resumedHistory.filter((block) => block.type === "tool_use" && block.id === "call_local").length, 1);
+  assert.equal(resumedHistory.filter((block) => block.type === "tool_result" && block.tool_use_id === "call_local").length, 1);
+  assert.equal(resumedHistory.some((block) => block.type === "thinking"), false);
+  outcome = "bad_tool";
   const failed = await (await post(body)).text();
   assert.match(failed, /invalid_tool_arguments/);
   assert.doesNotMatch(failed, /response\.output_item\.done/);
@@ -262,6 +294,66 @@ test("Claude 工具完成及失敗經真實 HTTP 返回 Codex 格式，未知附
   assert.equal(detail.error.code, "unsupported_bridge_input");
   assert.doesNotMatch(JSON.stringify(detail), /fixture-local-only|file-private/);
   assert.equal(requests.length, before);
+});
+
+test("Claude API 只回保活時停止等待，持續收到推理時可超過閒置時限", async (t) => {
+  const cancelled = [];
+  const upstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const request = JSON.parse(Buffer.concat(chunks));
+    const active = request.messages.at(-1).content[0].text === "active reasoning";
+    const send = (...events) => res.write(sse(events));
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    send({ type: "ping" });
+    if (active) send({ type: "content_block_start", content_block: { type: "thinking" } });
+    let ticks = 0;
+    const timer = setInterval(() => {
+      send({ type: "ping" });
+      if (!active) return;
+      send({ type: "content_block_delta", delta: { type: "thinking_delta", thinking: "step " } });
+      if (++ticks < 9) return;
+      res.end(sse([{ type: "content_block_stop" },
+        { type: "content_block_start", content_block: { type: "text", text: "Done" } },
+        { type: "content_block_stop" },
+        { type: "message_delta", delta: { stop_reason: "end_turn" } }, { type: "message_stop" }]));
+      clearInterval(timer);
+    }, 50);
+    res.once("close", () => {
+      clearInterval(timer);
+      if (!active) cancelled.push(true);
+    });
+  });
+  upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
+  t.after(() => { upstream.closeAllConnections(); upstream.close(); });
+  const instance = await loadRouterWith({ apiRoot: `http://127.0.0.1:${upstream.address().port}/v1`, claudeStreamIdleTimeoutMs: 350 });
+  instance.markAuthValidated(headers);
+  const previous = process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
+  process.env.CODEX_MODEL_ROUTER_TEST_API_KEY = "fixture-local-only";
+  t.after(() => { if (previous === undefined) delete process.env.CODEX_MODEL_ROUTER_TEST_API_KEY; else process.env.CODEX_MODEL_ROUTER_TEST_API_KEY = previous; });
+  const server = instance.routerServer;
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const body = { model: "custom/claude-test", stream: true, input: "ping only", reasoning: { effort: "max" } };
+  const post = (request) => fetch(`http://127.0.0.1:${server.address().port}/v1/responses`, { method: "POST", headers,
+    body: JSON.stringify(request), signal: AbortSignal.timeout(3500) });
+  const terminal = async (request) => (await (await post(request)).text()).split("\n").filter(line => line.startsWith("data: "))
+    .map(line => JSON.parse(line.slice(6))).at(-1);
+  const assertTimeout = (event) => {
+    assert.equal(event.type, "response.failed");
+    assert.equal(event.response.error.code, "invalid_prompt");
+    assert.match(event.response.error.message, /沒有回傳生成事件/);
+    assert.equal(event.response.usage, null);
+  };
+  assertTimeout(await terminal(body));
+  const frames = [];
+  const socket = { destroyed: false, writable: true, write(value) { frames.push(Buffer.from(value)); return true; } };
+  await instance.handleWebSocketResponseInner({ headers }, socket, url, { ...body, type: "response.create" }, new AbortController());
+  const wsEvents = instance.parseWebSocketFrames(Buffer.concat(frames)).frames.filter(frame => frame.opcode === 1)
+    .map(frame => JSON.parse(frame.payload.toString("utf8")));
+  assertTimeout(wsEvents.at(-1));
+  assert.equal((await terminal({ ...body, input: "active reasoning" })).type, "response.completed");
+  assert.equal(cancelled.length, 2, "逾時會關閉上游 HTTP 串流");
 });
 
 test("真實 HTTP：GPT 截斷通知、官方搜尋/筆記透傳、壓縮錯誤及接收上限", async (t) => {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { loadPayloads, loadRouterWith } from "./helpers/payloads.mjs";
 
-const { router } = await loadPayloads();
+const { router, installer } = await loadPayloads();
 const headers = { authorization: "Bearer fixture", "chatgpt-account-id": "fixture", "session-id": "missing-call" };
 const call = { type: "function_call", id: "fc_lookup", call_id: "call_lookup", name: "lookup", arguments: "{}" };
 const output = (extra = {}) => ({ type: "function_call_output", output: "result", ...extra });
@@ -131,6 +131,19 @@ test("delegation shape does not bypass real tool context or incremental continua
   assert.strictEqual(router.normalizeHttpToolOutputs(valid), valid);
 });
 
+test("ambiguous tool results report only matching metadata", () => {
+  const second = { ...call, call_id: "call_private_second" };
+  const body = { input: [call, second, output({ id: call.id, call_id: " ", name: "private-tool", output: "private-result" })] };
+  assert.throws(() => router.normalizeHttpToolOutputs(body, true), error => {
+    const detail = router.describeRouterError(error).toolOutput;
+    assert.match(detail.name, /^hash:[a-f0-9]{16}$/);
+    assert.deepEqual(detail, { index: 2, type: "function_call_output", namespace: null, name: detail.name,
+      idState: "present", callIdState: "blank", pendingCount: 2, matchCount: 2, historyRebuilt: true });
+    assert.doesNotMatch(JSON.stringify(detail), /private|fc_lookup/);
+    return true;
+  });
+});
+
 for (const model of ["official-test", route.pickerSlug]) {
   test(`${model}: WebSocket to HTTP continuation, retries and compaction preserve the repaired history`, async (t) => {
     const instance = await loadRouterWith({ routes: [route], upstreamWebSocket: false });
@@ -197,6 +210,13 @@ for (const model of ["official-test", route.pickerSlug]) {
     const error = await rejected.json();
     assert.equal(error.error.code, "tool_output_call_id_missing");
     assert.doesNotMatch(JSON.stringify(error), /private-invalid-content/);
+    const health = await (await originalFetch(`http://127.0.0.1:${port}/healthz`)).json();
+    const record = health.stats.lastError;
+    const [entry] = installer.parseRouterLog("model-router-error:" + JSON.stringify(record));
+    assert.equal(entry.requestId, record.requestId);
+    assert.deepEqual(entry.toolOutput, { index: 0, type: "function_call_output", name: "create_thread",
+      namespace: null, idState: "missing", callIdState: "missing", pendingCount: 0, matchCount: 0, historyRebuilt: false });
+    assert.doesNotMatch(JSON.stringify(record), /private-invalid-content/);
     assert.equal(sent.length, count);
   });
 }

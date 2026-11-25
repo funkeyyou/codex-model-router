@@ -955,11 +955,28 @@ function isHostContextSnapshot(item) {
     item.call_id == null && typeof item.output === "string" && item.output.trim().length > 0;
 }
 
-export function normalizeHttpToolOutputs(body) {
+// Names that come from plug-ins can contain arbitrary text. Preserve protocol
+// names we recognize and fingerprint the rest so retries can still be compared.
+function diagnosticToolLabel(value) {
+  if (typeof value !== "string" || !value.length) return null;
+  if (HOST_CONTEXT_SNAPSHOT_NAME.test(value) ||
+      ["agent", "functions", "codex_app", "codex_tui", "browser_tabs", "create_thread",
+        "send_message_to_thread", "exec_command", "apply_patch", "write_stdin"].includes(value)) return value;
+  return "hash:" + createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function diagnosticIdState(value) {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (typeof value !== "string") return "invalid_type";
+  return value.trim() ? "present" : "blank";
+}
+
+export function normalizeHttpToolOutputs(body, historyRebuilt = false) {
   if (!Array.isArray(body?.input)) return body;
   const pending = new Map();
   let changed = false;
-  const input = body.input.map((item) => {
+  const input = body.input.map((item, index) => {
     if (!item || typeof item !== "object") return item;
     if (["function_call", "custom_tool_call"].includes(item.type) && item.call_id) {
       pending.set(item.call_id, item);
@@ -975,12 +992,14 @@ export function normalizeHttpToolOutputs(body) {
     if (isHostContextSnapshot(item)) {
       return { type: "message", role: "user", content: [{ type: "input_text", text: `[${item.name}]\n${item.output}` }] };
     }
+    let matchCount = 0;
     if (pending.size) {
       const callType = item.type === "function_call_output" ? "function_call" : "custom_tool_call";
       const matches = [...pending.values()].filter((call) => call.type === callType &&
         typeof item.id === "string" && item.id.length > 0 &&
         (call.id === item.id || call.call_id === item.id));
-      if (matches.length === 1) {
+      matchCount = matches.length;
+      if (matchCount === 1) {
         pending.delete(matches[0].call_id);
         const { id: _id, ...output } = item;
         return { ...output, call_id: matches[0].call_id };
@@ -990,9 +1009,15 @@ export function normalizeHttpToolOutputs(body) {
     // 已重建的歷史可以包含先前的委派信封，仍須保留以便重播與壓縮。
     if (pending.size || body.previous_response_id ||
         (item.call_id != null && typeof item.call_id !== "string") || !isDelegationBootstrap(item)) {
-      throw new RouterRequestError(422, "tool_output_call_id_missing",
+      const error = new RouterRequestError(422, "tool_output_call_id_missing",
         "工具結果缺少 call_id，且無法從歷史唯一確認對應的呼叫。請重新連線並重送完整對話；若仍失敗，請在新任務提供工作摘要。路由器未猜測配對或重新執行工具。",
         "request");
+      error.toolOutput = {
+        index, type: item.type, namespace: diagnosticToolLabel(item.namespace), name: diagnosticToolLabel(item.name),
+        idState: diagnosticIdState(item.id), callIdState: diagnosticIdState(item.call_id),
+        pendingCount: pending.size, matchCount, historyRebuilt,
+      };
+      throw error;
     }
     return { type: "message", role: "user", content: [{ type: "input_text", text: item.output }] };
   });
@@ -1026,6 +1051,10 @@ function stripRouterImageArtifacts(body) {
 }
 const heartbeatIntervalMs =
   Number(settings.heartbeatIntervalMs) > 0 ? Number(settings.heartbeatIntervalMs) : 15000;
+// 在 Codex 預設的五分鐘串流逾時之前回報，避免用戶端反覆重送同一輪。
+const claudeStreamIdleTimeoutMs = Number.isSafeInteger(settings.claudeStreamIdleTimeoutMs) &&
+  settings.claudeStreamIdleTimeoutMs > 0 && settings.claudeStreamIdleTimeoutMs <= 2_147_483_647
+  ? settings.claudeStreamIdleTimeoutMs : 240_000;
 
 const requestHopByHopHeaders = new Set([
   "connection",
@@ -1991,6 +2020,7 @@ export function describeRouterError(error) {
     const { status, code, message, phase, upstreamStatus } = error;
     return { status, code, message, phase, upstreamStatus, causeCode: null,
       ...(code === "router_history_unavailable" ? { historyReason: error.historyReason || "unknown" } : {}),
+      ...(code === "tool_output_call_id_missing" && error.toolOutput ? { toolOutput: error.toolOutput } : {}),
     };
   }
   const chain = [];
@@ -2927,7 +2957,9 @@ export async function fetchModelUpstream(
   }
   // 先重建完整歷史才配對；在剝除選填 item id 之前保留可驗證的識別。
   // Claude/Chat 轉譯各自已有工具結果處理，官方原生 WS 不走此 HTTP 路徑。
-  if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) effectiveBody = normalizeHttpToolOutputs(effectiveBody);
+  if (!route?.translate && !needsDeepseekChat(effectiveBody, route)) {
+    effectiveBody = normalizeHttpToolOutputs(effectiveBody, Boolean(body?.previous_response_id));
+  }
   meta.history = comboRole ? null : prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id);
   // 沒有歷史鍵（無法接續）的請求也要記用量：用一個不保存歷史的空殼承載用量資訊。
   meta.history = meta.history || { disabled: true };
@@ -3013,14 +3045,18 @@ export async function fetchModelUpstream(
         stats.lastProvider = "claude-cli";
         return translated;
       }
+      const upstreamController = new AbortController();
+      const upstreamSignal = signal ? AbortSignal.any([signal, upstreamController.signal]) : upstreamController.signal;
       const translated = await fetchCustom(
         provider,
         new URL(`${provider.apiRoot}/messages`),
         requestHeaders,
         anthropicBody,
-        signal,
+        upstreamSignal,
         { model: route.upstreamModel },
       );
+      meta.abortClaudeUpstream = () => upstreamController.abort();
+      meta.claudeStreamIdleTimeoutMs = claudeStreamIdleTimeoutMs;
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
       return translated;
@@ -4158,7 +4194,8 @@ function recordClaudeBridgeFailure(event, meta) {
       "translation",
     ), { transport: meta.transport || null, route: "custom", model: meta.model });
   }
-  if (meta.translate !== "anthropic" || event.type !== "response.failed") return;
+  const outputLimit = event.type === "response.incomplete" && meta.claudeFailureKind === "output_limit";
+  if (meta.translate !== "anthropic" || (event.type !== "response.failed" && !outputLimit)) return;
   if (meta.claudeFailureKind === "refusal") stats.claudeRefusals += 1;
   if (["empty_response", "output_limit"].includes(meta.claudeFailureKind)) stats.claudeEmptyResponses += 1;
   if (meta.claudeCompactionFailed) stats.claudeCompactionFailures += 1;
