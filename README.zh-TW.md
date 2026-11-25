@@ -96,9 +96,9 @@ curl.exe -fsSL --connect-timeout 10 --max-time 120 https://github.com/funkeyyou/
 
 <img src="docs/images/codex-manager-entry-zh-Hant.png" alt="Codex 側邊欄「更多」選單中的自訂模型管理入口" width="300">
 
-<img src="docs/images/manager-models-zh-Hant.png" alt="網頁管理頁的模型列表：調整順序、上下文、輸出與推理強度">
+<img src="docs/images/manager-models-zh-Hant.png" alt="網頁管理頁的模型頁：近 24 小時統計、背景任務模型，以及依供應商篩選的模型列表與組合模型">
 
-<img src="docs/images/manager-providers-zh-Hant.png" alt="網頁管理頁的供應商頁：API Key 供應商與 Claude 訂閱">
+<img src="docs/images/manager-providers-zh-Hant.png" alt="網頁管理頁的供應商頁：API Key 供應商、備用 Key 與 Antigravity CLI">
 
 *截圖中的供應商名稱與網址已替換或模糊處理。*
 

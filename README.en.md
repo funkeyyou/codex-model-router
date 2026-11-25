@@ -96,9 +96,9 @@ Day-to-day tasks live in the web manager. Open it from any of:
 
 <img src="docs/images/codex-manager-entry-en.png" alt="The Custom Model Manager entry in the Codex sidebar More menu" width="300">
 
-<img src="docs/images/manager-models-en.png" alt="Web manager models page: order, context, output and reasoning effort">
+<img src="docs/images/manager-models-en.png" alt="Web manager models page: 24-hour stats, background task model, and the model list filtered by provider, including a combo model">
 
-<img src="docs/images/manager-providers-en.png" alt="Web manager providers page: API Key providers and Claude subscription">
+<img src="docs/images/manager-providers-en.png" alt="Web manager providers page: API key providers, backup keys, and Antigravity CLI">
 
 *Provider names and URLs in the screenshots are replaced or blurred.*
 
