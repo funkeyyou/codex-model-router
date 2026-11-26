@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadPayloads } from "./helpers/payloads.mjs";
 
-const { bridge, chat } = await loadPayloads();
+const { bridge, chat, router } = await loadPayloads();
 const { ENCRYPTED_AGENT_PAYLOAD_NOTICE, FOREIGN_COMPACTION_NOTICE, encodeCompaction } = bridge;
 const agent = (content) => ({
   type: "agent_message", author: "/root/reviewer", recipient: "/root",
@@ -76,6 +76,17 @@ for (const [name, translate] of [
     assert.ok(!own.includes("compacted while another model"));
   });
 
+  test(`${name}: plaintext that Codex stored in an encrypted field (non-OpenAI sender) is passed through`, () => {
+    // Codex 把 spawn_agent 的 message 標成加密參數；派工的不是 OpenAI 模型時，明文會原樣放進 encrypted_content。
+    const request = translate([agent([
+      { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/update_readme\nSender: /root\nPayload:\n" },
+      { type: "encrypted_content", encrypted_content: "請校對 README.md\n只改三個檔案。" },
+    ])]);
+    const encoded = JSON.stringify(request.messages);
+    assert.ok(encoded.includes("請校對 README.md\\n只改三個檔案。"));
+    assert.ok(!encoded.includes("Encrypted payload omitted"));
+  });
+
   test(`${name}: malformed agent messages fail without leaking payload`, () => {
     for (const item of [
       agent([{ type: "future_content", text: "SECRET" }]),
@@ -88,3 +99,29 @@ for (const [name, translate] of [
     }
   });
 }
+
+test("OpenAI 密文的判斷：Fernet token 視為密文，其餘非空字串視為明文", () => {
+  assert.equal(bridge.isOpenAIEncryptedPayload("gAAAAABpQ2_x-y=="), true);
+  assert.equal(bridge.isOpenAIEncryptedPayload(" gAAAAABSECRET "), true);
+  for (const value of ["請校對 README", "gAAAAA 有空白", "hello", "Zm9vYmFy"]) assert.equal(bridge.isOpenAIEncryptedPayload(value), false, value);
+  assert.equal(bridge.agentPayloadText({ encrypted_content: "   " }), null);
+  assert.equal(bridge.agentPayloadText({ encrypted_content: 42 }), null);
+});
+
+test("Responses 上游：代理間訊息裡的明文改成 input_text，真正的密文與其他項目不動", () => {
+  const header = { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" };
+  const cipher = { type: "encrypted_content", encrypted_content: "gAAAAABSECRET" };
+  const body = { model: "custom/x", input: [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+    agent([header, { type: "encrypted_content", encrypted_content: "請校對 README" }]),
+    agent([header, cipher]),
+  ] };
+  const before = structuredClone(body);
+  const next = router.plaintextAgentPayloads(body);
+  assert.deepEqual(next.input[1].content, [header, { type: "input_text", text: "請校對 README" }]);
+  assert.deepEqual(next.input[2].content, [header, cipher]);
+  assert.equal(next.input[0], body.input[0]);
+  assert.deepEqual(body, before, "不就地改動請求");
+  const untouched = { input: [agent([header, cipher])] };
+  assert.equal(router.plaintextAgentPayloads(untouched), untouched);
+});

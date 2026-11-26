@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.48.1";
+const INSTALLER_VERSION = "1.48.2";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -10995,6 +10995,7 @@ import {
   decodeCompaction,
   codexErrorFromUpstream,
   COMPACTION_REPLAY_PREFIX,
+  agentPayloadText,
 } from "./claude-bridge.mjs";
 import { toChatRequest, bridgeChatStream, isChatReasoning } from "./chat-bridge.mjs";
 import { createDesktopHandler, desktopHeaders, DESKTOP_PREFIX, DESKTOP_CONFIG_FILE, hasDesktopToken } from "./claude-desktop.mjs";
@@ -11778,6 +11779,16 @@ export function historyKeyFor(body, headers, connectionNamespace = null) {
   return logicalKey;
 }
 
+function antigravitySessionKey(headers, route, historyKey, backgroundKind, comboRole) {
+  const task = [headers["thread-id"], headers["session-id"]].find(value => typeof value === "string" && value);
+  const account = authDigest(headers) ?? (isQuotaModeRequest(headers) ? quotaModeDigest() : null);
+  // ACP has its own history. Reuse it across connections only for the same authenticated
+  // client, task and route. The Responses previous_response_id cache stays connection-scoped.
+  const scope = task && account ? ["task", task] : ["connection", historyKey];
+  if (!scope[1]) return null;
+  return historyDigest([account, scope, route.pickerSlug, backgroundKind, comboRole?.combo, comboRole?.role]);
+}
+
 // 每次嘗試持有自己的暫存副本。只有成功終止才保存，失敗、取消或換傳輸重送
 // 都不會改到 previous_response_id 指向的歷史，也不會把同一份工具結果再加一次。
 function prepareHistory(key, input, previousId = null) {
@@ -12085,6 +12096,7 @@ const stats = {
   comboNative: 0,
   comboNativeSubagents: 0,
   comboSpawnRewrites: 0,
+  agentPlaintextPayloads: 0,
   customInstructionSyncs: 0,
   usageRecords: 0,
   usageLogFailures: 0,
@@ -14149,6 +14161,30 @@ async function fetchCustom(provider, target, headers, body, signal, { model = nu
   throw new Error("沒有可用的 API Key");
 }
 
+// 代理間訊息（agent_message）裡被標成 encrypted_content、其實是明文的內容，改成 input_text：
+// 非 OpenAI 模型派工時 Codex 會把明文放進加密欄位，原樣送往 Responses 上游會被當成壞掉的密文，
+// 送給其他模型也讀不到。真正的 OpenAI 密文（gAAAAA…）保持不動。沒有改動時回傳同一個物件。
+export function plaintextAgentPayloads(body) {
+  if (!Array.isArray(body?.input) || !body.input.some((item) => item?.type === "agent_message")) return body;
+  let changed = false;
+  const input = body.input.map((item) => {
+    if (item?.type !== "agent_message" || !Array.isArray(item.content)) return item;
+    let itemChanged = false;
+    const content = item.content.map((part) => {
+      if (part?.type !== "encrypted_content") return part;
+      const text = agentPayloadText(part);
+      if (text == null) return part;
+      itemChanged = true;
+      return { type: "input_text", text };
+    });
+    if (!itemChanged) return item;
+    changed = true;
+    stats.agentPlaintextPayloads += 1;
+    return { ...item, content };
+  });
+  return changed ? { ...body, input } : body;
+}
+
 export async function fetchModelUpstream(
   requestHeaders,
   incomingUrl,
@@ -14175,7 +14211,6 @@ export async function fetchModelUpstream(
   // 組合的內部請求依角色分開：大腦與雙手若都是 Antigravity CLI，各自續接自己的對話。
   const baseHistoryKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
   const historyKey = comboRole ? `${baseHistoryKey ?? "anonymous"}\0combo:${comboRole.combo}:${comboRole.role}` : baseHistoryKey;
-  meta.historyKey = historyKey;
   let effectiveBody = body;
   if (body?.previous_response_id) {
     const rebuilt = rebuildStatefulInput(historyKey, body.input, body.previous_response_id);
@@ -14188,6 +14223,7 @@ export async function fetchModelUpstream(
       throw historyUnavailableError(historyKey, body, requestHeaders);
     }
   }
+  effectiveBody = plaintextAgentPayloads(effectiveBody);
   if (route?.transport === "combo") {
     meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id) || { disabled: true };
     meta.history.recoveryIds = historyRecoveryCandidates(body, requestHeaders);
@@ -14329,13 +14365,14 @@ export async function fetchModelUpstream(
       }
       if (chatRoute.transport === "antigravity-cli") {
         const { fetchAntigravityChat } = await import("./antigravity-cli.mjs");
+        const agySessionKey = antigravitySessionKey(requestHeaders, chatRoute, historyKey, meta.backgroundKind, comboRole);
         let textDeltas = 0;
         meta.history.usage.bufferedOutput = true;
         const translated = await fetchAntigravityChat(chatRequest, chatRoute, settings.antigravityCli?.binary,
-          translatedInput.reasoning?.effort, signal, meta.historyKey, () => {
+          translatedInput.reasoning?.effort, signal, agySessionKey, () => {
             textDeltas += 1;
             if (textDeltas > 1) meta.history.usage.bufferedOutput = false;
-          });
+          }, meta.connectionNamespace ?? null);
         stats.lastCustomStatus = translated.status;
         stats.lastProvider = chatRoute.transport;
         if (translated.status >= 400) {
@@ -16464,6 +16501,19 @@ export const ENCRYPTED_AGENT_PAYLOAD_NOTICE =
   "[Encrypted payload omitted: this inter-agent content was encrypted by the OpenAI model that produced it and cannot be read by the current model. " +
   "Do not guess what it said. Rely on the visible conversation and tool results; if the missing content matters, say so and ask for it to be restated in plain text.]";
 
+// OpenAI 的加密內容是 Fernet token（base64url，固定以 gAAAAA 開頭）。Codex 把 spawn_agent 等工具的
+// message 標成加密參數，發起的若不是 OpenAI 模型（Claude、Gemini 等），Codex 會把模型寫的明文
+// 原樣放進 encrypted_content；這種內容不是密文，要照原文交給模型，否則子 Agent 收不到任務。
+export function isOpenAIEncryptedPayload(value) {
+  return typeof value === "string" && /^gAAAAA[A-Za-z0-9_\-+/=]*$/.test(value.trim());
+}
+
+export function agentPayloadText(part) {
+  const value = part?.encrypted_content;
+  if (typeof value !== "string" || !value.trim() || isOpenAIEncryptedPayload(value)) return null;
+  return value;
+}
+
 // Codex protocol AgentMessage: inter-agent input, not this assistant's reply
 // or a tool result. Keep provenance and every plaintext block in order.
 export function agentMessageText(item) {
@@ -16471,7 +16521,7 @@ export function agentMessageText(item) {
     throw bridgeInputError("agent_message 欄位不完整，無法安全轉譯；請提供明文工作摘要。");
   }
   const parts = item.content.map((part) => {
-    if (part?.type === "encrypted_content") return ENCRYPTED_AGENT_PAYLOAD_NOTICE;
+    if (part?.type === "encrypted_content") return agentPayloadText(part) ?? ENCRYPTED_AGENT_PAYLOAD_NOTICE;
     if (part?.type !== "input_text" || typeof part.text !== "string") {
       throw bridgeInputError("agent_message 包含不支援的內容格式，無法安全省略；請提供明文工作摘要。");
     }
@@ -20460,7 +20510,7 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
 }
 __CODEX_MODEL_ROUTER_AGY_JS__
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20525,8 +20575,8 @@ const callLimit = request => request.parallel_tool_calls === false
   ? "\nReturn at most ONE call this turn, even if the user asks for several. Wait for its result before the next call."
   : "";
 
-// agy truncates one user message near 190 KB (text and embedded resources together), while the
-// session system prompt has no such cap. Instructions, tools and handled history go there.
+// agy truncates large individual user messages. The system prompt can carry more, but it
+// also consumes the CLI's context budget. A failed replay can shorten earlier tool output.
 const promptByteLimit = 150000;
 const isStanding = message => ["system", "developer"].includes(message.role);
 // The CLI's own system prompt outweighs appended text, so every user prompt restates the reply
@@ -20570,6 +20620,35 @@ export function antigravityPrompt(request, images = null) {
   if (Buffer.byteLength(prompt) <= promptByteLimit) return { system, prompt };
   return { system: system + "\n" + respondTo(latest.filter(message => !isStanding(message))),
     prompt: protocol(request) + "Respond to the new chat messages at the end of the system context." };
+}
+
+function shorterHistoryReplay(request) {
+  // Everything after the last assistant message is still awaiting a reply. Keep those
+  // results, tool arguments, instructions and user messages intact.
+  const latestAssistant = request.messages.findLastIndex(message => message.role === "assistant");
+  const oldToolCount = request.messages.slice(0, Math.max(0, latestAssistant))
+    .filter(message => message.role === "tool" && typeof message.content === "string").length;
+  if (!oldToolCount) return null;
+  const excerptBytes = Math.min(8192, Math.max(1024, Math.floor(600000 / oldToolCount)));
+  let shortened = 0, omittedBytes = 0;
+  const messages = request.messages.map((message, index) => {
+    if (index >= latestAssistant || message.role !== "tool" || typeof message.content !== "string" ||
+        Buffer.byteLength(message.content) <= excerptBytes) return message;
+    const data = Buffer.from(message.content);
+    let firstEnd = Math.floor(excerptBytes / 2);
+    let lastStart = data.length - firstEnd;
+    while ((data[firstEnd] & 0xc0) === 0x80) firstEnd--;
+    while ((data[lastStart] & 0xc0) === 0x80) lastStart++;
+    const omitted = lastStart - firstEnd;
+    const notice = "\n[Middle of earlier tool output omitted by the router to fit the context. Check missing details with read-only tools or ask the user.]\n";
+    if (omitted <= Buffer.byteLength(notice)) return message;
+    shortened++;
+    omittedBytes += omitted;
+    return { ...message, content: data.toString("utf8", 0, firstEnd) + notice + data.toString("utf8", lastStart) };
+  });
+  if (!shortened) return null;
+  const images = [];
+  return { ...antigravityPrompt({ ...request, messages }, images), images, shortened, omittedBytes };
 }
 
 // Tool lists grow during a Codex task (tool search, MCP startup). Only the difference is sent so
@@ -20883,27 +20962,36 @@ export function envelopeText(buffer) {
 // user input, tool results and the call IDs the model produced. Assistant prose may come back
 // reformatted (thinking moved to the reasoning panel, reasoning replay fields), and the router's
 // image budget may swap old screenshots for a note; neither means the conversation branched.
+// Across a reconnect, require the visible replies and attachments to match as well.
 const imageBudgetNote = "(較舊的工具截圖已移出本輪請求";
+const messageDigest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 function comparable(message) {
-  if (message.role === "assistant") return { role: "assistant", calls: (message.tool_calls || []).map(call => call.id) };
+  if (message.role === "assistant") return {
+    role: "assistant",
+    calls: (message.tool_calls || []).map(call => call.id),
+    digest: messageDigest([message.content || "", message.tool_calls || []]),
+  };
   const parts = typeof message.content === "string" ? [message.content]
     : Array.isArray(message.content)
       ? message.content.filter(part => part?.type === "text" && !part.text.startsWith(imageBudgetNote)).map(part => part.text)
       : [];
-  return { role: message.role, text: parts.join("\n"), id: message.tool_call_id ?? null };
+  const attachments = Array.isArray(message.content) ? message.content.filter(part => part?.type !== "text") : [];
+  return { role: message.role, text: parts.join("\n"), id: message.tool_call_id ?? null,
+    digest: attachments.length ? messageDigest(attachments) : null };
 }
 
 // Codex appends developer text mid-task (for example an incremental tool update), and the Chat
 // translation merges it into the leading system message. Appended standing text continues the
 // conversation and is sent as an addition.
-function sameOrExtended(previous, next) {
-  if (isDeepStrictEqual(previous, next)) return true;
-  return isStanding(previous) && previous.role === next?.role && previous.id === next.id &&
-    typeof next.text === "string" && next.text.startsWith(previous.text);
+function sameOrExtended(previous, next, strict) {
+  if (previous.role !== next.role || (strict && previous.digest !== next.digest)) return false;
+  if (previous.role === "assistant") return isDeepStrictEqual(previous.calls, next.calls);
+  if (previous.id !== next.id) return false;
+  return previous.text === next.text || (isStanding(previous) && next.text.startsWith(previous.text));
 }
 
-const continues = (history, incoming) => incoming.length > history.length &&
-  history.every((message, index) => sameOrExtended(message, incoming[index]));
+const continues = (record, incoming, connection) => incoming.length > record.history.length &&
+  record.history.every((message, index) => sameOrExtended(message, incoming[index], record.connection !== connection));
 
 function standingAdditions(history, incoming) {
   return history.flatMap((message, index) => isStanding(message) && incoming[index].text !== message.text
@@ -21061,7 +21149,7 @@ const maxResumable = 64;
 function rememberResumable(key, session) {
   resumable.delete(key);
   resumable.set(key, { sessionId: session.sessionId, history: session.history,
-    settings: session.settings, system: session.system, at: Date.now() });
+    settings: session.settings, system: session.system, connection: session.connection, at: Date.now() });
   for (const [oldKey, record] of resumable) {
     if (resumable.size <= maxResumable && Date.now() - record.at < resumableMs) break;
     resumable.delete(oldKey);
@@ -21074,7 +21162,7 @@ function findResumable(key) {
   return record || null;
 }
 
-async function openSession(binary, record, system) {
+async function openSession(binary, record, freshSystem) {
   const directory = await sharedWorkspace();
   let client;
   let stage = "initialize";
@@ -21095,16 +21183,19 @@ async function openSession(binary, record, system) {
       result = await client.call("session/resume", { sessionId: record.sessionId, cwd: directory, mcpServers: [],
         ...meta(record.system) }).catch(() => null);
     }
-    const resumed = Boolean(result);
-    stage = "new";
-    if (!result) result = await client.call("session/new", { cwd: directory, mcpServers: [], ...meta(system) });
+    const resumed = Boolean(result) && (!result.sessionId || result.sessionId === record.sessionId);
+    const system = resumed ? record.system : freshSystem();
+    if (!resumed) {
+      stage = "new";
+      result = await client.call("session/new", { cwd: directory, mcpServers: [], ...meta(system) });
+    }
     const sessionId = result.sessionId || (resumed ? record.sessionId : null);
     if (!sessionId) throw Error("Antigravity CLI did not create a session");
     return { client, sessionId, resumed,
       imageInput: capabilities.promptCapabilities?.image === true,
       models: new Set((result.models?.availableModels || []).map(model => model.modelId)),
       model: null, history: resumed ? record.history : [], settings: resumed ? record.settings : null,
-      system: resumed ? record.system : system, busy: false, closed: false, timer: null };
+      system, connection: resumed ? record.connection : null, busy: false, closed: false, timer: null };
   } catch (error) {
     logSession("init-failed", { stage, kind: antigravityFailureKind(error, { stage, abortReason: timedOut ? "timeout" : null,
       closeReason: client?.closeReason }), acpCode: error?.acpCode ?? null, exitCode: client?.exitCode ?? null });
@@ -21114,6 +21205,7 @@ async function openSession(binary, record, system) {
 }
 
 function closeSession(key, session, { keepResumable = false } = {}) {
+  if (session.closed) return;
   clearTimeout(session.timer);
   session.closed = true;
   session.client.close();
@@ -21133,7 +21225,11 @@ export function suspendAntigravitySessions() {
   for (const [key, session] of sessions) if (!session.busy) closeSession(key, session, { keepResumable: true });
 }
 
-export async function fetchAntigravityChat(request, route, binary, effort, signal, sessionKey = null, onTextDelta = () => {}) {
+export function fetchAntigravityChat(request, route, binary, effort, signal, sessionKey = null, onTextDelta = () => {}, connection = sessionKey) {
+  return antigravityTurn(request, route, binary, effort, signal, { sessionKey, onTextDelta, connection });
+}
+
+async function antigravityTurn(request, route, binary, effort, signal, { sessionKey, onTextDelta, connection, recoveryPlan = null }) {
   const model = (effort && route.effortModels?.[effort]) || route.defaultCliModel;
   if (!binary || !model) throw Error("Antigravity CLI model configuration is incomplete");
   const key = JSON.stringify([sessionKey || randomUUID(), binary]);
@@ -21142,29 +21238,35 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
   if (initializing.has(key)) return Response.json({ error: { message: "Antigravity session is starting." } }, { status: 409 });
   let session = sessions.get(key);
   if (session?.busy) return Response.json({ error: { message: "Antigravity conversation already has an active request." } }, { status: 409 });
-  if (session && (session.closed || !continues(session.history, incoming))) {
+  if (session && (session.closed || !continues(session, incoming, connection))) {
     logSession("rebuild", session.closed ? { reason: "closed" } : divergence(session.history, incoming));
     closeSession(key, session); session = null;
   }
   const replay = () => { const images = []; return { ...antigravityPrompt(request, images), images }; };
   const open = async resume => {
     if (sessions.size >= 16) throw Error("Too many active Antigravity conversations. Retry after an idle session expires.");
-    const fresh = replay();
+    let fresh = null;
     initializing.add(key);
-    try { session = await openSession(binary, resume, fresh.system); }
+    try {
+      session = await openSession(binary, resume, () => {
+        fresh = recoveryPlan ?? replay();
+        return fresh.system;
+      });
+    }
     finally { initializing.delete(key); }
     sessions.set(key, session);
-    return session.resumed ? null : fresh;
+    return fresh;
   };
   let plan = null;
   try {
     if (!session) {
       const record = findResumable(key);
-      const resume = record && continues(record.history, incoming) ? record : null;
+      const resume = record && continues(record, incoming, connection) ? record : null;
       resumable.delete(key);
       if (record && !resume) logSession("rebuild", { ...divergence(record.history, incoming), resumable: true });
       plan = await open(resume);
       logSession(session.resumed ? "resume" : "new", { messages: incoming.length, keyed: Boolean(sessionKey),
+        ...(plan ? { systemBytes: Buffer.byteLength(plan.system), shortenedToolOutputs: plan.shortened ?? 0 } : {}),
         ...(resume && !session.resumed ? { reason: "resume-failed" } : {}) });
     }
     if (!plan) {
@@ -21176,6 +21278,7 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
       if (Buffer.byteLength(prompt) <= promptByteLimit) {
         plan = { prompt, images };
         logSession("continue", { messages: incoming.length - session.history.length,
+          reconnected: session.connection !== connection,
           settingsChanged: !isDeepStrictEqual(settingsShape(session.settings), settingsShape(settings)), standingAdditions: additions.length });
       } else {
         logSession("rebuild", { reason: "oversize", bytes: Buffer.byteLength(prompt) });
@@ -21201,9 +21304,13 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
   session.busy = true;
   const { client } = session;
   const encoder = new TextEncoder();
+  let completed = false;
   let abortReason = null;
+  let recoveryAbort;
   const abort = (reason = "cancelled") => {
+    if (completed) return;
     abortReason ||= reason;
+    recoveryAbort?.abort();
     closeSession(key, session);
   };
   const onAbort = () => abort("cancelled");
@@ -21287,16 +21394,38 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
             completion_tokens: usage.outputTokens || 0, prompt_tokens_details: { cached_tokens: usage.cachedReadTokens || 0 },
             completion_tokens_details: { reasoning_tokens: usage.thoughtTokens || 0 } } });
         }
-        session.history = [...request.messages, message].map(comparable);
+        session.history = [...incoming, comparable(message)];
         session.settings = settings;
+        session.connection = connection;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        completed = true;
         controller.close();
-      }).catch(error => {
+      }).catch(async error => {
         const kind = antigravityFailureKind(error, { stage, abortReason, closeReason: client.closeReason });
+        closeSession(key, session);
+        if (kind === "context_length_exceeded" && !recoveryPlan && !abortReason && !formatRetries && !sent && !reasoningChunks) {
+          const shorter = shorterHistoryReplay(request);
+          if (shorter) {
+            logSession("context-retry", { shortenedToolOutputs: shorter.shortened, omittedBytes: shorter.omittedBytes,
+              systemBytes: Buffer.byteLength(shorter.system) });
+            recoveryAbort = new AbortController();
+            try {
+              const retry = await antigravityTurn(request, route, binary, effort, recoveryAbort.signal,
+                { sessionKey, onTextDelta, connection, recoveryPlan: shorter });
+              if (retry.ok) {
+                for await (const chunk of retry.body) controller.enqueue(chunk);
+                controller.close();
+                return;
+              }
+              await retry.body?.cancel();
+            } catch {
+              // The original budget error is still useful if the new session cannot be opened.
+            }
+          }
+        }
         logSession("turn-failed", { at: new Date().toISOString(), stage, kind, stopReason, responseShape: responseShape(raw),
           acpCode: error?.acpCode ?? null, exitCode: client.exitCode,
           elapsedMs: Date.now() - startedAt, responseChars: raw.length, emittedChars: sent.length, reasoningChunks, formatRetries });
-        closeSession(key, session);
         if (!signal?.aborted) {
           const code = kind === "rate_limited" ? "rate_limit_exceeded" : kind;
           const message = turnFailureMessages[kind] || "Antigravity CLI turn failed. Check the router log for its failure stage.";

@@ -16,6 +16,7 @@ import {
   decodeCompaction,
   codexErrorFromUpstream,
   COMPACTION_REPLAY_PREFIX,
+  agentPayloadText,
 } from "./claude-bridge.mjs";
 import { toChatRequest, bridgeChatStream, isChatReasoning } from "./chat-bridge.mjs";
 import { createDesktopHandler, desktopHeaders, DESKTOP_PREFIX, DESKTOP_CONFIG_FILE, hasDesktopToken } from "./claude-desktop.mjs";
@@ -799,6 +800,16 @@ export function historyKeyFor(body, headers, connectionNamespace = null) {
   return logicalKey;
 }
 
+function antigravitySessionKey(headers, route, historyKey, backgroundKind, comboRole) {
+  const task = [headers["thread-id"], headers["session-id"]].find(value => typeof value === "string" && value);
+  const account = authDigest(headers) ?? (isQuotaModeRequest(headers) ? quotaModeDigest() : null);
+  // ACP has its own history. Reuse it across connections only for the same authenticated
+  // client, task and route. The Responses previous_response_id cache stays connection-scoped.
+  const scope = task && account ? ["task", task] : ["connection", historyKey];
+  if (!scope[1]) return null;
+  return historyDigest([account, scope, route.pickerSlug, backgroundKind, comboRole?.combo, comboRole?.role]);
+}
+
 // 每次嘗試持有自己的暫存副本。只有成功終止才保存，失敗、取消或換傳輸重送
 // 都不會改到 previous_response_id 指向的歷史，也不會把同一份工具結果再加一次。
 function prepareHistory(key, input, previousId = null) {
@@ -1106,6 +1117,7 @@ const stats = {
   comboNative: 0,
   comboNativeSubagents: 0,
   comboSpawnRewrites: 0,
+  agentPlaintextPayloads: 0,
   customInstructionSyncs: 0,
   usageRecords: 0,
   usageLogFailures: 0,
@@ -3170,6 +3182,30 @@ async function fetchCustom(provider, target, headers, body, signal, { model = nu
   throw new Error("沒有可用的 API Key");
 }
 
+// 代理間訊息（agent_message）裡被標成 encrypted_content、其實是明文的內容，改成 input_text：
+// 非 OpenAI 模型派工時 Codex 會把明文放進加密欄位，原樣送往 Responses 上游會被當成壞掉的密文，
+// 送給其他模型也讀不到。真正的 OpenAI 密文（gAAAAA…）保持不動。沒有改動時回傳同一個物件。
+export function plaintextAgentPayloads(body) {
+  if (!Array.isArray(body?.input) || !body.input.some((item) => item?.type === "agent_message")) return body;
+  let changed = false;
+  const input = body.input.map((item) => {
+    if (item?.type !== "agent_message" || !Array.isArray(item.content)) return item;
+    let itemChanged = false;
+    const content = item.content.map((part) => {
+      if (part?.type !== "encrypted_content") return part;
+      const text = agentPayloadText(part);
+      if (text == null) return part;
+      itemChanged = true;
+      return { type: "input_text", text };
+    });
+    if (!itemChanged) return item;
+    changed = true;
+    stats.agentPlaintextPayloads += 1;
+    return { ...item, content };
+  });
+  return changed ? { ...body, input } : body;
+}
+
 export async function fetchModelUpstream(
   requestHeaders,
   incomingUrl,
@@ -3196,7 +3232,6 @@ export async function fetchModelUpstream(
   // 組合的內部請求依角色分開：大腦與雙手若都是 Antigravity CLI，各自續接自己的對話。
   const baseHistoryKey = historyKeyFor(body, requestHeaders, meta.connectionNamespace);
   const historyKey = comboRole ? `${baseHistoryKey ?? "anonymous"}\0combo:${comboRole.combo}:${comboRole.role}` : baseHistoryKey;
-  meta.historyKey = historyKey;
   let effectiveBody = body;
   if (body?.previous_response_id) {
     const rebuilt = rebuildStatefulInput(historyKey, body.input, body.previous_response_id);
@@ -3209,6 +3244,7 @@ export async function fetchModelUpstream(
       throw historyUnavailableError(historyKey, body, requestHeaders);
     }
   }
+  effectiveBody = plaintextAgentPayloads(effectiveBody);
   if (route?.transport === "combo") {
     meta.history = prepareHistory(historyKey, effectiveBody.input, body?.previous_response_id) || { disabled: true };
     meta.history.recoveryIds = historyRecoveryCandidates(body, requestHeaders);
@@ -3350,13 +3386,14 @@ export async function fetchModelUpstream(
       }
       if (chatRoute.transport === "antigravity-cli") {
         const { fetchAntigravityChat } = await import("./antigravity-cli.mjs");
+        const agySessionKey = antigravitySessionKey(requestHeaders, chatRoute, historyKey, meta.backgroundKind, comboRole);
         let textDeltas = 0;
         meta.history.usage.bufferedOutput = true;
         const translated = await fetchAntigravityChat(chatRequest, chatRoute, settings.antigravityCli?.binary,
-          translatedInput.reasoning?.effort, signal, meta.historyKey, () => {
+          translatedInput.reasoning?.effort, signal, agySessionKey, () => {
             textDeltas += 1;
             if (textDeltas > 1) meta.history.usage.bufferedOutput = false;
-          });
+          }, meta.connectionNamespace ?? null);
         stats.lastCustomStatus = translated.status;
         stats.lastProvider = chatRoute.transport;
         if (translated.status >= 400) {

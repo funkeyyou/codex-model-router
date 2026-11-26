@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -64,8 +64,8 @@ const callLimit = request => request.parallel_tool_calls === false
   ? "\nReturn at most ONE call this turn, even if the user asks for several. Wait for its result before the next call."
   : "";
 
-// agy truncates one user message near 190 KB (text and embedded resources together), while the
-// session system prompt has no such cap. Instructions, tools and handled history go there.
+// agy truncates large individual user messages. The system prompt can carry more, but it
+// also consumes the CLI's context budget. A failed replay can shorten earlier tool output.
 const promptByteLimit = 150000;
 const isStanding = message => ["system", "developer"].includes(message.role);
 // The CLI's own system prompt outweighs appended text, so every user prompt restates the reply
@@ -109,6 +109,35 @@ export function antigravityPrompt(request, images = null) {
   if (Buffer.byteLength(prompt) <= promptByteLimit) return { system, prompt };
   return { system: system + "\n" + respondTo(latest.filter(message => !isStanding(message))),
     prompt: protocol(request) + "Respond to the new chat messages at the end of the system context." };
+}
+
+function shorterHistoryReplay(request) {
+  // Everything after the last assistant message is still awaiting a reply. Keep those
+  // results, tool arguments, instructions and user messages intact.
+  const latestAssistant = request.messages.findLastIndex(message => message.role === "assistant");
+  const oldToolCount = request.messages.slice(0, Math.max(0, latestAssistant))
+    .filter(message => message.role === "tool" && typeof message.content === "string").length;
+  if (!oldToolCount) return null;
+  const excerptBytes = Math.min(8192, Math.max(1024, Math.floor(600000 / oldToolCount)));
+  let shortened = 0, omittedBytes = 0;
+  const messages = request.messages.map((message, index) => {
+    if (index >= latestAssistant || message.role !== "tool" || typeof message.content !== "string" ||
+        Buffer.byteLength(message.content) <= excerptBytes) return message;
+    const data = Buffer.from(message.content);
+    let firstEnd = Math.floor(excerptBytes / 2);
+    let lastStart = data.length - firstEnd;
+    while ((data[firstEnd] & 0xc0) === 0x80) firstEnd--;
+    while ((data[lastStart] & 0xc0) === 0x80) lastStart++;
+    const omitted = lastStart - firstEnd;
+    const notice = "\n[Middle of earlier tool output omitted by the router to fit the context. Check missing details with read-only tools or ask the user.]\n";
+    if (omitted <= Buffer.byteLength(notice)) return message;
+    shortened++;
+    omittedBytes += omitted;
+    return { ...message, content: data.toString("utf8", 0, firstEnd) + notice + data.toString("utf8", lastStart) };
+  });
+  if (!shortened) return null;
+  const images = [];
+  return { ...antigravityPrompt({ ...request, messages }, images), images, shortened, omittedBytes };
 }
 
 // Tool lists grow during a Codex task (tool search, MCP startup). Only the difference is sent so
@@ -422,27 +451,36 @@ export function envelopeText(buffer) {
 // user input, tool results and the call IDs the model produced. Assistant prose may come back
 // reformatted (thinking moved to the reasoning panel, reasoning replay fields), and the router's
 // image budget may swap old screenshots for a note; neither means the conversation branched.
+// Across a reconnect, require the visible replies and attachments to match as well.
 const imageBudgetNote = "(較舊的工具截圖已移出本輪請求";
+const messageDigest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 function comparable(message) {
-  if (message.role === "assistant") return { role: "assistant", calls: (message.tool_calls || []).map(call => call.id) };
+  if (message.role === "assistant") return {
+    role: "assistant",
+    calls: (message.tool_calls || []).map(call => call.id),
+    digest: messageDigest([message.content || "", message.tool_calls || []]),
+  };
   const parts = typeof message.content === "string" ? [message.content]
     : Array.isArray(message.content)
       ? message.content.filter(part => part?.type === "text" && !part.text.startsWith(imageBudgetNote)).map(part => part.text)
       : [];
-  return { role: message.role, text: parts.join("\n"), id: message.tool_call_id ?? null };
+  const attachments = Array.isArray(message.content) ? message.content.filter(part => part?.type !== "text") : [];
+  return { role: message.role, text: parts.join("\n"), id: message.tool_call_id ?? null,
+    digest: attachments.length ? messageDigest(attachments) : null };
 }
 
 // Codex appends developer text mid-task (for example an incremental tool update), and the Chat
 // translation merges it into the leading system message. Appended standing text continues the
 // conversation and is sent as an addition.
-function sameOrExtended(previous, next) {
-  if (isDeepStrictEqual(previous, next)) return true;
-  return isStanding(previous) && previous.role === next?.role && previous.id === next.id &&
-    typeof next.text === "string" && next.text.startsWith(previous.text);
+function sameOrExtended(previous, next, strict) {
+  if (previous.role !== next.role || (strict && previous.digest !== next.digest)) return false;
+  if (previous.role === "assistant") return isDeepStrictEqual(previous.calls, next.calls);
+  if (previous.id !== next.id) return false;
+  return previous.text === next.text || (isStanding(previous) && next.text.startsWith(previous.text));
 }
 
-const continues = (history, incoming) => incoming.length > history.length &&
-  history.every((message, index) => sameOrExtended(message, incoming[index]));
+const continues = (record, incoming, connection) => incoming.length > record.history.length &&
+  record.history.every((message, index) => sameOrExtended(message, incoming[index], record.connection !== connection));
 
 function standingAdditions(history, incoming) {
   return history.flatMap((message, index) => isStanding(message) && incoming[index].text !== message.text
@@ -600,7 +638,7 @@ const maxResumable = 64;
 function rememberResumable(key, session) {
   resumable.delete(key);
   resumable.set(key, { sessionId: session.sessionId, history: session.history,
-    settings: session.settings, system: session.system, at: Date.now() });
+    settings: session.settings, system: session.system, connection: session.connection, at: Date.now() });
   for (const [oldKey, record] of resumable) {
     if (resumable.size <= maxResumable && Date.now() - record.at < resumableMs) break;
     resumable.delete(oldKey);
@@ -613,7 +651,7 @@ function findResumable(key) {
   return record || null;
 }
 
-async function openSession(binary, record, system) {
+async function openSession(binary, record, freshSystem) {
   const directory = await sharedWorkspace();
   let client;
   let stage = "initialize";
@@ -634,16 +672,19 @@ async function openSession(binary, record, system) {
       result = await client.call("session/resume", { sessionId: record.sessionId, cwd: directory, mcpServers: [],
         ...meta(record.system) }).catch(() => null);
     }
-    const resumed = Boolean(result);
-    stage = "new";
-    if (!result) result = await client.call("session/new", { cwd: directory, mcpServers: [], ...meta(system) });
+    const resumed = Boolean(result) && (!result.sessionId || result.sessionId === record.sessionId);
+    const system = resumed ? record.system : freshSystem();
+    if (!resumed) {
+      stage = "new";
+      result = await client.call("session/new", { cwd: directory, mcpServers: [], ...meta(system) });
+    }
     const sessionId = result.sessionId || (resumed ? record.sessionId : null);
     if (!sessionId) throw Error("Antigravity CLI did not create a session");
     return { client, sessionId, resumed,
       imageInput: capabilities.promptCapabilities?.image === true,
       models: new Set((result.models?.availableModels || []).map(model => model.modelId)),
       model: null, history: resumed ? record.history : [], settings: resumed ? record.settings : null,
-      system: resumed ? record.system : system, busy: false, closed: false, timer: null };
+      system, connection: resumed ? record.connection : null, busy: false, closed: false, timer: null };
   } catch (error) {
     logSession("init-failed", { stage, kind: antigravityFailureKind(error, { stage, abortReason: timedOut ? "timeout" : null,
       closeReason: client?.closeReason }), acpCode: error?.acpCode ?? null, exitCode: client?.exitCode ?? null });
@@ -653,6 +694,7 @@ async function openSession(binary, record, system) {
 }
 
 function closeSession(key, session, { keepResumable = false } = {}) {
+  if (session.closed) return;
   clearTimeout(session.timer);
   session.closed = true;
   session.client.close();
@@ -672,7 +714,11 @@ export function suspendAntigravitySessions() {
   for (const [key, session] of sessions) if (!session.busy) closeSession(key, session, { keepResumable: true });
 }
 
-export async function fetchAntigravityChat(request, route, binary, effort, signal, sessionKey = null, onTextDelta = () => {}) {
+export function fetchAntigravityChat(request, route, binary, effort, signal, sessionKey = null, onTextDelta = () => {}, connection = sessionKey) {
+  return antigravityTurn(request, route, binary, effort, signal, { sessionKey, onTextDelta, connection });
+}
+
+async function antigravityTurn(request, route, binary, effort, signal, { sessionKey, onTextDelta, connection, recoveryPlan = null }) {
   const model = (effort && route.effortModels?.[effort]) || route.defaultCliModel;
   if (!binary || !model) throw Error("Antigravity CLI model configuration is incomplete");
   const key = JSON.stringify([sessionKey || randomUUID(), binary]);
@@ -681,29 +727,35 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
   if (initializing.has(key)) return Response.json({ error: { message: "Antigravity session is starting." } }, { status: 409 });
   let session = sessions.get(key);
   if (session?.busy) return Response.json({ error: { message: "Antigravity conversation already has an active request." } }, { status: 409 });
-  if (session && (session.closed || !continues(session.history, incoming))) {
+  if (session && (session.closed || !continues(session, incoming, connection))) {
     logSession("rebuild", session.closed ? { reason: "closed" } : divergence(session.history, incoming));
     closeSession(key, session); session = null;
   }
   const replay = () => { const images = []; return { ...antigravityPrompt(request, images), images }; };
   const open = async resume => {
     if (sessions.size >= 16) throw Error("Too many active Antigravity conversations. Retry after an idle session expires.");
-    const fresh = replay();
+    let fresh = null;
     initializing.add(key);
-    try { session = await openSession(binary, resume, fresh.system); }
+    try {
+      session = await openSession(binary, resume, () => {
+        fresh = recoveryPlan ?? replay();
+        return fresh.system;
+      });
+    }
     finally { initializing.delete(key); }
     sessions.set(key, session);
-    return session.resumed ? null : fresh;
+    return fresh;
   };
   let plan = null;
   try {
     if (!session) {
       const record = findResumable(key);
-      const resume = record && continues(record.history, incoming) ? record : null;
+      const resume = record && continues(record, incoming, connection) ? record : null;
       resumable.delete(key);
       if (record && !resume) logSession("rebuild", { ...divergence(record.history, incoming), resumable: true });
       plan = await open(resume);
       logSession(session.resumed ? "resume" : "new", { messages: incoming.length, keyed: Boolean(sessionKey),
+        ...(plan ? { systemBytes: Buffer.byteLength(plan.system), shortenedToolOutputs: plan.shortened ?? 0 } : {}),
         ...(resume && !session.resumed ? { reason: "resume-failed" } : {}) });
     }
     if (!plan) {
@@ -715,6 +767,7 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
       if (Buffer.byteLength(prompt) <= promptByteLimit) {
         plan = { prompt, images };
         logSession("continue", { messages: incoming.length - session.history.length,
+          reconnected: session.connection !== connection,
           settingsChanged: !isDeepStrictEqual(settingsShape(session.settings), settingsShape(settings)), standingAdditions: additions.length });
       } else {
         logSession("rebuild", { reason: "oversize", bytes: Buffer.byteLength(prompt) });
@@ -740,9 +793,13 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
   session.busy = true;
   const { client } = session;
   const encoder = new TextEncoder();
+  let completed = false;
   let abortReason = null;
+  let recoveryAbort;
   const abort = (reason = "cancelled") => {
+    if (completed) return;
     abortReason ||= reason;
+    recoveryAbort?.abort();
     closeSession(key, session);
   };
   const onAbort = () => abort("cancelled");
@@ -826,16 +883,38 @@ export async function fetchAntigravityChat(request, route, binary, effort, signa
             completion_tokens: usage.outputTokens || 0, prompt_tokens_details: { cached_tokens: usage.cachedReadTokens || 0 },
             completion_tokens_details: { reasoning_tokens: usage.thoughtTokens || 0 } } });
         }
-        session.history = [...request.messages, message].map(comparable);
+        session.history = [...incoming, comparable(message)];
         session.settings = settings;
+        session.connection = connection;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        completed = true;
         controller.close();
-      }).catch(error => {
+      }).catch(async error => {
         const kind = antigravityFailureKind(error, { stage, abortReason, closeReason: client.closeReason });
+        closeSession(key, session);
+        if (kind === "context_length_exceeded" && !recoveryPlan && !abortReason && !formatRetries && !sent && !reasoningChunks) {
+          const shorter = shorterHistoryReplay(request);
+          if (shorter) {
+            logSession("context-retry", { shortenedToolOutputs: shorter.shortened, omittedBytes: shorter.omittedBytes,
+              systemBytes: Buffer.byteLength(shorter.system) });
+            recoveryAbort = new AbortController();
+            try {
+              const retry = await antigravityTurn(request, route, binary, effort, recoveryAbort.signal,
+                { sessionKey, onTextDelta, connection, recoveryPlan: shorter });
+              if (retry.ok) {
+                for await (const chunk of retry.body) controller.enqueue(chunk);
+                controller.close();
+                return;
+              }
+              await retry.body?.cancel();
+            } catch {
+              // The original budget error is still useful if the new session cannot be opened.
+            }
+          }
+        }
         logSession("turn-failed", { at: new Date().toISOString(), stage, kind, stopReason, responseShape: responseShape(raw),
           acpCode: error?.acpCode ?? null, exitCode: client.exitCode,
           elapsedMs: Date.now() - startedAt, responseChars: raw.length, emittedChars: sent.length, reasoningChunks, formatRetries });
-        closeSession(key, session);
         if (!signal?.aborted) {
           const code = kind === "rate_limited" ? "rate_limit_exceeded" : kind;
           const message = turnFailureMessages[kind] || "Antigravity CLI turn failed. Check the router log for its failure stage.";

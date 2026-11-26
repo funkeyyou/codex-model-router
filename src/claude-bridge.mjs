@@ -303,6 +303,19 @@ export const ENCRYPTED_AGENT_PAYLOAD_NOTICE =
   "[Encrypted payload omitted: this inter-agent content was encrypted by the OpenAI model that produced it and cannot be read by the current model. " +
   "Do not guess what it said. Rely on the visible conversation and tool results; if the missing content matters, say so and ask for it to be restated in plain text.]";
 
+// OpenAI 的加密內容是 Fernet token（base64url，固定以 gAAAAA 開頭）。Codex 把 spawn_agent 等工具的
+// message 標成加密參數，發起的若不是 OpenAI 模型（Claude、Gemini 等），Codex 會把模型寫的明文
+// 原樣放進 encrypted_content；這種內容不是密文，要照原文交給模型，否則子 Agent 收不到任務。
+export function isOpenAIEncryptedPayload(value) {
+  return typeof value === "string" && /^gAAAAA[A-Za-z0-9_\-+/=]*$/.test(value.trim());
+}
+
+export function agentPayloadText(part) {
+  const value = part?.encrypted_content;
+  if (typeof value !== "string" || !value.trim() || isOpenAIEncryptedPayload(value)) return null;
+  return value;
+}
+
 // Codex protocol AgentMessage: inter-agent input, not this assistant's reply
 // or a tool result. Keep provenance and every plaintext block in order.
 export function agentMessageText(item) {
@@ -310,7 +323,7 @@ export function agentMessageText(item) {
     throw bridgeInputError("agent_message 欄位不完整，無法安全轉譯；請提供明文工作摘要。");
   }
   const parts = item.content.map((part) => {
-    if (part?.type === "encrypted_content") return ENCRYPTED_AGENT_PAYLOAD_NOTICE;
+    if (part?.type === "encrypted_content") return agentPayloadText(part) ?? ENCRYPTED_AGENT_PAYLOAD_NOTICE;
     if (part?.type !== "input_text" || typeof part.text !== "string") {
       throw bridgeInputError("agent_message 包含不支援的內容格式，無法安全省略；請提供明文工作摘要。");
     }

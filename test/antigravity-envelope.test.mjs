@@ -216,17 +216,35 @@ test("Antigravity ACP recovery and error codes reach Codex Responses events, log
   await writeFile(join(workspace, "acp"), `
 const replies = ${JSON.stringify(replies)};
 const retryPrefix = ${JSON.stringify(formatRetryPrefix)};
+const zeroBudget = ${JSON.stringify(zeroBudgetFailure)};
+let system = "";
 let last = null;
 const send = event => process.stdout.write(JSON.stringify({jsonrpc: "2.0", ...event}) + "\\n");
 require("node:readline").createInterface({input: process.stdin}).on("line", line => {
   const {id, method, params} = JSON.parse(line);
   const result = value => send({id, result: value});
   if (method === "initialize") return result({agentCapabilities: {_meta: {antigravity: {systemPrompt: {append: true}}}}});
-  if (method === "session/new") return result({sessionId: "fixture"});
+  if (method === "session/new") {
+    system = params._meta.antigravity.systemPrompt.append;
+    return result({sessionId: "fixture"});
+  }
   if (method === "session/set_model") return result({});
   if (method !== "session/prompt") return;
   const input = params.prompt[0].text;
   const update = value => send({method: "session/update", params: {sessionId: "fixture", update: value}});
+  const chunk = text => update({sessionUpdate: "agent_message_chunk", content: {type: "text", text}});
+  if (input.includes("FIXTURE_LONG_REPLAY") || system.includes("LONG_CONTEXT_BEGIN")) {
+    if (system.includes("LONG_CONTEXT_MIDDLE") || input.includes("FIXTURE_REPEAT_BUDGET")) {
+      chunk(zeroBudget);
+      return result({stopReason: "end_turn"});
+    }
+    const valid = system.includes("LONG_CONTEXT_BEGIN") && system.includes("LONG_CONTEXT_END") &&
+      system.includes("Middle of earlier tool output omitted") && system.includes("Preserve this earlier user request") &&
+      system.includes("preserve-old-argument") && !system.includes("\\uFFFD") &&
+      (input.includes("CURRENT_TOOL_RESULT") || input.includes("CONTEXT CHECKPOINT COMPACTION"));
+    chunk(JSON.stringify({text: valid ? "Recovered fixture" : "Incomplete fixture", calls: []}));
+    return result({stopReason: "end_turn", usage: {outputTokens: 5}});
+  }
   if (input.includes("FIXTURE_LOCAL")) return update({sessionUpdate: "tool_call"});
   if (input.includes("FIXTURE_TIMEOUT")) return;
   if (input.includes("FIXTURE_RATE")) return send({id, error: {code: -32603, message: "HTTP 429 PRIVATE_FIXTURE"}});
@@ -239,7 +257,6 @@ require("node:readline").createInterface({input: process.stdin}).on("line", line
   const raw = fixed ? replies[key + "_fixed"] : replies[key];
   if (typeof raw !== "string") return send({id, error: {code: -32603, message: "unknown fixture input"}});
   update({sessionUpdate: "agent_thought_chunk", content: {type: "text", text: "checking fixture"}});
-  const chunk = text => update({sessionUpdate: "agent_message_chunk", content: {type: "text", text}});
   chunk(raw.slice(0, 15));
   setTimeout(() => { chunk(raw.slice(15)); result({stopReason: "end_turn", usage: {outputTokens: 5}}); }, 10);
 });
@@ -397,5 +414,75 @@ plugins = false
     const additional = current.slice(usage.length);
     assert.equal(additional.length, 1, "no identical or generic-error retries");
     assert.equal(additional[0].error, "context_length_exceeded");
+  });
+
+  const message = (role, text) => ({ type: "message", role,
+    content: [{ type: role === "assistant" ? "output_text" : "input_text", text }] });
+  const call = (id, pattern) => ({ type: "function_call", name: "lookup", call_id: id,
+    arguments: JSON.stringify({ pattern }) });
+  const output = (id, text) => ({ type: "function_call_output", call_id: id, output: text });
+
+  await t.test("a cold ACP replay shortens only completed tool output after a budget rejection", async () => {
+    const original = [
+      message("user", "Preserve this earlier user request"),
+      call("call_old", "preserve-old-argument"),
+      output("call_old", "LONG_CONTEXT_BEGIN😀" + "😀".repeat(2400) + "LONG_CONTEXT_MIDDLE" + "測".repeat(4000) + "LONG_CONTEXT_END"),
+      call("call_open", "continue this call"),
+    ];
+    const resumed = [...original, output("call_open", "FIXTURE_LONG_REPLAY CURRENT_TOOL_RESULT")];
+    const from = stderr.length;
+    const events = await ask(resumed);
+    assert.equal(events.at(-1).type, "response.completed");
+    assert.equal(textOf(events), "Recovered fixture");
+    assert.equal(functionCalls(events).length, 0);
+    assert.match(stderr.slice(from).join(""), /context-retry \{"shortenedToolOutputs":1,"omittedBytes":\d+/);
+
+    const checkpoint = (await ask([...original.slice(0, -1), message("assistant", "Tool work completed"), { type: "compaction_trigger" }])).at(-1);
+    assert.equal(checkpoint.type, "response.completed");
+    const { bridge } = await loadPayloads();
+    assert.deepEqual(checkpoint.response.output.map(item => item.type), ["compaction"]);
+    assert.equal(bridge.decodeCompaction(checkpoint.response.output[0].encrypted_content), "Recovered fixture");
+
+    const retryFrom = stderr.length;
+    const rejected = (await ask([...original, output("call_open", "FIXTURE_LONG_REPLAY FIXTURE_REPEAT_BUDGET CURRENT_TOOL_RESULT")])).at(-1);
+    assert.equal(rejected.response.error.code, "context_length_exceeded");
+    assert.equal(stderr.slice(retryFrom).join("").match(/model-router-antigravity:context-retry /g)?.length, 1);
+    assert.match(resumed[2].output, /LONG_CONTEXT_MIDDLE/, "original tool history is intact");
+  });
+
+  await t.test("WebSocket reconnect reuses ACP only for the same account, task and history", async () => {
+    agy.closeAntigravitySessions();
+    const auth = { authorization: "Bearer fixture", "chatgpt-account-id": "fixture-account", "thread-id": "reconnect-task" };
+    const ws = async (connectionNamespace, input, { headers = auth, prior } = {}) => {
+      const chunks = [];
+      const socket = { destroyed: false, writable: true, write: (chunk) => { chunks.push(Buffer.from(chunk)); return true; } };
+      await router.handleWebSocketResponseInner({ headers }, socket, new URL(endpoint),
+        { type: "response.create", model: slug, input, tools, client_metadata: { session_id: "shared-metadata" },
+          ...(prior ? { previous_response_id: prior } : {}) }, new AbortController(),
+        { connectionNamespace, upstreamDisabled: true });
+      return router.parseWebSocketFrames(Buffer.concat(chunks)).frames
+        .filter(frame => frame.opcode === 1).map(frame => JSON.parse(frame.payload));
+    };
+    const start = [message("user", "FIXTURE_REPLY_recover")];
+    const first = (await ws("first", start)).at(-1).response;
+    const tail = message("user", "FIXTURE_REPLY_recover");
+    const replay = [...start, ...first.output, tail];
+    await assert.rejects(ws("second", [tail], { prior: first.id }), { code: "router_history_unavailable" });
+    const resumedFrom = stderr.length;
+    const second = (await ws("second", replay)).at(-1);
+    assert.equal(second.type, "response.completed");
+    assert.match(stderr.slice(resumedFrom).join(""), /antigravity:continue \{"messages":1,"reconnected":true/);
+
+    for (const [other, headers] of [
+      ["different task", { ...auth, "thread-id": "other-task" }],
+      ["different account", { ...auth, "chatgpt-account-id": "other-account" }],
+      ["changed assistant", auth],
+    ]) {
+      const before = stderr.length;
+      const input = other === "changed assistant" ? [...start, message("assistant", "edited"), tail] : replay;
+      const result = (await ws(other, input, { headers })).at(-1);
+      assert.equal(result.type, "response.completed", other);
+      assert.match(stderr.slice(before).join(""), /antigravity:new /, other);
+    }
   });
 });
