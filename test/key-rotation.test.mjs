@@ -1,5 +1,4 @@
-// 同一家供應商的多把 API Key：目前這把回 401／402／403／429 才換下一把並重送，
-// 失敗的那把冷卻；其他狀態碼照原樣回給 Codex，不會亂換 Key。沒有備用 Key 時行為不變。
+// 同一家供應商的多把 API Key：驗證一般輪替、每個模型的 Key 選擇與模型權限錯誤。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -182,6 +181,33 @@ test("主 Key 沒有的模型直接用有它的備用 Key；換到備用 Key 後
   assert.equal(health.stats.keyRotations, 0, "不是失敗換 Key");
 });
 
+
+test("既有模型遇到 model_not_found 時改試備用 Key，一般 404 原樣回傳", async (t) => {
+  const { instance } = await startRouter(t, { providers: { default: [
+    { id: "k-a", keychainService: "svc.k-a", models: ["model-a"] },
+  ] }, primaryModels: { default: ["model-a"] } });
+  const seen = [];
+  let code = "model_not_found";
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    if (!String(url).startsWith("https://relay.example/")) return Response.json({ models: [] });
+    const key = new Headers(options.headers).get("authorization");
+    seen.push(key);
+    if (key === "Bearer main-k-a") return completed();
+    return Response.json({ error: { code, message: "not found" } }, { status: 404 });
+  });
+
+  assert.equal(await send(instance), 200);
+  assert.deepEqual(seen, ["Bearer main", "Bearer main-k-a"]);
+
+  code = "endpoint_not_found";
+  seen.length = 0;
+  const body = { model: route.pickerSlug, input: "hi", stream: true };
+  const response = await instance.fetchModelUpstream(authHeaders, new URL("http://127.0.0.1/v1/responses"),
+    body, Buffer.from(JSON.stringify(body)), undefined, {});
+  assert.equal(response.status, 404);
+  assert.deepEqual(await response.json(), { error: { code, message: "not found" } });
+  assert.deepEqual(seen, ["Bearer main"], "模型專屬的 404 不應該切換供應商目前使用的 Key");
+});
 
 test("沒有備用 Key 時與以前相同：只送一次，Key 沒變不重送", async (t) => {
   const { instance, origin } = await startRouter(t, null);

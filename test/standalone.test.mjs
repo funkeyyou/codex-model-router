@@ -88,19 +88,24 @@ async function runScenario(t, scenario, { noCodex = true, root = null } = {}) {
   assert.match(output, /STANDALONE_FIXTURE_OK/);
 }
 
-async function upstream(t) {
+async function upstream(t, { backupModel = false } = {}) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
-    requests.push({ path: req.url, model: body.model, key: req.headers.authorization });
+    requests.push({ path: req.url, model: body.model, key: req.headers.authorization,
+      prompt: body.messages?.[0]?.content });
     res.setHeader("content-type", "application/json");
     if (req.url.split("?")[0] === "/moved/v1/models") {
       res.statusCode = 404;
       return res.end(JSON.stringify({ error: { message: "not found" } }));
     }
     if (req.url.split("?")[0].endsWith("/models")) return res.end(JSON.stringify({ data: ["claude-opus-fixture", "claude-sonnet-fixture"].map(id => ({ id })) }));
+    if (backupModel && body.model === "claude-sonnet-fixture" && req.headers.authorization !== "Bearer fixture-key-k-working") {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ error: { code: "model_not_found" } }));
+    }
     if (body.max_tokens === 9999999) {
       res.statusCode = 400;
       return res.end(JSON.stringify({ error: { message: "max_tokens: 9999999 > 128000" } }));
@@ -202,6 +207,47 @@ test("沒有 Codex：首次安裝、Claude Gateway 對話、模型管理、更�
   `);
   assert.ok(api.requests.some(req => req.model === "claude-opus-fixture" && req.key === "Bearer fixture-key"));
   assert.ok(api.requests.some(req => req.path === "/moved/messages" && req.model === "claude-opus-fixture"), "修改 Base URL 後應改送往新路徑");
+});
+
+test("主 Key 列出模型卻無法推理時，添加模型依序試備用 Key，對話優先使用測通的那把", { timeout: 90000 }, async t => {
+  const api = await upstream(t, { backupModel: true });
+  await runScenario(t, `
+  await installManagerOnly();
+  const ops = managerOperations();
+  const draft = await ops.providerDraft({ baseUrl: ${JSON.stringify(api.baseUrl)}, apiKey: "fixture-key" });
+  await ops.jobs.install.run({ draftId: draft.draftId, models: ["claude-opus-fixture"] });
+  const provider = requireInstallation().providers[0];
+  const originalReadApiKey = readApiKey;
+  writeKeyPoolFile({ providers: { default: ["k-rejected", "k-working"].map(id => ({ id, keychainService: id })) } });
+  readApiKey = service => service === provider.keychainService ? originalReadApiKey(service) : "fixture-key-" + service;
+  const selected = (await ops.discover({ providerId: "default" })).models.find(model => model.id === "claude-sonnet-fixture");
+  assert.ok(selected);
+  assert.equal(selected.onlyBackup, undefined, "主 Key 的 /models 也列出這個模型");
+  const result = await ops.jobs["add-models"].run({ providerId: "default", models: [selected.id] });
+  assert.equal(result.added.length, 1);
+  const settings = readSettingsIfExists();
+  const [unaffected, added] = settings.routes;
+  assert.equal(unaffected.preferredKeyId, undefined);
+  assert.equal(added.preferredKeyId, "k-working");
+  assert.equal(readManifest().routes.find(route => route.pickerSlug === added.pickerSlug).preferredKeyId, "k-working");
+  await ops.jobs["set-claude-desktop"].run({ enabled: true });
+  const { connection } = await ops.queries["claude-desktop-connection"]();
+  const url = "http://127.0.0.1:" + settings.port + "/claude/v1/messages";
+  const send = async (route, prompt) => {
+    const response = await fetch(url, { method: "POST", headers: { "x-api-key": connection.inferenceGatewayApiKey,
+      "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model: route.pickerSlug, max_tokens: 16, messages: [{ role: "user", content: prompt }] }) });
+    assert.equal(response.status, 200, await response.text());
+  };
+  await send(added, "use backup");
+  await send(unaffected, "use primary");
+  `);
+  const attempts = api.requests.filter(req => req.model === "claude-sonnet-fixture" && req.prompt === "Reply with exactly OK.");
+  const order = attempts.map(req => req.key).filter((key, index, keys) => index === 0 || key !== keys[index - 1]);
+  assert.deepEqual(order, ["Bearer fixture-key", "Bearer fixture-key-k-rejected", "Bearer fixture-key-k-working"]);
+  const keysForPrompt = (prompt) => api.requests.filter(req => req.prompt === prompt).map(req => req.key);
+  assert.deepEqual(keysForPrompt("use backup"), ["Bearer fixture-key-k-working"], "正式請求第一把就應該用測通的 Key");
+  assert.deepEqual(keysForPrompt("use primary"), ["Bearer fixture-key"], "同一供應商的其他模型仍使用主 Key");
 });
 
 test("獨立安裝後偵測到 Codex 不自動改設定；明確連接可用真實 Codex model/list 驗證並可回退", {

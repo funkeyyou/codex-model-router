@@ -2640,9 +2640,9 @@ export function keySlotsFor(provider, pool = readKeyPool()) {
 }
 
 // 只在有這個模型的 Key 之間切換；清單未知（null）視為支援。都不支援時退回全部，維持原行為。
-export function keySlotsForModel(slots, model) {
+export function keySlotsForModel(slots, model, preferredKeyId) {
   if (typeof model !== "string" || !model) return slots;
-  const usable = slots.filter((slot) => !slot.models || slot.models.has(model));
+  const usable = slots.filter((slot) => slot.id === preferredKeyId || !slot.models || slot.models.has(model));
   return usable.length ? usable : slots;
 }
 
@@ -2654,10 +2654,13 @@ export function createKeyRotation({ now = Date.now } = {}) {
   return {
     // 嘗試順序：從目前這把開始、跳過冷卻中的；全部都在冷卻時，仍依解除時間先後全部試一次，
     // 不會因為冷卻就讓請求直接失敗。
-    order(providerId, slotIds) {
+    order(providerId, slotIds, preferredKeyId) {
       if (slotIds.length <= 1) return [...slotIds];
       const current = Math.max(0, slotIds.indexOf(active.get(providerId)));
-      const rotated = [...slotIds.slice(current), ...slotIds.slice(0, current)];
+      let rotated = [...slotIds.slice(current), ...slotIds.slice(0, current)];
+      if (rotated.includes(preferredKeyId)) {
+        rotated = [preferredKeyId, ...rotated.filter((id) => id !== preferredKeyId)];
+      }
       const time = now();
       const ready = [];
       const waiting = [];
@@ -2673,8 +2676,8 @@ export function createKeyRotation({ now = Date.now } = {}) {
       const until = now() + keyCooldownMs(status, retryAfterSeconds);
       cooling.set(coolKey(providerId, slotId), { until, status, reason: keyFailureReason(status) });
     },
-    succeed(providerId, slotId) {
-      active.set(providerId, slotId);
+    succeed(providerId, slotId, { makeActive = true } = {}) {
+      if (makeActive) active.set(providerId, slotId);
       cooling.delete(coolKey(providerId, slotId));
     },
     active(providerId) {
@@ -3149,30 +3152,61 @@ async function fetchWithKeySlot(provider, slot, target, headers, body, signal, h
   return send(reloaded);
 }
 
-async function fetchCustom(provider, target, headers, body, signal, { model = null, headerBuilder = buildCustomHeaders } = {}) {
-  const slots = keySlotsForModel(keySlotsFor(provider), model);
-  if (slots[0]?.id !== PRIMARY_KEY_SLOT && model) stats.keyModelRoutes += 1;
+// 區分模型無權存取與端點不存在。只檢查小型 HTTP 404 錯誤，原回應仍可交給呼叫端。
+async function rejectsUpstreamModel(upstream) {
+  const reader = upstream.clone().body?.getReader();
+  if (!reader) return false;
+  try {
+    const chunks = [];
+    let bytes = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 8192) return false;
+      chunks.push(value);
+    }
+    const { error } = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
+    return [error, error?.code, error?.type, error?.message].includes("model_not_found");
+  } catch {
+    return false;
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+}
+
+async function fetchCustom(provider, target, headers, body, signal, { route, headerBuilder = buildCustomHeaders } = {}) {
+  const model = route?.upstreamModel;
+  const slots = keySlotsForModel(keySlotsFor(provider), model, route?.preferredKeyId);
+  const preferred = slots.find((slot) => slot.id === route?.preferredKeyId);
+  if (model && (preferred || slots[0]?.id !== PRIMARY_KEY_SLOT)) stats.keyModelRoutes += 1;
   if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal, headerBuilder);
   const bySlot = new Map(slots.map((slot) => [slot.id, slot]));
-  const order = keyRotation.order(provider.id, slots.map((slot) => slot.id));
+  const order = keyRotation.order(provider.id, slots.map((slot) => slot.id), preferred?.id);
+  let modelRejected = false;
   for (let index = 0; index < order.length; index += 1) {
     const slot = bySlot.get(order[index]);
+    const hasNext = index + 1 < order.length;
     let upstream;
     try {
       upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder);
     } catch (error) {
       // 讀不到這把 Key（被刪掉、密文檔損壞）：當作被拒，換下一把；連線錯誤照常往外拋。
-      if (!error?.keyReadFailed || index === order.length - 1) throw error;
+      if (!error?.keyReadFailed || !hasNext) throw error;
       keyRotation.fail(provider.id, slot.id, 401);
       stats.keyReadFailures += 1;
       continue;
     }
-    if (!KEY_ROTATION_STATUSES.has(upstream.status)) {
-      if (upstream.status < 400) keyRotation.succeed(provider.id, slot.id);
+    if (KEY_ROTATION_STATUSES.has(upstream.status)) {
+      keyRotation.fail(provider.id, slot.id, upstream.status, parseRetryAfter(upstream.headers.get("retry-after")));
+      if (!hasNext) return upstream;
+    } else if (hasNext && model && upstream.status === 404 && await rejectsUpstreamModel(upstream)) {
+      // 同一把 Key 可能仍可使用其他模型，這個 404 不應造成整家供應商的 Key 冷卻。
+      modelRejected = true;
+    } else {
+      if (upstream.status < 400) keyRotation.succeed(provider.id, slot.id, { makeActive: !preferred && !modelRejected });
       return upstream;
     }
-    keyRotation.fail(provider.id, slot.id, upstream.status, parseRetryAfter(upstream.headers.get("retry-after")));
-    if (index === order.length - 1) return upstream;
     await upstream.arrayBuffer().catch(() => {});
     stats.keyRotations += 1;
     stats.lastKeyRotation = {
@@ -3352,7 +3386,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         anthropicBody,
         upstreamSignal,
-        { model: route.upstreamModel },
+        { route },
       );
       meta.abortClaudeUpstream = () => upstreamController.abort();
       meta.claudeStreamIdleTimeoutMs = claudeStreamIdleTimeoutMs;
@@ -3409,7 +3443,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         chatBody,
         signal,
-        { model: route.upstreamModel },
+        { route },
       );
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -3427,7 +3461,7 @@ export async function fetchModelUpstream(
       requestHeaders,
       outboundBody,
       signal,
-      { model: route.upstreamModel, headerBuilder: responsesHeaderBuilder(provider) },
+      { route, headerBuilder: responsesHeaderBuilder(provider) },
     );
     stats.lastCustomStatus = upstream.status;
     if (upstream.status === 400 || upstream.status === 422) {
@@ -5065,7 +5099,7 @@ const handleClaudeDesktop = createDesktopHandler({
     const provider = providerForRoute(route);
     stats.custom += 1;
     const upstream = await fetchCustom(provider, new URL(provider.apiRoot + path), headers, body, signal,
-      { model: route.upstreamModel, headerBuilder: desktopHeaders });
+      { route, headerBuilder: desktopHeaders });
     stats.lastCustomStatus = upstream.status;
     return upstream;
   },

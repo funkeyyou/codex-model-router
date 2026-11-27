@@ -617,7 +617,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "尚未連接供應商，可先開啟 API Key 模式或調整全域上下文。": "No provider is connected yet. You can enable API key mode or adjust the global context first.",
 "首次設定": "First-time setup",
 "僅備用 Key": "Backup key only",
-"主 Key 沒有這個模型；路由器會固定用有它的備用 Key。": "The primary key doesn't have this model, so the router always uses a backup key that does.",
+"主 Key 的清單未列出這個模型。添加時優先用有列出它的備用 Key 探測。": "The primary key doesn't list this model. Model setup first tests a backup key that lists it.",
 "強制顯示隱藏模型要靠路由器提供的模型清單，連接供應商、安裝路由器後才能儲存。": "Force-showing hidden models relies on the model list served by the router. Connect a provider to install the router before saving.",
 "每個模型會發送一次短測試並使用訂閱用量；有模型通過才會安裝路由器並添加，固定使用回應中的完整模型版本。": "Each model gets one short test that uses your subscription. The router is installed and models are added only if a test passes; the exact model version from the response is kept.",
 "開始測試並安裝": "Test and install",
@@ -1379,6 +1379,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 ["^新增供應商的資料已過期，請重新查詢模型。$", "The new provider draft expired. Fetch the models again."],
 ["^上游拒絕這把 Key（HTTP (\\d+)），沒有更換。$", "The upstream rejected this key (HTTP $1); it wasn't replaced."],
 ["^請填寫備用 API Key。$", "Enter the backup API key."],
+["^供應商的連線設定已變更，請重新探測模型。$", "The provider's connection settings changed. Test the models again."],
+["^探測通過的備用 Key 已移除，請重新探測模型。$", "The backup key that passed the test was removed. Test the models again."],
 ["^沒有新增任何備用 Key，請檢查上面的訊息。$", "No backup keys were added; see the messages above."],
 ["^這次填了 (\\d+) 把，但只能再加 (\\d+) 把（每家最多 (\\d+) 把備用 Key）。$", "You entered $1 keys, but only $2 more can be added (at most $3 backup keys per provider)."],
 ["^備用 Key 最多 (\\d+) 把，這次填了 (\\d+) 把。$", "At most $1 backup keys are allowed; you entered $2."],
@@ -4427,7 +4429,7 @@ function modelPicker({ onChange, allowConfigured = false, idPattern = MODEL_ID_P
           model.label && model.label !== model.id ? h("span", { class: "faint", text: model.label }) : null),
         model.configured ? h("span", { class: "chip", text: allowConfigured ? t("已添加，可重新設定") : t("已添加") }) : null,
         model.note ? h("span", { class: "chip amber", text: model.note }) : null,
-        model.onlyBackup ? h("span", { class: "chip amber", title: t("主 Key 沒有這個模型；路由器會固定用有它的備用 Key。"), text: t("僅備用 Key") }) : null,
+        model.onlyBackup ? h("span", { class: "chip amber", title: t("主 Key 的清單未列出這個模型。添加時優先用有列出它的備用 Key 探測。"), text: t("僅備用 Key") }) : null,
         !model.configured && model.anthropic ? h("span", { class: "chip violet", text: t("Claude 轉譯") }) : null);
     }));
   }

@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.48.2";
+const INSTALLER_VERSION = "1.48.3";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -1080,22 +1080,31 @@ async function refreshKeyPoolModels(providerId, apiRoot, primaryModels) {
 }
 
 // 合併主 Key 與備用 Key 的模型清單，順便把各自的清單記進 key-pool.json 給路由器用。
-// 只有備用 Key 有的模型列在主 Key 的後面，並用 keyFor 取得能測它的那把 Key。
+// 清單只決定探測順序，有些閘道對所有 Key 公布相同清單，實際推理時才檢查權限。
 async function discoverProviderModels(provider, primaryKey) {
   const discovery = await discoverApiRoot(provider.baseUrl, primaryKey);
-  const pool = readKeyPoolFile();
-  const backups = backupKeysOf(pool, provider.id);
-  if (!backups.length) return { discovery, onlyBackup: new Set(), keyFor: () => primaryKey };
-  const lists = await Promise.all(backups.map(async (item) => {
+  const primary = { key: primaryKey };
+  const backups = backupKeysOf(readKeyPoolFile(), provider.id);
+  if (!backups.length) return { discovery, onlyBackup: new Set(), keysFor: () => [primary] };
+  const checked = await Promise.all(backups.map(async (item) => {
     let key;
-    try { key = readApiKey(item.keychainService); } catch { return { item, key: null, models: null }; }
+    try { key = readApiKey(item.keychainService); } catch { return null; }
     return { item, key, models: (await fetchKeyModels(discovery.apiRoot, key)).models };
   }));
+  const lists = checked.filter(Boolean);
   const primarySet = new Set(discovery.models);
   try {
-    pool.primaryModels = { ...(pool.primaryModels || {}), [provider.id]: discovery.models };
-    for (const { item, models } of lists) if (models) item.models = models;
-    writeKeyPoolFile(pool);
+    // 查清單期間可能刪除了備用 Key，合併到當前清單以免把它寫回去。
+    const pool = readKeyPoolFile();
+    const current = backupKeysOf(pool, provider.id);
+    if (current.length) {
+      pool.primaryModels = { ...(pool.primaryModels || {}), [provider.id]: discovery.models };
+      for (const item of current) {
+        const models = lists.find((entry) => entry.item.id === item.id)?.models;
+        if (models) item.models = models;
+      }
+      writeKeyPoolFile(pool);
+    }
   } catch (error) {
     console.error(`各 Key 的模型清單未能保存：${error.message}`);
   }
@@ -1104,9 +1113,15 @@ async function discoverProviderModels(provider, primaryKey) {
     for (const model of models || []) if (!primarySet.has(model) && !extra.includes(model)) extra.push(model);
   }
   if (extra.length) console.log(`備用 Key 另外提供 ${extra.length} 個主 Key 沒有的模型。`);
-  const keyFor = (model) => primarySet.has(model) ? primaryKey
-    : lists.find((entry) => entry.key && entry.models?.includes(model))?.key || primaryKey;
-  return { discovery: { ...discovery, models: [...discovery.models, ...extra] }, onlyBackup: new Set(extra), keyFor };
+  const keysFor = (model, preferredKeyId) => {
+    const listed = lists.filter((entry) => entry.models?.includes(model));
+    const unlisted = lists.filter((entry) => !listed.includes(entry));
+    const ordered = primarySet.has(model) || listed.length === 0 ? [primary, ...listed] : [...listed, primary];
+    ordered.push(...unlisted);
+    const preferred = lists.find(({ item }) => item.id === preferredKeyId);
+    return preferred ? [preferred, ...ordered.filter((entry) => entry !== preferred)] : ordered;
+  };
+  return { discovery: { ...discovery, models: [...discovery.models, ...extra] }, onlyBackup: new Set(extra), keysFor };
 }
 
 // 供應商被移除或整個回退時呼叫：刪掉這些備用 Key 的鑰匙圈項目／密文檔與清單記錄。
@@ -2221,8 +2236,9 @@ export function planEditProvider(manifest, settings, catalog, providerId, { name
   const updateRoute = (route) => {
     let next = route;
     if (renamed.has(route.pickerSlug)) next = { ...next, displayName: renamed.get(route.pickerSlug) };
-    if (baseUrlChanged && routeSlugs.has(route.pickerSlug) && next.providerHost !== nextHost) {
+    if (baseUrlChanged && routeSlugs.has(route.pickerSlug)) {
       next = { ...next, providerHost: nextHost };
+      delete next.preferredKeyId;
     }
     return next;
   };
@@ -4422,6 +4438,19 @@ export async function buildRouteForModel(discovery, apiKey, model, log = console
   return { route, transient: false, transientEfforts: probe.transientEfforts || [] };
 }
 
+async function probeProviderModel({ discovery, keysFor }, model, log, providerId) {
+  let outcome;
+  for (const { key, item } of keysFor(model)) {
+    if (item) log.line(`  使用備用 Key ${maskKeyTail(item.tail)} 探測。`);
+    outcome = await buildRouteForModel(discovery, key, model, log, providerId);
+    if (!outcome.route) continue;
+    if (!item) return outcome;
+    log.line(`  探測通過，${model} 將優先使用這把備用 Key。`);
+    return { ...outcome, route: { ...outcome.route, preferredKeyId: item.id } };
+  }
+  return outcome;
+}
+
 // preset 由網頁管理頁的首次設定帶入：Base URL、Key、查詢結果與所選模型都已確定，
 // 不能再向終端提問。終端安裝（preset 為 null）的流程不變。
 async function install(preset = null) {
@@ -4827,9 +4856,9 @@ async function addModels() {
 
   const apiKey = readApiKey(keychainService);
   console.log("\n正在發現可用模型...");
-  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
+  const discovered = await discoverProviderModels(provider, apiKey);
   const configured = new Set(providerRoutes.map((route) => route.upstreamModel));
-  const available = discovery.models.filter((model) => !configured.has(model));
+  const available = discovered.discovery.models.filter((model) => !configured.has(model));
   if (available.length === 0) {
     console.log("清單上的模型都已配置；仍可直接輸入清單沒有列出的模型 ID。");
   }
@@ -4840,18 +4869,18 @@ async function addModels() {
     return false;
   });
   if (selectedModels.length === 0) fail("未選擇任何模型。");
-  console.log(`\n每個選中的模型最多會執行五次小型 Responses API 探測；同時最多探測 ${probeConcurrency()} 個模型。`);
+  console.log(`\n將送出小型 API 請求探測模型，同時最多探測 ${probeConcurrency()} 個模型。`);
   if (!(await confirm("是否繼續進行能力探測？", true))) {
     fail("已在修改配置前取消。");
   }
 
   // 這裡的模型都是新選的，沒有既有設定可以沿用；暫時性失敗只能略過。
   const outcomes = await probeModelsInParallel(selectedModels,
-    (model, log) => buildRouteForModel(discovery, keyFor(model), model, log, provider.id));
+    (model, log) => probeProviderModel(discovered, model, log, provider.id));
   const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean);
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
 
-  const { plan, backupDir } = await commitAddedModels(provider, newRoutes, discovery.models);
+  const { plan, backupDir } = await commitAddedModels(provider, newRoutes, discovered.discovery.models);
 
   printHeading("添加完成");
   console.log("本次新增：");
@@ -4871,8 +4900,18 @@ async function addModels() {
 // 否則 settings.version 會與實際執行的程式碼對不上；失敗時 commitRouterChange 會還原並確認服務回來。
 async function commitAddedModels(provider, newRoutes, discoveredModels) {
   const templates = await withCodexLock(() => loadCatalogTemplates());
-  const { manifest, settings, catalog } = requireInstallation();
+  const { manifest, settings, catalog, providers } = requireInstallation();
   const plan = planAddModels(manifest, settings, catalog, templates, provider, newRoutes, discoveredModels);
+  const currentProvider = providers.find((item) => item.id === provider.id);
+  if (currentProvider.apiRoot !== provider.apiRoot || currentProvider.keychainService !== provider.keychainService) {
+    fail("供應商的連線設定已變更，請重新探測模型。");
+  }
+  if (plan.added.some((route) => route.preferredKeyId)) {
+    const keyIds = new Set(backupKeysOf(readKeyPoolFile(), provider.id).map((item) => item.id));
+    if (plan.added.some((route) => route.preferredKeyId && !keyIds.has(route.preferredKeyId))) {
+      fail("探測通過的備用 Key 已移除，請重新探測模型。");
+    }
+  }
   const backupDir = await commitRouterChange("add-model", { ...plan, autoApiKeyMode: true });
   return { plan, backupDir };
 }
@@ -8217,15 +8256,15 @@ async function managerAddModels({ providerId, models, contextWindow, maxOutputTo
   const apiKey = readApiKey(provider.keychainService);
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("正在查詢模型清單…");
-  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
+  const discovered = await discoverProviderModels(provider, apiKey);
   console.log(`將探測 ${selected.length} 個模型，同時最多 ${probeConcurrency()} 個。`);
   const outcomes = await probeModelsInParallel(selected,
-    (model, log) => buildRouteForModel(discovery, keyFor(model), model, log, provider.id));
+    (model, log) => probeProviderModel(discovered, model, log, provider.id));
   const newRoutes = outcomes.map((outcome) => outcome.route).filter(Boolean)
     .map((route) => applyNewModelDefaults(route, defaults));
   if (newRoutes.length === 0) fail("選中的模型均未通過探測，配置未改動。");
   console.log("\n探測完成，正在寫入設定並重新啟動路由器…");
-  const { plan, backupDir } = await commitAddedModels(provider, newRoutes, discovery.models);
+  const { plan, backupDir } = await commitAddedModels(provider, newRoutes, discovered.discovery.models);
   printAddedLimits(plan.added, defaults);
   console.log(`備份：${backupDir}`);
   return {
@@ -8332,9 +8371,9 @@ async function managerDetectFast({ slug } = {}) {
   const apiKey = readApiKey(provider.keychainService);
   console.log(`供應商：${providerName(provider)}（${provider.baseUrl}）`);
   console.log("正在查詢模型清單…");
-  const { discovery, keyFor } = await discoverProviderModels(provider, apiKey);
+  const { discovery, keysFor } = await discoverProviderModels(provider, apiKey);
   console.log(`正在偵測 ${route.upstreamModel} 的 Fast（service_tier=priority），會送出兩個很短的請求…`);
-  const key = keyFor(route.upstreamModel);
+  const [{ key }] = keysFor(route.upstreamModel, route.preferredKeyId);
   const effort = route.stripReasoning || !route.efforts?.length ? null
     : (route.efforts.includes("low") ? "low" : route.efforts[0]);
   const fastProbe = await probeServiceTier(route.translate === "chat"
