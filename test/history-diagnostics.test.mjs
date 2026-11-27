@@ -208,7 +208,7 @@ test("官方 WebSocket 換連線後，完整重送完成也會按原診斷 ID �
     return originalWrite.call(this, chunk, ...args);
   });
   t.mock.method(globalThis, "fetch", () => assert.fail("完整重送應走既有上游 WebSocket"));
-  const state = namespace => ({ connectionNamespace: namespace, upstreamDisabled: false, session: {
+  const state = namespace => ({ connectionNamespace: namespace, upstreamRetryAt: 0, session: {
     closed: false, responseIds: new Set(), destroy() { this.closed = true; },
     send() { queueMicrotask(() => this.onEvent?.(done("resp_ws_recovered"))); },
   } });

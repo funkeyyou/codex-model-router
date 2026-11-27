@@ -141,6 +141,12 @@ If the picker shows stale names or removed models, v1.27.8 adds **Sync and repai
 
 ## Development and help
 
+**Slow first output.** If an official upstream WebSocket fails, that client connection uses HTTP for 60 seconds by default (`upstreamWebSocketRetryMs`). The next eligible official turn tries WebSocket again unless the global cooldown is still active. The first turn on a fresh upstream socket may need the full history; later turns can send just the new items. An in-flight response with forwarded output is never replayed by this retry.
+
+On 2026-11-27 the **Codex backend** (not the public Responses API) rejected HTTP POSTs with `previous_response_id` as an unsupported parameter (400, `store: false`), both after closing a WebSocket and after a successful HTTP parent. Both full-history controls returned 200 and recalled a random marker. To repeat this small, billable live test explicitly, run `node tools/probe-official-http-continuation.mjs --live`.
+
+HTTP fallback and ordinary relay requests send full history, even if the provider reports a token cache hit. In the manager's usage log, select a recent request's **First output** time for its HTTP stages: before dispatch, earlier attempts, connection/upload, wait for headers, and headers to first output. Upload completion is measured locally, not at the provider. Older records and non-HTTP upstreams don't have a breakdown.
+
 Source files live in `src/`; the single-file installers are generated with `node tools/build.mjs`. Run `npm ci` and `npm run check` for build consistency, lint, and tests.
 
 For troubleshooting, advanced settings, and architecture, see the Chinese [guide](guide.md) and [troubleshooting](troubleshooting.md) pages. When [reporting an issue](https://github.com/funkeyyou/codex-model-router/issues), include your OS, desktop/CLI version, router version, and redacted error output. Do not include API keys or login tokens.

@@ -570,7 +570,7 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   同版本起轉譯路由（Claude 與 Chat Completions）把整輪最後一段、沒有接工具呼叫的文字標成
   `final_answer`，其餘維持 `commentary`；串流時先以進度更新顯示，完成時才定案。
 - **有狀態接續的本機重建**——Codex 在工具接續回合只送工具結果並倚賴
-  `previous_response_id`，但該參數需要真正的 WebSocket 上游。本路由改以
+  `previous_response_id`。2026-11-27 對官方 Codex 後端實測（`store: false`）：在 HTTP POST 中使用剛關閉的 WebSocket 回應 ID，或上一輪 HTTP 回應 ID，都得到 HTTP 400（不支援此參數）；送完整歷史則都成功。這不是 HTTP 協定本身的限制。回退時本路由改以
   「上次完整輸入 + 該輪輸出 + 本次新項目」在本機重建等價的完整請求；每條
   WebSocket 都有獨立的歷史 namespace，背景任務即使重複使用同一個 `session_id`
   也不會覆蓋目前對話。
@@ -584,6 +584,8 @@ API Key 只有目前的 Windows 使用者帳號解得開，換帳號或搬到別
   暫停嘗試一段時間並直接走 HTTP，避免每個新對話的第一輪都先賠一次握手；
   上游恢復後立刻解除。門檻與冷卻時間可用 `settings.json` 的
   `upstreamWebSocketFailureThreshold` 與 `upstreamWebSocketCooldownMs` 調整。
+  單條連線回退 HTTP 後，預設等 60 秒（`upstreamWebSocketRetryMs`），由下一個符合條件的官方回合重試 WebSocket；若全域仍在冷卻則繼續用 HTTP。不會中斷或重播已經轉發輸出的回合。
+- **首次輸出慢在哪裡**——官方 WebSocket 可在原上游連線只送增量，HTTP 回退與一般中轉則要重送完整歷史，即使上游回報 token 快取命中也一樣。在管理頁「使用記錄」點選最近請求的「首次輸出」，可看 HTTP 送出前、連線與送出、等標頭、標頭到首次輸出，以及重試花的時間。上傳完成是本機傳輸層的觀測點，不代表供應商已收到；各段不能單獨當成模型推理時間。舊紀錄與非 HTTP 上游沒有這些數字。
 - **重啟時同步最新模型**——Codex 啟動向本機 `/models` 請求時，路由器先用該請求的
   ChatGPT 登入資訊讀取官方清單，再合併既有 `custom/*` 模型與強制顯示設定。
   Codex 啟動瞬間可能先顯示自己的快取，背景同步完成後再次開啟模型選單即可讀取新清單。

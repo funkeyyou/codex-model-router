@@ -459,7 +459,7 @@ plugins = false
       await router.handleWebSocketResponseInner({ headers }, socket, new URL(endpoint),
         { type: "response.create", model: slug, input, tools, client_metadata: { session_id: "shared-metadata" },
           ...(prior ? { previous_response_id: prior } : {}) }, new AbortController(),
-        { connectionNamespace, upstreamDisabled: true });
+        { connectionNamespace, upstreamRetryAt: Infinity });
       return router.parseWebSocketFrames(Buffer.concat(chunks)).frames
         .filter(frame => frame.opcode === 1).map(frame => JSON.parse(frame.payload));
     };

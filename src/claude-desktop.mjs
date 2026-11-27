@@ -442,7 +442,7 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
       context = { startedAt, model: route.pickerSlug, upstreamModel: route.upstreamModel,
         route: "custom", provider: route.providerId || "default", transport: "claude-desktop", backgroundKind: null, thread: null, recorded: false };
       const upstream = await fetchUpstream(route, countTokens ? "/messages/count_tokens" : "/messages", request.headers,
-        Buffer.from(JSON.stringify({ ...body, model: route.upstreamModel })), controller.signal);
+        Buffer.from(JSON.stringify({ ...body, model: route.upstreamModel })), controller.signal, countTokens ? null : context);
       if (!upstream.ok) throw failure(upstream.status >= 400 ? upstream.status : 502, "claude_upstream_error", `Claude upstream returned HTTP ${upstream.status}.`);
       if (body.stream === true && !countTokens) {
         if (!upstream.headers.get("content-type")?.includes("text/event-stream") || !upstream.body) throw failure(502, "invalid_upstream_response", "Expected an Anthropic event stream.");

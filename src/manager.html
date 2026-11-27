@@ -1083,6 +1083,16 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "官方": "Official",
 "最近的請求": "Recent requests",
 "首次輸出": "First output",
+"HTTP 分段計時": "HTTP timing breakdown",
+"首次送出前": "Before first dispatch",
+"先前嘗試與重試準備": "Earlier attempts and retry preparation",
+"連線與送出請求": "Connection and request upload",
+"送出後等回應標頭": "Upload to response headers",
+"送出請求到回應標頭（合計）": "Dispatch to response headers (combined)",
+"回應標頭到首次輸出": "Response headers to first output",
+"HTTP 嘗試次數": "HTTP attempts",
+"最後一次請求大小": "Last request size",
+"送出完成指本機傳輸層送完，不代表上游已讀完。連線、上傳與等標頭顯示最後一次嘗試；無法量測的階段顯示 —。": "Upload completion is measured by the local transport, not by the server. Connection, upload, and header timings are for the last attempt. Unavailable measurements show —.",
 "總耗時": "Total duration",
 "輸出 TPS": "Output TPS",
 "從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。": "From router request receipt to the first streamed thinking, text or tool call.",
@@ -2617,6 +2627,31 @@ function formatOutputTps(value) {
   return Number.isFinite(value) ? value.toFixed(1) + " tok/s" : "—";
 }
 
+function firstOutputCell(entry) {
+  const value = formatRequestDuration(entry.firstOutputMs ?? entry.firstTextMs);
+  const timing = entry.httpTiming;
+  if (!timing) return h("td", { class: "nowrap num", text: value });
+  const title = t("HTTP 分段計時");
+  const show = () => {
+    const rows = [
+      [t("首次送出前"), formatRequestDuration(timing.beforeDispatchMs)],
+      ...(timing.attempts > 1 ? [[t("先前嘗試與重試準備"), formatRequestDuration(timing.previousAttemptsMs)]] : []),
+      [t("連線與送出請求"), formatRequestDuration(timing.sendMs)],
+      [t("送出後等回應標頭"), formatRequestDuration(timing.waitHeadersMs)],
+      [t("送出請求到回應標頭（合計）"), formatRequestDuration(timing.dispatchToHeadersMs)],
+      [t("回應標頭到首次輸出"), formatRequestDuration(timing.headersToFirstOutputMs)],
+      [t("HTTP 嘗試次數"), formatNumber(timing.attempts)],
+      [t("最後一次請求大小"), Number.isFinite(timing.requestBytes) ? formatNumber(timing.requestBytes) + " B" : "—"],
+    ];
+    openModal({ title, body: [
+      h("dl", { class: "kv" }, rows.map(([label, text]) => [h("dt", { text: label }), h("dd", { class: "mono", text })])),
+      paragraph(t("送出完成指本機傳輸層送完，不代表上游已讀完。連線、上傳與等標頭顯示最後一次嘗試；無法量測的階段顯示 —。"), "note"),
+    ] });
+  };
+  return h("td", { class: "nowrap num" }, h("button", { type: "button", class: "link-button", title,
+    "aria-label": title + " · " + value, text: value, onclick: show }));
+}
+
 function renderUsage() {
   if (!usageData && !usageLoading) loadUsage();
   const range = h("select", { "aria-label": t("時間範圍"), disabled: usageLoading, onchange: (event) => { usageHours = Number(event.target.value); loadUsage(); } },
@@ -2694,7 +2729,7 @@ function renderUsage() {
         num(entry.hasUsage ? formatTokens(entry.input) : "—"),
         num(entry.hasUsage && entry.input ? percent(entry.cached / entry.input) : "—"),
         num(entry.hasUsage ? formatTokens(entry.output) : "—"),
-        num(formatRequestDuration(entry.firstOutputMs ?? entry.firstTextMs)),
+        firstOutputCell(entry),
         num(formatRequestDuration(entry.durationMs)),
         num(formatOutputTps(entry.outputTps)))))))));
   parts.push(h("div", { class: "note mono", text: usageData.logPath || "" }));

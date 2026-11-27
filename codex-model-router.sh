@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.48.4";
+const INSTALLER_VERSION = "1.48.5";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2704,6 +2704,7 @@ export const preservedSettingKeys = [
   "maxUpstreamRequestBytes",
   "upstreamWebSocket",
   "upstreamWebSocketCooldownMs",
+  "upstreamWebSocketRetryMs",
   "upstreamWebSocketFailureThreshold",
   "viewImageBridge",
 ];
@@ -11048,6 +11049,8 @@ if (!process.env.CODEX_MODEL_ROUTER_IMPORT_ONLY) {
 }
 __CODEX_MODEL_ROUTER_ROUTER_JS__
 import http from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { channel } from "node:diagnostics_channel";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
@@ -11611,10 +11614,13 @@ export function stripRouterImageCalls(input) {
 // previous_response_id 接續，每輪只送新項目，不必重送完整歷史。
 // 設 settings.upstreamWebSocket = false 可退回全 HTTP 行為。
 const upstreamWebSocketEnabled = settings.upstreamWebSocket !== false;
+// Per connection; only the next eligible turn probes. No timers or mid-stream replay.
+const upstreamWebSocketRetryMs = Number.isSafeInteger(settings.upstreamWebSocketRetryMs) && settings.upstreamWebSocketRetryMs > 0
+  ? settings.upstreamWebSocketRetryMs : 60_000;
 
 // 上游 WebSocket 不通時的全域冷卻。
 //
-// upstreamDisabled 只記在單一條 Codex 連線上，所以上游持續回 404 的期間，
+// 只冷卻單一條 Codex 連線時，上游持續回 404 的期間，
 // 每開一條新連線都會再賠一次 TLS 連線加握手才回退——成本落在每個新對話的
 // 第一輪。這裡改記在模組層：連續失敗達門檻就整個路由器暫停嘗試一段時間，
 // 期間直接走 HTTP，時間到再放行一次探測。
@@ -12217,6 +12223,7 @@ const stats = {
   statefulRebuilds: 0,
   statefulRebuildMisses: 0,
   upstreamWebSocketConnects: 0,
+  upstreamWebSocketReprobes: 0,
   upstreamWebSocketTurns: 0,
   upstreamWebSocketIncremental: 0,
   upstreamWebSocketReplays: 0,
@@ -12369,6 +12376,60 @@ const usageNumber = (value) => (Number.isFinite(Number(value)) && Number(value) 
 // 這時量不到生成速度，記成 null，不拿送達時間硬算。
 const usageMinGenerationMs = 500;
 
+// Built-in fetch (undici): associate the low-level bodySent event with its own
+// attempt, not with the socket or "latest" request. Never inspect headers/body.
+const fetchAttempt = new AsyncLocalStorage();
+const pendingUploads = new WeakMap();
+const createdChannel = channel("undici:request:create");
+const sentChannel = channel("undici:request:bodySent");
+const onRequestCreated = ({ request }) => {
+  const attempt = fetchAttempt.getStore();
+  // A proxy CONNECT handshake may run in the same async context; it isn't the model POST.
+  if (attempt && request.method === "POST") pendingUploads.set(request, attempt);
+};
+const onBodySent = ({ request }) => {
+  const attempt = pendingUploads.get(request);
+  if (attempt) attempt.sentAt = Date.now();
+};
+let timedFetches = 0;
+async function timedModelFetch(usage, target, init) {
+  if (!usage || settings.usageLog === false) return fetch(target, init);
+  const at = Date.now();
+  const timing = usage.httpAttempts ??= { firstAt: at, count: 0 };
+  timing.count++;
+  const attempt = timing.last = { at, bytes: init.body?.byteLength ?? null };
+  if (++timedFetches === 1) {
+    createdChannel.subscribe(onRequestCreated);
+    sentChannel.subscribe(onBodySent);
+  }
+  try {
+    const response = await fetchAttempt.run(attempt, () => fetch(target, init));
+    attempt.headersAt = Date.now();
+    return response;
+  } finally {
+    if (--timedFetches === 0) {
+      sentChannel.unsubscribe(onBodySent);
+      createdChannel.unsubscribe(onRequestCreated);
+    }
+  }
+}
+
+function httpTiming(context, firstOutputAt) {
+  const timing = context.httpAttempts;
+  if (!timing) return {};
+  const { at, sentAt, headersAt, bytes } = timing.last;
+  const span = (start, end) => Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+  // If an upstream returns early, or the runtime didn't emit bodySent, don't invent
+  // an upload duration. dispatchToHeadersMs is still useful in that case.
+  const uploadEnd = sentAt <= headersAt ? sentAt : null;
+  return { httpTiming: {
+    attempts: timing.count, requestBytes: bytes, beforeDispatchMs: span(context.startedAt, timing.firstAt),
+    previousAttemptsMs: span(timing.firstAt, at), sendMs: span(at, uploadEnd),
+    waitHeadersMs: span(uploadEnd, headersAt), dispatchToHeadersMs: span(at, headersAt),
+    headersToFirstOutputMs: span(headersAt, firstOutputAt),
+  } };
+}
+
 export function usageRecord(context, event, now = Date.now()) {
   const status = event?.type === "response.completed" ? "completed"
     : event?.type === "response.incomplete" ? "incomplete"
@@ -12402,6 +12463,7 @@ export function usageRecord(context, event, now = Date.now()) {
     background: context.backgroundKind, thread: context.thread, status,
     ...(context.combo ? { combo: context.combo, comboRole: context.comboRole } : {}),
     durationMs, firstTextMs, firstOutputMs, generationMs, hasText,
+    ...httpTiming(context, firstOutputAt),
     outputTps: measurable ? (windowTokens - 1) * 1000 / generationMs : null,
     input: usageNumber(usage?.input_tokens),
     cached: usageNumber(usage?.input_tokens_details?.cached_tokens),
@@ -14192,8 +14254,8 @@ export async function streamUpstream(upstream, response, history = null, respons
 
 // 單把 Key 的一次請求。上游回 401／403 時重讀這把 Key（可能剛在管理頁換過）；
 // 只有內容真的變了才重送，Key 本身無效時不會白白多打一次。
-async function fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder = buildCustomHeaders) {
-  const send = (apiKey, builder = headerBuilder) => fetch(target, {
+async function fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder, usage) {
+  const send = (apiKey, builder = headerBuilder) => timedModelFetch(usage, target, {
     method: "POST",
     headers: builder(headers, apiKey, target),
     body,
@@ -14246,12 +14308,12 @@ async function rejectsUpstreamModel(upstream) {
   }
 }
 
-async function fetchCustom(provider, target, headers, body, signal, { route, headerBuilder = buildCustomHeaders } = {}) {
+async function fetchCustom(provider, target, headers, body, signal, { route, headerBuilder = buildCustomHeaders, usage } = {}) {
   const model = route?.upstreamModel;
   const slots = keySlotsForModel(keySlotsFor(provider), model, route?.preferredKeyId);
   const preferred = slots.find((slot) => slot.id === route?.preferredKeyId);
   if (model && (preferred || slots[0]?.id !== PRIMARY_KEY_SLOT)) stats.keyModelRoutes += 1;
-  if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal, headerBuilder);
+  if (slots.length === 1) return fetchWithKeySlot(provider, slots[0], target, headers, body, signal, headerBuilder, usage);
   const bySlot = new Map(slots.map((slot) => [slot.id, slot]));
   const order = keyRotation.order(provider.id, slots.map((slot) => slot.id), preferred?.id);
   let modelRejected = false;
@@ -14260,7 +14322,7 @@ async function fetchCustom(provider, target, headers, body, signal, { route, hea
     const hasNext = index + 1 < order.length;
     let upstream;
     try {
-      upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder);
+      upstream = await fetchWithKeySlot(provider, slot, target, headers, body, signal, headerBuilder, usage);
     } catch (error) {
       // 讀不到這把 Key（被刪掉、密文檔損壞）：當作被拒，換下一把；連線錯誤照常往外拋。
       if (!error?.keyReadFailed || !hasNext) throw error;
@@ -14611,7 +14673,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         anthropicBody,
         upstreamSignal,
-        { route },
+        { route, usage: meta.history.usage },
       );
       meta.abortClaudeUpstream = () => upstreamController.abort();
       meta.claudeStreamIdleTimeoutMs = claudeStreamIdleTimeoutMs;
@@ -14668,7 +14730,7 @@ export async function fetchModelUpstream(
         requestHeaders,
         chatBody,
         signal,
-        { route },
+        { route, usage: meta.history.usage },
       );
       stats.lastCustomStatus = translated.status;
       recordUpstreamFailure(translated, { transport: meta.transport, route: "custom", model: body?.model, provider });
@@ -14686,7 +14748,7 @@ export async function fetchModelUpstream(
       requestHeaders,
       outboundBody,
       signal,
-      { route, headerBuilder: responsesHeaderBuilder(provider) },
+      { route, headerBuilder: responsesHeaderBuilder(provider), usage: meta.history.usage },
     );
     stats.lastCustomStatus = upstream.status;
     if (upstream.status === 400 || upstream.status === 422) {
@@ -14720,7 +14782,7 @@ export async function fetchModelUpstream(
     );
   }
   stats.official += 1;
-  const upstream = await fetch(targetUrl(false, incomingUrl), {
+  const upstream = await timedModelFetch(meta.history.usage, targetUrl(false, incomingUrl), {
     method: "POST",
     headers: buildOfficialHeaders(requestHeaders),
     body: effectiveBody === body && bodyBuffer ? bodyBuffer : Buffer.from(JSON.stringify(outboundBodyObject)),
@@ -15879,7 +15941,7 @@ async function tryUpstreamWebSocketTurn(
     try {
       session = await connectUpstreamWebSocket(request.headers);
     } catch (error) {
-      connectionState.upstreamDisabled = true;
+      connectionState.upstreamRetryAt = Date.now() + upstreamWebSocketRetryMs;
       connectionState.session = null;
       stats.upstreamWebSocketFallbacks += 1;
       // 握手失敗代表這個端點現在不可用，是全域現象而非這條連線的問題。
@@ -15937,7 +15999,7 @@ async function tryUpstreamWebSocketTurn(
       });
     } catch (error) {
       if (error instanceof Error && error.message === "已取消") return true;
-      connectionState.upstreamDisabled = true;
+      connectionState.upstreamRetryAt = Date.now() + upstreamWebSocketRetryMs;
       connectionState.session = null;
       session.destroy();
       // 已把本輪內容送給 Codex 時不能再透明重播，否則會產生兩套輸出／工具呼叫。
@@ -16045,12 +16107,16 @@ export async function handleWebSocketResponseInner(
   if (
     upstreamWebSocketEnabled &&
     connectionState &&
-    !connectionState.upstreamDisabled &&
+    !(connectionState.upstreamRetryAt > Date.now()) &&
     !upstreamWebSocketInCooldown() &&
     message?.type === "response.create" &&
     route == null &&
     authDigest(request.headers)
   ) {
+    if (connectionState.upstreamRetryAt) {
+      stats.upstreamWebSocketReprobes += 1;
+      connectionState.upstreamRetryAt = 0;
+    }
     const handled = await tryUpstreamWebSocketTurn(
       request,
       socket,
@@ -16162,7 +16228,7 @@ function handleWebSocketUpgrade(request, socket, head) {
   // 每條 Codex 連線對應一條上游 WebSocket；接續狀態不能跨連線共用。
   const connectionState = {
     session: null,
-    upstreamDisabled: false,
+    upstreamRetryAt: 0,
     connectionNamespace: randomBytes(16).toString("hex"),
   };
 
@@ -16320,11 +16386,11 @@ function handleWebSocketUpgrade(request, socket, head) {
 
 const handleClaudeDesktop = createDesktopHandler({
   settings, configPath: join(routerDirectory, DESKTOP_CONFIG_FILE), readBody: readRequestBody,
-  fetchUpstream: async (route, path, headers, body, signal) => {
+  fetchUpstream: async (route, path, headers, body, signal, usage) => {
     const provider = providerForRoute(route);
     stats.custom += 1;
     const upstream = await fetchCustom(provider, new URL(provider.apiRoot + path), headers, body, signal,
-      { route, headerBuilder: desktopHeaders });
+      { route, headerBuilder: desktopHeaders, usage });
     stats.lastCustomStatus = upstream.status;
     return upstream;
   },
@@ -20829,7 +20895,7 @@ export function createDesktopHandler({ settings, configPath, readBody, fetchUpst
       context = { startedAt, model: route.pickerSlug, upstreamModel: route.upstreamModel,
         route: "custom", provider: route.providerId || "default", transport: "claude-desktop", backgroundKind: null, thread: null, recorded: false };
       const upstream = await fetchUpstream(route, countTokens ? "/messages/count_tokens" : "/messages", request.headers,
-        Buffer.from(JSON.stringify({ ...body, model: route.upstreamModel })), controller.signal);
+        Buffer.from(JSON.stringify({ ...body, model: route.upstreamModel })), controller.signal, countTokens ? null : context);
       if (!upstream.ok) throw failure(upstream.status >= 400 ? upstream.status : 502, "claude_upstream_error", `Claude upstream returned HTTP ${upstream.status}.`);
       if (body.stream === true && !countTokens) {
         if (!upstream.headers.get("content-type")?.includes("text/event-stream") || !upstream.body) throw failure(502, "invalid_upstream_response", "Expected an Anthropic event stream.");
@@ -23411,6 +23477,16 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 "官方": "Official",
 "最近的請求": "Recent requests",
 "首次輸出": "First output",
+"HTTP 分段計時": "HTTP timing breakdown",
+"首次送出前": "Before first dispatch",
+"先前嘗試與重試準備": "Earlier attempts and retry preparation",
+"連線與送出請求": "Connection and request upload",
+"送出後等回應標頭": "Upload to response headers",
+"送出請求到回應標頭（合計）": "Dispatch to response headers (combined)",
+"回應標頭到首次輸出": "Response headers to first output",
+"HTTP 嘗試次數": "HTTP attempts",
+"最後一次請求大小": "Last request size",
+"送出完成指本機傳輸層送完，不代表上游已讀完。連線、上傳與等標頭顯示最後一次嘗試；無法量測的階段顯示 —。": "Upload completion is measured by the local transport, not by the server. Connection, upload, and header timings are for the last attempt. Unavailable measurements show —.",
 "總耗時": "Total duration",
 "輸出 TPS": "Output TPS",
 "從路由器收到請求到第一段串流思考、文字或第一個工具呼叫。": "From router request receipt to the first streamed thinking, text or tool call.",
@@ -24945,6 +25021,31 @@ function formatOutputTps(value) {
   return Number.isFinite(value) ? value.toFixed(1) + " tok/s" : "—";
 }
 
+function firstOutputCell(entry) {
+  const value = formatRequestDuration(entry.firstOutputMs ?? entry.firstTextMs);
+  const timing = entry.httpTiming;
+  if (!timing) return h("td", { class: "nowrap num", text: value });
+  const title = t("HTTP 分段計時");
+  const show = () => {
+    const rows = [
+      [t("首次送出前"), formatRequestDuration(timing.beforeDispatchMs)],
+      ...(timing.attempts > 1 ? [[t("先前嘗試與重試準備"), formatRequestDuration(timing.previousAttemptsMs)]] : []),
+      [t("連線與送出請求"), formatRequestDuration(timing.sendMs)],
+      [t("送出後等回應標頭"), formatRequestDuration(timing.waitHeadersMs)],
+      [t("送出請求到回應標頭（合計）"), formatRequestDuration(timing.dispatchToHeadersMs)],
+      [t("回應標頭到首次輸出"), formatRequestDuration(timing.headersToFirstOutputMs)],
+      [t("HTTP 嘗試次數"), formatNumber(timing.attempts)],
+      [t("最後一次請求大小"), Number.isFinite(timing.requestBytes) ? formatNumber(timing.requestBytes) + " B" : "—"],
+    ];
+    openModal({ title, body: [
+      h("dl", { class: "kv" }, rows.map(([label, text]) => [h("dt", { text: label }), h("dd", { class: "mono", text })])),
+      paragraph(t("送出完成指本機傳輸層送完，不代表上游已讀完。連線、上傳與等標頭顯示最後一次嘗試；無法量測的階段顯示 —。"), "note"),
+    ] });
+  };
+  return h("td", { class: "nowrap num" }, h("button", { type: "button", class: "link-button", title,
+    "aria-label": title + " · " + value, text: value, onclick: show }));
+}
+
 function renderUsage() {
   if (!usageData && !usageLoading) loadUsage();
   const range = h("select", { "aria-label": t("時間範圍"), disabled: usageLoading, onchange: (event) => { usageHours = Number(event.target.value); loadUsage(); } },
@@ -25022,7 +25123,7 @@ function renderUsage() {
         num(entry.hasUsage ? formatTokens(entry.input) : "—"),
         num(entry.hasUsage && entry.input ? percent(entry.cached / entry.input) : "—"),
         num(entry.hasUsage ? formatTokens(entry.output) : "—"),
-        num(formatRequestDuration(entry.firstOutputMs ?? entry.firstTextMs)),
+        firstOutputCell(entry),
         num(formatRequestDuration(entry.durationMs)),
         num(formatOutputTps(entry.outputTps)))))))));
   parts.push(h("div", { class: "note mono", text: usageData.logPath || "" }));

@@ -1,6 +1,7 @@
 // 模型使用記錄：路由器每一輪寫一筆到 usage.jsonl，管理頁彙整各模型的 token、快取命中率與耗時。
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { once } from "node:events";
 import { readFileSync, existsSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -148,6 +149,9 @@ test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", as
   const record = JSON.parse(text.trim().split("\n").pop());
   assert.equal(record.model, "custom/owo-gpt");
   assert.equal(record.status, "completed");
+  assert.equal(record.httpTiming.sendMs, null, "mock fetch has no transport upload signal");
+  assert.equal(record.httpTiming.waitHeadersMs, null);
+  assert.ok(Number.isFinite(record.httpTiming.dispatchToHeadersMs));
   assert.equal(record.input, 500);
   assert.equal(record.cached, 400);
   assert.equal(record.output, 30);
@@ -170,4 +174,60 @@ test("經過路由器的一輪會寫進 usage.jsonl，不含提示詞內容", as
   assert.ok(toolRecord.durationMs - toolRecord.firstOutputMs >= 30, "streamed thinking starts the output clock");
   assert.equal(toolRecord.output, 30);
   assert.equal(toolRecord.outputTps, null);
+});
+
+test("HTTP 分段：兩個並行請求、換 Key 重試，以及標頭後延遲的第一段 SSE", async (t) => {
+  const previous = process.env.CODEX_MODEL_ROUTER_TEST_API_KEY;
+  process.env.CODEX_MODEL_ROUTER_TEST_API_KEY = "fixture-key";
+  t.after(() => { if (previous === undefined) delete process.env.CODEX_MODEL_ROUTER_TEST_API_KEY; else process.env.CODEX_MODEL_ROUTER_TEST_API_KEY = previous; });
+  const listen = async server => {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    return "http://127.0.0.1:" + server.address().port;
+  };
+  const bytes = {};
+  let rejected = false;
+  const apiRoot = await listen(http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    const id = body.includes("private-prompt-b") ? "b" : "a";
+    bytes[id] = body.length;
+    await delay(40);
+    if (id === "b" && !rejected) { rejected = true; res.writeHead(429); res.end(); return; }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.flushHeaders();
+    await delay(id === "b" ? 90 : 50);
+    res.end('data: {"type":"response.output_text.delta","delta":"x"}\n\ndata: ' + JSON.stringify({
+      type: "response.completed", response: { id, status: "completed", output: [] },
+    }) + "\n\n");
+  }));
+  const route = { pickerSlug: "custom/relay", upstreamModel: "relay", efforts: [] };
+  const { router, dir } = await loadRouterInDir({ apiRoot, routes: [route] });
+  writeFileSync(router.KEY_POOL_FILE, JSON.stringify({ providers: { default: [{ id: "k-a", keychainService: "fixture" }] } }));
+  const origin = await listen(router.routerServer);
+  const headers = { authorization: "Bearer synthetic", "chatgpt-account-id": "test" };
+  router.markAuthValidated(headers);
+  await Promise.all(["a", "b"].map(async id => {
+    const response = await fetch(origin + "/v1/responses", { method: "POST", headers: { ...headers, "thread-id": id },
+      body: JSON.stringify({ model: route.pickerSlug, stream: true, input: "private-prompt-" + id + (id === "b" ? "x".repeat(30000) : "") }) });
+    assert.equal(response.status, 200);
+    await response.text();
+  }));
+  const raw = readFileSync(join(dir, "usage.jsonl"), "utf8");
+  assert.doesNotMatch(raw, /private-prompt|fixture-key|Bearer synthetic/);
+  const records = raw.trim().split("\n").map(s => JSON.parse(s));
+  assert.equal(records.length, 2);
+  for (const r of records) {
+    const m = r.httpTiming;
+    assert.equal(m.attempts, r.thread === "b" ? 2 : 1);
+    assert.equal(m.requestBytes, bytes[r.thread]);
+    assert.ok(Number.isFinite(m.sendMs) && m.sendMs >= 0);
+    assert.ok(m.waitHeadersMs >= 25);
+    assert.ok(m.headersToFirstOutputMs >= (r.thread === "b" ? 65 : 25));
+    assert.ok(r.thread === "b" ? m.previousAttemptsMs >= 25 : m.previousAttemptsMs === 0);
+    assert.equal(m.dispatchToHeadersMs, m.sendMs + m.waitHeadersMs);
+    assert.equal(r.firstOutputMs, m.beforeDispatchMs + m.previousAttemptsMs + m.dispatchToHeadersMs + m.headersToFirstOutputMs);
+  }
 });

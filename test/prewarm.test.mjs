@@ -94,7 +94,7 @@ test("中轉 GPT 的預熱由路由器本機完成，不送上游；下一輪增
   useTestKey(t);
   const instance = await loadRouterWith({ upstreamWebSocket: false, routes: [claude, relay] });
   const sent = mockUpstream(t);
-  const state = { session: null, connectionNamespace: "relay-prewarm", upstreamDisabled: true };
+  const state = { session: null, connectionNamespace: "relay-prewarm", upstreamRetryAt: Infinity };
 
   const warm = await turn(instance, state, { model: relay.pickerSlug, generate: false, instructions: "sys", tools: [], input: base });
   assert.equal(sent.length, 0, "預熱不能變成一次完整生成");
@@ -117,7 +117,7 @@ test("預熱只有指令與工具（沒有輸入）時，下一輪仍可接續�
   useTestKey(t);
   const instance = await loadRouterWith({ upstreamWebSocket: false, routes: [claude, relay] });
   const sent = mockUpstream(t);
-  const state = { session: null, connectionNamespace: "empty-prewarm", upstreamDisabled: true };
+  const state = { session: null, connectionNamespace: "empty-prewarm", upstreamRetryAt: Infinity };
   const warm = await turn(instance, state, { model: relay.pickerSlug, generate: false, instructions: "sys", tools: [], input: [] });
   const next = await turn(instance, state, { model: relay.pickerSlug, previous_response_id: warm.at(-1).response.id, input: [user("第一則")] });
   assert.equal(next.at(-1).type, "response.completed");
@@ -128,7 +128,7 @@ test("預熱與下一輪帶的工作階段識別不同時，仍能憑預熱 id �
   useTestKey(t);
   const instance = await loadRouterWith({ upstreamWebSocket: false, routes: [claude, relay] });
   const sent = mockUpstream(t);
-  const state = { session: null, connectionNamespace: "identity-prewarm", upstreamDisabled: true };
+  const state = { session: null, connectionNamespace: "identity-prewarm", upstreamRetryAt: Infinity };
   const warm = await turn(instance, state, { model: relay.pickerSlug, generate: false, input: base,
     client_metadata: { session_id: "prewarm-meta" } });
   await turn(instance, state, { model: relay.pickerSlug, previous_response_id: warm.at(-1).response.id,
@@ -144,7 +144,7 @@ test("Claude 路由的預熱同樣不送上游；接續時把預熱輸入一起�
   useTestKey(t);
   const instance = await loadRouterWith({ upstreamWebSocket: false, routes: [claude, relay] });
   const sent = mockUpstream(t, () => anthropicStream("好"));
-  const state = { session: null, connectionNamespace: "claude-prewarm", upstreamDisabled: true };
+  const state = { session: null, connectionNamespace: "claude-prewarm", upstreamRetryAt: Infinity };
   const warm = await turn(instance, state, { model: claude.pickerSlug, generate: false, instructions: "sys", tools: [], input: base });
   assert.equal(sent.length, 0);
   assert.equal(warm.at(-1).type, "response.completed");
@@ -162,14 +162,14 @@ test("官方路由：上游 WebSocket 可用時預熱原樣交給官方；回退
   const forwarded = [];
   const session = { closed: false, responseIds: new Set(), destroy() { this.closed = true; },
     send(payload) { forwarded.push(payload); queueMicrotask(() => this.onEvent(completed("official-" + forwarded.length))); } };
-  const live = { session, connectionNamespace: "official-live", upstreamDisabled: false };
+  const live = { session, connectionNamespace: "official-live", upstreamRetryAt: 0 };
   const warm = await turn(instance, live, { model: "gpt-test", generate: false, input: base });
   assert.equal(forwarded.length, 1);
   assert.equal(forwarded[0].generate, false, "官方後端自己支援預熱，要原樣轉交");
   assert.equal(warm.at(-1).response.id, "official-1");
 
   const sent = mockUpstream(t);
-  const fallback = { session: null, connectionNamespace: "official-fallback", upstreamDisabled: true };
+  const fallback = { session: null, connectionNamespace: "official-fallback", upstreamRetryAt: Infinity };
   const local = await turn(instance, fallback, { model: "gpt-test", generate: false, input: base });
   assert.equal(sent.length, 0, "HTTP 回退時不能把預熱變成完整生成");
   assert.match(local.at(-1).response.id, /^resp_prewarm_/);

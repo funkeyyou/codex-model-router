@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import tls from "node:tls";
+import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { loadRouterWith } from "./helpers/payloads.mjs";
 
 const headers = {
@@ -158,7 +161,7 @@ for (const fallback of [false, true]) {
       httpSent.push(JSON.parse(options.body));
       return stream([completed("resp_http", [])]);
     });
-    const state = { session, connectionNamespace: "ws-test", upstreamDisabled: false };
+    const state = { session, connectionNamespace: "ws-test", upstreamRetryAt: 0 };
     const run = (body) => router.handleWebSocketResponseInner(
       { headers }, socketFor(router), inputUrl, { type: "response.create", ...body }, new AbortController(), state,
     );
@@ -168,7 +171,10 @@ for (const fallback of [false, true]) {
     assert.equal(sent[2].previous_response_id, undefined);
     assert.equal(sent[2].input.filter((item) => item.type === "function_call_output").length, 1);
     assert.equal(httpSent.length, fallback ? 1 : 0);
-    if (fallback) assert.deepEqual(httpSent[0].input, sent[2].input);
+    if (fallback) {
+      assert.equal(Object.hasOwn(httpSent[0], "previous_response_id"), false, "WS → official HTTP: never forward the WS id");
+      assert.deepEqual(httpSent[0].input, sent[2].input);
+    }
   });
 }
 
@@ -193,7 +199,7 @@ test("官方 WebSocket 回 previous_response_not_found 時由路由器重播，C
     destroy() { this.closed = true; },
   };
   t.mock.method(globalThis, "fetch", () => assert.fail("重播應留在同一條 WebSocket，不必回退 HTTP"));
-  const state = { session, connectionNamespace: "ws-not-found", upstreamDisabled: false };
+  const state = { session, connectionNamespace: "ws-not-found", upstreamRetryAt: 0 };
   const socket = socketFor(router);
   const run = (body) => router.handleWebSocketResponseInner(
     { headers }, socket, inputUrl, { type: "response.create", ...body }, new AbortController(), state,
@@ -220,7 +226,61 @@ test("WebSocket 已轉發內容後斷線，不再透明回退而重複產生輸�
   };
   await assert.rejects(router.handleWebSocketResponseInner(
     { headers }, socketFor(router), inputUrl, { type: "response.create", ...initial() }, new AbortController(),
-    { session, connectionNamespace: "partial", upstreamDisabled: false },
+    { session, connectionNamespace: "partial", upstreamRetryAt: 0 },
   ), (error) => error.eventsForwarded === true);
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("同一條官方連線：HTTP 冷卻、探測失敗續冷卻、全域冷卻後重建，再恢復增量", async (t) => {
+  const router = await loadRouterWith({ upstreamWebSocketRetryMs: 1000, upstreamWebSocketCooldownMs: 5000 });
+  let clock = Date.now(), connects = 0, http = 0;
+  t.mock.method(Date, "now", () => clock);
+  const ws = [];
+  t.mock.method(tls, "connect", () => {
+    const tcp = new EventEmitter();
+    tcp.writable = true;
+    tcp.destroy = () => { tcp.destroyed = true; };
+    if (++connects < 3) queueMicrotask(() => tcp.emit("error", new Error("reset")));
+    else {
+      tcp.write = (data) => {
+        if (typeof data === "string") {
+          const key = /Sec-WebSocket-Key: (\S+)/i.exec(data)[1];
+          const accept = createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+          queueMicrotask(() => tcp.emit("data", Buffer.from("HTTP/1.1 101 OK\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n")));
+        } else {
+          ws.push(JSON.parse(router.parseWebSocketFrames(data).frames[0].payload));
+          queueMicrotask(() => tcp.emit("data", router.encodeWebSocketFrame(1, JSON.stringify(completed("ws" + ws.length, [])))));
+        }
+        return true;
+      };
+      queueMicrotask(() => tcp.emit("secureConnect"));
+    }
+    return tcp;
+  });
+  t.mock.method(globalThis, "fetch", (_target, init) => {
+    const body = JSON.parse(init.body);
+    assert.equal(Object.hasOwn(body, "previous_response_id"), false, "official HTTP rejects this parameter even for an HTTP parent");
+    assert.deepEqual(body.input.map(i => i.content), ["a", "b", "c", "d"].slice(0, http + 1));
+    return stream([completed("http" + ++http, [])]);
+  });
+  const state = { connectionNamespace: "reprobe" };
+  const run = (previous_response_id, text) => router.handleWebSocketResponseInner({ headers }, socketFor(router), inputUrl,
+    { type: "response.create", model: "official-test", previous_response_id, input: [{ role: "user", content: text }] },
+    new AbortController(), state);
+  await run(undefined, "a");
+  clock += 999; await run("http1", "b");
+  assert.equal(connects, 1);
+  clock++; await run("http2", "c");
+  assert.equal(connects, 2);
+  clock += 1001; await run("http3", "d");
+  assert.equal(connects, 2, "per-connection probe must respect global cooldown");
+  clock += 4000; await run("http4", "e");
+  assert.equal(connects, 3);
+  assert.equal(ws[0].previous_response_id, undefined, "HTTP id cannot be chained on the new upstream socket");
+  assert.deepEqual(ws[0].input.map(i => i.content), ["a", "b", "c", "d", "e"]);
+  await run("ws1", "f");
+  assert.equal(ws[1].previous_response_id, "ws1");
+  assert.deepEqual(ws[1].input.map(i => i.content), ["f"]);
+  assert.equal(http, 4);
+  assert.equal(connects, 3);
 });

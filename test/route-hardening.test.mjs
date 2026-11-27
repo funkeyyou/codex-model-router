@@ -197,7 +197,7 @@ test("切換官方 GPT 模型會重播完整歷史，且不外送本機圖片工
   const sent = [];
   const session = { closed: false, responseIds: new Set(), destroy() { this.closed = true; },
     send(payload) { sent.push(payload); queueMicrotask(() => this.onEvent(completed(`r${sent.length}`))); } };
-  const state = { session, connectionNamespace: "model-switch", upstreamDisabled: false };
+  const state = { session, connectionNamespace: "model-switch", upstreamRetryAt: 0 };
   const socket = { destroyed: false, writable: true, write() { return true; } };
   await instance.handleWebSocketResponseInner({ headers }, socket, url, { type: "response.create", model: "gpt-one", input: [user("original")] }, new AbortController(), state);
   await instance.handleWebSocketResponseInner({ headers }, socket, url, { type: "response.create", model: "gpt-two", previous_response_id: "r1", input: [user("next")] }, new AbortController(), state);

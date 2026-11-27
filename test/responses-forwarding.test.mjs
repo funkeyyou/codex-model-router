@@ -64,7 +64,7 @@ for (const transport of ["HTTP", "WebSocket"]) {
         const chunks = [];
         const socket = { destroyed: false, writable: true, write(chunk) { chunks.push(Buffer.from(chunk)); return true; } };
         await instance.handleWebSocketResponseInner({ headers }, socket, new URL("http://localhost/v1/responses"),
-          { ...body, type: "response.create" }, new AbortController(), { upstreamDisabled: true, connectionNamespace: "cold" });
+          { ...body, type: "response.create" }, new AbortController(), { upstreamRetryAt: Infinity, connectionNamespace: "cold" });
         const events = instance.parseWebSocketFrames(Buffer.concat(chunks)).frames.map(frame => JSON.parse(frame.payload));
         assert.equal(events.at(-1).type, "response.completed");
       }

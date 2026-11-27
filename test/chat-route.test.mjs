@@ -105,7 +105,7 @@ for (const transport of ["HTTP", "WebSocket"]) {
       const socket = socketFor(instance);
       await instance.handleWebSocketResponseInner({ headers }, socket, new URL("http://localhost/v1/responses"),
         { ...body, type: "response.create" }, new AbortController(),
-        { session: null, connectionNamespace: "deepseek-tools", upstreamDisabled: true });
+        { session: null, connectionNamespace: "deepseek-tools", upstreamRetryAt: Infinity });
       return socket.events;
     };
     const events = await run({ model: native.pickerSlug, stream: true, input: [
@@ -163,7 +163,7 @@ for (const transport of ["HTTP", "WebSocket"]) {
         const socket = socketFor(instance);
         await instance.handleWebSocketResponseInner({ headers }, socket, new URL("http://localhost/v1/responses"),
           { ...body, type: "response.create" }, new AbortController(),
-          { session: null, connectionNamespace: "compact", upstreamDisabled: true });
+          { session: null, connectionNamespace: "compact", upstreamRetryAt: Infinity });
         events = socket.events;
       }
       assert.equal(sent.length, 1);
@@ -267,7 +267,7 @@ test("WebSocket：同樣轉成 Responses 事件並以終止事件收尾；上游
     const socket = socketFor(instance);
     await instance.handleWebSocketResponseInner({ headers }, socket, new URL("http://127.0.0.1/v1/responses"),
       { type: "response.create", model: chatRoute.pickerSlug, input: "hi" }, new AbortController(),
-      { session: null, connectionNamespace: "chat-ws", upstreamDisabled: true });
+      { session: null, connectionNamespace: "chat-ws", upstreamRetryAt: Infinity });
     return socket.events;
   };
   const events = await run();
