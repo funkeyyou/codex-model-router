@@ -29,7 +29,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.48.3";
+const INSTALLER_VERSION = "1.48.4";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2771,6 +2771,7 @@ const ANTIGRAVITY_INPUT_MODALITIES = ["text", "image"];
 export function refreshCustomCatalogCapabilities(catalog, routes) {
   if (!Array.isArray(catalog?.models)) return catalog;
   const bySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
+  const officialModels = catalog.models.filter((model) => !String(model?.slug || "").startsWith("custom/"));
   let changed = false;
   const models = catalog.models.map((model) => {
     const route = bySlug.get(model.slug);
@@ -2779,14 +2780,20 @@ export function refreshCustomCatalogCapabilities(catalog, routes) {
     const effortFields = route.transport === "antigravity-cli"
       ? { ...catalogEffortFields(route.efforts), input_modalities: ANTIGRAVITY_INPUT_MODALITIES }
       : fixedReasoningEffort(route.upstreamModel) ? catalogEffortFields([]) : {};
+    // 沒有官方模板可對照（獨立模式）時不動既有值；沒有這個欄位等同關閉，需要開啟才補上。
+    const template = catalogTemplateFor(officialModels, route);
+    const toolSearch = template ? customToolSearch(route, model, template) : false;
+    const capabilityFields = template && (toolSearch || model.supports_search_tool !== undefined)
+      ? { ...effortFields, supports_search_tool: toolSearch }
+      : effortFields;
     const instructions = modelIdentityInstructions(model.base_instructions, route);
     const messages = modelIdentityMessages(model.model_messages, route);
     const tiersMatch = isDeepStrictEqual(model.additional_speed_tiers ?? [], tiers.additional_speed_tiers)
       && isDeepStrictEqual(model.service_tiers ?? [], tiers.service_tiers);
     if (tiersMatch && instructions === model.base_instructions && messages === model.model_messages
-      && Object.entries(effortFields).every(([key, value]) => isDeepStrictEqual(model[key], value))) return model;
+      && Object.entries(capabilityFields).every(([key, value]) => isDeepStrictEqual(model[key], value))) return model;
     changed = true;
-    return { ...model, ...tiers, ...effortFields, ...(instructions === undefined ? {} : { base_instructions: instructions }),
+    return { ...model, ...tiers, ...capabilityFields, ...(instructions === undefined ? {} : { base_instructions: instructions }),
       ...(messages === undefined ? {} : { model_messages: messages }) };
   });
   return changed ? { ...catalog, models } : catalog;
@@ -3148,16 +3155,10 @@ export function planDetectedFast(manifest, settings, catalog, slug, fastProbe) {
 }
 
 export function customCatalogEntry(officialModels, route, index) {
-  const lastSegment = route.upstreamModel.split("/").at(-1);
-  const exactTemplate = officialModels.find(
-    (model) => model.slug === route.upstreamModel || model.slug === lastSegment,
-  );
-  const fallbackTemplate =
-    officialModels.find((model) => model.slug === "gpt-5.6-sol") ||
-    officialModels.find((model) => model.visibility === "list") ||
-    officialModels[0];
+  const exactTemplate = exactCatalogTemplate(officialModels, route);
+  const template = catalogTemplateFor(officialModels, route);
   // 獨立模式沒有 Codex 內建目錄，只保留路由器自己的中繼資料，不宣稱官方模型能力。
-  const entry = structuredClone(exactTemplate || fallbackTemplate || {
+  const entry = structuredClone(template || {
     context_window: route.contextWindow || NEW_MODEL_DEFAULTS.contextWindow,
     max_context_window: route.contextWindow || NEW_MODEL_DEFAULTS.contextWindow,
     effective_context_window_percent: 95,
@@ -3181,7 +3182,6 @@ export function customCatalogEntry(officialModels, route, index) {
     entry.input_modalities = ANTIGRAVITY_INPUT_MODALITIES;
     entry.supports_parallel_tool_calls = true;
   }
-  entry.supports_search_tool = false;
   delete entry.web_search_tool_type;
   // 只有 Chat Completions 的模型改用一般函式工具，不用 Code Mode：Code Mode 要模型把整段
   // JavaScript 塞進單一工具參數，這些模型熟悉的是一般的函式呼叫。
@@ -3190,6 +3190,7 @@ export function customCatalogEntry(officialModels, route, index) {
     if (route.combo?.executorTranslate === "chat") delete entry.tool_mode;
     if (Array.isArray(route.combo?.inputModalities)) entry.input_modalities = route.combo.inputModalities;
   }
+  entry.supports_search_tool = customToolSearch(route, entry, template);
   // 上下文視窗解析順序：探測值 > 官方同名模板 > 通用模板值（並警告）。
   if (Number.isFinite(route.contextWindow) && route.contextWindow > 0) {
     entry.context_window = route.contextWindow;
@@ -3207,6 +3208,36 @@ export function customCatalogEntry(officialModels, route, index) {
     entry.max_output_tokens = route.maxOutputTokens;
   }
   return entry;
+}
+
+function exactCatalogTemplate(officialModels, route) {
+  const upstream = String(route?.upstreamModel || "");
+  const lastSegment = upstream.split("/").at(-1);
+  return officialModels.find((model) => model.slug === upstream || model.slug === lastSegment);
+}
+
+// 自訂模型的能力欄位以哪個官方項目為模板：同名模型，否則 gpt-5.6-sol。router.mjs 的
+// syncCustomInstructions 用同樣的順序挑模板。
+export function catalogTemplateFor(officialModels, route) {
+  const models = Array.isArray(officialModels) ? officialModels : [];
+  return exactCatalogTemplate(models, route) ||
+    models.find((model) => model.slug === "gpt-5.6-sol") ||
+    models.find((model) => model.visibility === "list") ||
+    models[0];
+}
+
+// 官方模型開啟 supports_search_tool 時，Codex 會延後載入外掛與 MCP 工具，而且全在 Codex 本機
+// 完成，上游不必支援 Responses 原生的 tool_search：
+//   - Code Mode：exec 說明只寫核心工具，其他工具改列命名空間清單，模型用到時從 ALL_TOOLS 查。
+//   - 一般函式工具模式：Codex 改送一個 execution:"client" 的 tool_search 工具，由 Codex 執行搜尋。
+//     chat-bridge.mjs 會把它轉成函式並把模型的呼叫改回 tool_search_call；目前只對 Antigravity CLI
+//     開啟，其他 Chat Completions 上游的模型能否照著先搜再用尚未驗證，維持關閉。
+// 組合模型的大腦與雙手可能分屬兩種模式，也先關閉。router.mjs 的 customToolSearch 是同一條規則，
+// 兩邊要一起改。
+export function customToolSearch(route, entry, template) {
+  if (template?.supports_search_tool !== true || route?.transport === "combo") return false;
+  if (entry?.tool_mode === "code_mode_only") return route?.translate !== "chat";
+  return route?.transport === "antigravity-cli";
 }
 
 function deepGet(object, path) {

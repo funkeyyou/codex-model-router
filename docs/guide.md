@@ -441,6 +441,25 @@ Ark 不支持指定尺寸／品质或透明背景，`--size`、`--quality` 须�
 `claudeToolDefinitionsDeferred` 与 `claudeToolDescriptionCharsSaved` 为启动后累计值。
 这些是字符统计，不是 token 数，也不是帐单节省。
 
+**1.48.4 起，自定义模型沿用官方的工具延后载入。** 官方模型的目录项目开启 `supports_search_tool` 时，
+Codex 只送核心工具，插件与 MCP 工具改列一份命名空间清单，用到时才取得完整定义；整个过程在 Codex 本机完成，
+上游不必支持 Responses 原生 `tool_search`。Code Mode 的模型（Responses 转送与 Claude 转译）从 `ALL_TOOLS`
+查完整定义再呼叫。一般函数工具模式的 Antigravity CLI 则会收到一个 `execution:"client"` 的 `tool_search`
+工具，路由器把它转成同名函数；模型呼叫时改回 `tool_search_call` 交给 Codex 搜寻，下一轮 Codex 带回的完整定义
+并进工具清单。这些模型沿用同名官方模型（没有同名时用 gpt-5.6-sol）的设置，安装、更新与每次同步官方清单时
+自动对齐。其他 Chat Completions 上游与组合模型尚未验证先搜再用，维持关闭。实测同一份工具组合，第一轮输入
+GPT 自定义模型从约 10.9 万 tokens 降到约 3.5 万，Antigravity CLI 的 Gemini 从约 9.3 万降到约 3.5 万。第一次
+用到某组插件时会多一轮搜寻。只有新对话受益：更新前已开始的对话会补送一份精简清单，原本的完整清单仍留在
+历史里。上面的 Claude 摘要化仍保留，处理没有被延后的工具。
+
+**1.48.4 起，换模型后送出的请求会拿掉旧工具定义。** Codex 换模型时会把工具清单整份再送一次，并声明
+哪些旧工具不再可用，旧清单却仍留在历史里、每一轮跟着重送。自定义模型在换模型之后，送出前会拿掉已被
+重新定义或声明不可用的旧定义；历史里呼叫过的工具保留定义，保存的历史维持原文。换模型那一轮新模型
+本来就没有快取，之后每一轮精简的结果都相同，不会额外打断快取；若在快取有效期内切回先前用过的模型，
+那一轮不会沿用该模型先前的快取。同一个模型中途补送清单（例如插件晚连上）不处理，以免已命中的快取
+前缀失效。健康检查的 `lastSwitchToolPrune` 显示最近一次拿掉的工具数与字符数，
+`switchToolDefinitionsPruned` 与 `switchToolDefinitionCharsPruned` 为启动后累计值。
+
 **1.22.4 起，同一个工具呼叫的多笔输出会合并成一个结果。** Code Mode 的 `exec` 每呼叫一次
 `notify()`，Codex 就替同一个 `call_id` 追加一笔输出；Responses 接受这种历史，Anthropic 则规定
 每个 `tool_use` 只能有一个 `tool_result`。Claude 转译会把同一则消息内的后续输出依序并回原本的结果；

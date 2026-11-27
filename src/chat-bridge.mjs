@@ -41,6 +41,48 @@ const CHAT_EFFORTS = {
 
 const NO_OUTPUT = "(no output)";
 
+// ---------------------------------------------------------------- 工具搜尋
+//
+// 一般函式工具模式的模型開啟延後載入（supports_search_tool）時，Codex 只送核心工具與一個
+// type:"tool_search"、execution:"client" 的搜尋工具，外掛與 MCP 工具改列分類清單。搜尋由
+// Codex 本機執行：收到 tool_search_call 後比對延後的工具，下一輪以 tool_search_output 帶回
+// 完整定義（collectToolDefinitions 會把它們併進工具清單）。Chat Completions 沒有這種工具，
+// 轉成同名函式；模型呼叫它時改回 tool_search_call，交給 Codex 執行。伺服器端執行
+// （execution:"server"）的版本沒有執行器，照舊視為不可用的平台工具。
+const TOOL_SEARCH_NAME = "tool_search";
+const isClientToolSearch = (item) => item?.execution === "client";
+
+function toolSearchFunction(tool) {
+  const parameters = tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
+    ? tool.parameters
+    : { type: "object", properties: { query: { type: "string" }, limit: { type: "number" } }, required: ["query"] };
+  return {
+    type: "function",
+    function: {
+      name: TOOL_SEARCH_NAME,
+      description: tool.description || "Search deferred tools by keywords and load the matching tools for the next call.",
+      parameters: sanitizeToolSchema(flattenTopLevelSchema(parameters)),
+    },
+  };
+}
+
+function toolSearchArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  try {
+    const parsed = parseToolArguments(typeof value === "string" ? value : "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// 搜尋結果的定義已併進工具清單，這裡只列出載入了哪些工具（用模型看到的名稱）。
+function toolSearchResultText(item) {
+  const names = flattenTools(Array.isArray(item.tools) ? item.tools : []).tools.map((tool) => tool.name);
+  if (!names.length) return "No matching tools were found. Try another query, or continue without them.";
+  return `Loaded ${names.length} tool(s). They are now in your tool list and can be called directly: ${names.join(", ")}`;
+}
+
 // ---------------------------------------------------------------- 推理
 //
 // Chat Completions 的推理是明文（delta.reasoning_content 或 delta.reasoning）。
@@ -234,11 +276,13 @@ export function toChatRequest(body, route) {
 
   // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
   const toolDefinitions = collectToolDefinitions(body, inputItems);
+  const toolSearch = toolDefinitions.findLast((tool) => tool?.type === "tool_search" && isClientToolSearch(tool)) || null;
   const { tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions);
   const unavailable = [];
   const inspectTools = (tools) => {
     for (const tool of tools) {
       if (tool?.type === "namespace") inspectTools(tool.tools || []);
+      else if (tool?.type === "tool_search" && isClientToolSearch(tool)) continue;
       else if (!["function", "custom"].includes(tool?.type)) unavailable.push(tool?.type || "unknown");
     }
   };
@@ -314,6 +358,14 @@ export function toChatRequest(body, route) {
     if (!text) return;
     const current = currentAssistant(index);
     current.text = current.text ? `${current.text}\n\n${text}` : text;
+  };
+  const pushHostedSummary = (index, item) => {
+    const summary = hostedToolSummary(item);
+    if (summary.role === "assistant") appendAssistantText(index, summary.text);
+    else {
+      closeToolGroup();
+      pushUser([{ type: "text", text: summary.text }]);
+    }
   };
   const pushToolCall = (index, callId, name, args) => {
     if (textOnlyTools || !callId) {
@@ -425,6 +477,23 @@ export function toChatRequest(body, route) {
         handleToolOutput(item);
         break;
 
+      // Codex 本機執行的工具搜尋：轉成一般的工具呼叫與結果，模型才看得出自己搜過什麼。
+      case "tool_search_call":
+        if (isClientToolSearch(item) && item.call_id) {
+          pushToolCall(index, item.call_id, TOOL_SEARCH_NAME, JSON.stringify(toolSearchArguments(item.arguments)));
+        } else {
+          pushHostedSummary(index, item);
+        }
+        break;
+
+      case "tool_search_output":
+        if (isClientToolSearch(item) && item.call_id) {
+          handleToolOutput({ type: "function_call_output", call_id: item.call_id, output: toolSearchResultText(item) });
+        } else {
+          pushHostedSummary(index, item);
+        }
+        break;
+
       // 官方 GPT 回合留下的平台內建工具項目：都已完成，也沒有可轉送的執行器，轉成簡短文字。
       case "web_search_call":
       case "file_search_call":
@@ -436,16 +505,8 @@ export function toChatRequest(body, route) {
       case "mcp_list_tools":
       case "mcp_approval_request":
       case "mcp_approval_response":
-      case "tool_search_call":
-      case "tool_search_output": {
-        const summary = hostedToolSummary(item);
-        if (summary.role === "assistant") appendAssistantText(index, summary.text);
-        else {
-          closeToolGroup();
-          pushUser([{ type: "text", text: summary.text }]);
-        }
+        pushHostedSummary(index, item);
         break;
-      }
 
       case "compaction_trigger":
         compaction = true;
@@ -482,6 +543,10 @@ export function toChatRequest(body, route) {
   if (systemParts.length) chatMessages.unshift({ role: "system", content: systemParts.join("\n\n") });
 
   const { tools, freeform, toolContext } = toChatTools(codexTools);
+  if (toolSearch && !tools.some((tool) => tool.function.name === TOOL_SEARCH_NAME)) {
+    tools.push(toolSearchFunction(toolSearch));
+    toolTargets.set(TOOL_SEARCH_NAME, { name: TOOL_SEARCH_NAME, toolSearch: true });
+  }
   const request = { model: upstreamModel, messages: chatMessages, stream: true };
   for (const key of ["temperature", "top_p"]) {
     if (body[key] !== undefined) request[key] = body[key];
@@ -784,6 +849,18 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     const target = ctx.toolTargets?.get(entry.alias);
     entry.name = target?.name || entry.alias;
     entry.namespace = target?.namespace || null;
+    if (target?.toolSearch) {
+      // 交給 Codex 執行的工具搜尋，見檔案開頭「工具搜尋」。
+      entry.toolSearch = true;
+      entry.itemId = randomId("tsc_", 54);
+      send({
+        type: "response.output_item.added",
+        output_index: entry.index,
+        item: { id: entry.itemId, type: "tool_search_call", status: "in_progress", call_id: entry.callId,
+          execution: "client", arguments: {} },
+      });
+      return;
+    }
     entry.freeform = ctx.freeform.has(entry.alias);
     if (entry.freeform) entry.itemId = randomId("ctc_", 54);
     const identity = entry.namespace ? { name: entry.name, namespace: entry.namespace } : { name: entry.name };
@@ -852,6 +929,13 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     if (!parsed || (entry.freeform && typeof parsed[FREEFORM_KEY] !== "string")) {
       fail({ code: "invalid_tool_arguments", message: "上游工具參數不完整或格式錯誤；未產生替代參數，請重新產生該工具呼叫。" });
       return false;
+    }
+    if (entry.toolSearch) {
+      const item = { id: entry.itemId, type: "tool_search_call", status: "completed", call_id: entry.callId,
+        execution: "client", arguments: parsed };
+      output.push(item);
+      send({ type: "response.output_item.done", output_index: entry.index, item });
+      return true;
     }
     const identity = entry.namespace ? { name: entry.name, namespace: entry.namespace } : { name: entry.name };
     let item;

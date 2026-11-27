@@ -107,7 +107,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const INSTALLER_VERSION = "1.48.3";
+const INSTALLER_VERSION = "1.48.4";
 export const CLAUDE_CLI_MIN_VERSION = "2.1.280";
 const isWindows = process.platform === "win32";
 // 憑證儲存：macOS 走鑰匙圈；Windows 走 DPAPI（CurrentUser 範圍）加密檔。
@@ -2849,6 +2849,7 @@ const ANTIGRAVITY_INPUT_MODALITIES = ["text", "image"];
 export function refreshCustomCatalogCapabilities(catalog, routes) {
   if (!Array.isArray(catalog?.models)) return catalog;
   const bySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
+  const officialModels = catalog.models.filter((model) => !String(model?.slug || "").startsWith("custom/"));
   let changed = false;
   const models = catalog.models.map((model) => {
     const route = bySlug.get(model.slug);
@@ -2857,14 +2858,20 @@ export function refreshCustomCatalogCapabilities(catalog, routes) {
     const effortFields = route.transport === "antigravity-cli"
       ? { ...catalogEffortFields(route.efforts), input_modalities: ANTIGRAVITY_INPUT_MODALITIES }
       : fixedReasoningEffort(route.upstreamModel) ? catalogEffortFields([]) : {};
+    // 沒有官方模板可對照（獨立模式）時不動既有值；沒有這個欄位等同關閉，需要開啟才補上。
+    const template = catalogTemplateFor(officialModels, route);
+    const toolSearch = template ? customToolSearch(route, model, template) : false;
+    const capabilityFields = template && (toolSearch || model.supports_search_tool !== undefined)
+      ? { ...effortFields, supports_search_tool: toolSearch }
+      : effortFields;
     const instructions = modelIdentityInstructions(model.base_instructions, route);
     const messages = modelIdentityMessages(model.model_messages, route);
     const tiersMatch = isDeepStrictEqual(model.additional_speed_tiers ?? [], tiers.additional_speed_tiers)
       && isDeepStrictEqual(model.service_tiers ?? [], tiers.service_tiers);
     if (tiersMatch && instructions === model.base_instructions && messages === model.model_messages
-      && Object.entries(effortFields).every(([key, value]) => isDeepStrictEqual(model[key], value))) return model;
+      && Object.entries(capabilityFields).every(([key, value]) => isDeepStrictEqual(model[key], value))) return model;
     changed = true;
-    return { ...model, ...tiers, ...effortFields, ...(instructions === undefined ? {} : { base_instructions: instructions }),
+    return { ...model, ...tiers, ...capabilityFields, ...(instructions === undefined ? {} : { base_instructions: instructions }),
       ...(messages === undefined ? {} : { model_messages: messages }) };
   });
   return changed ? { ...catalog, models } : catalog;
@@ -3226,16 +3233,10 @@ export function planDetectedFast(manifest, settings, catalog, slug, fastProbe) {
 }
 
 export function customCatalogEntry(officialModels, route, index) {
-  const lastSegment = route.upstreamModel.split("/").at(-1);
-  const exactTemplate = officialModels.find(
-    (model) => model.slug === route.upstreamModel || model.slug === lastSegment,
-  );
-  const fallbackTemplate =
-    officialModels.find((model) => model.slug === "gpt-5.6-sol") ||
-    officialModels.find((model) => model.visibility === "list") ||
-    officialModels[0];
+  const exactTemplate = exactCatalogTemplate(officialModels, route);
+  const template = catalogTemplateFor(officialModels, route);
   // 獨立模式沒有 Codex 內建目錄，只保留路由器自己的中繼資料，不宣稱官方模型能力。
-  const entry = structuredClone(exactTemplate || fallbackTemplate || {
+  const entry = structuredClone(template || {
     context_window: route.contextWindow || NEW_MODEL_DEFAULTS.contextWindow,
     max_context_window: route.contextWindow || NEW_MODEL_DEFAULTS.contextWindow,
     effective_context_window_percent: 95,
@@ -3259,7 +3260,6 @@ export function customCatalogEntry(officialModels, route, index) {
     entry.input_modalities = ANTIGRAVITY_INPUT_MODALITIES;
     entry.supports_parallel_tool_calls = true;
   }
-  entry.supports_search_tool = false;
   delete entry.web_search_tool_type;
   // 只有 Chat Completions 的模型改用一般函式工具，不用 Code Mode：Code Mode 要模型把整段
   // JavaScript 塞進單一工具參數，這些模型熟悉的是一般的函式呼叫。
@@ -3268,6 +3268,7 @@ export function customCatalogEntry(officialModels, route, index) {
     if (route.combo?.executorTranslate === "chat") delete entry.tool_mode;
     if (Array.isArray(route.combo?.inputModalities)) entry.input_modalities = route.combo.inputModalities;
   }
+  entry.supports_search_tool = customToolSearch(route, entry, template);
   // 上下文視窗解析順序：探測值 > 官方同名模板 > 通用模板值（並警告）。
   if (Number.isFinite(route.contextWindow) && route.contextWindow > 0) {
     entry.context_window = route.contextWindow;
@@ -3285,6 +3286,36 @@ export function customCatalogEntry(officialModels, route, index) {
     entry.max_output_tokens = route.maxOutputTokens;
   }
   return entry;
+}
+
+function exactCatalogTemplate(officialModels, route) {
+  const upstream = String(route?.upstreamModel || "");
+  const lastSegment = upstream.split("/").at(-1);
+  return officialModels.find((model) => model.slug === upstream || model.slug === lastSegment);
+}
+
+// 自訂模型的能力欄位以哪個官方項目為模板：同名模型，否則 gpt-5.6-sol。router.mjs 的
+// syncCustomInstructions 用同樣的順序挑模板。
+export function catalogTemplateFor(officialModels, route) {
+  const models = Array.isArray(officialModels) ? officialModels : [];
+  return exactCatalogTemplate(models, route) ||
+    models.find((model) => model.slug === "gpt-5.6-sol") ||
+    models.find((model) => model.visibility === "list") ||
+    models[0];
+}
+
+// 官方模型開啟 supports_search_tool 時，Codex 會延後載入外掛與 MCP 工具，而且全在 Codex 本機
+// 完成，上游不必支援 Responses 原生的 tool_search：
+//   - Code Mode：exec 說明只寫核心工具，其他工具改列命名空間清單，模型用到時從 ALL_TOOLS 查。
+//   - 一般函式工具模式：Codex 改送一個 execution:"client" 的 tool_search 工具，由 Codex 執行搜尋。
+//     chat-bridge.mjs 會把它轉成函式並把模型的呼叫改回 tool_search_call；目前只對 Antigravity CLI
+//     開啟，其他 Chat Completions 上游的模型能否照著先搜再用尚未驗證，維持關閉。
+// 組合模型的大腦與雙手可能分屬兩種模式，也先關閉。router.mjs 的 customToolSearch 是同一條規則，
+// 兩邊要一起改。
+export function customToolSearch(route, entry, template) {
+  if (template?.supports_search_tool !== true || route?.transport === "combo") return false;
+  if (entry?.tool_mode === "code_mode_only") return route?.translate !== "chat";
+  return route?.transport === "antigravity-cli";
 }
 
 function deepGet(object, path) {
@@ -11404,26 +11435,44 @@ export function syncCustomInstructions(catalog, routes) {
   const fallback = bySlug.get("gpt-5.6-sol") || official.find((model) => model.visibility === "list") || official[0];
   const routeBySlug = new Map((routes || []).map((route) => [route.pickerSlug, route]));
   let changed = false;
+  let searchChanged = false;
   const models = catalog.models.map((model) => {
     const route = routeBySlug.get(model.slug);
     if (!route) return model;
     const upstream = String(route.upstreamModel || "");
     const name = upstream.split("/").at(-1);
     const template = bySlug.get(upstream) || bySlug.get(name) || fallback;
-    if (!template || (template.base_instructions === undefined && template.model_messages === undefined)) return model;
+    if (!template) return model;
     const next = { ...model };
     if (template.base_instructions !== undefined) next.base_instructions = identityInstructions(template.base_instructions, name);
     if (template.model_messages && typeof template.model_messages === "object") {
       next.model_messages = structuredClone(template.model_messages);
       next.model_messages.instructions_template = identityInstructions(next.model_messages.instructions_template, name);
     }
-    if (JSON.stringify(next.base_instructions) === JSON.stringify(model.base_instructions)
-      && JSON.stringify(next.model_messages) === JSON.stringify(model.model_messages)) return model;
-    changed = true;
+    const instructionsChanged = JSON.stringify(next.base_instructions) !== JSON.stringify(model.base_instructions)
+      || JSON.stringify(next.model_messages) !== JSON.stringify(model.model_messages);
+    // 官方日後若關閉某個模型的延後載入，這裡也跟著關。
+    const search = customToolSearch(route, model, template);
+    // 沒有這個欄位等同關閉。
+    const toolSearchChanged = (model.supports_search_tool === true) !== search;
+    if (!instructionsChanged && !toolSearchChanged) return model;
+    if (toolSearchChanged) next.supports_search_tool = search;
+    changed ||= instructionsChanged;
+    searchChanged ||= toolSearchChanged;
     return next;
   });
   if (changed) stats.customInstructionSyncs += 1;
-  return changed ? { ...catalog, models } : catalog;
+  if (searchChanged) stats.customToolSearchSyncs += 1;
+  return changed || searchChanged ? { ...catalog, models } : catalog;
+}
+
+// 與 installer.mjs 的 customToolSearch 相同：沿用官方模板的 supports_search_tool。Code Mode 只靠
+// Codex 本機的 ALL_TOOLS；一般函式工具模式靠 chat-bridge.mjs 轉譯 Codex 本機執行的 tool_search，
+// 目前只開 Antigravity CLI。組合模型維持關閉。
+export function customToolSearch(route, entry, template) {
+  if (template?.supports_search_tool !== true || route?.transport === "combo") return false;
+  if (entry?.tool_mode === "code_mode_only") return route?.translate !== "chat";
+  return route?.transport === "antigravity-cli";
 }
 
 // 只合併同帳號、同 client_version 同時進行的查詢；完成後立刻移除，不會讓下一次
@@ -11756,7 +11805,7 @@ export function stripBridgeReasoning(input, { keepChatReasoning = false } = {}) 
   return { input: kept, removed: input.length - kept.length };
 }
 
-// 轉譯層必須替它合成的 message / function_call 補上 item id（串流協定要求），
+// 轉譯層必須替它合成的 message / function_call / tool_search_call 補上 item id（串流協定要求），
 // 但那是本機隨機鑄的混合大小寫字串。官方後端只認自己發過的 id 格式，會整輪回
 // Invalid 'input[n].id'：碰過 Claude 的對話一切回官方模型就卡死。
 // 上游發的 id 一律是小寫十六進位，因此「後綴帶大寫」足以辨識出自鑄的 id。
@@ -11764,7 +11813,7 @@ export function stripBridgeReasoning(input, { keepChatReasoning = false } = {}) 
 // 工具配對靠的是 call_id，內容因此完整保留。
 export function isBridgeMintedId(value) {
   if (typeof value !== "string") return false;
-  const match = /^(?:msg|fc|ctc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
+  const match = /^(?:msg|fc|ctc|tsc|rs|resp|cmp)_([A-Za-z0-9]{20,})$/.exec(value);
   return match !== null && /[A-Z]/.test(match[1]);
 }
 
@@ -12137,6 +12186,10 @@ const stats = {
   comboSpawnRewrites: 0,
   agentPlaintextPayloads: 0,
   customInstructionSyncs: 0,
+  customToolSearchSyncs: 0,
+  switchToolDefinitionsPruned: 0,
+  switchToolDefinitionCharsPruned: 0,
+  lastSwitchToolPrune: null,
   usageRecords: 0,
   usageLogFailures: 0,
   upstreamErrorCloses: 0,
@@ -14258,6 +14311,148 @@ export function plaintextAgentPayloads(body) {
   return changed ? { ...body, input } : body;
 }
 
+// --- 換模型時清掉舊工具定義 -------------------------------------------------------
+//
+// Codex 換模型時會把工具清單（additional_tools）整份再送一次，並用開發者訊息宣告哪些舊工具
+// 不再可用，但舊清單仍留在歷史裡，之後每一輪都跟著重送。換模型那一輪新模型本來就沒有快取，
+// 這時拿掉已被重新定義或宣告不可用的舊定義，不會多打斷一次快取。同一個模型中途補送清單
+// （例如外掛晚連上）不處理：舊清單在歷史最前面，拿掉會讓已命中的快取前綴整段失效。
+//
+// 只認 Codex 的固定格式。換模型的標記是開頭為 MODEL_SWITCH_MARKER 的開發者訊息；同模型時
+// Codex 也會送 <model_instructions>（只寫「replace the previous base instructions」），那種
+// 不算。標記前後相連的開場項目（開發者訊息、additional_tools、環境資訊）是這次換模型的更新，
+// 只清掉更早的定義。歷史裡呼叫過的工具即使宣告不可用也保留定義，讓每筆舊呼叫都還有對應工具；
+// 被重新定義的工具一律保留最新那份。巢狀命名空間與無法辨識的格式原樣保留。
+const MODEL_SWITCH_MARKER = "<model_instructions>\nThe current model is ";
+const UNAVAILABLE_NAMESPACES_HEADER = "The following namespaces are no longer available.";
+const UNAVAILABLE_TOOLS_HEADER = "The following tools are no longer available.";
+
+function plainMessageText(item) {
+  if (!item || (item.type !== undefined && item.type !== "message")) return "";
+  if (typeof item.content === "string") return item.content;
+  if (!Array.isArray(item.content)) return "";
+  return item.content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("");
+}
+
+function isSwitchContextItem(item) {
+  if (item?.type === "additional_tools" || item?.type === "configuration_update") return true;
+  if (item?.type !== undefined && item?.type !== "message") return false;
+  if (item?.role === "developer" || item?.role === "system") return true;
+  return item?.role === "user" && plainMessageText(item).trimStart().startsWith("<environment_context>");
+}
+
+// 標題那一行之後連續的「- 名稱」才算清單，遇到空行或其他文字就結束。
+export function listedUnavailableNames(text, header) {
+  const index = typeof text === "string" ? text.indexOf(header) : -1;
+  if (index < 0) return [];
+  const names = [];
+  for (const line of text.slice(index).split("\n").slice(1)) {
+    const match = /^- ([A-Za-z0-9_.-]{1,200})\s*$/.exec(line);
+    if (!match) break;
+    names.push(match[1]);
+  }
+  return names;
+}
+
+function toolDefinitionKeys(item) {
+  const keys = [];
+  for (const tool of item?.tools || []) {
+    if (tool?.type === "namespace") {
+      if (typeof tool.name !== "string" || !Array.isArray(tool.tools)) continue;
+      for (const child of tool.tools) {
+        if (child?.type !== "namespace" && typeof child?.name === "string") keys.push(`${tool.name}.${child.name}`);
+      }
+    } else if (typeof tool?.name === "string") {
+      keys.push(`${tool.namespace || "functions"}.${tool.name}`);
+    }
+  }
+  return keys;
+}
+
+export function pruneSwitchedToolDefinitions(body) {
+  const unchanged = { body, removed: 0, chars: 0 };
+  const input = body?.input;
+  if (!Array.isArray(input) || !input.some((item) => item?.type === "additional_tools")) return unchanged;
+  const events = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const marker = input[index];
+    if ((marker?.role !== "developer" && marker?.role !== "system") ||
+        !plainMessageText(marker).startsWith(MODEL_SWITCH_MARKER)) continue;
+    let start = index;
+    while (start > 0 && isSwitchContextItem(input[start - 1])) start -= 1;
+    let end = index;
+    while (end + 1 < input.length && isSwitchContextItem(input[end + 1])) end += 1;
+    const event = { start, redefined: new Set(), namespaces: new Set(), tools: new Set() };
+    for (let position = start; position <= end; position += 1) {
+      const item = input[position];
+      if (item?.type === "additional_tools") {
+        for (const key of toolDefinitionKeys(item)) event.redefined.add(key);
+        continue;
+      }
+      const text = plainMessageText(item);
+      for (const name of listedUnavailableNames(text, UNAVAILABLE_NAMESPACES_HEADER)) event.namespaces.add(name);
+      for (const name of listedUnavailableNames(text, UNAVAILABLE_TOOLS_HEADER)) event.tools.add(name);
+    }
+    if (start > 0 && (event.redefined.size || event.namespaces.size || event.tools.size)) events.push(event);
+    index = end;
+  }
+  if (!events.length) return unchanged;
+
+  // 沒帶 namespace 的呼叫（functions 底下的工具）視為任何命名空間的同名工具都被用過。
+  const referenced = new Set();
+  for (const item of input) {
+    if (typeof item?.type === "string" && item.type.endsWith("_call") && typeof item.name === "string") {
+      referenced.add(`${typeof item.namespace === "string" && item.namespace ? item.namespace : "*"}.${item.name}`);
+    }
+  }
+  const isReferenced = (namespace, name) => referenced.has(`${namespace}.${name}`) || referenced.has(`*.${name}`);
+  const superseded = (position, namespace, name) => events.some((event) => event.start > position && (
+    event.redefined.has(`${namespace}.${name}`) ||
+    ((event.namespaces.has(namespace) || event.tools.has(`${namespace}.${name}`)) && !isReferenced(namespace, name))));
+
+  let removed = 0;
+  let chars = 0;
+  const output = [];
+  input.forEach((item, position) => {
+    if (item?.type !== "additional_tools" || !Array.isArray(item.tools)) {
+      output.push(item);
+      return;
+    }
+    const tools = [];
+    let itemChanged = false;
+    for (const tool of item.tools) {
+      if (tool?.type === "namespace") {
+        if (typeof tool.name !== "string" || !Array.isArray(tool.tools)) {
+          tools.push(tool);
+          continue;
+        }
+        const kept = tool.tools.filter((child) => child?.type === "namespace" || typeof child?.name !== "string" ||
+          !superseded(position, tool.name, child.name));
+        if (kept.length === tool.tools.length) {
+          tools.push(tool);
+          continue;
+        }
+        removed += tool.tools.length - kept.length;
+        itemChanged = true;
+        if (kept.length) tools.push({ ...tool, tools: kept });
+      } else if (typeof tool?.name === "string" && superseded(position, tool.namespace || "functions", tool.name)) {
+        removed += 1;
+        itemChanged = true;
+      } else {
+        tools.push(tool);
+      }
+    }
+    if (!itemChanged) {
+      output.push(item);
+      return;
+    }
+    const next = tools.length ? { ...item, tools } : null;
+    chars += JSON.stringify(item).length - (next ? JSON.stringify(next).length : 0);
+    if (next) output.push(next);
+  });
+  return removed ? { body: { ...body, input: output }, removed, chars } : unchanged;
+}
+
 export async function fetchModelUpstream(
   requestHeaders,
   incomingUrl,
@@ -14321,6 +14516,18 @@ export async function fetchModelUpstream(
     transport: meta.transport || "http", backgroundKind: meta.backgroundKind ?? null, startedAt,
     combo: comboRole,
   });
+  // 歷史照原樣保存，只精簡這次送出的內容；結果只取決於輸入，換模型之後每一輪都一樣，不影響快取。
+  if (isCustom) {
+    const pruned = pruneSwitchedToolDefinitions(effectiveBody);
+    if (pruned.removed) {
+      effectiveBody = pruned.body;
+      stats.switchToolDefinitionsPruned += pruned.removed;
+      stats.switchToolDefinitionCharsPruned += pruned.chars;
+      stats.lastSwitchToolPrune = {
+        at: new Date().toISOString(), model: body?.model ?? null, removed: pruned.removed, chars: pruned.chars,
+      };
+    }
+  }
 
   // 只有 Anthropic 轉譯路由能解讀自己產生的 reasoning，其餘路由一律剝除；
   // 自鑄的 item id 同理，留著會讓上游拒收整輪請求。
@@ -18024,6 +18231,48 @@ const CHAT_EFFORTS = {
 
 const NO_OUTPUT = "(no output)";
 
+// ---------------------------------------------------------------- 工具搜尋
+//
+// 一般函式工具模式的模型開啟延後載入（supports_search_tool）時，Codex 只送核心工具與一個
+// type:"tool_search"、execution:"client" 的搜尋工具，外掛與 MCP 工具改列分類清單。搜尋由
+// Codex 本機執行：收到 tool_search_call 後比對延後的工具，下一輪以 tool_search_output 帶回
+// 完整定義（collectToolDefinitions 會把它們併進工具清單）。Chat Completions 沒有這種工具，
+// 轉成同名函式；模型呼叫它時改回 tool_search_call，交給 Codex 執行。伺服器端執行
+// （execution:"server"）的版本沒有執行器，照舊視為不可用的平台工具。
+const TOOL_SEARCH_NAME = "tool_search";
+const isClientToolSearch = (item) => item?.execution === "client";
+
+function toolSearchFunction(tool) {
+  const parameters = tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)
+    ? tool.parameters
+    : { type: "object", properties: { query: { type: "string" }, limit: { type: "number" } }, required: ["query"] };
+  return {
+    type: "function",
+    function: {
+      name: TOOL_SEARCH_NAME,
+      description: tool.description || "Search deferred tools by keywords and load the matching tools for the next call.",
+      parameters: sanitizeToolSchema(flattenTopLevelSchema(parameters)),
+    },
+  };
+}
+
+function toolSearchArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  try {
+    const parsed = parseToolArguments(typeof value === "string" ? value : "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// 搜尋結果的定義已併進工具清單，這裡只列出載入了哪些工具（用模型看到的名稱）。
+function toolSearchResultText(item) {
+  const names = flattenTools(Array.isArray(item.tools) ? item.tools : []).tools.map((tool) => tool.name);
+  if (!names.length) return "No matching tools were found. Try another query, or continue without them.";
+  return `Loaded ${names.length} tool(s). They are now in your tool list and can be called directly: ${names.join(", ")}`;
+}
+
 // ---------------------------------------------------------------- 推理
 //
 // Chat Completions 的推理是明文（delta.reasoning_content 或 delta.reasoning）。
@@ -18217,11 +18466,13 @@ export function toChatRequest(body, route) {
 
   // 同時接受標準 Responses 頂層 tools 與 Codex 的 additional_tools；後出現的同名定義優先。
   const toolDefinitions = collectToolDefinitions(body, inputItems);
+  const toolSearch = toolDefinitions.findLast((tool) => tool?.type === "tool_search" && isClientToolSearch(tool)) || null;
   const { tools: codexTools, targets: toolTargets } = flattenTools(toolDefinitions);
   const unavailable = [];
   const inspectTools = (tools) => {
     for (const tool of tools) {
       if (tool?.type === "namespace") inspectTools(tool.tools || []);
+      else if (tool?.type === "tool_search" && isClientToolSearch(tool)) continue;
       else if (!["function", "custom"].includes(tool?.type)) unavailable.push(tool?.type || "unknown");
     }
   };
@@ -18297,6 +18548,14 @@ export function toChatRequest(body, route) {
     if (!text) return;
     const current = currentAssistant(index);
     current.text = current.text ? `${current.text}\n\n${text}` : text;
+  };
+  const pushHostedSummary = (index, item) => {
+    const summary = hostedToolSummary(item);
+    if (summary.role === "assistant") appendAssistantText(index, summary.text);
+    else {
+      closeToolGroup();
+      pushUser([{ type: "text", text: summary.text }]);
+    }
   };
   const pushToolCall = (index, callId, name, args) => {
     if (textOnlyTools || !callId) {
@@ -18408,6 +18667,23 @@ export function toChatRequest(body, route) {
         handleToolOutput(item);
         break;
 
+      // Codex 本機執行的工具搜尋：轉成一般的工具呼叫與結果，模型才看得出自己搜過什麼。
+      case "tool_search_call":
+        if (isClientToolSearch(item) && item.call_id) {
+          pushToolCall(index, item.call_id, TOOL_SEARCH_NAME, JSON.stringify(toolSearchArguments(item.arguments)));
+        } else {
+          pushHostedSummary(index, item);
+        }
+        break;
+
+      case "tool_search_output":
+        if (isClientToolSearch(item) && item.call_id) {
+          handleToolOutput({ type: "function_call_output", call_id: item.call_id, output: toolSearchResultText(item) });
+        } else {
+          pushHostedSummary(index, item);
+        }
+        break;
+
       // 官方 GPT 回合留下的平台內建工具項目：都已完成，也沒有可轉送的執行器，轉成簡短文字。
       case "web_search_call":
       case "file_search_call":
@@ -18419,16 +18695,8 @@ export function toChatRequest(body, route) {
       case "mcp_list_tools":
       case "mcp_approval_request":
       case "mcp_approval_response":
-      case "tool_search_call":
-      case "tool_search_output": {
-        const summary = hostedToolSummary(item);
-        if (summary.role === "assistant") appendAssistantText(index, summary.text);
-        else {
-          closeToolGroup();
-          pushUser([{ type: "text", text: summary.text }]);
-        }
+        pushHostedSummary(index, item);
         break;
-      }
 
       case "compaction_trigger":
         compaction = true;
@@ -18465,6 +18733,10 @@ export function toChatRequest(body, route) {
   if (systemParts.length) chatMessages.unshift({ role: "system", content: systemParts.join("\n\n") });
 
   const { tools, freeform, toolContext } = toChatTools(codexTools);
+  if (toolSearch && !tools.some((tool) => tool.function.name === TOOL_SEARCH_NAME)) {
+    tools.push(toolSearchFunction(toolSearch));
+    toolTargets.set(TOOL_SEARCH_NAME, { name: TOOL_SEARCH_NAME, toolSearch: true });
+  }
   const request = { model: upstreamModel, messages: chatMessages, stream: true };
   for (const key of ["temperature", "top_p"]) {
     if (body[key] !== undefined) request[key] = body[key];
@@ -18767,6 +19039,18 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     const target = ctx.toolTargets?.get(entry.alias);
     entry.name = target?.name || entry.alias;
     entry.namespace = target?.namespace || null;
+    if (target?.toolSearch) {
+      // 交給 Codex 執行的工具搜尋，見檔案開頭「工具搜尋」。
+      entry.toolSearch = true;
+      entry.itemId = randomId("tsc_", 54);
+      send({
+        type: "response.output_item.added",
+        output_index: entry.index,
+        item: { id: entry.itemId, type: "tool_search_call", status: "in_progress", call_id: entry.callId,
+          execution: "client", arguments: {} },
+      });
+      return;
+    }
     entry.freeform = ctx.freeform.has(entry.alias);
     if (entry.freeform) entry.itemId = randomId("ctc_", 54);
     const identity = entry.namespace ? { name: entry.name, namespace: entry.namespace } : { name: entry.name };
@@ -18835,6 +19119,13 @@ export async function bridgeChatStream(upstreamBody, emit, ctx) {
     if (!parsed || (entry.freeform && typeof parsed[FREEFORM_KEY] !== "string")) {
       fail({ code: "invalid_tool_arguments", message: "上游工具參數不完整或格式錯誤；未產生替代參數，請重新產生該工具呼叫。" });
       return false;
+    }
+    if (entry.toolSearch) {
+      const item = { id: entry.itemId, type: "tool_search_call", status: "completed", call_id: entry.callId,
+        execution: "client", arguments: parsed };
+      output.push(item);
+      send({ type: "response.output_item.done", output_index: entry.index, item });
+      return true;
     }
     const identity = entry.namespace ? { name: entry.name, namespace: entry.namespace } : { name: entry.name };
     let item;
